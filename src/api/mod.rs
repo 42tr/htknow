@@ -1,9 +1,12 @@
-use axum::{Router, response::IntoResponse, routing::get};
+use axum::{Router, routing::get};
+use sqlx::SqlitePool;
 
-pub fn app() -> Router {
-    Router::new().route("/", get(root))
-}
+mod error;
+mod knowledge;
 
-async fn root() -> impl IntoResponse {
-    "Hello from axum!"
+pub fn app(pool: SqlitePool) -> Router {
+    let knowledge_router = Router::new()
+        .route("/", get(knowledge::list))
+        .with_state(pool);
+    Router::new().nest("/knowledge/", knowledge_router)
 }
