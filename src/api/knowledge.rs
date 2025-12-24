@@ -2,7 +2,7 @@ use crate::api::error::ApiResult;
 use axum::extract::{Query, State};
 use axum::response::Json;
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, SqlitePool};
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 #[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow)]
 pub struct Knowledge {
@@ -14,48 +14,49 @@ pub struct Knowledge {
 
 #[derive(Debug, Deserialize)]
 pub struct ListQuery {
-    // optional pagination
-    pub limit: Option<i64>,
-    pub offset: Option<i64>,
-
-    // optional filters
-    pub user_id: Option<String>,
+    /// 页码，从1开始
+    pub page: Option<i64>,
+    /// 每页条数
+    pub size: Option<i64>,
+    /// 关键词搜索信息（在 name + description 中搜索）
+    pub keyword: Option<String>,
+    /// 模糊搜索 name 字段
     pub name: Option<String>,
+    /// 知识库 ID（精确匹配）
+    pub id: Option<String>,
 }
 
 pub async fn list(
     State(pool): State<SqlitePool>,
     Query(params): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<Knowledge>>> {
-    // Build dynamic SQL depending on provided query params
-    let mut qb =
-        QueryBuilder::<sqlx::Sqlite>::new("SELECT id, user_id, name, description FROM knowledge");
+    // Determine pagination: default size 10, default page 1
+    let size = params.size.unwrap_or(10).max(1);
+    let page = params.page.unwrap_or(1).max(1);
+    let limit = size;
+    let offset = (page - 1) * size;
 
-    // If any filter is present, add a WHERE 1=1 and append conditions
-    if params.user_id.is_some() || params.name.is_some() {
-        qb.push(" WHERE 1=1");
-        if let Some(user_id) = &params.user_id {
-            qb.push(" AND user_id = ").push_bind(user_id);
-        }
-        if let Some(name) = &params.name {
-            // use LIKE for name partial matches
-            let pattern = format!("%{}%", name);
-            qb.push(" AND name LIKE ").push_bind(pattern);
-        }
+    // Start building the query
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "SELECT id, user_id, name, description FROM knowledge WHERE 1=1 ",
+    );
+
+    // If `id` provided, try to parse as integer id and filter by id
+    if let Some(id_str) = params.id.as_deref() {
+        qb.push(" AND id = ").push_bind(id_str);
     }
 
-    // ordering
+    // name fuzzy search (only name column)
+    if let Some(name) = &params.name {
+        qb.push("AND name LIKE ").push_bind(format!("%{}%", name));
+    }
+
+    // ordering and pagination
     qb.push(" ORDER BY id");
+    qb.push(" LIMIT ").push_bind(limit);
+    qb.push(" OFFSET ").push_bind(offset);
 
-    // pagination
-    if let Some(limit) = params.limit {
-        qb.push(" LIMIT ").push_bind(limit);
-    }
-    if let Some(offset) = params.offset {
-        qb.push(" OFFSET ").push_bind(offset);
-    }
-
-    // Build and execute
+    // Execute
     let query = qb.build_query_as::<Knowledge>();
     let knowledges = query.fetch_all(&pool).await?;
 
