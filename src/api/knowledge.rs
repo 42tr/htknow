@@ -1,4 +1,5 @@
 use crate::api::error::ApiResult;
+use axum::Extension;
 use axum::extract::{Query, State};
 use axum::response::Json;
 use serde::{Deserialize, Serialize};
@@ -29,7 +30,9 @@ pub struct ListQuery {
 pub async fn list(
     State(pool): State<SqlitePool>,
     Query(params): Query<ListQuery>,
+    Extension(user_id): Extension<String>,
 ) -> ApiResult<Json<Vec<Knowledge>>> {
+    println!("user_id = {}", user_id);
     // Determine pagination: default size 10, default page 1
     let size = params.size.unwrap_or(10).max(1);
     let page = params.page.unwrap_or(1).max(1);
