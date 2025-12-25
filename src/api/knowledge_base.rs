@@ -91,39 +91,36 @@ pub async fn create(
 
 #[derive(Deserialize)]
 pub struct KnowledgeUpdateReq {
-    pub id: i64,
     pub name: Option<String>,
     pub description: Option<String>,
 }
 
 pub async fn update(
-    State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
+    Path(id): Path<u32>, State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
     Json(knowledge): Json<KnowledgeUpdateReq>,
 ) -> ApiResult<Json<Knowledge>> {
     let query = "UPDATE knowledge_base SET name = ?, description = ? WHERE id = ? AND user_id = ?";
     sqlx::query(query)
         .bind(knowledge.name)
         .bind(knowledge.description)
-        .bind(knowledge.id)
+        .bind(id)
         .bind(auth_user.user_id)
         .execute(&pool)
         .await?;
     let kb = sqlx::query_as("SELECT id, user_id, name, description FROM knowledge_base WHERE id = ?")
-        .bind(knowledge.id)
+        .bind(id)
         .fetch_one(&pool)
         .await?;
     Ok(Json(kb))
 }
 
-pub async fn get(State(pool): State<SqlitePool>, Path(id): Path<String>) -> ApiResult<Json<Knowledge>> {
-    let id = id.parse::<u32>().unwrap();
+pub async fn get(State(pool): State<SqlitePool>, Path(id): Path<u32>) -> ApiResult<Json<Knowledge>> {
     let query = "SELECT id, user_id, name, description FROM knowledge_base WHERE id = ?";
     let knowledge = sqlx::query_as(query).bind(id).fetch_one(&pool).await?;
     Ok(Json(knowledge))
 }
 
-pub async fn delete(State(pool): State<SqlitePool>, Path(id): Path<String>) -> ApiResult<()> {
-    let id = id.parse::<u32>().unwrap();
+pub async fn delete(State(pool): State<SqlitePool>, Path(id): Path<u32>) -> ApiResult<()> {
     let query = "DELETE FROM knowledge_base WHERE id = ?";
     sqlx::query(query).bind(id).execute(&pool).await?;
     Ok(())

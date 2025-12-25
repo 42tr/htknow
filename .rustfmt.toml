@@ -22,7 +22,7 @@ brace_style = "PreferSameLine"         # 结构体、enum 的 `{` 放同一行�
 
 # 函数相关
 fn_params_layout = "Compressed" # 函数参数紧凑布局（少换行）
-fn_call_width = 60              # 函数调用超过 60 字符才换行
+fn_call_width = 120              # 函数调用超过 60 字符才换行
 fn_single_line = false          # 不强制简单函数写成单行
 
 # 结构体与元组

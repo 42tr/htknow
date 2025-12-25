@@ -1,4 +1,4 @@
-use std::{fmt, result};
+use std::{fmt, num::ParseIntError, result};
 
 use axum::{
     Json, http::StatusCode, response::{IntoResponse, Response}
@@ -17,6 +17,7 @@ pub enum ApiError {
     Unauthorized(String),
     NotFound(String),
     Database(sqlx::Error),
+    System(std::io::Error),
     Internal(String),
 }
 
@@ -27,6 +28,7 @@ impl fmt::Display for ApiError {
             ApiError::Unauthorized(msg) => write!(f, "Unauthorized: {}", msg),
             ApiError::NotFound(msg) => write!(f, "NotFound: {}", msg),
             ApiError::Database(e) => write!(f, "Database error: {}", e),
+            ApiError::System(e) => write!(f, "System error: {}", e),
             ApiError::Internal(msg) => write!(f, "Internal error: {}", msg),
         }
     }
@@ -37,6 +39,24 @@ impl std::error::Error for ApiError {}
 impl From<sqlx::Error> for ApiError {
     fn from(e: sqlx::Error) -> Self {
         ApiError::Database(e)
+    }
+}
+
+impl From<std::io::Error> for ApiError {
+    fn from(e: std::io::Error) -> Self {
+        ApiError::System(e)
+    }
+}
+
+impl From<axum::extract::multipart::MultipartError> for ApiError {
+    fn from(e: axum::extract::multipart::MultipartError) -> Self {
+        ApiError::Internal(format!("Multipart error: {}", e))
+    }
+}
+
+impl From<ParseIntError> for ApiError {
+    fn from(e: ParseIntError) -> Self {
+        ApiError::BadRequest(format!("Int error: {}", e))
     }
 }
 
@@ -58,17 +78,16 @@ impl IntoResponse for ApiError {
             ApiError::Database(e) => {
                 // Log detailed error server-side but avoid leaking internals to clients.
                 log::error!("Database error: {}", e);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal server error".into(),
-                )
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".into())
+            }
+            ApiError::System(e) => {
+                // Log detailed error server-side but avoid leaking internals to clients.
+                log::error!("System error: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".into())
             }
             ApiError::Internal(msg) => {
                 log::error!("Internal error: {}", msg);
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "Internal server error".into(),
-                )
+                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".into())
             }
         };
 
