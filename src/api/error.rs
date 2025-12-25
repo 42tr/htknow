@@ -1,11 +1,10 @@
+use std::{fmt, result};
+
 use axum::{
-    Json,
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    Json, http::StatusCode, response::{IntoResponse, Response}
 };
 use serde::Serialize;
 use sqlx;
-use std::{fmt, result};
 
 /// Unified API error type for handlers to return.
 ///
@@ -73,10 +72,7 @@ impl IntoResponse for ApiError {
             }
         };
 
-        let body = ErrorBody {
-            code: status.as_u16(),
-            error: message,
-        };
+        let body = ErrorBody { code: status.as_u16(), error: message };
 
         (status, Json(body)).into_response()
     }

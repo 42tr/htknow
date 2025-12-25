@@ -10,12 +10,12 @@ CREATE TABLE IF NOT EXISTS file (
     log TEXT DEFAULT '', -- 日志
     slices TEXT DEFAULT '[]', -- 切片信息
     slice_type TEXT, -- 切片类型
-    knowledge_id TEXT DEFAULT NULL, -- 知识库ID
+    kb_id TEXT DEFAULT NULL, -- 知识库ID
     created_at INTEGER,
     updated_at INTEGER
 );
 
-CREATE TABLE IF NOT EXISTS knowledge (
+CREATE TABLE IF NOT EXISTS knowledge_base (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT, -- 归属用户ID
     name TEXT NOT NULL, -- 知识库名称

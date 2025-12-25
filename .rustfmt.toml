@@ -1,0 +1,61 @@
+# .rustfmt.toml
+
+# 基本设置
+edition = "2024"
+max_width = 120        # 每行最大字符数（建议 80~120）
+hard_tabs = false      # 使用空格而不是制表符
+tab_spaces = 4         # 一个缩进等于 4 个空格
+newline_style = "Unix" # 换行符使用 \n（Linux/macOS/WSL 风格）
+
+use_small_heuristics = "Max" # 尽量将短的 use 合并成一行
+
+
+# 空格与括号
+space_before_colon = false   # 类型声明中冒号前不加空格: `foo: i32`
+space_after_colon = true     # 冒号后加空格
+spaces_around_ranges = false # 不在 range 周围加空格: `..` 而不是 ` .. `
+
+# 控制结构格式
+indent_style = "Block"                 # 使用块式缩进（而非 Visual）
+control_brace_style = "AlwaysSameLine" # if/else、fn 的 `{` 放下一行
+brace_style = "PreferSameLine"         # 结构体、enum 的 `{` 放同一行（除非有 where）
+
+# 函数相关
+fn_params_layout = "Compressed" # 函数参数紧凑布局（少换行）
+fn_call_width = 60              # 函数调用超过 60 字符才换行
+fn_single_line = false          # 不强制简单函数写成单行
+
+# 结构体与元组
+struct_lit_single_line = true # 简短结构体字面量放在一行: `Point { x: 1, y: 2 }`
+
+# use 语句的分组方式
+group_imports = "StdExternalCrate" # 可选: "StdExternalCrate", "Preserve", "One"
+# 导入排序
+reorder_imports = true        # 自动对 use 导入语句排序
+reorder_modules = true        # 是否对模块内的 use 按照路径排序
+imports_indent = "Block"      # use 导入缩进为块风格
+imports_layout = "Horizontal" # 垂直排列导入（每行一个）
+# 导入同一模块的类型，应该置于同一个块内
+imports_granularity = "Crate"
+
+# 模式匹配
+match_arm_blocks = true           # match 分支使用块时换行
+match_arm_leading_pipes = "Never" # 不在 match 分支前加 `|`
+force_multiline_blocks = false    # 不强制复杂块换行
+
+# 表达式
+trailing_comma = "Vertical" # 垂直列表末尾加逗号
+trailing_semicolon = true   # 语句结尾加分号
+wrap_comments = false       # 不自动换行注释（保留手动格式）
+
+# 类型与泛型
+type_punctuation_density = "Compressed" # 类型标点紧凑: `Vec<i32>` 而非 `Vec< i32 >`
+binop_separator = "Front"               # 二元操作符换行时，操作符放下一行开头
+
+# 宏
+format_macro_matchers = true # 格式化 macro_rules! 中的匹配模式
+format_macro_bodies = true   # 格式化宏体内容
+
+# 高级（按需启用）
+normalize_comments = false     # 不自动规范化注释大小写或空格
+overflow_delimited_expr = true # 允许括号表达式溢出时不换行（实验性）

@@ -1,32 +1,39 @@
-use axum::Router;
-use axum::body::Body;
-use axum::http::{Request, StatusCode};
-use axum::middleware::{self, Next};
-use axum::response::{IntoResponse, Response};
 use std::net::SocketAddr;
+
+use axum::{
+    Router, body::Body, http::{Request, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Response}
+};
 use tokio::net::TcpListener;
 
 mod api;
 mod db;
 mod log4rs;
+mod search;
 
-/// Auth middleware: extract `x-user-id` from headers and put the raw `String`
-/// into request extensions so handlers can extract `Extension<String>`.
-/// Returns 401 if the header is missing or invalid.
+/// User authentication info extracted from request headers
+#[derive(Clone, Debug)]
+pub struct AuthUser {
+    pub user_id: String,
+    pub role: String,
+}
+
+/// Auth middleware: extract `x-user-id` and `x-role` from headers and put them
+/// into request extensions as `AuthUser` so handlers can extract `Extension<AuthUser>`.
+/// Returns 401 if required headers are missing or invalid.
 async fn auth<B>(mut req: Request<Body>, next: Next) -> Response {
-    // Extract header value into an owned String first (no references into `req` are kept).
-    let user_id_opt = req
-        .headers()
-        .get("x-user-id")
-        .and_then(|v| v.to_str().ok())
-        .map(|s| s.to_owned());
+    // Extract header values into owned Strings
+    let user_id_opt = req.headers().get("x-user-id").and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
 
-    match user_id_opt {
-        Some(uid) => {
-            req.extensions_mut().insert(uid);
+    let role_opt = req.headers().get("x-role").and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
+
+    match (user_id_opt, role_opt) {
+        (Some(user_id), Some(role)) => {
+            let auth_user = AuthUser { user_id, role };
+            req.extensions_mut().insert(auth_user);
             next.run(req).await
         }
-        None => (StatusCode::UNAUTHORIZED, "Missing x-user-id header").into_response(),
+        (None, _) => (StatusCode::UNAUTHORIZED, "Missing x-user-id header").into_response(),
+        (_, None) => (StatusCode::UNAUTHORIZED, "Missing x-role header").into_response(),
     }
 }
 
@@ -34,9 +41,10 @@ async fn auth<B>(mut req: Request<Body>, next: Next) -> Response {
 async fn main() -> anyhow::Result<()> {
     log4rs::init();
     let pool = db::init().await?;
+    let search_engine = search::SearchEngine::init().await;
 
     let app = Router::new()
-        .nest("/api/v1/knowledge/", api::app(pool))
+        .nest("/api/v1/knowledge/", api::app(pool, search_engine))
         .layer(middleware::from_fn(auth::<Body>));
 
     let listener = TcpListener::bind("0.0.0.0:3000").await?;

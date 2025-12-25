@@ -1,5 +1,6 @@
-use std::fs::OpenOptions;
-use std::path::{Path, PathBuf};
+use std::{
+    fs::OpenOptions, path::{Path, PathBuf}
+};
 
 use anyhow::Context;
 use log::info;
@@ -11,41 +12,27 @@ use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 /// 或者直接 `./data/db.sqlite`），会确保父目录存在并且数据库文件被创建（如果不存在）。
 pub async fn init() -> anyhow::Result<SqlitePool> {
     // 读取环境变量，如果没有则使用默认文件路径
-    let database_url =
-        std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://app.sqlite".to_string());
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://app.sqlite".to_string());
 
     // 尝试从 URL 中解析出文件路径并提前创建目录/文件
     if let Some(db_path) = sqlite_path_from_url(&database_url) {
-        ensure_db_file(&db_path)
-            .with_context(|| format!("failed to ensure sqlite db file: {}", db_path.display()))?;
+        ensure_db_file(&db_path).with_context(|| format!("failed to ensure sqlite db file: {}", db_path.display()))?;
     } else {
         info!("Detected non-file SQLite URL or in-memory DB; skipping file creation");
     }
 
     info!("Connecting to SQLite database...");
 
-    let pool = SqlitePoolOptions::new()
-        .max_connections(10)
-        .connect(&database_url)
-        .await?;
+    let pool = SqlitePoolOptions::new().max_connections(10).connect(&database_url).await?;
 
     info!("SQLite database connected successfully");
 
     // 可选：设置一些 PRAGMA，以优化并保证行为
     // 开启 WAL 模式与外键支持，设置 busy_timeout（毫秒）
     // 忽略这些 PRAGMA 的错误以兼容不同环境（例如某些内存 DB URL）
-    sqlx::query("PRAGMA journal_mode = WAL;")
-        .execute(&pool)
-        .await
-        .ok();
-    sqlx::query("PRAGMA foreign_keys = ON;")
-        .execute(&pool)
-        .await
-        .ok();
-    sqlx::query("PRAGMA busy_timeout = 5000;")
-        .execute(&pool)
-        .await
-        .ok();
+    sqlx::query("PRAGMA journal_mode = WAL;").execute(&pool).await.ok();
+    sqlx::query("PRAGMA foreign_keys = ON;").execute(&pool).await.ok();
+    sqlx::query("PRAGMA busy_timeout = 5000;").execute(&pool).await.ok();
 
     // 自动创建表
     create_tables(&pool).await?;
@@ -64,10 +51,7 @@ async fn create_tables(pool: &SqlitePool) -> anyhow::Result<()> {
         if sql.is_empty() {
             continue;
         }
-        sqlx::query(sql)
-            .execute(pool)
-            .await
-            .expect("Failed to execute SQL");
+        sqlx::query(sql).execute(pool).await.expect("Failed to execute SQL");
     }
 
     info!("Tables created successfully");
@@ -139,9 +123,8 @@ fn sqlite_path_from_url(url: &str) -> Option<PathBuf> {
 fn ensure_db_file(path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         if !parent.exists() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("failed to create parent directory {}", parent.display())
-            })?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
             info!(
                 "Created parent directory for sqlite DB: {}",
                 parent.display()
