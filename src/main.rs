@@ -8,6 +8,7 @@ use tokio::net::TcpListener;
 mod api;
 mod db;
 mod log4rs;
+mod processor;
 mod search;
 
 /// User authentication info extracted from request headers
@@ -42,6 +43,10 @@ async fn main() -> anyhow::Result<()> {
     log4rs::init();
     let pool = db::init().await?;
     let search_engine = search::SearchEngine::init().await;
+
+    // 启动文件处理后台任务（每30秒检查一次）
+    let processor = processor::FileProcessor::new(pool.clone(), 30);
+    processor.start();
 
     let app = Router::new()
         .nest("/api/v1/knowledge/", api::app(pool, search_engine))

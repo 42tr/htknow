@@ -8,6 +8,9 @@ mod file;
 mod knowledge_base;
 use crate::search::SearchEngine;
 
+// 重新导出 File 类型供其他模块使用
+pub use file::File;
+
 pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
     let knowledge_router = Router::new()
         .route("/", get(knowledge_base::list).post(knowledge_base::create))

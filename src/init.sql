@@ -1,4 +1,4 @@
-CREATE TABLE IF NOT EXISTS file (
+CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT, -- 归属用户ID
     hash TEXT NOT NULL, -- 文件HASH
@@ -29,5 +29,5 @@ CREATE TABLE IF NOT EXISTS slices (
     content TEXT NOT NULL, -- 切片内容
     created_at INTEGER DEFAULT CURRENT_TIMESTAMP,
     updated_at INTEGER DEFAULT CURRENT_TIMESTAMP,
-    FOREIGN KEY (file_id) REFERENCES file(id)
+    FOREIGN KEY (file_id) REFERENCES files(id)
 );
