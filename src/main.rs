@@ -45,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
     let search_engine = search::SearchEngine::init().await;
 
     // 启动文件处理后台任务（每30秒检查一次）
-    let processor = processor::FileProcessor::new(pool.clone(), 30);
+    let processor = processor::FileProcessor::new(pool.clone(), search_engine.clone(), 30);
     processor.start();
 
     let app = Router::new()
@@ -53,10 +53,6 @@ async fn main() -> anyhow::Result<()> {
         .layer(middleware::from_fn(auth::<Body>));
 
     let listener = TcpListener::bind("0.0.0.0:3000").await?;
-    axum::serve(
-        listener,
-        app.into_make_service_with_connect_info::<SocketAddr>(),
-    )
-    .await?;
+    axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }

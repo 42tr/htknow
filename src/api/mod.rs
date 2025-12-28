@@ -6,10 +6,11 @@ use sqlx::SqlitePool;
 mod error;
 mod file;
 mod knowledge_base;
-use crate::search::SearchEngine;
-
+mod search;
 // 重新导出 File 类型供其他模块使用
 pub use file::File;
+
+use crate::search::SearchEngine;
 
 pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
     let knowledge_router = Router::new()
@@ -18,9 +19,11 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
     let file_router = Router::new()
         .route("/", post(file::upload))
         .route("/{id}", get(file::get).put(file::update).delete(file::delete));
+    let search_router = Router::new().route("/", get(search::search));
     Router::new()
         .nest("/knowledge_base/", knowledge_router)
         .nest("/files/", file_router)
+        .nest("/search/", search_router)
         .with_state(pool)
         .layer(Extension(search_engine))
 }

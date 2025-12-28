@@ -10,8 +10,8 @@ CREATE TABLE IF NOT EXISTS files (
     log TEXT DEFAULT '', -- 日志
     slice_type TEXT DEFAULT '', -- 切片类型
     kb_id TEXT DEFAULT NULL, -- 知识库ID
-    created_at INTEGER DEFAULT CURRENT_TIMESTAMP,
-    updated_at INTEGER DEFAULT CURRENT_TIMESTAMP
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    updated_at INTEGER DEFAULT (strftime('%s','now'))
 );
 
 CREATE TABLE IF NOT EXISTS knowledge_base (
@@ -19,15 +19,15 @@ CREATE TABLE IF NOT EXISTS knowledge_base (
     user_id TEXT, -- 归属用户ID
     name TEXT NOT NULL, -- 知识库名称
     description TEXT DEFAULT '', -- 知识库描述
-    created_at INTEGER DEFAULT CURRENT_TIMESTAMP,
-    updated_at INTEGER DEFAULT CURRENT_TIMESTAMP
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    updated_at INTEGER DEFAULT (strftime('%s','now'))
 );
 
 CREATE TABLE IF NOT EXISTS slices (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id INTEGER NOT NULL, -- 文件ID
     content TEXT NOT NULL, -- 切片内容
-    created_at INTEGER DEFAULT CURRENT_TIMESTAMP,
-    updated_at INTEGER DEFAULT CURRENT_TIMESTAMP,
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    updated_at INTEGER DEFAULT (strftime('%s','now')),
     FOREIGN KEY (file_id) REFERENCES files(id)
 );

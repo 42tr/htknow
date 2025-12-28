@@ -4,11 +4,14 @@ use log::{error, info};
 use sqlx::SqlitePool;
 use tokio::time;
 
-use crate::api::File;
+use crate::{
+    api::File, search::{self, tantivy_engine}
+};
 
 /// 文件处理器：定时从数据库读取未处理的文件并处理
 pub struct FileProcessor {
     pool: SqlitePool,
+    search_engine: search::SearchEngine,
     interval: Duration,
 }
 
@@ -17,12 +20,10 @@ impl FileProcessor {
     ///
     /// # Arguments
     /// * `pool` - 数据库连接池
+    /// * `search_engine` - 搜索引擎实例
     /// * `interval_secs` - 处理间隔（秒）
-    pub fn new(pool: SqlitePool, interval_secs: u64) -> Self {
-        Self {
-            pool,
-            interval: Duration::from_secs(interval_secs),
-        }
+    pub fn new(pool: SqlitePool, search_engine: search::SearchEngine, interval_secs: u64) -> Self {
+        Self { pool, search_engine, interval: Duration::from_secs(interval_secs) }
     }
 
     /// 启动后台处理任务
@@ -83,9 +84,7 @@ impl FileProcessor {
     /// 从数据库获取未处理的文件
     async fn fetch_pending_files(&self) -> anyhow::Result<Vec<File>> {
         let sql = "SELECT * FROM files WHERE status = 0 ORDER BY created_at ASC LIMIT 10";
-        let files = sqlx::query_as::<_, File>(sql)
-            .fetch_all(&self.pool)
-            .await?;
+        let files = sqlx::query_as::<_, File>(sql).fetch_all(&self.pool).await?;
         Ok(files)
     }
 
@@ -106,15 +105,12 @@ impl FileProcessor {
         // 保存分片到数据库
         for slice in slices {
             let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
-            sqlx::query(sql)
-                .bind(file.id)
-                .bind(slice)
-                .execute(&self.pool)
-                .await?;
+            let id = sqlx::query(sql).bind(file.id).bind(&slice).execute(&self.pool).await?.last_insert_rowid();
+            self.search_engine.write(tantivy_engine::Document::new(id, file.id, file.kb_id, slice)).await?;
         }
 
         // 更新文件状态为已处理，并保存内容
-        let sql = "UPDATE files SET status = 1, content = ?, log = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?";
+        let sql = "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
         sqlx::query(sql)
             .bind(&content)
             .bind("Processing completed successfully")
@@ -128,12 +124,8 @@ impl FileProcessor {
 
     /// 标记文件处理失败
     async fn mark_file_failed(&self, file_id: i64, error_msg: &str) -> anyhow::Result<()> {
-        let sql = "UPDATE files SET status = -1, log = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?";
-        sqlx::query(sql)
-            .bind(error_msg)
-            .bind(file_id)
-            .execute(&self.pool)
-            .await?;
+        let sql = "UPDATE files SET status = -1, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
+        sqlx::query(sql).bind(error_msg).bind(file_id).execute(&self.pool).await?;
         Ok(())
     }
 
@@ -142,12 +134,7 @@ impl FileProcessor {
         match slice_type {
             "paragraph" => {
                 // 按段落分片（以双换行符分隔）
-                Ok(content
-                    .split("\n\n")
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect())
+                Ok(content.split("\n\n").map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
             }
             "fixed" => {
                 // 固定长度分片（每1000字符）

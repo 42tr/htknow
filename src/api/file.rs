@@ -20,7 +20,7 @@ pub struct File {
     pub status: i32,
     pub log: String,
     pub slice_type: String,
-    pub kb_id: Option<String>,
+    pub kb_id: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }

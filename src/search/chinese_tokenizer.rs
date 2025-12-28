@@ -4,6 +4,7 @@ use std::sync::Arc;
 
 use jieba_rs::Jieba;
 use lazy_static::lazy_static;
+use log::info;
 use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
 
 // 使用全局静态 Jieba 实例，避免重复初始化
@@ -50,13 +51,15 @@ impl FastChineseTokenizer {
 
     /// 执行分词
     pub fn segment(&self, text: &str) -> Vec<String> {
-        match self.mode {
+        let words = match self.mode {
             SegmentationMode::Search => {
                 // 搜索模式：使用 cut_for_search，召回率高
                 JIEBA.cut_for_search(text, false).into_iter().map(|s| s.to_string()).collect()
             }
             SegmentationMode::All => JIEBA.cut_all(text).into_iter().map(|s| s.to_string()).collect(),
-        }
+        };
+        info!("Segmented words: {:?}", words);
+        words
     }
 }
 
