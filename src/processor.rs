@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use log::{error, info};
+use log::{debug, error, info};
 use sqlx::SqlitePool;
 use tokio::time;
 
@@ -38,11 +38,11 @@ impl FileProcessor {
                         Ok(has_more) => {
                             if !has_more {
                                 // 没有更多文件需要处理，退出内循环
-                                info!("No more pending files, waiting for next check");
+                                debug!("No more pending files, waiting for next check");
                                 break;
                             }
                             // 有更多文件，继续处理
-                            info!("More files pending, continuing processing");
+                            debug!("More files pending, continuing processing");
                         }
                         Err(e) => {
                             error!("Error processing files: {}", e);

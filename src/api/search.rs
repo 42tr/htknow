@@ -1,5 +1,4 @@
 use axum::{Extension, extract::Query, response::Json};
-use log::info;
 use serde::{Deserialize, Serialize};
 
 use crate::{api::error::ApiResult, search::SearchEngine};

@@ -12,7 +12,7 @@ pub fn init() {
     let config = Config::builder()
         .appender(Appender::builder().build("stdout", Box::new(stdout)))
         .build(
-            Root::builder().appender("stdout").build(log::LevelFilter::Debug), // 设置日志级别
+            Root::builder().appender("stdout").build(log::LevelFilter::Info), // 设置日志级别
         )
         .expect("构建 log4rs 配置失败");
 

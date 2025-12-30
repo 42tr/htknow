@@ -1,5 +1,5 @@
 use axum::{
-    Extension, extract::{Multipart, Path, State}, response::Json
+    Extension, extract::{Multipart, Path, Query, State}, response::Json
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -104,4 +104,52 @@ pub async fn update(
 pub async fn delete(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> ApiResult<()> {
     sqlx::query("DELETE FROM files WHERE id = ?").bind(id).execute(&pool).await?;
     Ok(())
+}
+
+#[derive(Deserialize)]
+pub struct ListQuery {
+    pub kb_id: Option<i64>,
+}
+
+pub async fn list(
+    State(pool): State<SqlitePool>,
+    Extension(auth_user): Extension<AuthUser>,
+    Query(query): Query<ListQuery>,
+) -> ApiResult<Json<Vec<File>>> {
+    let files = match query.kb_id {
+        Some(kb_id) => {
+            sqlx::query_as("SELECT * FROM files WHERE user_id = ? AND kb_id = ? ORDER BY created_at DESC")
+                .bind(&auth_user.user_id)
+                .bind(kb_id)
+                .fetch_all(&pool)
+                .await?
+        }
+        None => {
+            sqlx::query_as("SELECT * FROM files WHERE user_id = ? ORDER BY created_at DESC")
+                .bind(&auth_user.user_id)
+                .fetch_all(&pool)
+                .await?
+        }
+    };
+    Ok(Json(files))
+}
+
+#[derive(Serialize, sqlx::FromRow)]
+pub struct Slice {
+    pub id: i64,
+    pub file_id: i64,
+    pub content: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+pub async fn get_slices(
+    State(pool): State<SqlitePool>,
+    Path(id): Path<i64>,
+) -> ApiResult<Json<Vec<Slice>>> {
+    let slices = sqlx::query_as("SELECT * FROM slices WHERE file_id = ? ORDER BY id")
+        .bind(id)
+        .fetch_all(&pool)
+        .await?;
+    Ok(Json(slices))
 }

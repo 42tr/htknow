@@ -18,7 +18,7 @@ const getHeaders = (contentType = true) => {
 export const api = {
   // 搜索
   async search(query) {
-    const response = await fetch(`${API_BASE}/search/?q=${encodeURIComponent(query)}`, {
+    const response = await fetch(`${API_BASE}/search/?query=${encodeURIComponent(query)}`, {
       headers: getHeaders(),
     })
     if (!response.ok) throw new Error('搜索失败')
@@ -86,6 +86,41 @@ export const api = {
       headers: getHeaders(),
     })
     if (!response.ok) throw new Error('删除文件失败')
+    return response.json()
+  },
+
+  async getFiles(kbId) {
+    const url = kbId ? `${API_BASE}/files/?kb_id=${kbId}` : `${API_BASE}/files/`
+    const response = await fetch(url, {
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error('获取文件列表失败')
+    return response.json()
+  },
+
+  async getFile(id) {
+    const response = await fetch(`${API_BASE}/files/${id}`, {
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error('获取文件失败')
+    return response.json()
+  },
+
+  async updateFile(id, data) {
+    const response = await fetch(`${API_BASE}/files/${id}`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify(data),
+    })
+    if (!response.ok) throw new Error('更新文件失败')
+    return response.json()
+  },
+
+  async getFileSlices(fileId) {
+    const response = await fetch(`${API_BASE}/files/${fileId}/slices`, {
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error('获取切片失败')
     return response.json()
   },
 }
