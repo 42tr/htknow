@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use log::info;
+use serde::Serialize;
 use tantivy::{
     Index, Result, TantivyDocument, Term, collector::TopDocs, doc, query::{BooleanQuery, Occur, Query, TermQuery}, schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _}
 };
@@ -17,6 +18,16 @@ pub struct Document {
     file_id: i64,       // 文件 ID
     kb_id: Option<i64>, // 知识库 ID
     content: String,    // 内容
+}
+
+/// 搜索结果项
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchResultItem {
+    pub id: i64,            // 切片 ID
+    pub file_id: i64,       // 文件 ID
+    pub kb_id: Option<i64>, // 知识库 ID
+    pub content: String,    // 内容
+    pub score: f32,         // 搜索得分
 }
 
 impl Document {
@@ -50,21 +61,42 @@ pub async fn write_documents(index: &Index, schema: &Schema, doc: Document) -> t
 
 pub async fn search(
     index: &Index, schema: &Schema, query: &str, file_id: Option<i64>, kb_id: Option<i64>,
-) -> anyhow::Result<Vec<String>> {
+) -> anyhow::Result<Vec<SearchResultItem>> {
     let searcher = index.reader()?.searcher();
     let tantivy_query = build_query(query, file_id, kb_id, schema)?;
     let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(SEARCH_LIMIT))?;
 
     let mut results = vec![];
-    for (_score, doc_address) in top_docs {
+    for (score, doc_address) in top_docs {
         let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
-        if let Some(content) = retrieved_doc
+
+        let id = retrieved_doc
+            .get_first(get_field(schema, "id"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        let file_id = retrieved_doc
+            .get_first(get_field(schema, "file_id"))
+            .and_then(|v| v.as_i64())
+            .unwrap_or(0);
+
+        let kb_id = retrieved_doc
+            .get_first(get_field(schema, "kb_id"))
+            .and_then(|v| v.as_i64());
+
+        let content = retrieved_doc
             .get_first(get_field(schema, "content"))
-            .and_then(|field_value| field_value.as_str())
+            .and_then(|v| v.as_str())
             .map(|s| s.to_string())
-        {
-            results.push(content);
-        }
+            .unwrap_or_default();
+
+        results.push(SearchResultItem {
+            id,
+            file_id,
+            kb_id,
+            content,
+            score,
+        });
     }
 
     Ok(results)
@@ -123,8 +155,8 @@ fn register_tokenizers(index: &Index) {
 fn build_schema() -> Schema {
     let mut schema_builder = Schema::builder();
     schema_builder.add_i64_field("id", INDEXED | STORED | FAST); // 切片 id
-    schema_builder.add_i64_field("file_id", INDEXED | FAST); // 文件 id
-    schema_builder.add_i64_field("kb_id", INDEXED | FAST); // 知识库 id
+    schema_builder.add_i64_field("file_id", INDEXED | STORED | FAST); // 文件 id
+    schema_builder.add_i64_field("kb_id", INDEXED | STORED | FAST); // 知识库 id
 
     let text_options = TextOptions::default()
         .set_indexing_options(

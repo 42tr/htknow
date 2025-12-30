@@ -22,7 +22,8 @@ export const api = {
       headers: getHeaders(),
     })
     if (!response.ok) throw new Error('搜索失败')
-    return response.json()
+    const data = await response.json()
+    return data.results || []
   },
 
   // 知识库

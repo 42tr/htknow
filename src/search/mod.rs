@@ -5,6 +5,8 @@ use tantivy::{Index, schema::Schema};
 mod chinese_tokenizer;
 pub mod tantivy_engine;
 
+pub use tantivy_engine::SearchResultItem;
+
 #[derive(Debug, Clone)]
 pub struct SearchEngine {
     index: Index,
@@ -22,7 +24,7 @@ impl SearchEngine {
         Ok(())
     }
 
-    pub async fn search(&self, query: &str, file_id: Option<i64>, kb_id: Option<i64>) -> anyhow::Result<Vec<String>> {
+    pub async fn search(&self, query: &str, file_id: Option<i64>, kb_id: Option<i64>) -> anyhow::Result<Vec<SearchResultItem>> {
         info!("Searching for query: {}", query);
         let results = tantivy_engine::search(&self.index, &self.schema, query, file_id, kb_id).await?;
         Ok(results)

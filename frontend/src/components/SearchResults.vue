@@ -49,10 +49,10 @@ defineProps({
           </div>
           <div class="flex-1 min-w-0">
             <h3 class="font-semibold text-slate-800 mb-1 truncate">
-              {{ result.title || result.file_name || '未命名文档' }}
+              {{ result.file?.filename || '未命名文档' }}
             </h3>
             <p class="text-slate-600 text-sm line-clamp-2 mb-2">
-              {{ result.content || result.snippet || '无内容预览' }}
+              {{ result.content || '无内容预览' }}
             </p>
             <div class="flex items-center gap-4 text-xs text-slate-400">
               <span class="flex items-center gap-1">
@@ -61,11 +61,11 @@ defineProps({
                 </svg>
                 相关度: {{ (result.score * 100).toFixed(0) }}%
               </span>
-              <span v-if="result.knowledge_base_name" class="flex items-center gap-1">
+              <span v-if="result.kb?.name" class="flex items-center gap-1">
                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 19a2 2 0 01-2-2V7a2 2 0 012-2h4l2 2h4a2 2 0 012 2v1M5 19h14a2 2 0 002-2v-5a2 2 0 00-2-2H9a2 2 0 00-2 2v5a2 2 0 01-2 2z" />
                 </svg>
-                {{ result.knowledge_base_name }}
+                {{ result.kb.name }}
               </span>
             </div>
           </div>
