@@ -35,7 +35,7 @@ const handleKbCreated = () => {
 </script>
 
 <template>
-  <div class="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100">
+  <div class="min-h-screen flex flex-col bg-gradient-to-br from-slate-50 to-slate-100">
     <!-- Header -->
     <header class="bg-white border-b border-slate-200 sticky top-0 z-50">
       <div class="max-w-6xl mx-auto px-6 py-4">
@@ -69,7 +69,7 @@ const handleKbCreated = () => {
     </header>
 
     <!-- Main Content -->
-    <main class="max-w-6xl mx-auto px-6 py-8">
+    <main class="flex-1 max-w-6xl mx-auto px-6 py-8 w-full">
       <!-- Search Tab -->
       <div v-if="activeTab === 'search'" class="space-y-6">
         <div class="text-center mb-8">
