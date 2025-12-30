@@ -13,11 +13,12 @@ const ALL_TOKENIZER: &str = "all";
 const INDEX_WRITER_MEMORY: usize = 50_000_000;
 const SEARCH_LIMIT: usize = 10;
 
+#[derive(Clone)]
 pub struct Document {
-    id: i64,            // 切片 ID
-    file_id: i64,       // 文件 ID
-    kb_id: Option<i64>, // 知识库 ID
-    content: String,    // 内容
+    pub id: i64,            // 切片 ID
+    pub file_id: i64,       // 文件 ID
+    pub kb_id: Option<i64>, // 知识库 ID
+    pub content: String,    // 内容
 }
 
 /// 搜索结果项
@@ -70,19 +71,11 @@ pub async fn search(
     for (score, doc_address) in top_docs {
         let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
 
-        let id = retrieved_doc
-            .get_first(get_field(schema, "id"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let id = retrieved_doc.get_first(get_field(schema, "id")).and_then(|v| v.as_i64()).unwrap_or(0);
 
-        let file_id = retrieved_doc
-            .get_first(get_field(schema, "file_id"))
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0);
+        let file_id = retrieved_doc.get_first(get_field(schema, "file_id")).and_then(|v| v.as_i64()).unwrap_or(0);
 
-        let kb_id = retrieved_doc
-            .get_first(get_field(schema, "kb_id"))
-            .and_then(|v| v.as_i64());
+        let kb_id = retrieved_doc.get_first(get_field(schema, "kb_id")).and_then(|v| v.as_i64());
 
         let content = retrieved_doc
             .get_first(get_field(schema, "content"))
@@ -90,13 +83,7 @@ pub async fn search(
             .map(|s| s.to_string())
             .unwrap_or_default();
 
-        results.push(SearchResultItem {
-            id,
-            file_id,
-            kb_id,
-            content,
-            score,
-        });
+        results.push(SearchResultItem { id, file_id, kb_id, content, score });
     }
 
     Ok(results)
