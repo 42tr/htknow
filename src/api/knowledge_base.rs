@@ -43,7 +43,6 @@ pub struct ListQuery {
 pub async fn list(
     State(pool): State<SqlitePool>, Query(params): Query<ListQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<Vec<KnowledgeResponse>>> {
-    println!("user_id = {}, role = {}", auth_user.user_id, auth_user.role);
     // Determine pagination: default size 10, default page 1
     let size = params.size.unwrap_or(10).max(1);
     let page = params.page.unwrap_or(1).max(1);
