@@ -43,7 +43,8 @@ pub async fn upload(
             Some("file") => {
                 let mut hasher = Sha256::new();
                 filename = field.file_name().unwrap_or("unknown").to_string();
-                filepath = format!("{}/{}", dir, filename);
+                let tempname = uuid::Uuid::new_v4().to_string();
+                filepath = format!("{}/{}", dir, tempname);
                 let mut file = tokio::fs::File::create(filepath.clone()).await?;
                 while let Some(chunk) = field.chunk().await? {
                     file.write_all(&chunk).await?;

@@ -23,3 +23,4 @@ hex = "0.4"
 
 rust-embed = "8"
 mime_guess = "2"
+uuid = "1.19.0"
