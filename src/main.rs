@@ -7,6 +7,7 @@ use tokio::net::TcpListener;
 
 mod api;
 mod db;
+mod frontend;
 mod log4rs;
 mod processor;
 mod search;
@@ -48,9 +49,15 @@ async fn main() -> anyhow::Result<()> {
     let processor = processor::FileProcessor::new(pool.clone(), search_engine.clone(), 30);
     processor.start();
 
-    let app = Router::new()
+    // API 路由需要认证
+    let api_router = Router::new()
         .nest("/api/v1/knowledge/", api::app(pool, search_engine))
         .layer(middleware::from_fn(auth::<Body>));
+
+    // 合并路由：前端不需要认证，API需要认证
+    let app = Router::new()
+        .merge(api_router)
+        .merge(frontend::router());
 
     let listener = TcpListener::bind("0.0.0.0:3000").await?;
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;

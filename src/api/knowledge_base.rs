@@ -1,8 +1,11 @@
+use std::collections::HashMap;
+
 use axum::{
     Extension, extract::{Path, Query, State}, response::Json
 };
+use log::debug;
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 
 use crate::{AuthUser, api::error::ApiResult};
 
@@ -12,6 +15,15 @@ pub struct Knowledge {
     pub user_id: String,
     pub name: String,
     pub description: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow)]
+pub struct KnowledgeResponse {
+    pub id: i64,
+    pub user_id: String,
+    pub name: String,
+    pub description: String,
+    pub file_count: i64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,7 +42,7 @@ pub struct ListQuery {
 
 pub async fn list(
     State(pool): State<SqlitePool>, Query(params): Query<ListQuery>, Extension(auth_user): Extension<AuthUser>,
-) -> ApiResult<Json<Vec<Knowledge>>> {
+) -> ApiResult<Json<Vec<KnowledgeResponse>>> {
     println!("user_id = {}, role = {}", auth_user.user_id, auth_user.role);
     // Determine pagination: default size 10, default page 1
     let size = params.size.unwrap_or(10).max(1);
@@ -60,8 +72,35 @@ pub async fn list(
     // Execute
     let query = qb.build_query_as::<Knowledge>();
     let knowledges = query.fetch_all(&pool).await?;
+    let knowledge_ids = knowledges.iter().map(|kb| kb.id).collect::<Vec<i64>>();
+    let count_map = get_file_counts(&pool, &knowledge_ids).await?;
+    let knowledge_responses = knowledges
+        .into_iter()
+        .map(|kb| KnowledgeResponse {
+            id: kb.id,
+            user_id: kb.user_id,
+            name: kb.name,
+            description: kb.description,
+            file_count: *count_map.get(&kb.id).unwrap_or(&0),
+        })
+        .collect();
 
-    Ok(Json(knowledges))
+    Ok(Json(knowledge_responses))
+}
+
+async fn get_file_counts(pool: &SqlitePool, knowledge_ids: &[i64]) -> anyhow::Result<HashMap<i64, i64>> {
+    let query = "SELECT kb_id, COUNT(*) FROM files WHERE kb_id IN (?) GROUP BY kb_id";
+    let params = knowledge_ids.iter().map(|id| id.to_string()).collect::<Vec<String>>();
+    let file_counts = sqlx::query(query)
+        .bind(params.join(","))
+        .fetch_all(pool)
+        .await?
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1)))
+        .collect();
+    debug!("File counts: {:?}", file_counts);
+
+    Ok(file_counts)
 }
 
 #[derive(Deserialize)]

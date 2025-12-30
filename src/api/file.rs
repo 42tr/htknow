@@ -6,7 +6,9 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::io::AsyncWriteExt as _;
 
-use crate::{AuthUser, api::error::ApiResult};
+use crate::{
+    AuthUser, api::error::{ApiError, ApiResult}
+};
 
 #[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow)]
 pub struct File {
@@ -57,6 +59,9 @@ pub async fn upload(
             }
             _ => {}
         }
+    }
+    if filename.is_empty() {
+        return Err(ApiError::BadRequest("file is required".to_string()));
     }
     let sql = "INSERT INTO files (user_id, hash, filename, path, slice_type, kb_id) VALUES (?, ?, ?, ?, ?, ?)";
     let id = sqlx::query(sql)

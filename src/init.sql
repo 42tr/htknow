@@ -9,7 +9,7 @@ CREATE TABLE IF NOT EXISTS files (
     status INTEGER NOT NULL DEFAULT 0, -- 状态: 0-未处理, 1-已处理, -1-处理失败
     log TEXT DEFAULT '', -- 日志
     slice_type TEXT DEFAULT '', -- 切片类型
-    kb_id TEXT DEFAULT NULL, -- 知识库ID
+    kb_id INTEGER DEFAULT NULL, -- 知识库ID
     created_at INTEGER DEFAULT (strftime('%s','now')),
     updated_at INTEGER DEFAULT (strftime('%s','now'))
 );

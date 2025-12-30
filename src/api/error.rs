@@ -60,6 +60,12 @@ impl From<ParseIntError> for ApiError {
     }
 }
 
+impl From<anyhow::Error> for ApiError {
+    fn from(e: anyhow::Error) -> Self {
+        ApiError::Internal(format!("Internal error: {}", e))
+    }
+}
+
 /// Standardized JSON body returned for errors.
 #[derive(Serialize)]
 struct ErrorBody {
