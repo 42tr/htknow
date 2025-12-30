@@ -2475,6 +2475,7 @@ dependencies = [
  "log4rs",
  "mime_guess",
  "once_cell",
+ "reqwest",
  "rust-embed",
  "serde",
  "serde_json",

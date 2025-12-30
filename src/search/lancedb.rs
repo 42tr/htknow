@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use arrow_array::{
-    Array, ArrayRef, Int64Array, RecordBatch, RecordBatchIterator, StringArray, builder::{FixedSizeListBuilder, Float32Builder}
+    Array, ArrayRef, Float32Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray, builder::{FixedSizeListBuilder, Float32Builder}
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::stream::StreamExt;
@@ -11,10 +11,11 @@ use lancedb::{
 };
 use once_cell::sync::OnceCell;
 
-use super::tantivy_engine::SearchResultItem;
+use super::{embedding, tantivy_engine::SearchResultItem};
 
 static LANCEDB: OnceCell<Arc<Connection>> = OnceCell::new();
 static TABLE_NAME: &str = "documents";
+const VECTOR_DIM: i32 = 1024; // bge-m3 模型的向量维度
 
 #[derive(Clone)]
 pub struct Document {
@@ -40,19 +41,22 @@ pub async fn init() -> Result<()> {
     // 创建表的 schema
     let schema = create_schema();
 
-    // 检查表是否存在，如果存在则删除
+    // 检查表是否存在
     let conn = get_connection()?;
-    if let Ok(table_names) = conn.table_names().execute().await {
-        if table_names.contains(&TABLE_NAME.to_string()) {
-            conn.drop_table(TABLE_NAME).await?;
-        }
-    }
+    let table_exists = if let Ok(table_names) = conn.table_names().execute().await {
+        table_names.contains(&TABLE_NAME.to_string())
+    } else {
+        false
+    };
 
-    // 创建空表
-    let empty_batch = create_empty_batch(&schema)?;
-    conn.create_table(TABLE_NAME, Box::new(RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone())))
-        .execute()
-        .await?;
+    if !table_exists {
+        // 表不存在，创建新表
+        let empty_batch = create_empty_batch(&schema)?;
+        conn.create_table(TABLE_NAME, Box::new(RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone())))
+            .execute()
+            .await?;
+    }
+    // 如果表已存在，直接使用现有的表
 
     Ok(())
 }
@@ -62,7 +66,7 @@ pub async fn write_documents(doc: Document) -> Result<()> {
     let table = conn.open_table(TABLE_NAME).execute().await?;
 
     let schema = create_schema();
-    let batch = create_record_batch(vec![doc], &schema)?;
+    let batch = create_record_batch(vec![doc], &schema).await?;
 
     table.add(Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema))).execute().await?;
 
@@ -73,9 +77,11 @@ pub async fn search(query: &str, file_id: Option<i64>, kb_id: Option<i64>) -> Re
     let conn = get_connection()?;
     let table = conn.open_table(TABLE_NAME).execute().await?;
 
-    // LanceDB 主要用于向量搜索，这里我们使用简单的全表扫描过滤
-    // 在实际应用中，你需要将 content 转换为向量嵌入后进行向量搜索
-    let mut query_builder = table.query();
+    // 获取查询文本的 embedding
+    let query_vector = embedding::get_embedding(query).await?;
+
+    // 使用向量搜索
+    let mut query_builder = table.query().nearest_to(query_vector)?;
 
     // 应用过滤条件
     let mut filter_conditions = Vec::new();
@@ -116,14 +122,24 @@ pub async fn search(query: &str, file_id: Option<i64>, kb_id: Option<i64>) -> Re
             .and_then(|col| col.as_any().downcast_ref::<StringArray>())
             .ok_or_else(|| anyhow::anyhow!("Missing or invalid content column"))?;
 
+        // 获取距离分数（如果有的话）
+        let distance_array =
+            batch.column_by_name("_distance").and_then(|col| col.as_any().downcast_ref::<Float32Array>());
+
         for i in 0..num_rows {
             let id = id_array.value(i);
             let file_id = file_id_array.value(i);
             let kb_id = kb_id_array.and_then(|arr| if arr.is_null(i) { None } else { Some(arr.value(i)) });
             let content = content_array.value(i).to_string();
 
-            // 简单的文本匹配评分（实际应该使用向量相似度）
-            let score = if content.contains(query) { 0.8 } else { 0.1 };
+            // 使用向量距离作为分数（距离越小，分数越高）
+            let score = if let Some(dist_arr) = distance_array {
+                let distance = dist_arr.value(i);
+                // 将距离转换为相似度分数 (0-1)，距离越小分数越高
+                (1.0 / (1.0 + distance)).max(0.0).min(1.0)
+            } else {
+                0.5 // 默认分数
+            };
 
             search_results.push(SearchResultItem { id, file_id, kb_id, content, score });
         }
@@ -145,8 +161,12 @@ fn create_schema() -> Arc<ArrowSchema> {
         Field::new("file_id", DataType::Int64, false),
         Field::new("kb_id", DataType::Int64, true),
         Field::new("content", DataType::Utf8, false),
-        // 为向量搜索预留字段（维度为 384，常用的嵌入维度）
-        Field::new("vector", DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), 384), true),
+        // 向量字段 - bge-m3 模型使用 1024 维
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), VECTOR_DIM),
+            false,
+        ),
     ]))
 }
 
@@ -158,13 +178,13 @@ fn create_empty_batch(schema: &Arc<ArrowSchema>) -> Result<RecordBatch> {
 
     // 创建空的向量数组
     let value_builder = Float32Builder::new();
-    let mut list_builder = FixedSizeListBuilder::new(value_builder, 384);
+    let mut list_builder = FixedSizeListBuilder::new(value_builder, VECTOR_DIM);
     let vector_array: ArrayRef = Arc::new(list_builder.finish());
 
     Ok(RecordBatch::try_new(schema.clone(), vec![id_array, file_id_array, kb_id_array, content_array, vector_array])?)
 }
 
-fn create_record_batch(docs: Vec<Document>, schema: &Arc<ArrowSchema>) -> Result<RecordBatch> {
+async fn create_record_batch(docs: Vec<Document>, schema: &Arc<ArrowSchema>) -> Result<RecordBatch> {
     let ids: Vec<i64> = docs.iter().map(|d| d.id).collect();
     let file_ids: Vec<i64> = docs.iter().map(|d| d.file_id).collect();
     let kb_ids: Vec<Option<i64>> = docs.iter().map(|d| d.kb_id).collect();
@@ -173,16 +193,22 @@ fn create_record_batch(docs: Vec<Document>, schema: &Arc<ArrowSchema>) -> Result
     let id_array: ArrayRef = Arc::new(Int64Array::from(ids));
     let file_id_array: ArrayRef = Arc::new(Int64Array::from(file_ids));
     let kb_id_array: ArrayRef = Arc::new(Int64Array::from(kb_ids));
-    let content_array: ArrayRef = Arc::new(StringArray::from(contents));
+    let content_array: ArrayRef = Arc::new(StringArray::from(contents.clone()));
 
-    // 创建虚拟向量（实际应该使用嵌入模型生成）
+    // 获取真实的 embedding 向量
+    let embeddings = embedding::get_embeddings(&contents).await?;
+
     let value_builder = Float32Builder::new();
-    let mut list_builder = FixedSizeListBuilder::new(value_builder, 384);
+    let mut list_builder = FixedSizeListBuilder::new(value_builder, VECTOR_DIM);
 
-    for _ in 0..docs.len() {
+    for embedding in embeddings {
+        if embedding.len() != VECTOR_DIM as usize {
+            anyhow::bail!("Embedding dimension mismatch: expected {}, got {}", VECTOR_DIM, embedding.len());
+        }
+
         let values_builder = list_builder.values();
-        for _ in 0..384 {
-            values_builder.append_value(0.0);
+        for &value in &embedding {
+            values_builder.append_value(value);
         }
         list_builder.append(true);
     }

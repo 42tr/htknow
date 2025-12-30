@@ -5,6 +5,7 @@ use log::info;
 use tantivy::{Index, schema::Schema};
 
 mod chinese_tokenizer;
+mod embedding;
 mod lancedb;
 pub mod tantivy_engine;
 
@@ -42,10 +43,12 @@ impl SearchEngine {
         // 使用 tantivy 搜索
         let tantivy_results = tantivy_engine::search(&self.index, &self.schema, query, file_id, kb_id).await?;
         info!("Tantivy results count: {}", tantivy_results.len());
+        info!("Tantivy results: {:?}", tantivy_results);
 
         // 使用 lancedb 搜索
         let lancedb_results = lancedb::search(query, file_id, kb_id).await?;
         info!("LanceDB results count: {}", lancedb_results.len());
+        info!("LanceDB results: {:?}", lancedb_results);
 
         // 合并结果：使用 HashMap 按 id 去重，保留最高分数
         let mut merged_map: HashMap<i64, SearchResultItem> = HashMap::new();
