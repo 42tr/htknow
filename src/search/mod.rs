@@ -3,6 +3,7 @@ use log::info;
 use tantivy::{Index, schema::Schema};
 
 mod chinese_tokenizer;
+mod qdrant;
 pub mod tantivy_engine;
 
 pub use tantivy_engine::SearchResultItem;
@@ -15,6 +16,7 @@ pub struct SearchEngine {
 
 impl SearchEngine {
     pub async fn init() -> Self {
+        qdrant::init().await;
         let (schema, index) = tantivy_engine::init().unwrap();
         Self { index, schema }
     }
@@ -24,7 +26,9 @@ impl SearchEngine {
         Ok(())
     }
 
-    pub async fn search(&self, query: &str, file_id: Option<i64>, kb_id: Option<i64>) -> anyhow::Result<Vec<SearchResultItem>> {
+    pub async fn search(
+        &self, query: &str, file_id: Option<i64>, kb_id: Option<i64>,
+    ) -> anyhow::Result<Vec<SearchResultItem>> {
         info!("Searching for query: {}", query);
         let results = tantivy_engine::search(&self.index, &self.schema, query, file_id, kb_id).await?;
         Ok(results)
