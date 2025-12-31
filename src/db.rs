@@ -12,7 +12,7 @@ use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 /// 或者直接 `./data/db.sqlite`），会确保父目录存在并且数据库文件被创建（如果不存在）。
 pub async fn init() -> anyhow::Result<SqlitePool> {
     // 读取环境变量，如果没有则使用默认文件路径
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://app.sqlite".to_string());
+    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data/app.sqlite".to_string());
 
     // 尝试从 URL 中解析出文件路径并提前创建目录/文件
     if let Some(db_path) = sqlite_path_from_url(&database_url) {
@@ -125,10 +125,7 @@ fn ensure_db_file(path: &Path) -> anyhow::Result<()> {
         if !parent.exists() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
-            info!(
-                "Created parent directory for sqlite DB: {}",
-                parent.display()
-            );
+            info!("Created parent directory for sqlite DB: {}", parent.display());
         }
     }
 

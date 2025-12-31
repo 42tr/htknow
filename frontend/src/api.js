@@ -68,7 +68,7 @@ export const api = {
       headers: getHeaders(),
     })
     if (!response.ok) throw new Error('删除知识库失败')
-    return response.json()
+    return
   },
 
   // 文件
@@ -96,7 +96,7 @@ export const api = {
       headers: getHeaders(),
     })
     if (!response.ok) throw new Error('删除文件失败')
-    return response.json()
+    return
   },
 
   async getFiles(kbId) {

@@ -3,11 +3,11 @@ use std::collections::HashMap;
 use axum::{
     Extension, extract::{Path, Query, State}, response::Json
 };
-use log::debug;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use tokio::fs;
 
-use crate::{AuthUser, api::error::ApiResult};
+use crate::{AuthUser, api::error::ApiResult, search::SearchEngine};
 
 #[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow)]
 pub struct Knowledge {
@@ -50,7 +50,7 @@ pub async fn list(
     let offset = (page - 1) * size;
 
     // Start building the query
-    let mut qb = QueryBuilder::<Sqlite>::new("SELECT id, user_id, name, description FROM knowledge_base WHERE 1=1 ");
+    let mut qb = QueryBuilder::<Sqlite>::new("SELECT id, user_id, name, description FROM knowledge_bases WHERE 1=1 ");
     qb.push(" AND user_id = ").push_bind(auth_user.user_id);
 
     // If `id` provided, try to parse as integer id and filter by id
@@ -126,7 +126,7 @@ pub async fn create(
     State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
     Json(knowledge): Json<KnowledgeCreateReq>,
 ) -> ApiResult<Json<Knowledge>> {
-    let query = "INSERT INTO knowledge_base (user_id, name, description) VALUES (?, ?, ?)";
+    let query = "INSERT INTO knowledge_bases (user_id, name, description) VALUES (?, ?, ?)";
     let id = sqlx::query(query)
         .bind(auth_user.user_id)
         .bind(knowledge.name)
@@ -134,7 +134,7 @@ pub async fn create(
         .execute(&pool)
         .await?
         .last_insert_rowid();
-    let kb = sqlx::query_as("SELECT id, user_id, name, description FROM knowledge_base WHERE id = ?")
+    let kb = sqlx::query_as("SELECT id, user_id, name, description FROM knowledge_bases WHERE id = ?")
         .bind(id)
         .fetch_one(&pool)
         .await?;
@@ -148,10 +148,10 @@ pub struct KnowledgeUpdateReq {
 }
 
 pub async fn update(
-    Path(id): Path<u32>, State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
+    Path(id): Path<i64>, State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
     Json(knowledge): Json<KnowledgeUpdateReq>,
 ) -> ApiResult<Json<Knowledge>> {
-    let query = "UPDATE knowledge_base SET name = ?, description = ? WHERE id = ? AND user_id = ?";
+    let query = "UPDATE knowledge_bases SET name = ?, description = ? WHERE id = ? AND user_id = ?";
     sqlx::query(query)
         .bind(knowledge.name)
         .bind(knowledge.description)
@@ -159,21 +159,36 @@ pub async fn update(
         .bind(auth_user.user_id)
         .execute(&pool)
         .await?;
-    let kb = sqlx::query_as("SELECT id, user_id, name, description FROM knowledge_base WHERE id = ?")
+    let kb = sqlx::query_as("SELECT id, user_id, name, description FROM knowledge_bases WHERE id = ?")
         .bind(id)
         .fetch_one(&pool)
         .await?;
     Ok(Json(kb))
 }
 
-pub async fn get(State(pool): State<SqlitePool>, Path(id): Path<u32>) -> ApiResult<Json<Knowledge>> {
-    let query = "SELECT id, user_id, name, description FROM knowledge_base WHERE id = ?";
+pub async fn get(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> ApiResult<Json<Knowledge>> {
+    let query = "SELECT id, user_id, name, description FROM knowledge_bases WHERE id = ?";
     let knowledge = sqlx::query_as(query).bind(id).fetch_one(&pool).await?;
     Ok(Json(knowledge))
 }
 
-pub async fn delete(State(pool): State<SqlitePool>, Path(id): Path<u32>) -> ApiResult<()> {
-    let query = "DELETE FROM knowledge_base WHERE id = ?";
+pub async fn delete(
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>, Path(id): Path<i64>,
+) -> ApiResult<()> {
+    let query = "SELECT * FROM files WHERE kb_id = ?";
+    let files: Vec<super::File> = sqlx::query_as(query).bind(id).fetch_all(&pool).await?;
+    let mut qb = QueryBuilder::new("DELETE FROM slices WHERE file_id IN (");
+    let mut separated = qb.separated(", ");
+    for file in files {
+        fs::remove_file(file.path).await?;
+        separated.push_bind(file.id);
+    }
+    qb.push(")");
+    qb.build().execute(&pool).await?;
+
+    sqlx::query("DELETE FROM files WHERE kb_id = ?").bind(id).execute(&pool).await?;
+    search_engine.delete(None, Some(id)).await?;
+    let query = "DELETE FROM knowledge_bases WHERE id = ?";
     sqlx::query(query).bind(id).execute(&pool).await?;
     Ok(())
 }

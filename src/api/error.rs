@@ -14,8 +14,8 @@ use sqlx;
 #[derive(Debug)]
 pub enum ApiError {
     BadRequest(String),
-    Unauthorized(String),
-    NotFound(String),
+    // Unauthorized(String),
+    // NotFound(String),
     Database(sqlx::Error),
     System(std::io::Error),
     Internal(String),
@@ -25,8 +25,8 @@ impl fmt::Display for ApiError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ApiError::BadRequest(msg) => write!(f, "BadRequest: {}", msg),
-            ApiError::Unauthorized(msg) => write!(f, "Unauthorized: {}", msg),
-            ApiError::NotFound(msg) => write!(f, "NotFound: {}", msg),
+            // ApiError::Unauthorized(msg) => write!(f, "Unauthorized: {}", msg),
+            // ApiError::NotFound(msg) => write!(f, "NotFound: {}", msg),
             ApiError::Database(e) => write!(f, "Database error: {}", e),
             ApiError::System(e) => write!(f, "System error: {}", e),
             ApiError::Internal(msg) => write!(f, "Internal error: {}", msg),
@@ -79,8 +79,8 @@ impl IntoResponse for ApiError {
         // Map each error variant to an HTTP status code and message.
         let (status, message) = match &self {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
-            ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
-            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
+            // ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
+            // ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::Database(e) => {
                 // Log detailed error server-side but avoid leaking internals to clients.
                 log::error!("Database error: {}", e);
@@ -108,19 +108,19 @@ pub type ApiResult<T> = result::Result<T, ApiError>;
 
 impl ApiError {
     /// Helper to create a `BadRequest` error.
-    pub fn bad_request<M: Into<String>>(msg: M) -> Self {
-        ApiError::BadRequest(msg.into())
-    }
+    // pub fn bad_request<M: Into<String>>(msg: M) -> Self {
+    //     ApiError::BadRequest(msg.into())
+    // }
 
-    /// Helper to create a `NotFound` error.
-    pub fn not_found<M: Into<String>>(msg: M) -> Self {
-        ApiError::NotFound(msg.into())
-    }
+    // /// Helper to create a `NotFound` error.
+    // pub fn not_found<M: Into<String>>(msg: M) -> Self {
+    //     ApiError::NotFound(msg.into())
+    // }
 
-    /// Helper to create an `Unauthorized` error.
-    pub fn unauthorized<M: Into<String>>(msg: M) -> Self {
-        ApiError::Unauthorized(msg.into())
-    }
+    // /// Helper to create an `Unauthorized` error.
+    // pub fn unauthorized<M: Into<String>>(msg: M) -> Self {
+    //     ApiError::Unauthorized(msg.into())
+    // }
 
     /// Helper to create a generic internal error (also logs).
     pub fn internal<M: Into<String>>(msg: M) -> Self {

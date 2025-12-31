@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use axum::{Extension, extract::{Query, State}, response::Json};
+use axum::{
+    Extension, extract::{Query, State}, response::Json
+};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
@@ -52,8 +54,7 @@ pub struct SearchResult {
 }
 
 pub async fn search(
-    State(pool): State<SqlitePool>,
-    Extension(search_engine): Extension<SearchEngine>,
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Query(params): Query<SearchQuery>,
 ) -> ApiResult<Json<SearchResult>> {
     let raw_results = search_engine
@@ -73,11 +74,7 @@ pub async fn search(
     let file_map = get_files_by_ids(&pool, &file_ids).await?;
 
     // 批量查询知识库信息
-    let kb_map = if !kb_ids.is_empty() {
-        get_kbs_by_ids(&pool, &kb_ids).await?
-    } else {
-        HashMap::new()
-    };
+    let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(&pool, &kb_ids).await? } else { HashMap::new() };
 
     // 组装结果
     let results = raw_results
@@ -85,13 +82,7 @@ pub async fn search(
         .map(|r| {
             let file = file_map.get(&r.file_id).cloned();
             let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
-            SearchResultItem {
-                id: r.id,
-                content: r.content,
-                score: r.score,
-                file,
-                kb,
-            }
+            SearchResultItem { id: r.id, content: r.content, score: r.score, file, kb }
         })
         .collect();
 
@@ -104,10 +95,7 @@ async fn get_files_by_ids(pool: &SqlitePool, file_ids: &[i64]) -> Result<HashMap
     }
 
     let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let query = format!(
-        "SELECT id, filename, kb_id FROM files WHERE id IN ({})",
-        placeholders
-    );
+    let query = format!("SELECT id, filename, kb_id FROM files WHERE id IN ({})", placeholders);
 
     let mut q = sqlx::query_as::<_, FileInfo>(&query);
     for id in file_ids {
@@ -124,10 +112,7 @@ async fn get_kbs_by_ids(pool: &SqlitePool, kb_ids: &[i64]) -> Result<HashMap<i64
     }
 
     let placeholders: String = kb_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let query = format!(
-        "SELECT id, name FROM knowledge_base WHERE id IN ({})",
-        placeholders
-    );
+    let query = format!("SELECT id, name FROM knowledge_bases WHERE id IN ({})", placeholders);
 
     let mut q = sqlx::query_as::<_, KbInfo>(&query);
     for id in kb_ids {

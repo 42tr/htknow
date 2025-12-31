@@ -64,12 +64,9 @@ pub async fn init() -> Result<()> {
 pub async fn write_documents(doc: Document) -> Result<()> {
     let conn = get_connection()?;
     let table = conn.open_table(TABLE_NAME).execute().await?;
-
     let schema = create_schema();
     let batch = create_record_batch(vec![doc], &schema).await?;
-
     table.add(Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema))).execute().await?;
-
     Ok(())
 }
 
@@ -149,6 +146,22 @@ pub async fn search(query: &str, file_id: Option<i64>, kb_id: Option<i64>) -> Re
     search_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
     Ok(search_results)
+}
+
+pub async fn delete_by_file(file_id: i64) -> Result<()> {
+    let conn = get_connection()?;
+    let table = conn.open_table(TABLE_NAME).execute().await?;
+    let predicate = format!("file_id = {}", file_id);
+    table.delete(&predicate).await?;
+    Ok(())
+}
+
+pub async fn delete_by_kb(kb_id: i64) -> Result<()> {
+    let conn = get_connection()?;
+    let table = conn.open_table(TABLE_NAME).execute().await?;
+    let predicate = format!("kb_id = {}", kb_id);
+    table.delete(&predicate).await?;
+    Ok(())
 }
 
 fn get_connection() -> Result<Arc<Connection>> {

@@ -70,23 +70,36 @@ pub async fn search(
     let mut results = vec![];
     for (score, doc_address) in top_docs {
         let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
-
         let id = retrieved_doc.get_first(get_field(schema, "id")).and_then(|v| v.as_i64()).unwrap_or(0);
-
         let file_id = retrieved_doc.get_first(get_field(schema, "file_id")).and_then(|v| v.as_i64()).unwrap_or(0);
-
         let kb_id = retrieved_doc.get_first(get_field(schema, "kb_id")).and_then(|v| v.as_i64());
-
         let content = retrieved_doc
             .get_first(get_field(schema, "content"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_default();
-
         results.push(SearchResultItem { id, file_id, kb_id, content, score });
     }
 
     Ok(results)
+}
+
+pub async fn delete_by_file(index: &Index, schema: &Schema, file_id: i64) -> anyhow::Result<()> {
+    let mut writer = index.writer::<TantivyDocument>(INDEX_WRITER_MEMORY)?;
+    let file_id_field = get_field(schema, "file_id");
+    let term = Term::from_field_i64(file_id_field, file_id);
+    writer.delete_term(term);
+    writer.commit()?;
+    Ok(())
+}
+
+pub async fn delete_by_kb(index: &Index, schema: &Schema, kb_id: i64) -> anyhow::Result<()> {
+    let mut writer = index.writer::<TantivyDocument>(INDEX_WRITER_MEMORY)?;
+    let kb_id_field = get_field(schema, "kb_id");
+    let term = Term::from_field_i64(kb_id_field, kb_id);
+    writer.delete_term(term);
+    writer.commit()?;
+    Ok(())
 }
 
 fn build_query(
@@ -140,7 +153,6 @@ fn perform_segmentation(text: &str, mode: chinese_tokenizer::SegmentationMode) -
 
 fn register_tokenizers(index: &Index) {
     let all_tokenizer = chinese_tokenizer::FastChineseTokenizer::all();
-
     index.tokenizers().register(ALL_TOKENIZER, all_tokenizer);
 }
 

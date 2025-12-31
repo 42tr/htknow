@@ -14,7 +14,7 @@ CREATE TABLE IF NOT EXISTS files (
     updated_at INTEGER DEFAULT (strftime('%s','now'))
 );
 
-CREATE TABLE IF NOT EXISTS knowledge_base (
+CREATE TABLE IF NOT EXISTS knowledge_bases (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT, -- 归属用户ID
     name TEXT NOT NULL, -- 知识库名称
@@ -28,6 +28,5 @@ CREATE TABLE IF NOT EXISTS slices (
     file_id INTEGER NOT NULL, -- 文件ID
     content TEXT NOT NULL, -- 切片内容
     created_at INTEGER DEFAULT (strftime('%s','now')),
-    updated_at INTEGER DEFAULT (strftime('%s','now')),
-    FOREIGN KEY (file_id) REFERENCES files(id)
+    updated_at INTEGER DEFAULT (strftime('%s','now'))
 );

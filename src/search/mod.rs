@@ -35,6 +35,18 @@ impl SearchEngine {
         Ok(())
     }
 
+    pub async fn delete(&self, file_id: Option<i64>, kb_id: Option<i64>) -> anyhow::Result<()> {
+        if let Some(file_id) = file_id {
+            tantivy_engine::delete_by_file(&self.index, &self.schema, file_id).await?;
+            lancedb::delete_by_file(file_id).await?;
+        }
+        if let Some(kb_id) = kb_id {
+            tantivy_engine::delete_by_kb(&self.index, &self.schema, kb_id).await?;
+            lancedb::delete_by_kb(kb_id).await?;
+        }
+        Ok(())
+    }
+
     pub async fn search(
         &self, query: &str, file_id: Option<i64>, kb_id: Option<i64>,
     ) -> anyhow::Result<Vec<SearchResultItem>> {
