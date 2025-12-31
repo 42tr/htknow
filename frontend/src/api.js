@@ -17,8 +17,12 @@ const getHeaders = (contentType = true) => {
 
 export const api = {
   // 搜索
-  async search(query) {
-    const response = await fetch(`${API_BASE}/search/?query=${encodeURIComponent(query)}`, {
+  async search(query, kbId = null) {
+    let url = `${API_BASE}/search/?query=${encodeURIComponent(query)}`
+    if (kbId) {
+      url += `&kb_id=${kbId}`
+    }
+    const response = await fetch(url, {
       headers: getHeaders(),
     })
     if (!response.ok) throw new Error('搜索失败')

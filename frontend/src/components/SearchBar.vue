@@ -1,11 +1,21 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, onMounted } from 'vue'
 import { api } from '../api'
 
 const emit = defineEmits(['search', 'search-start', 'search-end'])
 
 const query = ref('')
 const error = ref('')
+const selectedKbId = ref(null)
+const knowledgeBases = ref([])
+
+const loadKnowledgeBases = async () => {
+  try {
+    knowledgeBases.value = await api.getKnowledgeBases()
+  } catch (e) {
+    console.error('加载知识库列表失败:', e)
+  }
+}
 
 const handleSearch = async () => {
   if (!query.value.trim()) return
@@ -14,7 +24,7 @@ const handleSearch = async () => {
   emit('search-start')
 
   try {
-    const results = await api.search(query.value)
+    const results = await api.search(query.value, selectedKbId.value)
     emit('search', results)
   } catch (e) {
     error.value = e.message
@@ -29,10 +39,28 @@ const handleKeydown = (e) => {
     handleSearch()
   }
 }
+
+onMounted(() => {
+  loadKnowledgeBases()
+})
 </script>
 
 <template>
   <div class="max-w-2xl mx-auto">
+    <!-- 知识库选择 -->
+    <div class="mb-4">
+      <select
+        v-model="selectedKbId"
+        class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-base shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
+      >
+        <option :value="null">全部知识库</option>
+        <option v-for="kb in knowledgeBases" :key="kb.id" :value="kb.id">
+          {{ kb.name }}
+        </option>
+      </select>
+    </div>
+
+    <!-- 搜索输入框 -->
     <div class="relative">
       <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
         <svg class="h-5 w-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
