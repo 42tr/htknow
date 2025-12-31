@@ -30,6 +30,17 @@ const loadAllFiles = async () => {
   }
 }
 
+// 为文件添加知识库信息
+const filesWithKbInfo = computed(() => {
+  return allFiles.value.map(file => {
+    const kb = file.kb_id ? knowledgeBases.value.find(k => k.id === file.kb_id) : null
+    return {
+      ...file,
+      kbName: kb ? kb.name : '未分配知识库'
+    }
+  })
+})
+
 // 过滤后的知识库和文件列表
 const filteredKnowledgeBases = computed(() => {
   if (!scopeSearch.value) return knowledgeBases.value
@@ -40,10 +51,11 @@ const filteredKnowledgeBases = computed(() => {
 })
 
 const filteredFiles = computed(() => {
-  if (!scopeSearch.value) return allFiles.value
+  if (!scopeSearch.value) return filesWithKbInfo.value
   const search = scopeSearch.value.toLowerCase()
-  return allFiles.value.filter(file => 
-    file.filename.toLowerCase().includes(search)
+  return filesWithKbInfo.value.filter(file => 
+    file.filename.toLowerCase().includes(search) ||
+    file.kbName.toLowerCase().includes(search)
   )
 })
 
@@ -54,8 +66,11 @@ const scopeLabel = computed(() => {
     return kb ? `知识库: ${kb.name}` : '全部范围'
   }
   if (scopeType.value === 'file' && selectedFileId.value) {
-    const file = allFiles.value.find(f => f.id === selectedFileId.value)
-    return file ? `文件: ${file.filename}` : '全部范围'
+    const file = filesWithKbInfo.value.find(f => f.id === selectedFileId.value)
+    if (file) {
+      return `文件: ${file.filename} (${file.kbName})`
+    }
+    return '全部范围'
   }
   return '全部范围'
 })
@@ -177,9 +192,12 @@ onMounted(() => {
                 @click="selectScope('file', file.id)"
                 class="px-4 py-2.5 hover:bg-green-50 cursor-pointer"
               >
-                <div class="flex items-center gap-2">
-                  <span class="text-xl">📄</span>
-                  <span class="text-sm text-slate-700 truncate">{{ file.filename }}</span>
+                <div class="flex items-center gap-2 min-w-0">
+                  <span class="text-xl flex-shrink-0">📄</span>
+                  <div class="min-w-0 flex-1">
+                    <div class="text-sm text-slate-700 truncate">{{ file.filename }}</div>
+                    <div class="text-xs text-slate-400 truncate">{{ file.kbName }}</div>
+                  </div>
                 </div>
               </div>
             </div>

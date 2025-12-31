@@ -101,9 +101,14 @@ export const api = {
 
   async getFiles(kbId) {
     let url = `${API_BASE}/files/`
-    if (kbId !== null && kbId !== undefined) {
+    if (kbId === null) {
+      // 明确传递null时，获取未分配知识库的文件
+      url += `?kb_id=null`
+    } else if (kbId !== undefined) {
+      // 传递具体的知识库ID
       url += `?kb_id=${kbId}`
     }
+    // 不传参数时，获取所有文件
     const response = await fetch(url, {
       headers: getHeaders(),
     })

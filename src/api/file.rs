@@ -108,20 +108,30 @@ pub async fn delete(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> ApiR
 
 #[derive(Deserialize)]
 pub struct ListQuery {
-    pub kb_id: Option<i64>,
+    pub kb_id: Option<String>,
 }
 
 pub async fn list(
     State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Query(query): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<File>>> {
-    let files = match query.kb_id {
-        Some(kb_id) => {
+    let files = match query.kb_id.as_deref() {
+        // 明确指定查询未分配知识库的文件
+        Some("null") | Some("unassigned") => {
+            sqlx::query_as("SELECT * FROM files WHERE user_id = ? AND kb_id IS NULL ORDER BY created_at DESC")
+                .bind(&auth_user.user_id)
+                .fetch_all(&pool)
+                .await?
+        }
+        // 查询特定知识库的文件
+        Some(kb_id_str) => {
+            let kb_id = kb_id_str.parse::<i64>().map_err(|_| ApiError::internal("Invalid kb_id format"))?;
             sqlx::query_as("SELECT * FROM files WHERE user_id = ? AND kb_id = ? ORDER BY created_at DESC")
                 .bind(&auth_user.user_id)
                 .bind(kb_id)
                 .fetch_all(&pool)
                 .await?
         }
+        // 不传参数，查询所有文件
         None => {
             sqlx::query_as("SELECT * FROM files WHERE user_id = ? ORDER BY created_at DESC")
                 .bind(&auth_user.user_id)
