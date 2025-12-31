@@ -94,11 +94,16 @@ fn build_query(
 ) -> tantivy::Result<Box<dyn Query>> {
     let mut subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::new();
     let segmented_words = perform_segmentation(input, chinese_tokenizer::SegmentationMode::Search);
+
+    // content 至少命中一个
+    let mut content_queries = Vec::new();
     for word in segmented_words {
-        let term_query =
-            TermQuery::new(Term::from_field_text(get_field(schema, "content"), &word), IndexRecordOption::Basic);
-        subqueries.push((Occur::Should, Box::new(term_query)));
+        let tq = TermQuery::new(Term::from_field_text(get_field(schema, "content"), &word), IndexRecordOption::Basic);
+        content_queries.push((Occur::Should, Box::new(tq) as Box<dyn Query>));
     }
+    let content_bool = BooleanQuery::new(content_queries);
+    subqueries.push((Occur::Must, Box::new(content_bool)));
+
     if let Some(file_id) = file_id {
         let file_id_query =
             TermQuery::new(Term::from_field_i64(get_field(schema, "file_id"), file_id), IndexRecordOption::Basic);
