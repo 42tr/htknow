@@ -13,9 +13,7 @@ const isDragging = ref(false)
 const loadKnowledgeBases = async () => {
   try {
     knowledgeBases.value = await api.getKnowledgeBases()
-    if (knowledgeBases.value.length > 0) {
-      selectedKb.value = knowledgeBases.value[0].id
-    }
+    // 不再自动选择第一个知识库，允许为空
   } catch (e) {
     console.error('加载知识库失败:', e)
   }
@@ -45,14 +43,14 @@ const formatFileSize = (bytes) => {
 }
 
 const handleUpload = async () => {
-  if (!selectedKb.value || files.value.length === 0) return
+  if (files.value.length === 0) return
 
   uploading.value = true
   uploadStatus.value = ''
   uploadError.value = ''
 
   try {
-    await api.uploadFiles(selectedKb.value, files.value)
+    await api.uploadFiles(selectedKb.value || null, files.value)
     uploadStatus.value = `成功上传 ${files.value.length} 个文件`
     files.value = []
   } catch (e) {
@@ -71,18 +69,18 @@ onMounted(() => {
   <div class="max-w-2xl mx-auto">
     <!-- Knowledge Base Select -->
     <div class="bg-white rounded-xl p-5 border border-slate-200 mb-4">
-      <label class="block text-sm font-medium text-slate-700 mb-2">选择知识库</label>
+      <label class="block text-sm font-medium text-slate-700 mb-2">选择知识库（可选）</label>
       <select
         v-model="selectedKb"
         class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
       >
-        <option value="" disabled>请选择知识库</option>
+        <option value="">不分配到知识库</option>
         <option v-for="kb in knowledgeBases" :key="kb.id" :value="kb.id">
           {{ kb.name }}
         </option>
       </select>
-      <p v-if="knowledgeBases.length === 0" class="mt-2 text-sm text-amber-600">
-        暂无知识库，请先创建知识库
+      <p class="mt-2 text-xs text-slate-500">
+        未分配知识库的文件可以在知识库列表中查看
       </p>
     </div>
 
@@ -147,10 +145,10 @@ onMounted(() => {
     <!-- Upload Button -->
     <button
       @click="handleUpload"
-      :disabled="!selectedKb || files.length === 0 || uploading"
+      :disabled="files.length === 0 || uploading"
       :class="[
         'w-full mt-4 py-4 rounded-xl font-medium transition-all duration-200',
-        !selectedKb || files.length === 0 || uploading
+        files.length === 0 || uploading
           ? 'bg-slate-100 text-slate-400 cursor-not-allowed'
           : 'bg-gradient-to-r from-blue-500 to-indigo-600 text-white hover:from-blue-600 hover:to-indigo-700 shadow-sm'
       ]"

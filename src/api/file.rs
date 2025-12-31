@@ -112,9 +112,7 @@ pub struct ListQuery {
 }
 
 pub async fn list(
-    State(pool): State<SqlitePool>,
-    Extension(auth_user): Extension<AuthUser>,
-    Query(query): Query<ListQuery>,
+    State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Query(query): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<File>>> {
     let files = match query.kb_id {
         Some(kb_id) => {
@@ -143,13 +141,7 @@ pub struct Slice {
     pub updated_at: i64,
 }
 
-pub async fn get_slices(
-    State(pool): State<SqlitePool>,
-    Path(id): Path<i64>,
-) -> ApiResult<Json<Vec<Slice>>> {
-    let slices = sqlx::query_as("SELECT * FROM slices WHERE file_id = ? ORDER BY id")
-        .bind(id)
-        .fetch_all(&pool)
-        .await?;
+pub async fn get_slices(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> ApiResult<Json<Vec<Slice>>> {
+    let slices = sqlx::query_as("SELECT * FROM slices WHERE file_id = ? ORDER BY id").bind(id).fetch_all(&pool).await?;
     Ok(Json(slices))
 }

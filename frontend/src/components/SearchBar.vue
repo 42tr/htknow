@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, computed } from 'vue'
 import { api } from '../api'
 
 const emit = defineEmits(['search', 'search-start', 'search-end'])
@@ -7,7 +7,12 @@ const emit = defineEmits(['search', 'search-start', 'search-end'])
 const query = ref('')
 const error = ref('')
 const selectedKbId = ref(null)
+const selectedFileId = ref(null)
 const knowledgeBases = ref([])
+const allFiles = ref([])
+const scopeSearch = ref('')
+const showScopeDropdown = ref(false)
+const scopeType = ref('all') // 'all', 'kb', 'file'
 
 const loadKnowledgeBases = async () => {
   try {
@@ -17,6 +22,60 @@ const loadKnowledgeBases = async () => {
   }
 }
 
+const loadAllFiles = async () => {
+  try {
+    allFiles.value = await api.getFiles()
+  } catch (e) {
+    console.error('加载文件列表失败:', e)
+  }
+}
+
+// 过滤后的知识库和文件列表
+const filteredKnowledgeBases = computed(() => {
+  if (!scopeSearch.value) return knowledgeBases.value
+  const search = scopeSearch.value.toLowerCase()
+  return knowledgeBases.value.filter(kb => 
+    kb.name.toLowerCase().includes(search)
+  )
+})
+
+const filteredFiles = computed(() => {
+  if (!scopeSearch.value) return allFiles.value
+  const search = scopeSearch.value.toLowerCase()
+  return allFiles.value.filter(file => 
+    file.filename.toLowerCase().includes(search)
+  )
+})
+
+// 当前选择的范围描述
+const scopeLabel = computed(() => {
+  if (scopeType.value === 'kb' && selectedKbId.value) {
+    const kb = knowledgeBases.value.find(k => k.id === selectedKbId.value)
+    return kb ? `知识库: ${kb.name}` : '全部范围'
+  }
+  if (scopeType.value === 'file' && selectedFileId.value) {
+    const file = allFiles.value.find(f => f.id === selectedFileId.value)
+    return file ? `文件: ${file.filename}` : '全部范围'
+  }
+  return '全部范围'
+})
+
+const selectScope = (type, id = null) => {
+  scopeType.value = type
+  if (type === 'all') {
+    selectedKbId.value = null
+    selectedFileId.value = null
+  } else if (type === 'kb') {
+    selectedKbId.value = id
+    selectedFileId.value = null
+  } else if (type === 'file') {
+    selectedKbId.value = null
+    selectedFileId.value = id
+  }
+  showScopeDropdown.value = false
+  scopeSearch.value = ''
+}
+
 const handleSearch = async () => {
   if (!query.value.trim()) return
 
@@ -24,7 +83,7 @@ const handleSearch = async () => {
   emit('search-start')
 
   try {
-    const results = await api.search(query.value, selectedKbId.value)
+    const results = await api.search(query.value, selectedKbId.value, selectedFileId.value)
     emit('search', results)
   } catch (e) {
     error.value = e.message
@@ -42,22 +101,99 @@ const handleKeydown = (e) => {
 
 onMounted(() => {
   loadKnowledgeBases()
+  loadAllFiles()
 })
 </script>
 
 <template>
   <div class="max-w-2xl mx-auto">
-    <!-- 知识库选择 -->
-    <div class="mb-4">
-      <select
-        v-model="selectedKbId"
-        class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-base shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-      >
-        <option :value="null">全部知识库</option>
-        <option v-for="kb in knowledgeBases" :key="kb.id" :value="kb.id">
-          {{ kb.name }}
-        </option>
-      </select>
+    <!-- 搜索范围选择 -->
+    <div class="mb-4 relative">
+      <label class="block text-xs font-medium text-slate-600 mb-2">搜索范围</label>
+      <div class="relative">
+        <button
+          @click="showScopeDropdown = !showScopeDropdown"
+          class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-left flex items-center justify-between hover:border-slate-300 transition-colors"
+        >
+          <span class="text-slate-700">{{ scopeLabel }}</span>
+          <svg class="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+          </svg>
+        </button>
+
+        <!-- 下拉菜单 -->
+        <div
+          v-if="showScopeDropdown"
+          class="absolute z-10 w-full mt-2 bg-white border border-slate-200 rounded-xl shadow-lg max-h-96 overflow-hidden"
+        >
+          <!-- 搜索框 -->
+          <div class="p-3 border-b border-slate-100">
+            <input
+              v-model="scopeSearch"
+              type="text"
+              placeholder="搜索知识库或文件..."
+              class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+            />
+          </div>
+
+          <div class="max-h-80 overflow-y-auto">
+            <!-- 全部范围选项 -->
+            <div
+              @click="selectScope('all')"
+              class="px-4 py-2.5 hover:bg-slate-50 cursor-pointer border-b border-slate-100"
+            >
+              <div class="flex items-center gap-2">
+                <span class="text-2xl">🌐</span>
+                <span class="text-sm font-medium text-slate-700">全部范围</span>
+              </div>
+            </div>
+
+            <!-- 知识库列表 -->
+            <div v-if="filteredKnowledgeBases.length > 0" class="border-b border-slate-100">
+              <div class="px-4 py-2 bg-slate-50">
+                <span class="text-xs font-medium text-slate-500">知识库</span>
+              </div>
+              <div
+                v-for="kb in filteredKnowledgeBases"
+                :key="'kb-' + kb.id"
+                @click="selectScope('kb', kb.id)"
+                class="px-4 py-2.5 hover:bg-blue-50 cursor-pointer"
+              >
+                <div class="flex items-center gap-2">
+                  <span class="text-xl">📚</span>
+                  <span class="text-sm text-slate-700">{{ kb.name }}</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 文件列表 -->
+            <div v-if="filteredFiles.length > 0">
+              <div class="px-4 py-2 bg-slate-50">
+                <span class="text-xs font-medium text-slate-500">文件</span>
+              </div>
+              <div
+                v-for="file in filteredFiles"
+                :key="'file-' + file.id"
+                @click="selectScope('file', file.id)"
+                class="px-4 py-2.5 hover:bg-green-50 cursor-pointer"
+              >
+                <div class="flex items-center gap-2">
+                  <span class="text-xl">📄</span>
+                  <span class="text-sm text-slate-700 truncate">{{ file.filename }}</span>
+                </div>
+              </div>
+            </div>
+
+            <!-- 无结果 -->
+            <div
+              v-if="scopeSearch && filteredKnowledgeBases.length === 0 && filteredFiles.length === 0"
+              class="px-4 py-8 text-center text-slate-400 text-sm"
+            >
+              未找到匹配的知识库或文件
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
 
     <!-- 搜索输入框 -->

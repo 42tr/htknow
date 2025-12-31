@@ -7,12 +7,16 @@ const knowledgeBases = ref([])
 const loading = ref(true)
 const error = ref('')
 const selectedKb = ref(null)
+const unassignedFilesCount = ref(0)
 
 const loadKnowledgeBases = async () => {
   loading.value = true
   error.value = ''
   try {
     knowledgeBases.value = await api.getKnowledgeBases()
+    // 加载未分配知识库的文件数量
+    const unassignedFiles = await api.getFiles(null)
+    unassignedFilesCount.value = unassignedFiles.length
   } catch (e) {
     error.value = e.message
   } finally {
@@ -36,8 +40,13 @@ const selectKb = (kb) => {
   selectedKb.value = kb
 }
 
+const selectUnassigned = () => {
+  selectedKb.value = { id: null, name: '未分配知识库的文件', description: '这些文件尚未分配到任何知识库' }
+}
+
 const goBack = () => {
   selectedKb.value = null
+  loadKnowledgeBases() // 返回时重新加载列表
 }
 
 // 暴露刷新方法给父组件
@@ -89,7 +98,7 @@ onMounted(() => {
       </div>
 
       <!-- Empty -->
-      <div v-else-if="knowledgeBases.length === 0" class="text-center py-12">
+      <div v-else-if="knowledgeBases.length === 0 && unassignedFilesCount === 0" class="text-center py-12">
         <div class="w-16 h-16 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-4">
           <span class="text-3xl">📚</span>
         </div>
@@ -99,6 +108,40 @@ onMounted(() => {
 
       <!-- Knowledge Base Grid -->
       <div v-else class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+        <!-- 未分配知识库的文件卡片 -->
+        <div
+          v-if="unassignedFilesCount > 0"
+          @click="selectUnassigned"
+          class="bg-white rounded-xl p-5 border border-slate-200 hover:border-amber-300 hover:shadow-md transition-all duration-200 group cursor-pointer"
+        >
+          <div class="flex items-start justify-between mb-3">
+            <div class="w-12 h-12 bg-gradient-to-br from-amber-100 to-orange-100 rounded-xl flex items-center justify-center">
+              <span class="text-2xl">📂</span>
+            </div>
+          </div>
+
+          <h3 class="font-semibold text-slate-800 mb-1">未分配的文件</h3>
+          <p class="text-sm text-slate-500 line-clamp-2 mb-3">尚未分配到任何知识库的文件</p>
+
+          <div class="flex items-center justify-between">
+            <div class="flex items-center gap-3 text-xs text-slate-400">
+              <span class="flex items-center gap-1">
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+                {{ unassignedFilesCount }} 个文件
+              </span>
+            </div>
+            <span class="text-xs text-amber-500 opacity-0 group-hover:opacity-100 transition-opacity flex items-center gap-1">
+              查看详情
+              <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+              </svg>
+            </span>
+          </div>
+        </div>
+
+        <!-- 知识库卡片 -->
         <div
           v-for="kb in knowledgeBases"
           :key="kb.id"

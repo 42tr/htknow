@@ -88,16 +88,30 @@ pub async fn list(
 }
 
 async fn get_file_counts(pool: &SqlitePool, knowledge_ids: &[i64]) -> anyhow::Result<HashMap<i64, i64>> {
-    let query = "SELECT kb_id, COUNT(*) FROM files WHERE kb_id IN (?) GROUP BY kb_id";
-    let params = knowledge_ids.iter().map(|id| id.to_string()).collect::<Vec<String>>();
-    let file_counts = sqlx::query(query)
-        .bind(params.join(","))
-        .fetch_all(pool)
-        .await?
+    if knowledge_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut qb = QueryBuilder::new("SELECT kb_id, COUNT(*) AS cnt FROM files WHERE kb_id IN (");
+
+    let mut separated = qb.separated(", ");
+
+    for id in knowledge_ids {
+        separated.push_bind(id);
+    }
+
+    qb.push(") GROUP BY kb_id");
+
+    let rows = qb.build().fetch_all(pool).await?;
+
+    let file_counts = rows
         .into_iter()
-        .map(|row| (row.get(0), row.get(1)))
+        .map(|row| {
+            let kb_id: i64 = row.get("kb_id");
+            let cnt: i64 = row.get("cnt");
+            (kb_id, cnt)
+        })
         .collect();
-    debug!("File counts: {:?}", file_counts);
 
     Ok(file_counts)
 }

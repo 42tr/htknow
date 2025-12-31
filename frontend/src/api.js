@@ -17,10 +17,13 @@ const getHeaders = (contentType = true) => {
 
 export const api = {
   // 搜索
-  async search(query, kbId = null) {
+  async search(query, kbId = null, fileId = null) {
     let url = `${API_BASE}/search/?query=${encodeURIComponent(query)}`
     if (kbId) {
       url += `&kb_id=${kbId}`
+    }
+    if (fileId) {
+      url += `&file_id=${fileId}`
     }
     const response = await fetch(url, {
       headers: getHeaders(),
@@ -71,7 +74,9 @@ export const api = {
   // 文件
   async uploadFiles(knowledgeBaseId, files) {
     const formData = new FormData()
-    formData.append('kb_id', knowledgeBaseId)
+    if (knowledgeBaseId) {
+      formData.append('kb_id', knowledgeBaseId)
+    }
     for (const file of files) {
       formData.append('file', file)
     }
@@ -95,7 +100,10 @@ export const api = {
   },
 
   async getFiles(kbId) {
-    const url = kbId ? `${API_BASE}/files/?kb_id=${kbId}` : `${API_BASE}/files/`
+    let url = `${API_BASE}/files/`
+    if (kbId !== null && kbId !== undefined) {
+      url += `?kb_id=${kbId}`
+    }
     const response = await fetch(url, {
       headers: getHeaders(),
     })
