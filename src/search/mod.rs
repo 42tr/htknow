@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::Ok;
 use log::info;
+use serde::{Deserialize, Serialize};
 use tantivy::{Index, schema::Schema};
 
 mod chinese_tokenizer;
@@ -10,6 +11,24 @@ mod lancedb;
 pub mod tantivy_engine;
 
 pub use tantivy_engine::SearchResultItem;
+
+#[derive(Debug, Serialize)]
+struct RerankRequest {
+    model: String,
+    query: String,
+    documents: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RerankResponse {
+    results: Vec<RerankResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RerankResult {
+    index: usize,
+    relevance_score: f32,
+}
 
 #[derive(Debug, Clone)]
 pub struct SearchEngine {
@@ -86,6 +105,68 @@ impl SearchEngine {
         merged_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
         info!("Merged results count: {}", merged_results.len());
-        Ok(merged_results)
+
+        // 如果结果为空，直接返回
+        if merged_results.is_empty() {
+            return Ok(merged_results);
+        }
+
+        // 使用 BGE-Rerank 重排序
+        let reranked_results = self.rerank(query, merged_results).await?;
+        info!("Reranked results count: {}", reranked_results.len());
+
+        Ok(reranked_results)
+    }
+
+    async fn rerank(&self, query: &str, results: Vec<SearchResultItem>) -> anyhow::Result<Vec<SearchResultItem>> {
+        // 提取所有文档内容用于重排序
+        let documents: Vec<String> = results.iter().map(|r| r.content.clone()).collect();
+
+        // 构造请求
+        let rerank_request = RerankRequest { model: "bge-rerank".to_string(), query: query.to_string(), documents };
+
+        // 调用 BGE-Rerank API
+        let client = reqwest::Client::new();
+        let response = client.post("http://192.168.0.46:9600/v1/rerank").json(&rerank_request).send().await?;
+
+        if !response.status().is_success() {
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_default();
+            anyhow::bail!("Rerank API failed with status {}: {}", status, error_text);
+        }
+
+        // 先获取响应文本用于调试
+        let response_text = response.text().await?;
+        info!("Rerank API response: {}", response_text);
+
+        // 解析 JSON 响应
+        let rerank_response: RerankResponse = serde_json::from_str(&response_text)?;
+
+        // 检查返回的结果数量是否匹配
+        if rerank_response.results.len() != results.len() {
+            anyhow::bail!(
+                "Rerank results count mismatch: expected {}, got {}",
+                results.len(),
+                rerank_response.results.len()
+            );
+        }
+
+        // 使用重排序分数更新结果
+        let mut reranked_results: Vec<SearchResultItem> = results
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut result)| {
+                // 根据 index 找到对应的重排序结果
+                if let Some(rerank_result) = rerank_response.results.iter().find(|r| r.index == i) {
+                    result.score = rerank_result.relevance_score;
+                }
+                result
+            })
+            .collect();
+
+        // 按新分数降序排序
+        reranked_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+        Ok(reranked_results)
     }
 }
