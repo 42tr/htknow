@@ -32,8 +32,8 @@ pub struct ListQuery {
     pub page: Option<i64>,
     /// 每页条数
     pub size: Option<i64>,
-    /// 关键词搜索信息（在 name + description 中搜索）
-    pub keyword: Option<String>,
+    // /// 关键词搜索信息（在 name + description 中搜索）
+    // pub keyword: Option<String>,
     /// 模糊搜索 name 字段
     pub name: Option<String>,
     /// 知识库 ID（精确匹配）
