@@ -8,7 +8,7 @@ use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tokio::{fs, time};
 
 use crate::{
-    api::File, graph::{EntityMention, graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, tantivy_engine}
+    api::File, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, tantivy_engine}
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -563,25 +563,13 @@ impl FileProcessor {
             relation.file_id = Some(file.id);
         }
 
-        // 6. 记录实体提及（简化处理，使用第一个切片）
-        let mut all_mentions = Vec::new();
-        if let Some((slice_id, content)) = slices.first() {
-            for _entity in &entities {
-                all_mentions.push(EntityMention::new(
-                    0, // node_id会在添加到图后更新
-                    *slice_id,
-                    content.clone(),
-                ));
-            }
-        }
-
-        // 7. 更新知识图谱
+        // 6. 更新知识图谱
         let mut graph = KnowledgeGraph::load_from_db(self.pool.clone(), file.kb_id).await?;
 
         // 添加实体和关系
-        graph.incremental_update(entities.clone(), relations).await?;
+        graph.incremental_update(entities, relations).await?;
 
-        // 8. 保存图快照
+        // 7. 保存图快照
         graph.save_snapshot().await?;
 
         info!("Knowledge graph updated successfully for file {} (LLM-generated)", file.id);
