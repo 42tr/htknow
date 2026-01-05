@@ -1,0 +1,25 @@
+version: '3.8'
+
+services:
+  htknow:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: htknow
+    ports:
+      - "8080:8080"
+    volumes:
+      # Mount data directory for persistent storage
+      - ./data:/app/data
+    environment:
+      - RUST_LOG=info
+      # Add other environment variables as needed
+    restart: unless-stopped
+    # Uncomment if you need to connect to other services
+    # networks:
+    #   - htknow-network
+
+# Uncomment if you need a network
+# networks:
+#   htknow-network:
+#     driver: bridge

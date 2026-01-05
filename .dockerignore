@@ -1,0 +1,40 @@
+# Rust build artifacts (except the release binary we need)
+target/debug
+target/*/incremental
+target/*/build
+target/*/deps
+target/*/examples
+target/*/.fingerprint
+*.pdb
+
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+*~
+
+# Local data (will be mounted as volumes in production)
+data/
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Documentation
+README.md
+docs/
+
+# CI/CD
+.github
+.gitlab-ci.yml
+
+# Development files
+clear.sh
