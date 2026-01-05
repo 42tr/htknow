@@ -66,7 +66,7 @@ struct ContentItem {
     #[serde(default)]
     text_level: Option<i32>,
     #[serde(default)]
-    text_format: Option<i32>, // latex
+    text_format: Option<String>, // latex
     #[serde(default)]
     img_path: Option<String>,
     #[serde(default)]
