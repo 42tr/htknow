@@ -2,6 +2,7 @@
 import { ref, computed } from 'vue'
 import { api } from '../api'
 import FileSlices from './FileSlices.vue'
+import FileGraph from './FileGraph.vue'
 
 const props = defineProps({
   file: {
@@ -14,6 +15,7 @@ const emit = defineEmits(['updated', 'deleted'])
 
 const showSlices = ref(false)
 const showSettings = ref(false)
+const showGraph = ref(false)
 const selectedSliceType = ref(props.file.slice_type || 'paragraph')
 const updating = ref(false)
 
@@ -111,6 +113,24 @@ const handleDelete = async () => {
 
         <!-- Actions -->
         <div class="flex items-center gap-1">
+          <button
+            v-if="file.status === 1"
+            @click="showGraph = true"
+            class="p-2 text-slate-400 hover:text-purple-500 hover:bg-purple-50 rounded-lg transition-all"
+            title="查看知识图谱"
+          >
+            <svg class="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <circle cx="12" cy="12" r="3" />
+              <circle cx="4" cy="8" r="2" />
+              <circle cx="20" cy="8" r="2" />
+              <circle cx="4" cy="16" r="2" />
+              <circle cx="20" cy="16" r="2" />
+              <line x1="6" y1="8" x2="9" y2="10" />
+              <line x1="18" y1="8" x2="15" y2="10" />
+              <line x1="6" y1="16" x2="9" y2="14" />
+              <line x1="18" y1="16" x2="15" y2="14" />
+            </svg>
+          </button>
           <button
             v-if="file.status === 1"
             @click="showSlices = true"
@@ -212,6 +232,13 @@ const handleDelete = async () => {
       v-if="showSlices"
       :file="file"
       @close="showSlices = false"
+    />
+
+    <!-- Graph Modal -->
+    <FileGraph
+      v-if="showGraph"
+      :file="file"
+      @close="showGraph = false"
     />
   </div>
 </template>

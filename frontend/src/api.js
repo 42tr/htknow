@@ -143,7 +143,7 @@ export const api = {
   },
 
   // 知识图谱
-  async searchEntities(query = null, entityType = null, kbId = null, limit = 100) {
+  async searchEntities(query = null, entityType = null, kbId = null, limit = 100, fileId = null) {
     let url = `${API_BASE}/graph/entities?limit=${limit}`
     if (query) {
       url += `&q=${encodeURIComponent(query)}`
@@ -153,6 +153,9 @@ export const api = {
     }
     if (kbId) {
       url += `&kb_id=${kbId}`
+    }
+    if (fileId) {
+      url += `&file_id=${fileId}`
     }
     const response = await fetch(url, {
       headers: getHeaders(),
@@ -169,10 +172,17 @@ export const api = {
     return response.json()
   },
 
-  async getGraphStats(kbId = null) {
+  async getGraphStats(kbId = null, fileId = null) {
     let url = `${API_BASE}/graph/stats`
+    const params = []
     if (kbId) {
-      url += `?kb_id=${kbId}`
+      params.push(`kb_id=${kbId}`)
+    }
+    if (fileId) {
+      params.push(`file_id=${fileId}`)
+    }
+    if (params.length > 0) {
+      url += '?' + params.join('&')
     }
     const response = await fetch(url, {
       headers: getHeaders(),

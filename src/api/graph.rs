@@ -26,6 +26,7 @@ pub struct EntitySearchParams {
     pub q: Option<String>,           // 搜索关键词
     pub entity_type: Option<String>, // 实体类型筛选
     pub kb_id: Option<i64>,          // 知识库ID筛选
+    pub file_id: Option<i64>,        // 文件ID筛选
     pub limit: Option<i64>,          // 返回数量限制
 }
 
@@ -45,6 +46,9 @@ pub async fn search_entities(
     }
     if params.kb_id.is_some() {
         sql.push_str(" AND kb_id = ?");
+    }
+    if params.file_id.is_some() {
+        sql.push_str(" AND file_id = ?");
     }
 
     sql.push_str(" ORDER BY created_at DESC");
@@ -66,6 +70,9 @@ pub async fn search_entities(
     }
     if let Some(kb_id) = params.kb_id {
         query = query.bind(kb_id);
+    }
+    if let Some(file_id) = params.file_id {
+        query = query.bind(file_id);
     }
 
     let rows = query.fetch_all(&pool).await?;
@@ -216,20 +223,33 @@ pub struct GraphStats {
 #[derive(Debug, Deserialize)]
 pub struct StatsParams {
     pub kb_id: Option<i64>,
+    pub file_id: Option<i64>,
 }
 
 /// 获取图统计信息
 pub async fn get_graph_stats(
     Query(params): Query<StatsParams>, State(pool): State<SqlitePool>,
 ) -> Result<Json<GraphStats>, ApiError> {
-    let where_clause = if let Some(kb_id) = params.kb_id { format!("WHERE kb_id = {}", kb_id) } else { "".to_string() };
+    // 构建 WHERE 子句
+    let where_clause = if let Some(file_id) = params.file_id {
+        format!("WHERE file_id = {}", file_id)
+    } else if let Some(kb_id) = params.kb_id {
+        format!("WHERE kb_id = {}", kb_id)
+    } else {
+        "".to_string()
+    };
 
     // 节点数量
     let node_count_sql = format!("SELECT COUNT(*) FROM graph_nodes {}", where_clause);
     let node_count: (i64,) = sqlx::query_as(&node_count_sql).fetch_one(&pool).await?;
 
     // 边数量
-    let edge_count_sql = if let Some(kb_id) = params.kb_id {
+    let edge_count_sql = if let Some(file_id) = params.file_id {
+        format!(
+            "SELECT COUNT(*) FROM graph_edges WHERE file_id = {}",
+            file_id
+        )
+    } else if let Some(kb_id) = params.kb_id {
         format!(
             "SELECT COUNT(*) FROM graph_edges e \
              INNER JOIN graph_nodes n ON e.source_node_id = n.id \
@@ -249,7 +269,13 @@ pub async fn get_graph_stats(
     let entity_types: HashMap<String, i64> = entity_types_rows.into_iter().collect();
 
     // 关系类型分布
-    let relation_types_sql = if let Some(kb_id) = params.kb_id {
+    let relation_types_sql = if let Some(file_id) = params.file_id {
+        format!(
+            "SELECT relation_type, COUNT(*) FROM graph_edges \
+             WHERE file_id = {} GROUP BY relation_type",
+            file_id
+        )
+    } else if let Some(kb_id) = params.kb_id {
         format!(
             "SELECT e.relation_type, COUNT(*) FROM graph_edges e \
              INNER JOIN graph_nodes n ON e.source_node_id = n.id \

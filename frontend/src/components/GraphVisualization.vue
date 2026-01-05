@@ -7,6 +7,10 @@ const props = defineProps({
     type: Number,
     default: null
   },
+  fileId: {
+    type: Number,
+    default: null
+  },
   maxNodes: {
     type: Number,
     default: 50
@@ -96,13 +100,13 @@ const initCanvas = () => {
 const loadGraphData = async () => {
   loading.value = true
   try {
-    // 获取实体
-    const entities = await api.searchEntities(null, null, props.kbId, props.maxNodes)
-    
+    // 获取实体（支持按文件ID或知识库ID筛选）
+    const entities = await api.searchEntities(null, null, props.kbId, props.maxNodes, props.fileId)
+
     // 将实体转换为节点
     const width = canvas.value.width
     const height = canvas.value.height
-    
+
     allNodes.value = entities.map((entity, i) => ({
       id: entity.id,
       name: entity.name,
@@ -114,16 +118,16 @@ const loadGraphData = async () => {
       radius: 8,
       entity: entity
     }))
-    
+
     // 获取每个实体的邻居来构建边
     allEdges.value = []
     const addedEdges = new Set()
-    
+
     // 加载所有节点的关系
     for (const node of allNodes.value) {
       try {
         const detail = await api.getEntity(node.id)
-        
+
         for (const neighbor of detail.neighbors) {
           const targetNode = allNodes.value.find(n => n.id === neighbor.entity.id)
           if (targetNode) {
@@ -142,10 +146,10 @@ const loadGraphData = async () => {
         console.warn('Failed to load neighbor for node', node.id)
       }
     }
-    
+
     // 应用筛选
     applyFilters()
-    
+
   } catch (error) {
     console.error('加载图谱数据失败:', error)
   } finally {
@@ -668,6 +672,10 @@ onBeforeUnmount(() => {
 })
 
 watch(() => props.kbId, () => {
+  loadGraphData()
+})
+
+watch(() => props.fileId, () => {
   loadGraphData()
 })
 
