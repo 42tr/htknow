@@ -22,10 +22,10 @@ impl KnowledgeGraph {
         let mut node_index = HashMap::new();
         let mut node_id_to_index = HashMap::new();
 
-        let where_clause = if let Some(kb_id) = kb_id { format!("WHERE kb_id = {}", kb_id) } else { "".to_string() };
+        let nodes_where_clause = if let Some(kb_id) = kb_id { format!("WHERE kb_id = {}", kb_id) } else { "".to_string() };
 
         // 加载节点
-        let nodes_sql = format!("SELECT id, name, entity_type, properties FROM graph_nodes {}", where_clause);
+        let nodes_sql = format!("SELECT id, name, entity_type, properties FROM graph_nodes {}", nodes_where_clause);
         let nodes: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(&nodes_sql).fetch_all(&pool).await?;
 
         for (id, name, entity_type_str, properties_json) in nodes {
@@ -43,14 +43,15 @@ impl KnowledgeGraph {
             node_id_to_index.insert(id, idx);
         }
 
-        // 加载边
+        // 加载边（使用 n1.kb_id 避免歧义）
+        let edges_where_clause = if let Some(kb_id) = kb_id { format!("WHERE n1.kb_id = {}", kb_id) } else { "".to_string() };
         let edges_sql = format!(
             "SELECT e.id, e.source_node_id, e.target_node_id, e.relation_type, e.properties, e.weight \
              FROM graph_edges e \
              INNER JOIN graph_nodes n1 ON e.source_node_id = n1.id \
              INNER JOIN graph_nodes n2 ON e.target_node_id = n2.id \
              {}",
-            where_clause
+            edges_where_clause
         );
         let edges: Vec<(i64, i64, i64, String, Option<String>, f32)> =
             sqlx::query_as(&edges_sql).fetch_all(&pool).await?;

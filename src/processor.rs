@@ -403,6 +403,12 @@ impl FileProcessor {
             self.search_engine.write(tantivy_engine::Document::new(id, file.id, file.kb_id, slice)).await?;
         }
 
+        // 构建知识图谱
+        if let Err(e) = self.build_knowledge_graph(file).await {
+            error!("Failed to build knowledge graph for file {}: {}", file.id, e);
+            // 不影响主流程，仅记录错误
+        }
+
         // 更新文件状态
         let sql = "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
         sqlx::query(sql)
@@ -413,12 +419,6 @@ impl FileProcessor {
             .await?;
 
         info!("PDF file {} processed successfully with {} slices", file.id, slice_count);
-
-        // 构建知识图谱
-        if let Err(e) = self.build_knowledge_graph(file).await {
-            error!("Failed to build knowledge graph for file {}: {}", file.id, e);
-            // 不影响主流程，仅记录错误
-        }
 
         Ok(())
     }
