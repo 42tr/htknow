@@ -179,8 +179,15 @@ impl FileProcessor {
             || filename_lower.ends_with(".heic")
             || filename_lower.ends_with(".heif");
 
-        if is_pdf_or_img {
-            // 处理 PDF 文件
+        // 检查文件是否为 Word 文档
+        let is_word = filename_lower.ends_with(".doc") || filename_lower.ends_with(".docx");
+
+        if is_word {
+            // Word 文档：先转换为 PDF，再使用 process_pdf_file 处理
+            info!("Detected Word document, converting to PDF: {}", file.filename);
+            self.convert_word_to_pdf_and_process(file).await?;
+        } else if is_pdf_or_img {
+            // 处理 PDF 或图片文件
             self.process_pdf_file(file).await?;
         } else {
             // 处理普通文本文件
@@ -188,6 +195,50 @@ impl FileProcessor {
         }
 
         Ok(())
+    }
+
+    /// 将 Word 文档转换为 PDF 并处理
+    async fn convert_word_to_pdf_and_process(&self, file: &File) -> anyhow::Result<()> {
+        // 创建临时目录用于存放转换后的 PDF
+        let temp_dir = std::path::Path::new("data/temp");
+        fs::create_dir_all(temp_dir).await?;
+
+        // 生成临时 PDF 文件路径
+        let pdf_filename = format!("{}.pdf", file.id);
+
+        // 使用 LibreOffice 将 Word 转换为 PDF
+        // 注意：这需要系统中安装了 LibreOffice
+        let output = tokio::process::Command::new("soffice")
+            .args(&["--headless", "--convert-to", "pdf", "--outdir", temp_dir.to_str().unwrap(), &file.path])
+            .output()
+            .await?;
+
+        if !output.status.success() {
+            let error_msg = String::from_utf8_lossy(&output.stderr);
+            return Err(anyhow::anyhow!("Failed to convert Word to PDF: {}", error_msg));
+        }
+
+        // 查找生成的 PDF 文件
+        // LibreOffice 会使用原文件名（不含扩展名）+ .pdf
+        let converted_pdf_path = temp_dir.join(format!("{}.pdf", file.path.split("/").last().unwrap()));
+
+        // 检查转换后的 PDF 是否存在
+        if !tokio::fs::try_exists(&converted_pdf_path).await? {
+            return Err(anyhow::anyhow!("Converted PDF file not found: {:?}", converted_pdf_path));
+        }
+
+        // 创建临时 File 结构用于处理 PDF
+        let mut temp_file = file.clone();
+        temp_file.path = converted_pdf_path.to_string_lossy().to_string();
+        temp_file.filename = pdf_filename;
+
+        // 使用 process_pdf_file 处理转换后的 PDF
+        let result = self.process_pdf_file(&temp_file).await;
+
+        // 清理临时 PDF 文件
+        let _ = fs::remove_file(&converted_pdf_path).await;
+
+        result
     }
 
     /// 处理 PDF 文件，调用 MinerU API
