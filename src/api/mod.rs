@@ -17,7 +17,9 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
     let file_router = Router::new()
         .route("/", get(file::list).post(file::upload))
         .route("/{id}", get(file::get).put(file::update).delete(file::delete))
-        .route("/{id}/slices", get(file::get_slices));
+        .route("/{id}/slices", get(file::get_slices))
+        .route("/{id}/images", get(file::get_images))
+        .route("/{file_id}/images/{image_id}", get(file::get_image));
     let search_router = Router::new().route("/", get(search::search));
     Router::new()
         .nest("/knowledge_base/", knowledge_router)

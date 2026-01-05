@@ -28,6 +28,8 @@ const statusInfo = computed(() => {
   switch (props.file.status) {
     case 0:
       return { text: '待处理', color: 'bg-amber-100 text-amber-700', icon: '⏳' }
+    case 2:
+      return { text: '处理中', color: 'bg-blue-100 text-blue-700', icon: '⚙️' }
     case 1:
       return { text: '已完成', color: 'bg-green-100 text-green-700', icon: '✓' }
     case -1:

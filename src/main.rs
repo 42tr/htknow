@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use axum::{
-    Router, body::Body, http::{Request, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Response}
+    Router, body::Body, http::{Request, StatusCode}, middleware::{self, Next}, response::{IntoResponse, Response}, extract::DefaultBodyLimit
 };
 use tokio::net::TcpListener;
 
@@ -52,7 +52,8 @@ async fn main() -> anyhow::Result<()> {
     // API 路由需要认证
     let api_router = Router::new()
         .nest("/api/v1/knowledge/", api::app(pool, search_engine))
-        .layer(middleware::from_fn(auth::<Body>));
+        .layer(middleware::from_fn(auth::<Body>))
+        .layer(DefaultBodyLimit::max(500 * 1024 * 1024)); // 500MB 上传限制
 
     // 合并路由：前端不需要认证，API需要认证
     let app = Router::new()
