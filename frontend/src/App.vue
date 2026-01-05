@@ -5,6 +5,7 @@ import SearchResults from './components/SearchResults.vue'
 import KnowledgeBaseList from './components/KnowledgeBaseList.vue'
 import FileUpload from './components/FileUpload.vue'
 import CreateKnowledgeBase from './components/CreateKnowledgeBase.vue'
+import KnowledgeGraph from './components/KnowledgeGraph.vue'
 
 const activeTab = ref('search')
 const searchResults = ref([])
@@ -14,6 +15,7 @@ const kbListRef = ref(null)
 const tabs = [
   { id: 'search', name: '搜索', icon: '🔍' },
   { id: 'knowledge', name: '知识库', icon: '📚' },
+  { id: 'graph', name: '知识图谱', icon: '🕸️' },
   { id: 'upload', name: '上传', icon: '📤' },
 ]
 
@@ -100,6 +102,16 @@ const handleKbCreated = () => {
         </div>
 
         <KnowledgeBaseList ref="kbListRef" />
+      </div>
+
+      <!-- Knowledge Graph Tab -->
+      <div v-if="activeTab === 'graph'" class="space-y-6">
+        <div class="text-center mb-8">
+          <h2 class="text-3xl font-bold text-slate-800 mb-2">知识图谱</h2>
+          <p class="text-slate-500">探索文档中的实体和关系</p>
+        </div>
+
+        <KnowledgeGraph />
       </div>
 
       <!-- Upload Tab -->

@@ -141,4 +141,43 @@ export const api = {
     if (!response.ok) throw new Error('获取切片失败')
     return response.json()
   },
+
+  // 知识图谱
+  async searchEntities(query = null, entityType = null, kbId = null, limit = 100) {
+    let url = `${API_BASE}/graph/entities?limit=${limit}`
+    if (query) {
+      url += `&q=${encodeURIComponent(query)}`
+    }
+    if (entityType) {
+      url += `&entity_type=${encodeURIComponent(entityType)}`
+    }
+    if (kbId) {
+      url += `&kb_id=${kbId}`
+    }
+    const response = await fetch(url, {
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error('搜索实体失败')
+    return response.json()
+  },
+
+  async getEntity(id) {
+    const response = await fetch(`${API_BASE}/graph/entities/${id}`, {
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error('获取实体详情失败')
+    return response.json()
+  },
+
+  async getGraphStats(kbId = null) {
+    let url = `${API_BASE}/graph/stats`
+    if (kbId) {
+      url += `?kb_id=${kbId}`
+    }
+    const response = await fetch(url, {
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error('获取图谱统计失败')
+    return response.json()
+  },
 }

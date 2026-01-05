@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use anyhow::Ok;
 use log::info;
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use tantivy::{Index, schema::Schema};
 
 mod chinese_tokenizer;
@@ -34,13 +35,19 @@ struct RerankResult {
 pub struct SearchEngine {
     index: Index,
     schema: Schema,
+    pool: Option<SqlitePool>,
 }
 
 impl SearchEngine {
     pub async fn init() -> Self {
         lancedb::init().await.expect("init lancedb failed");
         let (schema, index) = tantivy_engine::init().unwrap();
-        Self { index, schema }
+        Self { index, schema, pool: None }
+    }
+
+    pub fn with_pool(mut self, pool: SqlitePool) -> Self {
+        self.pool = Some(pool);
+        self
     }
 
     pub async fn write(&self, doc: tantivy_engine::Document) -> anyhow::Result<()> {
@@ -168,5 +175,105 @@ impl SearchEngine {
         reranked_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(reranked_results)
+    }
+
+    /// 使用知识图谱扩展查询
+    /// 从查询中识别实体，并查找相关实体来扩展查询
+    pub async fn expand_query_with_graph(&self, query: &str, kb_id: Option<i64>) -> anyhow::Result<Vec<String>> {
+        let pool = match &self.pool {
+            Some(p) => p,
+            None => return Ok(vec![query.to_string()]), // 如果没有数据库连接，直接返回原查询
+        };
+
+        let mut expanded_queries = vec![query.to_string()];
+
+        // 1. 在知识图谱中搜索匹配的实体
+        let mut sql = "SELECT DISTINCT name, entity_type FROM graph_nodes WHERE name LIKE ?".to_string();
+        let search_pattern = format!("%{}%", query);
+
+        if kb_id.is_some() {
+            sql.push_str(" AND kb_id = ?");
+        }
+
+        sql.push_str(" LIMIT 10");
+
+        let entities: Vec<(String, String)> = if let Some(kb_id) = kb_id {
+            sqlx::query_as(&sql).bind(&search_pattern).bind(kb_id).fetch_all(pool).await?
+        } else {
+            sqlx::query_as(&sql).bind(&search_pattern).fetch_all(pool).await?
+        };
+
+        // 2. 对于每个匹配的实体，查找相关实体
+        for (entity_name, _) in entities.iter().take(3) {
+            // 限制为前3个实体
+            // 查找与该实体相关的其他实体（通过边连接）
+            let related_sql = r#"
+                SELECT DISTINCT n.name
+                FROM graph_nodes n
+                JOIN graph_edges e ON (n.id = e.target_node_id OR n.id = e.source_node_id)
+                JOIN graph_nodes source ON (source.id = e.source_node_id OR source.id = e.target_node_id)
+                WHERE source.name = ?
+                AND n.name != ?
+                LIMIT 5
+            "#;
+
+            let related_entities: Vec<(String,)> =
+                sqlx::query_as(related_sql).bind(entity_name).bind(entity_name).fetch_all(pool).await?;
+
+            // 添加相关实体到扩展查询
+            for (related_name,) in related_entities {
+                if !expanded_queries.contains(&related_name) {
+                    expanded_queries.push(related_name);
+                }
+            }
+        }
+
+        info!("Query expansion: '{}' -> {:?}", query, expanded_queries);
+        Ok(expanded_queries)
+    }
+
+    /// 使用图谱增强的搜索
+    /// 先扩展查询，然后对每个扩展查询进行搜索，最后合并去重结果
+    pub async fn search_with_graph_expansion(
+        &self, query: &str, file_id: Option<i64>, kb_id: Option<i64>,
+    ) -> anyhow::Result<Vec<SearchResultItem>> {
+        // 1. 扩展查询
+        let expanded_queries = self.expand_query_with_graph(query, kb_id).await?;
+
+        if expanded_queries.len() == 1 {
+            // 没有扩展，直接使用原查询
+            return self.search(query, file_id, kb_id).await;
+        }
+
+        // 2. 对每个扩展查询进行搜索
+        let mut all_results: HashMap<i64, SearchResultItem> = HashMap::new();
+
+        for (idx, expanded_query) in expanded_queries.iter().enumerate() {
+            let results = self.search(expanded_query, file_id, kb_id).await?;
+
+            // 原始查询的结果权重更高
+            let weight = if idx == 0 { 1.0 } else { 0.7 };
+
+            for mut result in results {
+                result.score *= weight;
+
+                all_results
+                    .entry(result.id)
+                    .and_modify(|e| {
+                        // 如果已存在，取两者中分数较高的
+                        if result.score > e.score {
+                            *e = result.clone();
+                        }
+                    })
+                    .or_insert(result);
+            }
+        }
+
+        // 3. 转换为Vec并按分数排序
+        let mut merged_results: Vec<SearchResultItem> = all_results.into_values().collect();
+        merged_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+
+        info!("Graph-expanded search returned {} results", merged_results.len());
+        Ok(merged_results)
     }
 }

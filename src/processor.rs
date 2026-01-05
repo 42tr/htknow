@@ -1,14 +1,14 @@
 use std::{collections::HashMap, time::Duration};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use reqwest::multipart;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tokio::{fs, time};
 
 use crate::{
-    api::File, search::{self, tantivy_engine}
+    api::File, graph::{EntityMention, graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, tantivy_engine}
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -413,6 +413,13 @@ impl FileProcessor {
             .await?;
 
         info!("PDF file {} processed successfully with {} slices", file.id, slice_count);
+
+        // 构建知识图谱
+        if let Err(e) = self.build_knowledge_graph(file).await {
+            error!("Failed to build knowledge graph for file {}: {}", file.id, e);
+            // 不影响主流程，仅记录错误
+        }
+
         Ok(())
     }
 
@@ -442,6 +449,13 @@ impl FileProcessor {
             .await?;
 
         info!("File {} processed successfully with {} slices", file.id, slice_count);
+
+        // 构建知识图谱
+        if let Err(e) = self.build_knowledge_graph(file).await {
+            error!("Failed to build knowledge graph for file {}: {}", file.id, e);
+            // 不影响主流程，仅记录错误
+        }
+
         Ok(())
     }
 
@@ -483,5 +497,95 @@ impl FileProcessor {
                 Ok(vec![content.to_string()])
             }
         }
+    }
+
+    /// 构建知识图谱（完全由LLM生成）
+    async fn build_knowledge_graph(&self, file: &File) -> anyhow::Result<()> {
+        info!("Building knowledge graph for file {}", file.id);
+
+        // 1. 初始化LLM图谱提取器
+        let llm_extractor = LLMGraphExtractor::from_env();
+
+        if !llm_extractor.is_enabled() {
+            warn!("LLM not enabled, skipping knowledge graph building for file {}", file.id);
+            return Ok(());
+        }
+
+        info!("Using LLM to generate knowledge graph for file {}", file.id);
+
+        // 2. 获取文件的所有切片
+        let slices_sql = "SELECT id, content FROM slices WHERE file_id = ? ORDER BY id";
+        let slices: Vec<(i64, String)> = sqlx::query_as(slices_sql).bind(file.id).fetch_all(&self.pool).await?;
+
+        if slices.is_empty() {
+            debug!("No slices found for file {}, skipping graph building", file.id);
+            return Ok(());
+        }
+
+        // 3. 合并所有切片内容（限制长度避免超出LLM上下文）
+        let mut combined_content = String::new();
+        let max_content_length = 8000; // 限制总长度
+
+        for (_, content) in &slices {
+            if combined_content.len() + content.len() > max_content_length {
+                break;
+            }
+            combined_content.push_str(content);
+            combined_content.push_str("\n\n");
+        }
+
+        if combined_content.trim().is_empty() {
+            debug!("No content to process for file {}", file.id);
+            return Ok(());
+        }
+
+        // 4. 调用LLM提取知识图谱
+        let context = format!("文件名: {}", file.filename);
+
+        let (mut entities, mut relations) =
+            match llm_extractor.extract_knowledge_graph(&combined_content, &context).await {
+                Ok(result) => result,
+                Err(e) => {
+                    error!("LLM knowledge graph extraction failed for file {}: {}", file.id, e);
+                    return Err(e);
+                }
+            };
+
+        info!("LLM extracted {} entities and {} relations from file {}", entities.len(), relations.len(), file.id);
+
+        // 5. 为实体和关系添加文件信息
+        for entity in &mut entities {
+            entity.file_id = Some(file.id);
+            entity.kb_id = file.kb_id;
+        }
+
+        for relation in &mut relations {
+            relation.file_id = Some(file.id);
+        }
+
+        // 6. 记录实体提及（简化处理，使用第一个切片）
+        let mut all_mentions = Vec::new();
+        if let Some((slice_id, content)) = slices.first() {
+            for _entity in &entities {
+                all_mentions.push(EntityMention::new(
+                    0, // node_id会在添加到图后更新
+                    *slice_id,
+                    content.clone(),
+                ));
+            }
+        }
+
+        // 7. 更新知识图谱
+        let mut graph = KnowledgeGraph::load_from_db(self.pool.clone(), file.kb_id).await?;
+
+        // 添加实体和关系
+        graph.incremental_update(entities.clone(), relations).await?;
+
+        // 8. 保存图快照
+        graph.save_snapshot().await?;
+
+        info!("Knowledge graph updated successfully for file {} (LLM-generated)", file.id);
+
+        Ok(())
     }
 }

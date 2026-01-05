@@ -52,3 +52,69 @@ CREATE TABLE IF NOT EXISTS pdf_contents (
 --     created_at INTEGER DEFAULT (strftime('%s','now')),
 --     updated_at INTEGER DEFAULT (strftime('%s','now'))
 -- );
+
+-- 知识图谱相关表
+
+-- 图节点表（实体）
+CREATE TABLE IF NOT EXISTS graph_nodes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,                    -- 实体名称
+    entity_type TEXT NOT NULL,             -- 实体类型
+    properties TEXT,                        -- JSON格式的属性
+    embedding BLOB,                         -- 实体embedding向量
+    file_id INTEGER,                        -- 来源文件ID
+    kb_id INTEGER,                          -- 所属知识库ID
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    updated_at INTEGER DEFAULT (strftime('%s','now')),
+    UNIQUE(name, entity_type, kb_id)       -- 同一知识库内，同类型实体名称唯一
+);
+
+-- 图边表（关系）
+CREATE TABLE IF NOT EXISTS graph_edges (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source_node_id INTEGER NOT NULL,        -- 源节点ID
+    target_node_id INTEGER NOT NULL,        -- 目标节点ID
+    relation_type TEXT NOT NULL,            -- 关系类型
+    properties TEXT,                        -- JSON格式的属性
+    weight REAL DEFAULT 1.0,                -- 关系权重
+    file_id INTEGER,                        -- 来源文件ID
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    FOREIGN KEY (source_node_id) REFERENCES graph_nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (target_node_id) REFERENCES graph_nodes(id) ON DELETE CASCADE
+);
+
+-- 实体提及表（实体在文档中的出现位置）
+CREATE TABLE IF NOT EXISTS entity_mentions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_id INTEGER NOT NULL,               -- 节点ID
+    slice_id INTEGER NOT NULL,              -- 切片ID
+    start_offset INTEGER,                   -- 起始位置
+    end_offset INTEGER,                     -- 结束位置
+    context TEXT,                           -- 上下文片段
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    FOREIGN KEY (node_id) REFERENCES graph_nodes(id) ON DELETE CASCADE,
+    FOREIGN KEY (slice_id) REFERENCES slices(id) ON DELETE CASCADE
+);
+
+-- 图快照表（存储序列化的图结构）
+CREATE TABLE IF NOT EXISTS graph_snapshots (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kb_id INTEGER,                          -- 知识库ID（NULL表示全局）
+    graph_data BLOB NOT NULL,               -- 序列化的petgraph图
+    node_count INTEGER,                     -- 节点数量
+    edge_count INTEGER,                     -- 边数量
+    version INTEGER DEFAULT 1,              -- 版本号
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    UNIQUE(kb_id, version)
+);
+
+-- 索引
+CREATE INDEX IF NOT EXISTS idx_nodes_type ON graph_nodes(entity_type);
+CREATE INDEX IF NOT EXISTS idx_nodes_kb ON graph_nodes(kb_id);
+CREATE INDEX IF NOT EXISTS idx_nodes_file ON graph_nodes(file_id);
+CREATE INDEX IF NOT EXISTS idx_nodes_name ON graph_nodes(name);
+CREATE INDEX IF NOT EXISTS idx_edges_source ON graph_edges(source_node_id);
+CREATE INDEX IF NOT EXISTS idx_edges_target ON graph_edges(target_node_id);
+CREATE INDEX IF NOT EXISTS idx_edges_relation ON graph_edges(relation_type);
+CREATE INDEX IF NOT EXISTS idx_mentions_node ON entity_mentions(node_id);
+CREATE INDEX IF NOT EXISTS idx_mentions_slice ON entity_mentions(slice_id);

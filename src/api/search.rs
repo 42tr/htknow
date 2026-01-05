@@ -89,6 +89,43 @@ pub async fn search(
     Ok(Json(SearchResult { results }))
 }
 
+/// 使用知识图谱增强的搜索
+pub async fn search_with_graph(
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
+    Query(params): Query<SearchQuery>,
+) -> ApiResult<Json<SearchResult>> {
+    let raw_results = search_engine
+        .search_with_graph_expansion(&params.query, params.file_id, params.kb_id)
+        .await
+        .map_err(|e| crate::api::error::ApiError::internal(format!("Graph search failed: {}", e)))?;
+
+    if raw_results.is_empty() {
+        return Ok(Json(SearchResult { results: vec![] }));
+    }
+
+    // 收集所有 file_id 和 kb_id
+    let file_ids: Vec<i64> = raw_results.iter().map(|r| r.file_id).collect();
+    let kb_ids: Vec<i64> = raw_results.iter().filter_map(|r| r.kb_id).collect();
+
+    // 批量查询文件信息
+    let file_map = get_files_by_ids(&pool, &file_ids).await?;
+
+    // 批量查询知识库信息
+    let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(&pool, &kb_ids).await? } else { HashMap::new() };
+
+    // 组装结果
+    let results = raw_results
+        .into_iter()
+        .map(|r| {
+            let file = file_map.get(&r.file_id).cloned();
+            let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
+            SearchResultItem { id: r.id, content: r.content, score: r.score, file, kb }
+        })
+        .collect();
+
+    Ok(Json(SearchResult { results }))
+}
+
 async fn get_files_by_ids(pool: &SqlitePool, file_ids: &[i64]) -> Result<HashMap<i64, FileInfo>, sqlx::Error> {
     if file_ids.is_empty() {
         return Ok(HashMap::new());

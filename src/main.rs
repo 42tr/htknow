@@ -8,6 +8,7 @@ use tokio::net::TcpListener;
 mod api;
 mod db;
 mod frontend;
+mod graph;
 mod log4rs;
 mod processor;
 mod search;
@@ -43,7 +44,7 @@ async fn auth<B>(mut req: Request<Body>, next: Next) -> Response {
 async fn main() -> anyhow::Result<()> {
     log4rs::init();
     let pool = db::init().await?;
-    let search_engine = search::SearchEngine::init().await;
+    let search_engine = search::SearchEngine::init().await.with_pool(pool.clone());
 
     let processor = processor::FileProcessor::new(pool.clone(), search_engine.clone(), 10);
     processor.start();
