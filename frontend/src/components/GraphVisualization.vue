@@ -11,6 +11,14 @@ const props = defineProps({
     type: Number,
     default: null
   },
+  query: {
+    type: String,
+    default: null
+  },
+  entityType: {
+    type: String,
+    default: null
+  },
   maxNodes: {
     type: Number,
     default: 50
@@ -46,6 +54,9 @@ const selectedRelationTypes = ref([])
 // 全部节点和边（未筛选）
 const allNodes = ref([])
 const allEdges = ref([])
+
+// 搜索匹配的节点ID集合（用于高亮）
+const matchedNodeIds = ref(new Set())
 
 // 物理引擎参数
 const physics = {
@@ -86,6 +97,15 @@ const relationColors = {
   'default': '#cbd5e1'        // 灰色 - 其他
 }
 
+// 调整颜色透明度
+const adjustColorOpacity = (hexColor, opacity) => {
+  // 将 hex 转换为 rgba
+  const r = parseInt(hexColor.slice(1, 3), 16)
+  const g = parseInt(hexColor.slice(3, 5), 16)
+  const b = parseInt(hexColor.slice(5, 7), 16)
+  return `rgba(${r}, ${g}, ${b}, ${opacity})`
+}
+
 // 初始化画布
 const initCanvas = () => {
   if (!canvas.value || !container.value) return
@@ -100,52 +120,95 @@ const initCanvas = () => {
 const loadGraphData = async () => {
   loading.value = true
   try {
-    // 获取实体（支持按文件ID或知识库ID筛选）
-    const entities = await api.searchEntities(null, null, props.kbId, props.maxNodes, props.fileId)
+    // 获取实体（支持搜索、实体类型、文件ID、知识库ID筛选）
+    const entities = await api.searchEntities(
+      props.query || null,
+      props.entityType || null,
+      props.kbId,
+      props.maxNodes,
+      props.fileId
+    )
 
     // 将实体转换为节点
     const width = canvas.value.width
     const height = canvas.value.height
 
-    allNodes.value = entities.map((entity, i) => ({
-      id: entity.id,
-      name: entity.name,
-      type: entity.entity_type,
-      x: Math.random() * width,
-      y: Math.random() * height,
-      vx: 0,
-      vy: 0,
-      radius: 8,
-      entity: entity
-    }))
+    // 记录搜索匹配的节点ID
+    const matchedIds = new Set(entities.map(e => e.id))
+    matchedNodeIds.value = matchedIds
 
-    // 获取每个实体的邻居来构建边
-    allEdges.value = []
+    // 创建节点映射
+    const nodeMap = new Map()
+
+    // 添加搜索匹配的节点
+    entities.forEach((entity) => {
+      nodeMap.set(entity.id, {
+        id: entity.id,
+        name: entity.name,
+        type: entity.entity_type,
+        x: Math.random() * width,
+        y: Math.random() * height,
+        vx: 0,
+        vy: 0,
+        radius: 8,
+        entity: entity,
+        isMatched: true  // 标记为匹配的节点
+      })
+    })
+
+    // 获取每个实体的邻居来构建边，同时添加关联的节点
+    const edgeList = []
     const addedEdges = new Set()
 
-    // 加载所有节点的关系
-    for (const node of allNodes.value) {
+    // 加载所有匹配节点的关系
+    for (const entity of entities) {
       try {
-        const detail = await api.getEntity(node.id)
+        const detail = await api.getEntity(entity.id)
 
         for (const neighbor of detail.neighbors) {
-          const targetNode = allNodes.value.find(n => n.id === neighbor.entity.id)
-          if (targetNode) {
-            const edgeKey = `${Math.min(node.id, targetNode.id)}-${Math.max(node.id, targetNode.id)}`
-            if (!addedEdges.has(edgeKey)) {
-              allEdges.value.push({
-                source: node,
-                target: targetNode,
-                type: neighbor.relation_type
-              })
-              addedEdges.add(edgeKey)
-            }
+          // 如果邻居节点不存在，添加它（作为关联节点）
+          if (!nodeMap.has(neighbor.entity.id)) {
+            nodeMap.set(neighbor.entity.id, {
+              id: neighbor.entity.id,
+              name: neighbor.entity.name,
+              type: neighbor.entity.entity_type,
+              x: Math.random() * width,
+              y: Math.random() * height,
+              vx: 0,
+              vy: 0,
+              radius: 6,  // 关联节点稍小
+              entity: neighbor.entity,
+              isMatched: false  // 标记为关联节点
+            })
+          }
+
+          // 添加边
+          const sourceId = entity.id
+          const targetId = neighbor.entity.id
+          const edgeKey = `${Math.min(sourceId, targetId)}-${Math.max(sourceId, targetId)}`
+          if (!addedEdges.has(edgeKey)) {
+            edgeList.push({
+              sourceId,
+              targetId,
+              type: neighbor.relation_type
+            })
+            addedEdges.add(edgeKey)
           }
         }
       } catch (e) {
-        console.warn('Failed to load neighbor for node', node.id)
+        console.warn('Failed to load neighbor for entity', entity.id)
       }
     }
+
+    // 转换为数组
+    allNodes.value = Array.from(nodeMap.values())
+
+    // 构建边（引用节点对象）
+    allEdges.value = edgeList.map(e => ({
+      source: nodeMap.get(e.sourceId),
+      target: nodeMap.get(e.targetId),
+      type: e.type
+    })).filter(e => e.source && e.target)
 
     // 应用筛选
     applyFilters()
@@ -154,6 +217,80 @@ const loadGraphData = async () => {
     console.error('加载图谱数据失败:', error)
   } finally {
     loading.value = false
+  }
+}
+
+// 点击节点后加载更多关联实体
+const expandNode = async (node) => {
+  if (!node) return
+
+  try {
+    const detail = await api.getEntity(node.id)
+    const width = canvas.value.width
+    const height = canvas.value.height
+
+    // 获取当前所有节点ID
+    const existingIds = new Set(allNodes.value.map(n => n.id))
+    const newNodes = []
+    const newEdges = []
+    const addedEdges = new Set(allEdges.value.map(e =>
+      `${Math.min(e.source.id, e.target.id)}-${Math.max(e.source.id, e.target.id)}`
+    ))
+
+    for (const neighbor of detail.neighbors) {
+      // 如果邻居节点不存在，添加它
+      if (!existingIds.has(neighbor.entity.id)) {
+        const newNode = {
+          id: neighbor.entity.id,
+          name: neighbor.entity.name,
+          type: neighbor.entity.entity_type,
+          // 新节点放在被点击节点附近
+          x: node.x + (Math.random() - 0.5) * 150,
+          y: node.y + (Math.random() - 0.5) * 150,
+          vx: 0,
+          vy: 0,
+          radius: 6,
+          entity: neighbor.entity,
+          isMatched: false
+        }
+        newNodes.push(newNode)
+        existingIds.add(neighbor.entity.id)
+      }
+
+      // 添加边
+      const edgeKey = `${Math.min(node.id, neighbor.entity.id)}-${Math.max(node.id, neighbor.entity.id)}`
+      if (!addedEdges.has(edgeKey)) {
+        newEdges.push({
+          sourceId: node.id,
+          targetId: neighbor.entity.id,
+          type: neighbor.relation_type
+        })
+        addedEdges.add(edgeKey)
+      }
+    }
+
+    // 添加新节点
+    if (newNodes.length > 0) {
+      allNodes.value = [...allNodes.value, ...newNodes]
+    }
+
+    // 构建新边的引用
+    const nodeMap = new Map(allNodes.value.map(n => [n.id, n]))
+    const newEdgeObjects = newEdges.map(e => ({
+      source: nodeMap.get(e.sourceId),
+      target: nodeMap.get(e.targetId),
+      type: e.type
+    })).filter(e => e.source && e.target)
+
+    if (newEdgeObjects.length > 0) {
+      allEdges.value = [...allEdges.value, ...newEdgeObjects]
+    }
+
+    // 重新应用筛选
+    applyFilters()
+
+  } catch (e) {
+    console.warn('Failed to expand node', node.id, e)
   }
 }
 
@@ -403,44 +540,66 @@ const render = () => {
   for (const node of nodes.value) {
     const isSelected = selectedNode.value?.id === node.id
     const isHovered = hoveredNode.value?.id === node.id
+    const isMatched = node.isMatched  // 搜索匹配的节点
     const radius = isSelected || isHovered ? node.radius * 1.5 : node.radius
-    
-    // 节点阴影
+
+    // 搜索匹配节点的外发光效果
+    if (isMatched && !isSelected && !isHovered) {
+      ctx.beginPath()
+      ctx.arc(node.x, node.y, radius + 6, 0, Math.PI * 2)
+      ctx.fillStyle = 'rgba(251, 191, 36, 0.3)'  // 金色光晕
+      ctx.fill()
+      ctx.beginPath()
+      ctx.arc(node.x, node.y, radius + 3, 0, Math.PI * 2)
+      ctx.fillStyle = 'rgba(251, 191, 36, 0.4)'
+      ctx.fill()
+    }
+
+    // 节点阴影（选中或悬停）
     if (isSelected || isHovered) {
       ctx.beginPath()
       ctx.arc(node.x, node.y, radius + 4, 0, Math.PI * 2)
-      ctx.fillStyle = 'rgba(59, 130, 246, 0.2)'
+      ctx.fillStyle = 'rgba(59, 130, 246, 0.3)'
       ctx.fill()
     }
-    
+
     // 节点圆圈
     ctx.beginPath()
     ctx.arc(node.x, node.y, radius, 0, Math.PI * 2)
-    ctx.fillStyle = colors[node.type] || colors.default
+    // 关联节点使用半透明颜色
+    const baseColor = colors[node.type] || colors.default
+    ctx.fillStyle = isMatched ? baseColor : adjustColorOpacity(baseColor, 0.6)
     ctx.fill()
-    
+
     // 节点边框
-    ctx.strokeStyle = isSelected ? '#1e40af' : '#ffffff'
-    ctx.lineWidth = (isSelected ? 3 : 2) / scale.value
+    if (isMatched) {
+      // 匹配节点用金色边框
+      ctx.strokeStyle = isSelected ? '#1e40af' : '#f59e0b'
+      ctx.lineWidth = (isSelected ? 3 : 2.5) / scale.value
+    } else {
+      // 关联节点用白色虚线边框
+      ctx.strokeStyle = isSelected ? '#1e40af' : '#ffffff'
+      ctx.lineWidth = (isSelected ? 3 : 1.5) / scale.value
+    }
     ctx.stroke()
-    
-    // 绘制标签 - 默认显示所有节点名称
-    const shouldShowLabel = isHovered || isSelected || scale.value > 0.3
-    
+
+    // 绘制标签
+    const shouldShowLabel = isHovered || isSelected || isMatched || scale.value > 0.5
+
     if (shouldShowLabel) {
       ctx.fillStyle = '#1e293b'
-      ctx.font = `${isSelected ? 'bold 12px' : '11px'} sans-serif`
+      ctx.font = `${isSelected || isMatched ? 'bold 12px' : '10px'} sans-serif`
       ctx.textAlign = 'center'
       ctx.textBaseline = 'top'
-      
+
       // 文字背景
       const text = node.name
       const textWidth = ctx.measureText(text).width
-      ctx.fillStyle = 'rgba(255, 255, 255, 0.9)'
+      ctx.fillStyle = isMatched ? 'rgba(254, 243, 199, 0.95)' : 'rgba(255, 255, 255, 0.85)'
       ctx.fillRect(node.x - textWidth / 2 - 4, node.y + radius + 4, textWidth + 8, 16)
-      
+
       // 文字
-      ctx.fillStyle = '#1e293b'
+      ctx.fillStyle = isMatched ? '#92400e' : '#64748b'
       ctx.fillText(text, node.x, node.y + radius + 6)
     }
   }
@@ -572,14 +731,16 @@ const handleClick = (e) => {
   if (isDragging.value || isPanning.value) {
     return
   }
-  
+
   const { x, y } = getTransformedMousePos(e)
-  
+
   for (const node of nodes.value) {
     const dx = node.x - x
     const dy = node.y - y
     if (dx * dx + dy * dy < node.radius * node.radius * 4) {
       selectedNode.value = node
+      // 点击节点时展开其关联节点
+      expandNode(node)
       return
     }
   }
@@ -676,6 +837,14 @@ watch(() => props.kbId, () => {
 })
 
 watch(() => props.fileId, () => {
+  loadGraphData()
+})
+
+watch(() => props.query, () => {
+  loadGraphData()
+})
+
+watch(() => props.entityType, () => {
   loadGraphData()
 })
 
@@ -823,7 +992,22 @@ const getEntityTypeInfo = (type) => {
       <!-- 图例 -->
       <div class="absolute bottom-4 left-4 bg-white rounded-lg shadow-lg border border-slate-200 p-3 max-h-96 overflow-y-auto">
         <h4 class="text-xs font-semibold text-slate-700 mb-2">图例</h4>
-        
+
+        <!-- 节点状态 -->
+        <div class="mb-3">
+          <div class="text-xs font-medium text-slate-600 mb-1.5">节点状态</div>
+          <div class="space-y-1.5 text-xs">
+            <div class="flex items-center gap-2">
+              <div class="w-4 h-4 rounded-full bg-blue-500 border-2 border-amber-400 shadow-[0_0_6px_rgba(251,191,36,0.5)]"></div>
+              <span class="text-slate-600">搜索匹配</span>
+            </div>
+            <div class="flex items-center gap-2">
+              <div class="w-3 h-3 rounded-full bg-blue-300 border border-white opacity-70"></div>
+              <span class="text-slate-600">关联实体</span>
+            </div>
+          </div>
+        </div>
+
         <!-- 实体类型 -->
         <div class="mb-3">
           <div class="text-xs font-medium text-slate-600 mb-1.5">实体类型</div>
@@ -918,6 +1102,7 @@ const getEntityTypeInfo = (type) => {
       
       <!-- 操作提示 -->
       <div class="absolute top-4 left-4 bg-white/90 rounded-lg shadow border border-slate-200 px-3 py-2 text-xs text-slate-600">
+        <div>💡 <strong>点击节点</strong>: 展开关联实体</div>
         <div>💡 <strong>拖拽节点</strong>: 点击并拖动</div>
         <div>💡 <strong>平移视图</strong>: Shift + 拖动 或 中键拖动</div>
         <div>💡 <strong>缩放</strong>: 滚轮滚动</div>

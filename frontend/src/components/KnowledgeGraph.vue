@@ -215,7 +215,12 @@ onMounted(() => {
     </div>
 
     <!-- 图形可视化视图 -->
-    <GraphVisualization v-if="viewMode === 'graph'" :kb-id="selectedKbId" />
+    <GraphVisualization
+      v-if="viewMode === 'graph'"
+      :kb-id="selectedKbId"
+      :query="searchQuery || null"
+      :entity-type="selectedEntityType || null"
+    />
 
     <!-- 实体列表 -->
     <div v-if="viewMode === 'list'" class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
