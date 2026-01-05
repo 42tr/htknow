@@ -179,74 +179,120 @@ impl FileProcessor {
 
     /// 处理 PDF 文件，调用 MinerU API
     async fn process_pdf_file(&self, file: &File) -> anyhow::Result<()> {
-        info!("Processing PDF file with MinerU: {}", file.filename);
+        info!("Processing PDF file: {}", file.filename);
 
-        // 读取 PDF 文件
-        let file_bytes = tokio::fs::read(&file.path).await?;
+        // 先检查 pdf_contents 表中是否已有该文件的数据
+        let check_sql = "SELECT COUNT(*) as count FROM pdf_contents WHERE file_id = ?";
+        let count: (i64,) = sqlx::query_as(check_sql).bind(file.id).fetch_one(&self.pool).await?;
 
-        // 构建 multipart form
-        let form = multipart::Form::new()
-            .text("return_middle_json", "false")
-            .text("return_model_output", "false")
-            .text("return_md", "false")
-            .text("return_images", "true")
-            .text("end_page_id", "99999")
-            .text("parse_method", "auto")
-            .text("start_page_id", "0")
-            .text("lang_list", "ch")
-            .text("output_dir", "./output")
-            .text("server_url", "string")
-            .text("return_content_list", "true")
-            .text("backend", "pipeline")
-            .text("table_enable", "true")
-            .text("response_format_zip", "false")
-            .text("formula_enable", "true")
-            .part(
-                "files",
-                multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str("application/pdf")?,
-            );
+        let content_list: Vec<ContentItem>;
 
-        // 调用 MinerU API
-        let client = reqwest::Client::new();
-        let response = client.post("http://192.168.0.46:10001/file_parse").multipart(form).send().await?;
+        if count.0 > 0 {
+            // 已有数据，直接从数据库读取
+            info!("Found existing PDF contents in database for file {}, skipping MinerU API call", file.id);
 
-        if !response.status().is_success() {
-            let error_text = response.text().await?;
-            return Err(anyhow::anyhow!("MinerU API failed: {}", error_text));
-        }
+            let fetch_sql = "SELECT page_idx, text, text_level, img_path, table_body FROM pdf_contents WHERE file_id = ? ORDER BY page_idx, id";
+            let rows: Vec<(i32, Option<String>, Option<i32>, Option<String>, Option<String>)> =
+                sqlx::query_as(fetch_sql).bind(file.id).fetch_all(&self.pool).await?;
 
-        let result: MinerUResponse = response.json().await?;
+            // 将数据库记录转换为 ContentItem
+            content_list = rows
+                .iter()
+                .map(|row| {
+                    let typ = if row.1.is_some() {
+                        "text".to_string()
+                    } else if row.3.is_some() {
+                        "image".to_string()
+                    } else if row.4.is_some() {
+                        "table".to_string()
+                    } else {
+                        "unknown".to_string()
+                    };
 
-        let result = result.results.values().next().unwrap();
-        let content_list: Vec<ContentItem> = serde_json::from_str(&result.content_list)?;
-        // 提取文本内容并过滤掉 discarded 项
-        let valid_content_items: Vec<_> = content_list.iter().filter(|item| item.typ != "discarded").collect();
+                    ContentItem {
+                        typ,
+                        bbox: vec![],
+                        page_idx: row.0,
+                        text: row.1.clone(),
+                        text_level: row.2,
+                        text_format: None,
+                        img_path: row.3.clone(),
+                        image_caption: None,
+                        table_body: row.4.clone(),
+                        table_caption: None,
+                    }
+                })
+                .collect();
+        } else {
+            // 没有数据，调用 MinerU API
+            // 读取 PDF 文件
+            let file_bytes = tokio::fs::read(&file.path).await?;
 
-        // 只有在有有效内容时才插入数据库
-        if !valid_content_items.is_empty() {
-            let mut pdf_sql = QueryBuilder::<Sqlite>::new(
-                "insert into pdf_contents(file_id, page_idx, text, text_level, img_path, table_body) ",
-            );
-            pdf_sql.push_values(valid_content_items.iter(), |mut b, item| {
-                b.push_bind(file.id)
-                    .push_bind(item.page_idx)
-                    .push_bind(&item.text)
-                    .push_bind(item.text_level)
-                    .push_bind(&item.img_path)
-                    .push_bind(&item.table_body);
-            });
-            pdf_sql.build().execute(&self.pool).await?;
-        }
+            // 构建 multipart form
+            let form = multipart::Form::new()
+                .text("return_middle_json", "false")
+                .text("return_model_output", "false")
+                .text("return_md", "false")
+                .text("return_images", "true")
+                .text("end_page_id", "99999")
+                .text("parse_method", "auto")
+                .text("start_page_id", "0")
+                .text("lang_list", "ch")
+                .text("output_dir", "./output")
+                .text("server_url", "string")
+                .text("return_content_list", "true")
+                .text("backend", "pipeline")
+                .text("table_enable", "true")
+                .text("response_format_zip", "false")
+                .text("formula_enable", "true")
+                .part(
+                    "files",
+                    multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str("application/pdf")?,
+                );
 
-        // 保存图片到本地
-        fs::create_dir_all("images").await?;
-        for (img_name, img_base64) in &result.images {
-            // 保存图片
-            let b64 = img_base64
-                .strip_prefix("data:image/jpeg;base64,")
-                .ok_or_else(|| anyhow::anyhow!("invalid base64 image"))?;
-            let bytes = STANDARD.decode(b64)?;
-            fs::write(format!("images/{}", img_name), bytes).await?;
+            // 调用 MinerU API
+            let client = reqwest::Client::new();
+            let response = client.post("http://192.168.0.46:10001/file_parse").multipart(form).send().await?;
+
+            if !response.status().is_success() {
+                let error_text = response.text().await?;
+                return Err(anyhow::anyhow!("MinerU API failed: {}", error_text));
+            }
+
+            let result: MinerUResponse = response.json().await?;
+
+            let result = result.results.values().next().unwrap();
+            content_list = serde_json::from_str(&result.content_list)?;
+
+            // 提取文本内容并过滤掉 discarded 项
+            let valid_content_items: Vec<_> = content_list.iter().filter(|item| item.typ != "discarded").collect();
+
+            // 只有在有有效内容时才插入数据库
+            if !valid_content_items.is_empty() {
+                let mut pdf_sql = QueryBuilder::<Sqlite>::new(
+                    "insert into pdf_contents(file_id, page_idx, text, text_level, img_path, table_body) ",
+                );
+                pdf_sql.push_values(valid_content_items.iter(), |mut b, item| {
+                    b.push_bind(file.id)
+                        .push_bind(item.page_idx)
+                        .push_bind(&item.text)
+                        .push_bind(item.text_level)
+                        .push_bind(&item.img_path)
+                        .push_bind(&item.table_body);
+                });
+                pdf_sql.build().execute(&self.pool).await?;
+            }
+
+            // 保存图片到本地
+            fs::create_dir_all("images").await?;
+            for (img_name, img_base64) in &result.images {
+                // 保存图片
+                let b64 = img_base64
+                    .strip_prefix("data:image/jpeg;base64,")
+                    .ok_or_else(|| anyhow::anyhow!("invalid base64 image"))?;
+                let bytes = STANDARD.decode(b64)?;
+                fs::write(format!("images/{}", img_name), bytes).await?;
+            }
         }
 
         // 根据 slice_type 分片并保存
