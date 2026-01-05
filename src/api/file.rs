@@ -118,8 +118,10 @@ pub struct UpdateFileReq {
 }
 
 pub async fn update(
-    State(pool): State<SqlitePool>, Path(id): Path<i64>, Json(req): Json<UpdateFileReq>,
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>, Path(id): Path<i64>,
+    Json(req): Json<UpdateFileReq>,
 ) -> ApiResult<Json<File>> {
+    search_engine.delete(Some(id), None).await?;
     let sql = "DELETE FROM slices WHERE file_id = ?";
     sqlx::query(sql).bind(id).execute(&pool).await?;
     let sql = "UPDATE files SET slice_type = ?, status = ? WHERE id = ?";

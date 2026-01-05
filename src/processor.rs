@@ -11,13 +11,18 @@ use crate::{
     api::File, search::{self, tantivy_engine}
 };
 
+#[derive(Debug, Deserialize, Serialize)]
+struct Result {
+    #[serde(default)]
+    content_list: String,
+    #[serde(default)]
+    images: HashMap<String, String>,
+}
+
 /// MinerU API 返回的结果结构
 #[derive(Debug, Deserialize, Serialize)]
 struct MinerUResponse {
-    #[serde(default)]
-    content_list: Vec<ContentItem>,
-    #[serde(default)]
-    images: HashMap<String, String>,
+    results: HashMap<String, Result>,
 }
 /*
 "type": "text",
@@ -70,13 +75,6 @@ struct ContentItem {
     table_body: Option<String>,
     #[serde(default)]
     table_caption: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize, Serialize, Clone)]
-struct ImageInfo {
-    path: String,
-    #[serde(default)]
-    page_num: Option<i32>,
 }
 
 /// 文件处理器：定时从数据库读取未处理的文件并处理
@@ -217,42 +215,48 @@ impl FileProcessor {
             return Err(anyhow::anyhow!("MinerU API failed: {}", error_text));
         }
 
-        let result: MinerUResponse = response.json().await.expect("call mineru api failed");
+        let result: MinerUResponse = response.json().await?;
 
-        // 提取文本内容
-        let mut pdf_sql = QueryBuilder::<Sqlite>::new(
-            "insert into pdf_contents(file_id, page_idx, text, text_level, img_path, table_body) values",
-        );
-        pdf_sql.push_values(result.content_list.iter().filter(|item| item.typ != "discarded"), |mut b, item| {
-            b.push_bind(file.id)
-                .push_bind(item.page_idx)
-                .push_bind(&item.text)
-                .push_bind(item.text_level)
-                .push_bind(&item.img_path)
-                .push_bind(&item.table_body);
-        });
-        pdf_sql.build().execute(&self.pool).await.expect("insert into pdf_contents failed");
+        let result = result.results.values().next().unwrap();
+        let content_list: Vec<ContentItem> = serde_json::from_str(&result.content_list)?;
+        // 提取文本内容并过滤掉 discarded 项
+        let valid_content_items: Vec<_> = content_list.iter().filter(|item| item.typ != "discarded").collect();
+
+        // 只有在有有效内容时才插入数据库
+        if !valid_content_items.is_empty() {
+            let mut pdf_sql = QueryBuilder::<Sqlite>::new(
+                "insert into pdf_contents(file_id, page_idx, text, text_level, img_path, table_body) ",
+            );
+            pdf_sql.push_values(valid_content_items.iter(), |mut b, item| {
+                b.push_bind(file.id)
+                    .push_bind(item.page_idx)
+                    .push_bind(&item.text)
+                    .push_bind(item.text_level)
+                    .push_bind(&item.img_path)
+                    .push_bind(&item.table_body);
+            });
+            pdf_sql.build().execute(&self.pool).await?;
+        }
 
         // 保存图片到本地
-        fs::create_dir_all("images").await.expect("created image dir failed");
-        for (img_name, img_base64) in result.images {
+        fs::create_dir_all("images").await?;
+        for (img_name, img_base64) in &result.images {
             // 保存图片
             let b64 = img_base64
                 .strip_prefix("data:image/jpeg;base64,")
-                .ok_or_else(|| anyhow::anyhow!("invalid base64 image"))
-                .expect("get image base64 failed");
-            let bytes = STANDARD.decode(b64).expect("decode base64 failed");
-            fs::write(format!("images/{}", img_name), bytes).await.expect("write image failed");
+                .ok_or_else(|| anyhow::anyhow!("invalid base64 image"))?;
+            let bytes = STANDARD.decode(b64)?;
+            fs::write(format!("images/{}", img_name), bytes).await?;
         }
 
         // 根据 slice_type 分片并保存
         let mut full_content = String::new();
-        for pdf_content in result.content_list {
+        for pdf_content in &content_list {
             if pdf_content.typ == "discarded" {
                 continue;
             }
             if pdf_content.typ == "text" {
-                if let Some(text) = pdf_content.text {
+                if let Some(text) = &pdf_content.text {
                     if let Some(lv) = pdf_content.text_level {
                         full_content.push_str("#".repeat(lv as usize).as_str());
                         full_content.push_str(" ");
@@ -260,21 +264,21 @@ impl FileProcessor {
                     full_content.push_str(&text);
                 }
             } else if pdf_content.typ == "image" {
-                if let Some(img_name) = pdf_content.img_path {
+                if let Some(img_name) = &pdf_content.img_path {
                     full_content.push_str(&format!("![{}](images/{})", img_name, img_name,));
                 }
-                if let Some(captions) = pdf_content.image_caption {
+                if let Some(captions) = &pdf_content.image_caption {
                     for caption in captions {
                         full_content.push_str(&format!("{}", caption));
                     }
                 }
             } else if pdf_content.typ == "table" {
-                if let Some(table_caption) = pdf_content.table_caption {
+                if let Some(table_caption) = &pdf_content.table_caption {
                     for caption in table_caption {
                         full_content.push_str(&format!("{}", caption));
                     }
                 }
-                if let Some(table_body) = pdf_content.table_body {
+                if let Some(table_body) = &pdf_content.table_body {
                     full_content.push_str(&table_body);
                 }
             }
