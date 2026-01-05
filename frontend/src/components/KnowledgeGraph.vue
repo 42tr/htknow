@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import { api } from '../api.js'
 import EntityDetail from './EntityDetail.vue'
 import GraphVisualization from './GraphVisualization.vue'
@@ -9,10 +9,16 @@ const stats = ref(null)
 const loading = ref(false)
 const searchQuery = ref('')
 const selectedEntityType = ref('')
-const selectedKbId = ref(null)
 const selectedEntity = ref(null)
 const showEntityDetail = ref(false)
 const viewMode = ref('list') // 'list' or 'graph'
+
+// 范围过滤
+const scopeType = ref('all') // 'all', 'kb', 'file'
+const knowledgeBases = ref([])
+const files = ref([])
+const selectedKbId = ref(null)
+const selectedFileId = ref(null)
 
 // 实体类型映射
 const entityTypeMap = {
@@ -43,9 +49,31 @@ const filteredEntities = computed(() => {
   return entities.value
 })
 
+// 当前有效的过滤参数
+const currentKbId = computed(() => scopeType.value === 'kb' ? selectedKbId.value : null)
+const currentFileId = computed(() => scopeType.value === 'file' ? selectedFileId.value : null)
+
+// 加载知识库列表
+const loadKnowledgeBases = async () => {
+  try {
+    knowledgeBases.value = await api.getKnowledgeBases()
+  } catch (error) {
+    console.error('加载知识库列表失败:', error)
+  }
+}
+
+// 加载文件列表
+const loadFiles = async () => {
+  try {
+    files.value = await api.getFiles()
+  } catch (error) {
+    console.error('加载文件列表失败:', error)
+  }
+}
+
 const loadStats = async () => {
   try {
-    stats.value = await api.getGraphStats(selectedKbId.value)
+    stats.value = await api.getGraphStats(currentKbId.value, currentFileId.value)
   } catch (error) {
     console.error('加载统计失败:', error)
   }
@@ -57,8 +85,9 @@ const loadEntities = async () => {
     entities.value = await api.searchEntities(
       searchQuery.value || null,
       selectedEntityType.value || null,
-      selectedKbId.value,
-      100
+      currentKbId.value,
+      100,
+      currentFileId.value
     )
   } catch (error) {
     console.error('加载实体失败:', error)
@@ -68,6 +97,27 @@ const loadEntities = async () => {
 }
 
 const handleSearch = () => {
+  loadStats()
+  loadEntities()
+}
+
+const handleScopeChange = () => {
+  // 切换范围时重置选择
+  if (scopeType.value === 'all') {
+    selectedKbId.value = null
+    selectedFileId.value = null
+  } else if (scopeType.value === 'kb') {
+    selectedFileId.value = null
+    if (knowledgeBases.value.length > 0 && !selectedKbId.value) {
+      selectedKbId.value = knowledgeBases.value[0].id
+    }
+  } else if (scopeType.value === 'file') {
+    selectedKbId.value = null
+    if (files.value.length > 0 && !selectedFileId.value) {
+      selectedFileId.value = files.value[0].id
+    }
+  }
+  loadStats()
   loadEntities()
 }
 
@@ -94,7 +144,24 @@ const formatDate = (timestamp) => {
   return new Date(timestamp * 1000).toLocaleString('zh-CN')
 }
 
+// 监听知识库和文件选择变化
+watch(selectedKbId, () => {
+  if (scopeType.value === 'kb') {
+    loadStats()
+    loadEntities()
+  }
+})
+
+watch(selectedFileId, () => {
+  if (scopeType.value === 'file') {
+    loadStats()
+    loadEntities()
+  }
+})
+
 onMounted(() => {
+  loadKnowledgeBases()
+  loadFiles()
   loadStats()
   loadEntities()
 })
@@ -102,6 +169,78 @@ onMounted(() => {
 
 <template>
   <div class="space-y-6">
+    <!-- 范围选择 -->
+    <div class="bg-white rounded-xl p-6 border border-slate-200 shadow-sm">
+      <h3 class="text-sm font-semibold text-slate-700 mb-4">数据范围</h3>
+      <div class="flex flex-wrap items-center gap-4">
+        <!-- 范围类型选择 -->
+        <div class="flex gap-1 bg-slate-100 p-1 rounded-lg">
+          <button
+            @click="scopeType = 'all'; handleScopeChange()"
+            :class="[
+              'px-4 py-2 rounded-lg text-sm font-medium transition-all',
+              scopeType === 'all' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+            ]"
+          >
+            🌐 全部
+          </button>
+          <button
+            @click="scopeType = 'kb'; handleScopeChange()"
+            :class="[
+              'px-4 py-2 rounded-lg text-sm font-medium transition-all',
+              scopeType === 'kb' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+            ]"
+          >
+            📚 知识库
+          </button>
+          <button
+            @click="scopeType = 'file'; handleScopeChange()"
+            :class="[
+              'px-4 py-2 rounded-lg text-sm font-medium transition-all',
+              scopeType === 'file' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+            ]"
+          >
+            📄 文件
+          </button>
+        </div>
+
+        <!-- 知识库选择 -->
+        <select
+          v-if="scopeType === 'kb'"
+          v-model="selectedKbId"
+          class="px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white min-w-[200px]"
+        >
+          <option :value="null" disabled>选择知识库...</option>
+          <option v-for="kb in knowledgeBases" :key="kb.id" :value="kb.id">
+            {{ kb.name }}
+          </option>
+        </select>
+
+        <!-- 文件选择 -->
+        <select
+          v-if="scopeType === 'file'"
+          v-model="selectedFileId"
+          class="px-4 py-2 border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent bg-white min-w-[200px]"
+        >
+          <option :value="null" disabled>选择文件...</option>
+          <option v-for="file in files" :key="file.id" :value="file.id">
+            {{ file.filename }}
+          </option>
+        </select>
+
+        <!-- 当前范围提示 -->
+        <div class="text-sm text-slate-500">
+          <span v-if="scopeType === 'all'">显示所有知识图谱数据</span>
+          <span v-else-if="scopeType === 'kb' && selectedKbId">
+            已选择知识库: <strong class="text-slate-700">{{ knowledgeBases.find(kb => kb.id === selectedKbId)?.name }}</strong>
+          </span>
+          <span v-else-if="scopeType === 'file' && selectedFileId">
+            已选择文件: <strong class="text-slate-700">{{ files.find(f => f.id === selectedFileId)?.filename }}</strong>
+          </span>
+        </div>
+      </div>
+    </div>
+
     <!-- 统计卡片 -->
     <div v-if="stats" class="grid grid-cols-1 md:grid-cols-4 gap-4">
       <div class="bg-white rounded-xl p-6 border border-slate-200 shadow-sm">
@@ -217,7 +356,8 @@ onMounted(() => {
     <!-- 图形可视化视图 -->
     <GraphVisualization
       v-if="viewMode === 'graph'"
-      :kb-id="selectedKbId"
+      :kb-id="currentKbId"
+      :file-id="currentFileId"
       :query="searchQuery || null"
       :entity-type="selectedEntityType || null"
     />
