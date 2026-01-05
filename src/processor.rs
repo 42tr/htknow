@@ -163,10 +163,23 @@ impl FileProcessor {
         let sql = "UPDATE files SET status = 2, updated_at = strftime('%s','now') WHERE id = ?";
         sqlx::query(sql).bind(file.id).execute(&self.pool).await?;
 
-        // 检查文件是否为 PDF
-        let is_pdf = file.filename.to_lowercase().ends_with(".pdf");
+        // 检查文件是否为 PDF 或图片
+        let filename_lower = file.filename.to_lowercase();
+        let is_pdf_or_img = filename_lower.ends_with(".pdf")
+            || filename_lower.ends_with(".jpg")
+            || filename_lower.ends_with(".jpeg")
+            || filename_lower.ends_with(".png")
+            || filename_lower.ends_with(".gif")
+            || filename_lower.ends_with(".bmp")
+            || filename_lower.ends_with(".webp")
+            || filename_lower.ends_with(".tiff")
+            || filename_lower.ends_with(".tif")
+            || filename_lower.ends_with(".svg")
+            || filename_lower.ends_with(".ico")
+            || filename_lower.ends_with(".heic")
+            || filename_lower.ends_with(".heif");
 
-        if is_pdf {
+        if is_pdf_or_img {
             // 处理 PDF 文件
             self.process_pdf_file(file).await?;
         } else {
@@ -284,14 +297,14 @@ impl FileProcessor {
             }
 
             // 保存图片到本地
-            fs::create_dir_all("images").await?;
+            fs::create_dir_all("data/images").await?;
             for (img_name, img_base64) in &result.images {
                 // 保存图片
                 let b64 = img_base64
                     .strip_prefix("data:image/jpeg;base64,")
                     .ok_or_else(|| anyhow::anyhow!("invalid base64 image"))?;
                 let bytes = STANDARD.decode(b64)?;
-                fs::write(format!("images/{}", img_name), bytes).await?;
+                fs::write(format!("data/images/{}", img_name), bytes).await?;
             }
         }
 
