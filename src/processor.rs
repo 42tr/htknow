@@ -217,7 +217,7 @@ impl FileProcessor {
             return Err(anyhow::anyhow!("MinerU API failed: {}", error_text));
         }
 
-        let result: MinerUResponse = response.json().await?;
+        let result: MinerUResponse = response.json().await.expect("call mineru api failed");
 
         // 提取文本内容
         let mut pdf_sql = QueryBuilder::<Sqlite>::new(
@@ -231,17 +231,18 @@ impl FileProcessor {
                 .push_bind(&item.img_path)
                 .push_bind(&item.table_body);
         });
-        pdf_sql.build().execute(&self.pool).await?;
+        pdf_sql.build().execute(&self.pool).await.expect("insert into pdf_contents failed");
 
         // 保存图片到本地
-        fs::create_dir_all("images").await?;
+        fs::create_dir_all("images").await.expect("created image dir failed");
         for (img_name, img_base64) in result.images {
             // 保存图片
             let b64 = img_base64
                 .strip_prefix("data:image/jpeg;base64,")
-                .ok_or_else(|| anyhow::anyhow!("invalid base64 image"))?;
-            let bytes = STANDARD.decode(b64)?;
-            fs::write(format!("images/{}", img_name), bytes).await?;
+                .ok_or_else(|| anyhow::anyhow!("invalid base64 image"))
+                .expect("get image base64 failed");
+            let bytes = STANDARD.decode(b64).expect("decode base64 failed");
+            fs::write(format!("images/{}", img_name), bytes).await.expect("write image failed");
         }
 
         // 根据 slice_type 分片并保存
