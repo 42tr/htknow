@@ -8,7 +8,7 @@ use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tokio::{fs, time};
 
 use crate::{
-    api::File, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, tantivy_engine}
+    api::File, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, tantivy_engine}
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -200,7 +200,8 @@ impl FileProcessor {
     /// 将 Word 文档转换为 PDF 并处理
     async fn convert_word_to_pdf_and_process(&self, file: &File) -> anyhow::Result<()> {
         // 创建临时目录用于存放转换后的 PDF
-        let temp_dir = std::path::Path::new("data/temp");
+        let cfg = config::get();
+        let temp_dir = std::path::Path::new(&cfg.storage.temp_path);
         fs::create_dir_all(temp_dir).await?;
 
         // 生成临时 PDF 文件路径
@@ -316,7 +317,8 @@ impl FileProcessor {
 
             // 调用 MinerU API
             let client = reqwest::Client::new();
-            let response = client.post("http://192.168.0.46:10001/file_parse").multipart(form).send().await?;
+            let cfg = config::get();
+            let response = client.post(&cfg.services.mineru_url).multipart(form).send().await?;
 
             if !response.status().is_success() {
                 let error_text = response.text().await?;
@@ -348,14 +350,15 @@ impl FileProcessor {
             }
 
             // 保存图片到本地
-            fs::create_dir_all("data/images").await?;
+            let cfg = config::get();
+            fs::create_dir_all(&cfg.storage.images_path).await?;
             for (img_name, img_base64) in &result.images {
                 // 保存图片
                 let b64 = img_base64
                     .strip_prefix("data:image/jpeg;base64,")
                     .ok_or_else(|| anyhow::anyhow!("invalid base64 image"))?;
                 let bytes = STANDARD.decode(b64)?;
-                fs::write(format!("data/images/{}", img_name), bytes).await?;
+                fs::write(format!("{}/{}", cfg.storage.images_path, img_name), bytes).await?;
             }
         }
 

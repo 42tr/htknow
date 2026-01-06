@@ -7,13 +7,43 @@ services:
       dockerfile: Dockerfile
     container_name: htknow
     ports:
-      - "8080:8080"
+      - "8080:3000"
     volumes:
       # Mount data directory for persistent storage
       - ./data:/app/data
     environment:
       - RUST_LOG=info
-      # Add other environment variables as needed
+      # 服务器配置
+      - HTKNOW_SERVER_HOST=0.0.0.0
+      - HTKNOW_SERVER_PORT=3000
+      - HTKNOW_SERVER_UPLOAD_LIMIT_MB=500
+      - HTKNOW_SERVER_PROCESS_INTERVAL_SECS=10
+      # 外部服务地址
+      - HTKNOW_MINERU_URL=http://192.168.0.46:10001/file_parse
+      - HTKNOW_EMBEDDING_URL=http://192.168.0.46:9700/v1/embeddings
+      - HTKNOW_RERANK_URL=http://192.168.0.46:9600/v1/rerank
+      # AI 模型配置
+      - HTKNOW_EMBEDDING_MODEL=bge-m3
+      - HTKNOW_EMBEDDING_DIM=1024
+      - HTKNOW_RERANK_MODEL=bge-rerank
+      - HTKNOW_RERANK_THRESHOLD=0.1
+      # 数据库配置
+      - DATABASE_URL=sqlite://data/app.sqlite
+      - HTKNOW_DB_MAX_CONNECTIONS=10
+      - HTKNOW_DB_BUSY_TIMEOUT_MS=5000
+      # 存储路径配置
+      - HTKNOW_DATA_DIR=data
+      - HTKNOW_LANCEDB_PATH=data/lancedb_data
+      - HTKNOW_TEMP_PATH=data/temp
+      - HTKNOW_IMAGES_PATH=data/images
+      # 搜索配置
+      - HTKNOW_SEARCH_LIMIT=10
+      - HTKNOW_TANTIVY_INDEX_PATH=data/tantivy_index
+      - HTKNOW_TANTIVY_MEMORY_MB=50
+      # LLM 配置（可选，用于知识图谱构建）
+      # - LLM_API_URL=https://api.openai.com/v1/chat/completions
+      # - LLM_API_KEY=your-api-key
+      # - LLM_MODEL=gpt-3.5-turbo
     restart: unless-stopped
     # Uncomment if you need to connect to other services
     # networks:

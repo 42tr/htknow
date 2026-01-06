@@ -7,11 +7,9 @@ use tantivy::{
 };
 
 use super::chinese_tokenizer;
+use crate::config;
 
-const INDEX_PATH: &str = "data/tantivy_index";
 const ALL_TOKENIZER: &str = "all";
-const INDEX_WRITER_MEMORY: usize = 50_000_000;
-const SEARCH_LIMIT: usize = 10;
 
 #[derive(Clone)]
 pub struct Document {
@@ -41,8 +39,9 @@ impl Document {
 ///
 /// delete if it exists
 pub fn init() -> Result<(Schema, Index)> {
+    let cfg = config::get();
     let schema = build_schema();
-    let path = Path::new(INDEX_PATH);
+    let path = Path::new(&cfg.search.tantivy_index_path);
     let index = if path.exists() {
         Index::open_in_dir(path)?
     } else {
@@ -54,7 +53,8 @@ pub fn init() -> Result<(Schema, Index)> {
 }
 
 pub async fn write_documents(index: &Index, schema: &Schema, doc: Document) -> tantivy::Result<()> {
-    let mut index_writer = index.writer(INDEX_WRITER_MEMORY)?;
+    let writer_memory = config::get().search.tantivy_memory_mb * 1_000_000;
+    let mut index_writer = index.writer(writer_memory)?;
     index_writer.add_document(create_document(doc, schema))?;
     index_writer.commit()?;
     Ok(())
@@ -63,9 +63,10 @@ pub async fn write_documents(index: &Index, schema: &Schema, doc: Document) -> t
 pub async fn search(
     index: &Index, schema: &Schema, query: &str, file_id: Option<i64>, kb_id: Option<i64>,
 ) -> anyhow::Result<Vec<SearchResultItem>> {
+    let cfg = config::get();
     let searcher = index.reader()?.searcher();
     let tantivy_query = build_query(query, file_id, kb_id, schema)?;
-    let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(SEARCH_LIMIT))?;
+    let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(cfg.search.limit))?;
 
     let mut results = vec![];
     for (score, doc_address) in top_docs {
@@ -85,7 +86,8 @@ pub async fn search(
 }
 
 pub async fn delete_by_file(index: &Index, schema: &Schema, file_id: i64) -> anyhow::Result<()> {
-    let mut writer = index.writer::<TantivyDocument>(INDEX_WRITER_MEMORY)?;
+    let writer_memory = config::get().search.tantivy_memory_mb * 1_000_000;
+    let mut writer = index.writer::<TantivyDocument>(writer_memory)?;
     let file_id_field = get_field(schema, "file_id");
     let term = Term::from_field_i64(file_id_field, file_id);
     writer.delete_term(term);
@@ -94,7 +96,8 @@ pub async fn delete_by_file(index: &Index, schema: &Schema, file_id: i64) -> any
 }
 
 pub async fn delete_by_kb(index: &Index, schema: &Schema, kb_id: i64) -> anyhow::Result<()> {
-    let mut writer = index.writer::<TantivyDocument>(INDEX_WRITER_MEMORY)?;
+    let writer_memory = config::get().search.tantivy_memory_mb * 1_000_000;
+    let mut writer = index.writer::<TantivyDocument>(writer_memory)?;
     let kb_id_field = get_field(schema, "kb_id");
     let term = Term::from_field_i64(kb_id_field, kb_id);
     writer.delete_term(term);

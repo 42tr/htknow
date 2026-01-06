@@ -6,6 +6,7 @@ use axum::{
 use tokio::net::TcpListener;
 
 mod api;
+mod config;
 mod db;
 mod frontend;
 mod graph;
@@ -43,22 +44,30 @@ async fn auth<B>(mut req: Request<Body>, next: Next) -> Response {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     log4rs::init();
+
+    // 加载配置
+    let cfg = config::get();
+    log::info!("Configuration loaded: server={}:{}", cfg.server.host, cfg.server.port);
+
     let pool = db::init().await?;
     let search_engine = search::SearchEngine::init().await.with_pool(pool.clone());
 
-    let processor = processor::FileProcessor::new(pool.clone(), search_engine.clone(), 10);
+    let processor = processor::FileProcessor::new(pool.clone(), search_engine.clone(), cfg.server.process_interval_secs);
     processor.start();
 
     // API 路由需要认证
+    let upload_limit = cfg.server.upload_limit_mb * 1024 * 1024;
     let api_router = Router::new()
         .nest("/api/v1/knowledge/", api::app(pool, search_engine))
         .layer(middleware::from_fn(auth::<Body>))
-        .layer(DefaultBodyLimit::max(500 * 1024 * 1024)); // 500MB 上传限制
+        .layer(DefaultBodyLimit::max(upload_limit));
 
     // 合并路由：前端不需要认证，API需要认证
     let app = Router::new().merge(api_router).merge(frontend::router());
 
-    let listener = TcpListener::bind("0.0.0.0:3000").await?;
+    let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
+    let listener = TcpListener::bind(&addr).await?;
+    log::info!("Server listening on {}", addr);
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }

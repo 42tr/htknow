@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tantivy::{Index, schema::Schema};
 
+use crate::config;
+
 mod chinese_tokenizer;
 mod embedding;
 mod lancedb;
@@ -126,15 +128,17 @@ impl SearchEngine {
     }
 
     async fn rerank(&self, query: &str, results: Vec<SearchResultItem>) -> anyhow::Result<Vec<SearchResultItem>> {
+        let cfg = config::get();
+
         // 提取所有文档内容用于重排序
         let documents: Vec<String> = results.iter().map(|r| r.content.clone()).collect();
 
         // 构造请求
-        let rerank_request = RerankRequest { model: "bge-rerank".to_string(), query: query.to_string(), documents };
+        let rerank_request = RerankRequest { model: cfg.ai.rerank_model.clone(), query: query.to_string(), documents };
 
         // 调用 BGE-Rerank API
         let client = reqwest::Client::new();
-        let response = client.post("http://192.168.0.46:9600/v1/rerank").json(&rerank_request).send().await?;
+        let response = client.post(&cfg.services.rerank_url).json(&rerank_request).send().await?;
 
         if !response.status().is_success() {
             let status = response.status();
@@ -173,7 +177,8 @@ impl SearchEngine {
 
         // 按新分数降序排序
         reranked_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        let filter_results = reranked_results.into_iter().filter(|f| f.score >= 0.1).collect();
+        let threshold = cfg.ai.rerank_threshold;
+        let filter_results = reranked_results.into_iter().filter(|f| f.score >= threshold).collect();
         Ok(filter_results)
     }
 

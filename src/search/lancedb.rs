@@ -12,10 +12,10 @@ use lancedb::{
 use once_cell::sync::OnceCell;
 
 use super::{embedding, tantivy_engine::SearchResultItem};
+use crate::config;
 
 static LANCEDB: OnceCell<Arc<Connection>> = OnceCell::new();
 static TABLE_NAME: &str = "documents";
-const VECTOR_DIM: i32 = 1024; // bge-m3 模型的向量维度
 
 #[derive(Clone)]
 pub struct Document {
@@ -32,7 +32,8 @@ impl Document {
 }
 
 pub async fn init() -> Result<()> {
-    let storage_path = "data/lancedb_data";
+    let cfg = config::get();
+    let storage_path = &cfg.storage.lancedb_path;
     std::fs::create_dir_all(storage_path)?;
 
     let db = connect(storage_path).execute().await?;
@@ -71,6 +72,7 @@ pub async fn write_documents(doc: Document) -> Result<()> {
 }
 
 pub async fn search(query: &str, file_id: Option<i64>, kb_id: Option<i64>) -> Result<Vec<SearchResultItem>> {
+    let cfg = config::get();
     let conn = get_connection()?;
     let table = conn.open_table(TABLE_NAME).execute().await?;
 
@@ -93,7 +95,7 @@ pub async fn search(query: &str, file_id: Option<i64>, kb_id: Option<i64>) -> Re
         query_builder = query_builder.only_if(&filter_conditions.join(" AND "));
     }
 
-    let mut result_stream = query_builder.limit(10).execute().await?;
+    let mut result_stream = query_builder.limit(cfg.search.limit).execute().await?;
 
     let mut search_results = Vec::new();
 
@@ -169,21 +171,23 @@ fn get_connection() -> Result<Arc<Connection>> {
 }
 
 fn create_schema() -> Arc<ArrowSchema> {
+    let vector_dim = config::get().ai.embedding_dim;
     Arc::new(ArrowSchema::new(vec![
         Field::new("id", DataType::Int64, false),
         Field::new("file_id", DataType::Int64, false),
         Field::new("kb_id", DataType::Int64, true),
         Field::new("content", DataType::Utf8, false),
-        // 向量字段 - bge-m3 模型使用 1024 维
+        // 向量字段 - 从配置获取维度
         Field::new(
             "vector",
-            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), VECTOR_DIM),
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), vector_dim),
             false,
         ),
     ]))
 }
 
 fn create_empty_batch(schema: &Arc<ArrowSchema>) -> Result<RecordBatch> {
+    let vector_dim = config::get().ai.embedding_dim;
     let id_array: ArrayRef = Arc::new(Int64Array::from(Vec::<i64>::new()));
     let file_id_array: ArrayRef = Arc::new(Int64Array::from(Vec::<i64>::new()));
     let kb_id_array: ArrayRef = Arc::new(Int64Array::from(Vec::<Option<i64>>::new()));
@@ -191,13 +195,14 @@ fn create_empty_batch(schema: &Arc<ArrowSchema>) -> Result<RecordBatch> {
 
     // 创建空的向量数组
     let value_builder = Float32Builder::new();
-    let mut list_builder = FixedSizeListBuilder::new(value_builder, VECTOR_DIM);
+    let mut list_builder = FixedSizeListBuilder::new(value_builder, vector_dim);
     let vector_array: ArrayRef = Arc::new(list_builder.finish());
 
     Ok(RecordBatch::try_new(schema.clone(), vec![id_array, file_id_array, kb_id_array, content_array, vector_array])?)
 }
 
 async fn create_record_batch(docs: Vec<Document>, schema: &Arc<ArrowSchema>) -> Result<RecordBatch> {
+    let vector_dim = config::get().ai.embedding_dim;
     let ids: Vec<i64> = docs.iter().map(|d| d.id).collect();
     let file_ids: Vec<i64> = docs.iter().map(|d| d.file_id).collect();
     let kb_ids: Vec<Option<i64>> = docs.iter().map(|d| d.kb_id).collect();
@@ -212,15 +217,15 @@ async fn create_record_batch(docs: Vec<Document>, schema: &Arc<ArrowSchema>) -> 
     let embeddings = embedding::get_embeddings(&contents).await?;
 
     let value_builder = Float32Builder::new();
-    let mut list_builder = FixedSizeListBuilder::new(value_builder, VECTOR_DIM);
+    let mut list_builder = FixedSizeListBuilder::new(value_builder, vector_dim);
 
-    for embedding in embeddings {
-        if embedding.len() != VECTOR_DIM as usize {
-            anyhow::bail!("Embedding dimension mismatch: expected {}, got {}", VECTOR_DIM, embedding.len());
+    for embedding_vec in embeddings {
+        if embedding_vec.len() != vector_dim as usize {
+            anyhow::bail!("Embedding dimension mismatch: expected {}, got {}", vector_dim, embedding_vec.len());
         }
 
         let values_builder = list_builder.values();
-        for &value in &embedding {
+        for &value in &embedding_vec {
             values_builder.append_value(value);
         }
         list_builder.append(true);

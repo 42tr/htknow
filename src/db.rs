@@ -6,16 +6,19 @@ use anyhow::Context;
 use log::info;
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
 
+use crate::config;
+
 /// 初始化数据库连接池并自动创建表
 ///
 /// 在连接之前，如果 DATABASE_URL 指向一个文件型的 SQLite 数据库（例如 `sqlite://path/to/db.sqlite`
 /// 或者直接 `./data/db.sqlite`），会确保父目录存在并且数据库文件被创建（如果不存在）。
 pub async fn init() -> anyhow::Result<SqlitePool> {
-    // 读取环境变量，如果没有则使用默认文件路径
-    let database_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| "sqlite://data/app.sqlite".to_string());
+    // 从配置读取数据库设置
+    let cfg = config::get();
+    let database_url = &cfg.database.url;
 
     // 尝试从 URL 中解析出文件路径并提前创建目录/文件
-    if let Some(db_path) = sqlite_path_from_url(&database_url) {
+    if let Some(db_path) = sqlite_path_from_url(database_url) {
         ensure_db_file(&db_path).with_context(|| format!("failed to ensure sqlite db file: {}", db_path.display()))?;
     } else {
         info!("Detected non-file SQLite URL or in-memory DB; skipping file creation");
@@ -23,7 +26,10 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
 
     info!("Connecting to SQLite database...");
 
-    let pool = SqlitePoolOptions::new().max_connections(10).connect(&database_url).await?;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(cfg.database.max_connections)
+        .connect(database_url)
+        .await?;
 
     info!("SQLite database connected successfully");
 
@@ -32,7 +38,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     // 忽略这些 PRAGMA 的错误以兼容不同环境（例如某些内存 DB URL）
     sqlx::query("PRAGMA journal_mode = WAL;").execute(&pool).await.ok();
     sqlx::query("PRAGMA foreign_keys = ON;").execute(&pool).await.ok();
-    sqlx::query("PRAGMA busy_timeout = 5000;").execute(&pool).await.ok();
+    sqlx::query(&format!("PRAGMA busy_timeout = {};", cfg.database.busy_timeout_ms)).execute(&pool).await.ok();
 
     // 自动创建表
     create_tables(&pool).await?;

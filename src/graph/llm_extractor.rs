@@ -5,6 +5,7 @@ use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use super::{Entity, EntityType, Relation, RelationType};
+use crate::config;
 
 /// LLM API响应格式（OpenAI 兼容格式）
 #[derive(Debug, Deserialize)]
@@ -77,14 +78,15 @@ pub struct LLMGraphExtractor {
 }
 
 impl LLMGraphExtractor {
-    /// 从环境变量创建
+    /// 从配置创建
     pub fn from_env() -> Self {
-        let api_url = std::env::var("LLM_API_URL").ok();
-        let api_key = std::env::var("LLM_API_KEY").ok();
-        let model = std::env::var("LLM_MODEL").unwrap_or_else(|_| "gpt-3.5-turbo".to_string());
+        let cfg = config::get();
+        let llm_config = &cfg.llm;
 
-        let enabled = api_url.is_some();
-        let api_url = api_url.unwrap_or_default();
+        let enabled = llm_config.is_enabled();
+        let api_url = llm_config.api_url.clone().unwrap_or_default();
+        let api_key = llm_config.api_key.clone();
+        let model = llm_config.model.clone();
 
         let client = Client::builder().timeout(Duration::from_secs(120)).build().unwrap();
 

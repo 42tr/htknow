@@ -3,11 +3,9 @@ use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| Client::new());
+use crate::config;
 
-// 从环境变量读取，或使用默认值
-const EMBEDDING_URL: &str = "http://192.168.0.46:9700/v1/embeddings";
-const EMBEDDING_MODEL: &str = "bge-m3";
+static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| Client::new());
 
 #[derive(Debug, Serialize)]
 struct EmbeddingRequest {
@@ -27,9 +25,10 @@ struct EmbeddingData {
 
 /// 获取文本的 embedding 向量
 pub async fn get_embedding(text: &str) -> Result<Vec<f32>> {
-    let request = EmbeddingRequest { model: EMBEDDING_MODEL.to_string(), input: vec![text.to_string()] };
+    let cfg = config::get();
+    let request = EmbeddingRequest { model: cfg.ai.embedding_model.clone(), input: vec![text.to_string()] };
 
-    let response = HTTP_CLIENT.post(EMBEDDING_URL).json(&request).send().await?;
+    let response = HTTP_CLIENT.post(&cfg.services.embedding_url).json(&request).send().await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -53,9 +52,10 @@ pub async fn get_embeddings(texts: &[String]) -> Result<Vec<Vec<f32>>> {
         return Ok(Vec::new());
     }
 
-    let request = EmbeddingRequest { model: EMBEDDING_MODEL.to_string(), input: texts.to_vec() };
+    let cfg = config::get();
+    let request = EmbeddingRequest { model: cfg.ai.embedding_model.clone(), input: texts.to_vec() };
 
-    let response = HTTP_CLIENT.post(EMBEDDING_URL).json(&request).send().await?;
+    let response = HTTP_CLIENT.post(&cfg.services.embedding_url).json(&request).send().await?;
 
     if !response.status().is_success() {
         let status = response.status();
