@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::Ok;
-use log::info;
+use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use tantivy::{Index, schema::Schema};
@@ -76,17 +76,17 @@ impl SearchEngine {
     pub async fn search(
         &self, query: &str, file_id: Option<i64>, kb_id: Option<i64>,
     ) -> anyhow::Result<Vec<SearchResultItem>> {
-        info!("Searching for query: {}", query);
+        debug!("Searching for query: {}", query);
 
         // 使用 tantivy 搜索
         let tantivy_results = tantivy_engine::search(&self.index, &self.schema, query, file_id, kb_id).await?;
-        info!("Tantivy results count: {}", tantivy_results.len());
-        info!("Tantivy results: {:?}", tantivy_results);
+        debug!("Tantivy results count: {}", tantivy_results.len());
+        debug!("Tantivy results: {:?}", tantivy_results);
 
         // 使用 lancedb 搜索
         let lancedb_results = lancedb::search(query, file_id, kb_id).await?;
-        info!("LanceDB results count: {}", lancedb_results.len());
-        info!("LanceDB results: {:?}", lancedb_results);
+        debug!("LanceDB results count: {}", lancedb_results.len());
+        debug!("LanceDB results: {:?}", lancedb_results);
 
         // 合并结果：使用 HashMap 按 id 去重，保留最高分数
         let mut merged_map: HashMap<i64, SearchResultItem> = HashMap::new();
@@ -144,7 +144,7 @@ impl SearchEngine {
 
         // 先获取响应文本用于调试
         let response_text = response.text().await?;
-        info!("Rerank API response: {}", response_text);
+        debug!("Rerank API response: {}", response_text);
 
         // 解析 JSON 响应
         let rerank_response: RerankResponse = serde_json::from_str(&response_text)?;
@@ -173,8 +173,8 @@ impl SearchEngine {
 
         // 按新分数降序排序
         reranked_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-
-        Ok(reranked_results)
+        let filter_results = reranked_results.into_iter().filter(|f| f.score >= 0.1).collect();
+        Ok(filter_results)
     }
 
     /// 使用知识图谱扩展查询
