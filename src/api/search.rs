@@ -5,10 +5,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::{api::error::ApiResult, search::SearchEngine};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct SearchQuery {
     /// 搜索关键词
     pub query: String,
@@ -19,7 +20,7 @@ pub struct SearchQuery {
 }
 
 /// 文件信息
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow, ToSchema)]
 pub struct FileInfo {
     pub id: i64,
     pub filename: String,
@@ -27,14 +28,14 @@ pub struct FileInfo {
 }
 
 /// 知识库信息
-#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow, ToSchema)]
 pub struct KbInfo {
     pub id: i64,
     pub name: String,
 }
 
 /// 单个搜索结果项
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SearchResultItem {
     /// 切片 ID
     pub id: i64,
@@ -48,11 +49,22 @@ pub struct SearchResultItem {
     pub kb: Option<KbInfo>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct SearchResult {
     pub results: Vec<SearchResultItem>,
 }
 
+/// 搜索内容
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/search/",
+    tag = "search",
+    params(SearchQuery),
+    responses(
+        (status = 200, description = "搜索成功", body = SearchResult),
+        (status = 400, description = "请求参数错误")
+    )
+)]
 pub async fn search(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Query(params): Query<SearchQuery>,
@@ -90,6 +102,16 @@ pub async fn search(
 }
 
 /// 使用知识图谱增强的搜索
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/search/graph",
+    tag = "search",
+    params(SearchQuery),
+    responses(
+        (status = 200, description = "图谱搜索成功", body = SearchResult),
+        (status = 400, description = "请求参数错误")
+    )
+)]
 pub async fn search_with_graph(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Query(params): Query<SearchQuery>,

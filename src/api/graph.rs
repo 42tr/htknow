@@ -5,11 +5,12 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::api::error::ApiError;
 
 /// 实体信息
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct EntityInfo {
     pub id: i64,
     pub name: String,
@@ -21,7 +22,7 @@ pub struct EntityInfo {
 }
 
 /// 实体搜索参数
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct EntitySearchParams {
     pub q: Option<String>,           // 搜索关键词
     pub entity_type: Option<String>, // 实体类型筛选
@@ -31,6 +32,16 @@ pub struct EntitySearchParams {
 }
 
 /// 实体查询
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/graph/entities",
+    tag = "graph",
+    params(EntitySearchParams),
+    responses(
+        (status = 200, description = "成功返回实体列表", body = Vec<EntityInfo>),
+        (status = 400, description = "请求参数错误")
+    )
+)]
 pub async fn search_entities(
     Query(params): Query<EntitySearchParams>, State(pool): State<SqlitePool>,
 ) -> Result<Json<Vec<EntityInfo>>, ApiError> {
@@ -94,21 +105,21 @@ pub async fn search_entities(
 }
 
 /// 实体详情（包含邻居和提及）
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct EntityDetail {
     pub entity: EntityInfo,
     pub neighbors: Vec<NeighborInfo>,
     pub mentions: Vec<MentionInfo>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct NeighborInfo {
     pub entity: EntityInfo,
     pub relation_type: String,
     pub direction: String, // "outgoing" or "incoming"
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct MentionInfo {
     pub slice_id: i64,
     pub context: String,
@@ -117,6 +128,18 @@ pub struct MentionInfo {
 }
 
 /// 获取实体详情
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/graph/entities/{id}",
+    tag = "graph",
+    params(
+        ("id" = i64, Path, description = "实体 ID")
+    ),
+    responses(
+        (status = 200, description = "成功返回实体详情", body = EntityDetail),
+        (status = 404, description = "实体不存在")
+    )
+)]
 pub async fn get_entity(Path(id): Path<i64>, State(pool): State<SqlitePool>) -> Result<Json<EntityDetail>, ApiError> {
     // 查询实体基本信息
     let entity_sql =
@@ -212,7 +235,7 @@ pub async fn get_entity(Path(id): Path<i64>, State(pool): State<SqlitePool>) -> 
 }
 
 /// 图统计信息
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, ToSchema)]
 pub struct GraphStats {
     pub node_count: i64,
     pub edge_count: i64,
@@ -220,13 +243,23 @@ pub struct GraphStats {
     pub relation_types: HashMap<String, i64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct StatsParams {
     pub kb_id: Option<i64>,
     pub file_id: Option<i64>,
 }
 
 /// 获取图统计信息
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/graph/stats",
+    tag = "graph",
+    params(StatsParams),
+    responses(
+        (status = 200, description = "成功返回图统计信息", body = GraphStats),
+        (status = 400, description = "请求参数错误")
+    )
+)]
 pub async fn get_graph_stats(
     Query(params): Query<StatsParams>, State(pool): State<SqlitePool>,
 ) -> Result<Json<GraphStats>, ApiError> {
@@ -245,10 +278,7 @@ pub async fn get_graph_stats(
 
     // 边数量
     let edge_count_sql = if let Some(file_id) = params.file_id {
-        format!(
-            "SELECT COUNT(*) FROM graph_edges WHERE file_id = {}",
-            file_id
-        )
+        format!("SELECT COUNT(*) FROM graph_edges WHERE file_id = {}", file_id)
     } else if let Some(kb_id) = params.kb_id {
         format!(
             "SELECT COUNT(*) FROM graph_edges e \

@@ -6,10 +6,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use tokio::fs;
+use utoipa::{IntoParams, ToSchema};
 
 use crate::{AuthUser, api::error::ApiResult, search::SearchEngine};
 
-#[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow)]
+#[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
 pub struct Knowledge {
     pub id: i64,
     pub user_id: String,
@@ -17,7 +18,7 @@ pub struct Knowledge {
     pub description: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow)]
+#[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
 pub struct KnowledgeResponse {
     pub id: i64,
     pub user_id: String,
@@ -26,7 +27,7 @@ pub struct KnowledgeResponse {
     pub file_count: i64,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, IntoParams)]
 pub struct ListQuery {
     /// 页码，从1开始
     pub page: Option<i64>,
@@ -40,6 +41,21 @@ pub struct ListQuery {
     pub id: Option<String>,
 }
 
+/// 获取知识库列表
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/knowledge_base/",
+    tag = "knowledge_base",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "成功返回知识库列表", body = Vec<KnowledgeResponse>),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
 pub async fn list(
     State(pool): State<SqlitePool>, Query(params): Query<ListQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<Vec<KnowledgeResponse>>> {
@@ -116,12 +132,28 @@ async fn get_file_counts(pool: &SqlitePool, knowledge_ids: &[i64]) -> anyhow::Re
     Ok(file_counts)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct KnowledgeCreateReq {
     pub name: String,
     pub description: String,
 }
 
+/// 创建知识库
+#[utoipa::path(
+    post,
+    path = "/api/v1/knowledge/knowledge_base/",
+    tag = "knowledge_base",
+    request_body = KnowledgeCreateReq,
+    responses(
+        (status = 200, description = "成功创建知识库", body = Knowledge),
+        (status = 400, description = "请求参数错误"),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
 pub async fn create(
     State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
     Json(knowledge): Json<KnowledgeCreateReq>,
@@ -141,12 +173,31 @@ pub async fn create(
     Ok(Json(kb))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct KnowledgeUpdateReq {
     pub name: Option<String>,
     pub description: Option<String>,
 }
 
+/// 更新知识库
+#[utoipa::path(
+    put,
+    path = "/api/v1/knowledge/knowledge_base/{id}",
+    tag = "knowledge_base",
+    params(
+        ("id" = i64, Path, description = "知识库 ID")
+    ),
+    request_body = KnowledgeUpdateReq,
+    responses(
+        (status = 200, description = "成功更新知识库", body = Knowledge),
+        (status = 400, description = "请求参数错误"),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
 pub async fn update(
     Path(id): Path<i64>, State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
     Json(knowledge): Json<KnowledgeUpdateReq>,
@@ -166,12 +217,38 @@ pub async fn update(
     Ok(Json(kb))
 }
 
+/// 获取知识库详情
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/knowledge_base/{id}",
+    tag = "knowledge_base",
+    params(
+        ("id" = i64, Path, description = "知识库 ID")
+    ),
+    responses(
+        (status = 200, description = "成功返回知识库详情", body = Knowledge),
+        (status = 404, description = "知识库不存在")
+    )
+)]
 pub async fn get(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> ApiResult<Json<Knowledge>> {
     let query = "SELECT id, user_id, name, description FROM knowledge_bases WHERE id = ?";
     let knowledge = sqlx::query_as(query).bind(id).fetch_one(&pool).await?;
     Ok(Json(knowledge))
 }
 
+/// 删除知识库
+#[utoipa::path(
+    delete,
+    path = "/api/v1/knowledge/knowledge_base/{id}",
+    tag = "knowledge_base",
+    params(
+        ("id" = i64, Path, description = "知识库 ID")
+    ),
+    responses(
+        (status = 200, description = "成功删除知识库"),
+        (status = 404, description = "知识库不存在")
+    )
+)]
 pub async fn delete(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>, Path(id): Path<i64>,
 ) -> ApiResult<()> {

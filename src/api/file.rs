@@ -6,12 +6,13 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::{fs, io::AsyncWriteExt as _};
+use utoipa::{IntoParams, ToSchema};
 
 use crate::{
     AuthUser, api::error::{ApiError, ApiResult}, search::SearchEngine
 };
 
-#[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow)]
+#[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
 pub struct File {
     pub id: i64,
     pub user_id: String,
@@ -28,6 +29,22 @@ pub struct File {
     pub updated_at: i64,
 }
 
+/// 上传文件
+#[utoipa::path(
+    post,
+    path = "/api/v1/knowledge/files/",
+    tag = "file",
+    request_body(content_type = "multipart/form-data"),
+    responses(
+        (status = 200, description = "文件上传成功", body = File),
+        (status = 400, description = "请求参数错误"),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
 pub async fn upload(
     State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, mut multipart: Multipart,
 ) -> ApiResult<Json<File>> {
@@ -106,17 +123,49 @@ pub async fn upload(
     Ok(Json(file))
 }
 
+/// 获取文件详情
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/files/{id}",
+    tag = "file",
+    params(
+        ("id" = i64, Path, description = "文件 ID")
+    ),
+    responses(
+        (status = 200, description = "成功返回文件详情", body = File),
+        (status = 404, description = "文件不存在")
+    )
+)]
 pub async fn get(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> ApiResult<Json<File>> {
     let query = "SELECT * FROM files WHERE id = ?";
     let file = sqlx::query_as(query).bind(id).fetch_one(&pool).await?;
     Ok(Json(file))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 pub struct UpdateFileReq {
     pub slice_type: String,
 }
 
+/// 更新文件（重新切片）
+#[utoipa::path(
+    put,
+    path = "/api/v1/knowledge/files/{id}",
+    tag = "file",
+    params(
+        ("id" = i64, Path, description = "文件 ID")
+    ),
+    request_body = UpdateFileReq,
+    responses(
+        (status = 200, description = "成功更新文件", body = File),
+        (status = 400, description = "请求参数错误"),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
 pub async fn update(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>, Path(id): Path<i64>,
     Json(req): Json<UpdateFileReq>,
@@ -130,6 +179,19 @@ pub async fn update(
     Ok(Json(file))
 }
 
+/// 删除文件
+#[utoipa::path(
+    delete,
+    path = "/api/v1/knowledge/files/{id}",
+    tag = "file",
+    params(
+        ("id" = i64, Path, description = "文件 ID")
+    ),
+    responses(
+        (status = 200, description = "成功删除文件"),
+        (status = 404, description = "文件不存在")
+    )
+)]
 pub async fn delete(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>, Path(id): Path<i64>,
 ) -> ApiResult<()> {
@@ -162,11 +224,26 @@ pub async fn delete(
     Ok(())
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 pub struct ListQuery {
     pub kb_id: Option<String>,
 }
 
+/// 获取文件列表
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/files/",
+    tag = "file",
+    params(ListQuery),
+    responses(
+        (status = 200, description = "成功返回文件列表", body = Vec<File>),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
 pub async fn list(
     State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Query(query): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<File>>> {
@@ -198,7 +275,7 @@ pub async fn list(
     Ok(Json(files))
 }
 
-#[derive(Serialize, sqlx::FromRow)]
+#[derive(Serialize, sqlx::FromRow, ToSchema)]
 pub struct Slice {
     pub id: i64,
     pub file_id: i64,
@@ -207,12 +284,25 @@ pub struct Slice {
     pub updated_at: i64,
 }
 
+/// 获取文件的所有切片
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/files/{id}/slices",
+    tag = "file",
+    params(
+        ("id" = i64, Path, description = "文件 ID")
+    ),
+    responses(
+        (status = 200, description = "成功返回切片列表", body = Vec<Slice>),
+        (status = 404, description = "文件不存在")
+    )
+)]
 pub async fn get_slices(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> ApiResult<Json<Vec<Slice>>> {
     let slices = sqlx::query_as("SELECT * FROM slices WHERE file_id = ? ORDER BY id").bind(id).fetch_all(&pool).await?;
     Ok(Json(slices))
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow)]
+#[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
 pub struct PdfImage {
     pub id: i64,
     pub file_id: i64,
@@ -224,6 +314,18 @@ pub struct PdfImage {
 }
 
 /// 获取文件的所有图片列表
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/files/{file_id}/images",
+    tag = "file",
+    params(
+        ("file_id" = i64, Path, description = "文件 ID")
+    ),
+    responses(
+        (status = 200, description = "成功返回图片列表", body = Vec<PdfImage>),
+        (status = 404, description = "文件不存在")
+    )
+)]
 pub async fn get_images(State(pool): State<SqlitePool>, Path(file_id): Path<i64>) -> ApiResult<Json<Vec<PdfImage>>> {
     let images =
         sqlx::query_as("SELECT * FROM pdf_images WHERE file_id = ? ORDER BY id").bind(file_id).fetch_all(&pool).await?;
@@ -231,6 +333,19 @@ pub async fn get_images(State(pool): State<SqlitePool>, Path(file_id): Path<i64>
 }
 
 /// 获取单个图片文件
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/files/{file_id}/images/{image_id}",
+    tag = "file",
+    params(
+        ("file_id" = i64, Path, description = "文件 ID"),
+        ("image_id" = i64, Path, description = "图片 ID")
+    ),
+    responses(
+        (status = 200, description = "成功返回图片文件", content_type = "image/*"),
+        (status = 404, description = "图片不存在")
+    )
+)]
 pub async fn get_image(
     State(pool): State<SqlitePool>, Path((file_id, image_id)): Path<(i64, i64)>,
 ) -> Result<(StatusCode, [(header::HeaderName, String); 1], Body), ApiError> {
