@@ -152,8 +152,8 @@ impl ServicesConfig {
     fn from_env() -> Self {
         Self {
             mineru_url: env_or("HTKNOW_MINERU_URL", "http://192.168.0.46:10001/file_parse"),
-            embedding_url: env_or("HTKNOW_EMBEDDING_URL", "http://192.168.0.46:59700/v1/embeddings"),
-            rerank_url: env_or("HTKNOW_RERANK_URL", "http://192.168.0.46:59600/v1/rerank"),
+            embedding_url: env_or("HTKNOW_EMBEDDING_URL", "http://222.190.139.186:59700/v1/embeddings"),
+            rerank_url: env_or("HTKNOW_RERANK_URL", "http://222.190.139.186:59600/v1/rerank"),
         }
     }
 }

@@ -1,21 +1,22 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref } from 'vue'
 import { api } from '../api'
+import KnowledgeBaseSelector from './KnowledgeBaseSelector.vue'
 
-const knowledgeBases = ref([])
-const selectedKb = ref('')
+const selectedKb = ref({ id: null, name: '不分配到知识库' })
+const showKbSelector = ref(false)
+
 const files = ref([])
 const uploading = ref(false)
 const uploadStatus = ref('')
 const uploadError = ref('')
 const isDragging = ref(false)
 
-const loadKnowledgeBases = async () => {
-  try {
-    knowledgeBases.value = await api.getKnowledgeBases()
-    // 不再自动选择第一个知识库，允许为空
-  } catch (e) {
-    console.error('加载知识库失败:', e)
+const handleKbSelect = (kb) => {
+  if (kb) {
+    selectedKb.value = kb
+  } else {
+    selectedKb.value = { id: null, name: '不分配到知识库' }
   }
 }
 
@@ -50,8 +51,8 @@ const handleUpload = async () => {
   uploadError.value = ''
 
   try {
-    await api.uploadFiles(selectedKb.value || null, files.value)
-    uploadStatus.value = `成功上传 ${files.value.length} 个文件`
+    await api.uploadFiles(selectedKb.value?.id, files.value)
+    uploadStatus.value = `成功上传 ${files.value.length} 个文件到 "${selectedKb.value.name}"`
     files.value = []
   } catch (e) {
     uploadError.value = e.message
@@ -59,30 +60,29 @@ const handleUpload = async () => {
     uploading.value = false
   }
 }
-
-onMounted(() => {
-  loadKnowledgeBases()
-})
 </script>
 
 <template>
   <div class="max-w-2xl mx-auto">
     <!-- Knowledge Base Select -->
     <div class="bg-white rounded-xl p-5 border border-slate-200 mb-4">
-      <label class="block text-sm font-medium text-slate-700 mb-2">选择知识库（可选）</label>
-      <select
-        v-model="selectedKb"
-        class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+      <label class="block text-sm font-medium text-slate-700 mb-2">上传到知识库（可选）</label>
+      <button 
+        @click="showKbSelector = true"
+        class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-left"
       >
-        <option value="">不分配到知识库</option>
-        <option v-for="kb in knowledgeBases" :key="kb.id" :value="kb.id">
-          {{ kb.name }}
-        </option>
-      </select>
+        <span class="font-mono text-blue-600">{{ selectedKb.name }}</span>
+      </button>
       <p class="mt-2 text-xs text-slate-500">
-        未分配知识库的文件可以在知识库列表中查看
+        点击以上选择文件要上传到的知识库层级
       </p>
     </div>
+
+    <KnowledgeBaseSelector 
+      :show="showKbSelector" 
+      @close="showKbSelector = false"
+      @select="handleKbSelect"
+    />
 
     <!-- Drop Zone -->
     <div

@@ -11,7 +11,7 @@ pub fn init() {
     // 构建 log4rs 配置，仅输出到控制台
     let config = Config::builder()
         .appender(Appender::builder().build("stdout", Box::new(stdout)))
-        .build(Root::builder().appender("stdout").build(log::LevelFilter::Info))
+        .build(Root::builder().appender("stdout").build(log::LevelFilter::Debug))
         .expect("构建 log4rs 配置失败");
 
     // 初始化日志器

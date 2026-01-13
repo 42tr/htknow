@@ -4,13 +4,11 @@ import SearchBar from './components/SearchBar.vue'
 import SearchResults from './components/SearchResults.vue'
 import KnowledgeBaseList from './components/KnowledgeBaseList.vue'
 import FileUpload from './components/FileUpload.vue'
-import CreateKnowledgeBase from './components/CreateKnowledgeBase.vue'
 import KnowledgeGraph from './components/KnowledgeGraph.vue'
 
 const activeTab = ref('search')
 const searchResults = ref([])
 const isSearching = ref(false)
-const kbListRef = ref(null)
 
 const tabs = [
   { id: 'search', name: '搜索', icon: '🔍' },
@@ -29,10 +27,6 @@ const handleSearchStart = () => {
 
 const handleSearchEnd = () => {
   isSearching.value = false
-}
-
-const handleKbCreated = () => {
-  kbListRef.value?.refresh()
 }
 </script>
 
@@ -98,10 +92,9 @@ const handleKbCreated = () => {
             <h2 class="text-2xl font-bold text-slate-800">知识库管理</h2>
             <p class="text-slate-500 mt-1">管理您的知识库和文档</p>
           </div>
-          <CreateKnowledgeBase @created="handleKbCreated" />
         </div>
 
-        <KnowledgeBaseList ref="kbListRef" />
+        <KnowledgeBaseList />
       </div>
 
       <!-- Knowledge Graph Tab -->

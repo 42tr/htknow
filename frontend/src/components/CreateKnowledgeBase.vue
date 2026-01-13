@@ -1,6 +1,13 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, defineProps } from 'vue'
 import { api } from '../api'
+
+const props = defineProps({
+  parentId: {
+    type: Number,
+    default: null
+  }
+})
 
 const emit = defineEmits(['created'])
 
@@ -23,6 +30,7 @@ const handleCreate = async () => {
     await api.createKnowledgeBase({
       name: name.value.trim(),
       description: description.value.trim(),
+      parent_id: props.parentId
     })
     showModal.value = false
     name.value = ''

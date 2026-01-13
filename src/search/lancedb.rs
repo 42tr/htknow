@@ -71,7 +71,7 @@ pub async fn write_documents(doc: Document) -> Result<()> {
     Ok(())
 }
 
-pub async fn search(query: &str, file_id: Option<i64>, kb_id: Option<i64>) -> Result<Vec<SearchResultItem>> {
+pub async fn search(query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>) -> Result<Vec<SearchResultItem>> {
     let cfg = config::get();
     let conn = get_connection()?;
     let table = conn.open_table(TABLE_NAME).execute().await?;
@@ -87,8 +87,11 @@ pub async fn search(query: &str, file_id: Option<i64>, kb_id: Option<i64>) -> Re
     if let Some(fid) = file_id {
         filter_conditions.push(format!("file_id = {}", fid));
     }
-    if let Some(kid) = kb_id {
-        filter_conditions.push(format!("kb_id = {}", kid));
+    if let Some(kids) = kb_ids {
+        if !kids.is_empty() {
+            let ids_str = kids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+            filter_conditions.push(format!("kb_id IN ({})", ids_str));
+        }
     }
 
     if !filter_conditions.is_empty() {

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use anyhow::Ok;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, SqlitePool};
 use tantivy::{Index, schema::Schema};
 
 use crate::config;
@@ -76,17 +76,17 @@ impl SearchEngine {
     }
 
     pub async fn search(
-        &self, query: &str, file_id: Option<i64>, kb_id: Option<i64>,
+        &self, query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>,
     ) -> anyhow::Result<Vec<SearchResultItem>> {
         debug!("Searching for query: {}", query);
 
         // 使用 tantivy 搜索
-        let tantivy_results = tantivy_engine::search(&self.index, &self.schema, query, file_id, kb_id).await?;
+        let tantivy_results = tantivy_engine::search(&self.index, &self.schema, query, file_id, kb_ids).await?;
         debug!("Tantivy results count: {}", tantivy_results.len());
         debug!("Tantivy results: {:?}", tantivy_results);
 
         // 使用 lancedb 搜索
-        let lancedb_results = lancedb::search(query, file_id, kb_id).await?;
+        let lancedb_results = lancedb::search(query, file_id, kb_ids).await?;
         debug!("LanceDB results count: {}", lancedb_results.len());
         debug!("LanceDB results: {:?}", lancedb_results);
 
@@ -184,7 +184,7 @@ impl SearchEngine {
 
     /// 使用知识图谱扩展查询
     /// 从查询中识别实体，并查找相关实体来扩展查询
-    pub async fn expand_query_with_graph(&self, query: &str, kb_id: Option<i64>) -> anyhow::Result<Vec<String>> {
+    pub async fn expand_query_with_graph(&self, query: &str, kb_ids: Option<&Vec<i64>>) -> anyhow::Result<Vec<String>> {
         let pool = match &self.pool {
             Some(p) => p,
             None => return Ok(vec![query.to_string()]), // 如果没有数据库连接，直接返回原查询
@@ -193,20 +193,21 @@ impl SearchEngine {
         let mut expanded_queries = vec![query.to_string()];
 
         // 1. 在知识图谱中搜索匹配的实体
-        let mut sql = "SELECT DISTINCT name, entity_type FROM graph_nodes WHERE name LIKE ?".to_string();
-        let search_pattern = format!("%{}%", query);
+        let mut qb = QueryBuilder::new("SELECT DISTINCT name, entity_type FROM graph_nodes WHERE name LIKE ");
+        qb.push_bind(format!("%{}%", query));
 
-        if kb_id.is_some() {
-            sql.push_str(" AND kb_id = ?");
+        if let Some(ids) = kb_ids {
+            if !ids.is_empty() {
+                qb.push(" AND kb_id IN (");
+                let mut separated = qb.separated(", ");
+                for id in ids {
+                    separated.push_bind(id);
+                }
+                qb.push(")");
+            }
         }
-
-        sql.push_str(" LIMIT 10");
-
-        let entities: Vec<(String, String)> = if let Some(kb_id) = kb_id {
-            sqlx::query_as(&sql).bind(&search_pattern).bind(kb_id).fetch_all(pool).await?
-        } else {
-            sqlx::query_as(&sql).bind(&search_pattern).fetch_all(pool).await?
-        };
+        qb.push(" LIMIT 10");
+        let entities: Vec<(String, String)> = qb.build_query_as().fetch_all(pool).await?;
 
         // 2. 对于每个匹配的实体，查找相关实体
         for (entity_name, _) in entities.iter().take(3) {
@@ -240,21 +241,21 @@ impl SearchEngine {
     /// 使用图谱增强的搜索
     /// 先扩展查询，然后对每个扩展查询进行搜索，最后合并去重结果
     pub async fn search_with_graph_expansion(
-        &self, query: &str, file_id: Option<i64>, kb_id: Option<i64>,
+        &self, query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>,
     ) -> anyhow::Result<Vec<SearchResultItem>> {
         // 1. 扩展查询
-        let expanded_queries = self.expand_query_with_graph(query, kb_id).await?;
+        let expanded_queries = self.expand_query_with_graph(query, kb_ids).await?;
 
         if expanded_queries.len() == 1 {
             // 没有扩展，直接使用原查询
-            return self.search(query, file_id, kb_id).await;
+            return self.search(query, file_id, kb_ids).await;
         }
 
         // 2. 对每个扩展查询进行搜索
         let mut all_results: HashMap<i64, SearchResultItem> = HashMap::new();
 
         for (idx, expanded_query) in expanded_queries.iter().enumerate() {
-            let results = self.search(expanded_query, file_id, kb_id).await?;
+            let results = self.search(expanded_query, file_id, kb_ids).await?;
 
             // 原始查询的结果权重更高
             let weight = if idx == 0 { 1.0 } else { 0.7 };

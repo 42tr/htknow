@@ -7,7 +7,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use utoipa::{IntoParams, ToSchema};
 
-use crate::{api::error::ApiResult, search::SearchEngine};
+use crate::{api::error::ApiResult, search::SearchEngine, AuthUser};
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct SearchQuery {
@@ -63,14 +63,46 @@ pub struct SearchResult {
     responses(
         (status = 200, description = "搜索成功", body = SearchResult),
         (status = 400, description = "请求参数错误")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn search(
-    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
+    State(pool): State<SqlitePool>, 
+    Extension(search_engine): Extension<SearchEngine>,
     Query(params): Query<SearchQuery>,
+    Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<SearchResult>> {
+    // If a kb_id is specified, find all its descendants to search within.
+    let kb_ids_to_search = if let Some(root_kb_id) = params.kb_id {
+        let descendant_ids: Vec<i64> = sqlx::query_scalar(
+            r#"
+            WITH RECURSIVE kb_hierarchy AS (
+                SELECT id FROM knowledge_bases WHERE id = ? AND user_id = ?
+                UNION ALL
+                SELECT kb.id FROM knowledge_bases kb
+                INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
+            )
+            SELECT id FROM kb_hierarchy;
+            "#,
+        )
+        .bind(root_kb_id)
+        .bind(auth_user.user_id)
+        .fetch_all(&pool)
+        .await?;
+        
+        if descendant_ids.is_empty() {
+            return Ok(Json(SearchResult { results: vec![] }));
+        }
+        Some(descendant_ids)
+    } else {
+        None
+    };
+
     let raw_results = search_engine
-        .search(&params.query, params.file_id, params.kb_id)
+        .search(&params.query, params.file_id, kb_ids_to_search.as_ref())
         .await
         .map_err(|e| crate::api::error::ApiError::internal(format!("Search failed: {}", e)))?;
 
@@ -110,14 +142,46 @@ pub async fn search(
     responses(
         (status = 200, description = "图谱搜索成功", body = SearchResult),
         (status = 400, description = "请求参数错误")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn search_with_graph(
-    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
+    State(pool): State<SqlitePool>, 
+    Extension(search_engine): Extension<SearchEngine>,
     Query(params): Query<SearchQuery>,
+    Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<SearchResult>> {
+    // If a kb_id is specified, find all its descendants to search within.
+    let kb_ids_to_search = if let Some(root_kb_id) = params.kb_id {
+        let descendant_ids: Vec<i64> = sqlx::query_scalar(
+            r#"
+            WITH RECURSIVE kb_hierarchy AS (
+                SELECT id FROM knowledge_bases WHERE id = ? AND user_id = ?
+                UNION ALL
+                SELECT kb.id FROM knowledge_bases kb
+                INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
+            )
+            SELECT id FROM kb_hierarchy;
+            "#,
+        )
+        .bind(root_kb_id)
+        .bind(auth_user.user_id)
+        .fetch_all(&pool)
+        .await?;
+        
+        if descendant_ids.is_empty() {
+            return Ok(Json(SearchResult { results: vec![] }));
+        }
+        Some(descendant_ids)
+    } else {
+        None
+    };
+
     let raw_results = search_engine
-        .search_with_graph_expansion(&params.query, params.file_id, params.kb_id)
+        .search_with_graph_expansion(&params.query, params.file_id, kb_ids_to_search.as_ref())
         .await
         .map_err(|e| crate::api::error::ApiError::internal(format!("Graph search failed: {}", e)))?;
 

@@ -15,7 +15,7 @@ use sqlx;
 pub enum ApiError {
     BadRequest(String),
     // Unauthorized(String),
-    // NotFound(String),
+    NotFound(String),
     Database(sqlx::Error),
     System(std::io::Error),
     Internal(String),
@@ -26,7 +26,7 @@ impl fmt::Display for ApiError {
         match self {
             ApiError::BadRequest(msg) => write!(f, "BadRequest: {}", msg),
             // ApiError::Unauthorized(msg) => write!(f, "Unauthorized: {}", msg),
-            // ApiError::NotFound(msg) => write!(f, "NotFound: {}", msg),
+            ApiError::NotFound(msg) => write!(f, "NotFound: {}", msg),
             ApiError::Database(e) => write!(f, "Database error: {}", e),
             ApiError::System(e) => write!(f, "System error: {}", e),
             ApiError::Internal(msg) => write!(f, "Internal error: {}", msg),
@@ -80,7 +80,7 @@ impl IntoResponse for ApiError {
         let (status, message) = match &self {
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             // ApiError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
-            // ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
+            ApiError::NotFound(msg) => (StatusCode::NOT_FOUND, msg.clone()),
             ApiError::Database(e) => {
                 // Log detailed error server-side but avoid leaking internals to clients.
                 log::error!("Database error: {}", e);

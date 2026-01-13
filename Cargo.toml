@@ -46,6 +46,7 @@ lru = "0.12"              # LRU缓存
 
 # etcd 配置中心（可选）
 etcd-client = { version = "0.14", optional = true }
+serde_with = "3.16.1"
 
 [features]
 default = []

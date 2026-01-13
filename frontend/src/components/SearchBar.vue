@@ -1,94 +1,31 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { ref, watch } from 'vue'
 import { api } from '../api'
+import { currentKb } from '../store' // Import global store
+import KnowledgeBaseSelector from './KnowledgeBaseSelector.vue' // Import selector
 
 const emit = defineEmits(['search', 'search-start', 'search-end'])
 
 const query = ref('')
 const error = ref('')
-const selectedKbId = ref(null)
-const selectedFileId = ref(null)
-const knowledgeBases = ref([])
-const allFiles = ref([])
-const scopeSearch = ref('')
-const showScopeDropdown = ref(false)
-const scopeType = ref('all') // 'all', 'kb', 'file'
 
-const loadKnowledgeBases = async () => {
-  try {
-    knowledgeBases.value = await api.getKnowledgeBases()
-  } catch (e) {
-    console.error('加载知识库列表失败:', e)
+// Local state for search scope
+const localSelectedKb = ref({ id: null, name: '所有知识库' })
+const showKbSelector = ref(false)
+
+// Initialize local scope with global context on mount/visibility
+// And keep it in sync when global context changes
+watch(currentKb, (newGlobalKb) => {
+  localSelectedKb.value = newGlobalKb
+}, { immediate: true }) // immediate: true ensures it runs on initial component setup
+
+const handleKbSelect = (kb) => {
+  if (kb) {
+    localSelectedKb.value = kb
+  } else {
+    localSelectedKb.value = { id: null, name: '所有知识库' }
   }
-}
-
-const loadAllFiles = async () => {
-  try {
-    allFiles.value = await api.getFiles()
-  } catch (e) {
-    console.error('加载文件列表失败:', e)
-  }
-}
-
-// 为文件添加知识库信息
-const filesWithKbInfo = computed(() => {
-  return allFiles.value.map(file => {
-    const kb = file.kb_id ? knowledgeBases.value.find(k => k.id === file.kb_id) : null
-    return {
-      ...file,
-      kbName: kb ? kb.name : '未分配知识库'
-    }
-  })
-})
-
-// 过滤后的知识库和文件列表
-const filteredKnowledgeBases = computed(() => {
-  if (!scopeSearch.value) return knowledgeBases.value
-  const search = scopeSearch.value.toLowerCase()
-  return knowledgeBases.value.filter(kb => 
-    kb.name.toLowerCase().includes(search)
-  )
-})
-
-const filteredFiles = computed(() => {
-  if (!scopeSearch.value) return filesWithKbInfo.value
-  const search = scopeSearch.value.toLowerCase()
-  return filesWithKbInfo.value.filter(file => 
-    file.filename.toLowerCase().includes(search) ||
-    file.kbName.toLowerCase().includes(search)
-  )
-})
-
-// 当前选择的范围描述
-const scopeLabel = computed(() => {
-  if (scopeType.value === 'kb' && selectedKbId.value) {
-    const kb = knowledgeBases.value.find(k => k.id === selectedKbId.value)
-    return kb ? `知识库: ${kb.name}` : '全部范围'
-  }
-  if (scopeType.value === 'file' && selectedFileId.value) {
-    const file = filesWithKbInfo.value.find(f => f.id === selectedFileId.value)
-    if (file) {
-      return `文件: ${file.filename} (${file.kbName})`
-    }
-    return '全部范围'
-  }
-  return '全部范围'
-})
-
-const selectScope = (type, id = null) => {
-  scopeType.value = type
-  if (type === 'all') {
-    selectedKbId.value = null
-    selectedFileId.value = null
-  } else if (type === 'kb') {
-    selectedKbId.value = id
-    selectedFileId.value = null
-  } else if (type === 'file') {
-    selectedKbId.value = null
-    selectedFileId.value = id
-  }
-  showScopeDropdown.value = false
-  scopeSearch.value = ''
+  showKbSelector.value = false // Close modal after selection
 }
 
 const handleSearch = async () => {
@@ -98,7 +35,7 @@ const handleSearch = async () => {
   emit('search-start')
 
   try {
-    const results = await api.search(query.value, selectedKbId.value, selectedFileId.value)
+    const results = await api.search(query.value, localSelectedKb.value?.id)
     emit('search', results)
   } catch (e) {
     error.value = e.message
@@ -113,106 +50,33 @@ const handleKeydown = (e) => {
     handleSearch()
   }
 }
-
-onMounted(() => {
-  loadKnowledgeBases()
-  loadAllFiles()
-})
 </script>
 
 <template>
   <div class="max-w-2xl mx-auto">
-    <!-- 搜索范围选择 -->
-    <div class="mb-4 relative">
+    <!-- Search Scope Selection -->
+    <div class="mb-4">
       <label class="block text-xs font-medium text-slate-600 mb-2">搜索范围</label>
-      <div class="relative">
-        <button
-          @click="showScopeDropdown = !showScopeDropdown"
-          class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl text-left flex items-center justify-between hover:border-slate-300 transition-colors"
-        >
-          <span class="text-slate-700">{{ scopeLabel }}</span>
-          <svg class="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
-          </svg>
-        </button>
-
-        <!-- 下拉菜单 -->
-        <div
-          v-if="showScopeDropdown"
-          class="absolute z-10 w-full mt-2 bg-white border border-slate-200 rounded-xl shadow-lg max-h-96 overflow-hidden"
-        >
-          <!-- 搜索框 -->
-          <div class="p-3 border-b border-slate-100">
-            <input
-              v-model="scopeSearch"
-              type="text"
-              placeholder="搜索知识库或文件..."
-              class="w-full px-3 py-2 bg-slate-50 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-            />
-          </div>
-
-          <div class="max-h-80 overflow-y-auto">
-            <!-- 全部范围选项 -->
-            <div
-              @click="selectScope('all')"
-              class="px-4 py-2.5 hover:bg-slate-50 cursor-pointer border-b border-slate-100"
-            >
-              <div class="flex items-center gap-2">
-                <span class="text-2xl">🌐</span>
-                <span class="text-sm font-medium text-slate-700">全部范围</span>
-              </div>
-            </div>
-
-            <!-- 知识库列表 -->
-            <div v-if="filteredKnowledgeBases.length > 0" class="border-b border-slate-100">
-              <div class="px-4 py-2 bg-slate-50">
-                <span class="text-xs font-medium text-slate-500">知识库</span>
-              </div>
-              <div
-                v-for="kb in filteredKnowledgeBases"
-                :key="'kb-' + kb.id"
-                @click="selectScope('kb', kb.id)"
-                class="px-4 py-2.5 hover:bg-blue-50 cursor-pointer"
-              >
-                <div class="flex items-center gap-2">
-                  <span class="text-xl">📚</span>
-                  <span class="text-sm text-slate-700">{{ kb.name }}</span>
-                </div>
-              </div>
-            </div>
-
-            <!-- 文件列表 -->
-            <div v-if="filteredFiles.length > 0">
-              <div class="px-4 py-2 bg-slate-50">
-                <span class="text-xs font-medium text-slate-500">文件</span>
-              </div>
-              <div
-                v-for="file in filteredFiles"
-                :key="'file-' + file.id"
-                @click="selectScope('file', file.id)"
-                class="px-4 py-2.5 hover:bg-green-50 cursor-pointer"
-              >
-                <div class="flex items-center gap-2 min-w-0">
-                  <span class="text-xl flex-shrink-0">📄</span>
-                  <div class="min-w-0 flex-1">
-                    <div class="text-sm text-slate-700 truncate">{{ file.filename }}</div>
-                    <div class="text-xs text-slate-400 truncate">{{ file.kbName }}</div>
-                  </div>
-                </div>
-              </div>
-            </div>
-
-            <!-- 无结果 -->
-            <div
-              v-if="scopeSearch && filteredKnowledgeBases.length === 0 && filteredFiles.length === 0"
-              class="px-4 py-8 text-center text-slate-400 text-sm"
-            >
-              未找到匹配的知识库或文件
-            </div>
-          </div>
-        </div>
-      </div>
+      <button
+        @click="showKbSelector = true"
+        class="w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-left flex justify-between items-center hover:border-blue-300 transition-colors"
+      >
+        <span class="font-medium text-slate-700">{{ localSelectedKb.name }}</span>
+        <svg class="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l4-4 4 4m0 6l-4 4-4-4" />
+        </svg>
+      </button>
+      <p class="mt-2 text-xs text-slate-500">
+        当前搜索将在 <span class="font-medium text-blue-600">{{ localSelectedKb.name }}</span> 及其子知识库中进行。
+      </p>
     </div>
+
+    <!-- Knowledge Base Selector Modal -->
+    <KnowledgeBaseSelector
+      :show="showKbSelector"
+      @close="showKbSelector = false"
+      @select="handleKbSelect"
+    />
 
     <!-- 搜索输入框 -->
     <div class="relative">
@@ -230,7 +94,7 @@ onMounted(() => {
       />
       <button
         @click="handleSearch"
-        class="absolute right-2 top-1/2 -translate-y-1/2 px-6 py-2.5 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-medium hover:from-blue-600 hover:to-indigo-700 transition-all duration-200 shadow-sm"
+        class="absolute right-2 top-1/2 -translate-y-1/2 px-6 py-2.5 bg-linear-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-medium hover:from-blue-600 hover:to-indigo-700 transition-all duration-200 shadow-sm"
       >
         搜索
       </button>

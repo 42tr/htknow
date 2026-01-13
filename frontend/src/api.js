@@ -34,15 +34,33 @@ export const api = {
   },
 
   // 知识库
-  async getKnowledgeBases() {
-    const response = await fetch(`${API_BASE}/knowledge_base/`, {
+  async getKnowledgeBases(parentId = null) {
+    let url = `${API_BASE}/knowledge_base/`;
+    const params = new URLSearchParams();
+    // A null parentId fetches top-level KBs by default on the backend.
+    if (parentId) {
+      params.append('parent_id', parentId);
+    }
+    const queryString = params.toString();
+    if (queryString) {
+      url += `?${queryString}`;
+    }
+    const response = await fetch(url, {
       headers: getHeaders(),
     })
-    if (!response.ok) throw new Error('获取知识库失败')
+    if (!response.ok) throw new Error('获取知识库列表失败')
     return response.json()
   },
 
-  async createKnowledgeBase(data) {
+  async getKnowledgeBase(id) {
+    const response = await fetch(`${API_BASE}/knowledge_base/${id}`, {
+      headers: getHeaders(),
+    });
+    if (!response.ok) throw new Error('获取知识库详情失败');
+    return response.json();
+  },
+
+  async createKnowledgeBase(data) { // data may include { name, description, parent_id }
     const response = await fetch(`${API_BASE}/knowledge_base/`, {
       method: 'POST',
       headers: getHeaders(),
@@ -52,7 +70,7 @@ export const api = {
     return response.json()
   },
 
-  async updateKnowledgeBase(id, data) {
+  async updateKnowledgeBase(id, data) { // data may include { name, description, parent_id }
     const response = await fetch(`${API_BASE}/knowledge_base/${id}`, {
       method: 'PUT',
       headers: getHeaders(),

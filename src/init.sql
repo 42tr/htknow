@@ -19,8 +19,10 @@ CREATE TABLE IF NOT EXISTS knowledge_bases (
     user_id TEXT, -- 归属用户ID
     name TEXT NOT NULL, -- 知识库名称
     description TEXT DEFAULT '', -- 知识库描述
+    parent_id INTEGER, -- 父级知识库ID
     created_at INTEGER DEFAULT (strftime('%s','now')),
-    updated_at INTEGER DEFAULT (strftime('%s','now'))
+    updated_at INTEGER DEFAULT (strftime('%s','now')),
+    FOREIGN KEY(parent_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS slices (
