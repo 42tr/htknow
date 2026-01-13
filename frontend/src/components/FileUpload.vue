@@ -67,7 +67,7 @@ const handleUpload = async () => {
     <!-- Knowledge Base Select -->
     <div class="bg-white rounded-xl p-5 border border-slate-200 mb-4">
       <label class="block text-sm font-medium text-slate-700 mb-2">上传到知识库（可选）</label>
-      <button 
+      <button
         @click="showKbSelector = true"
         class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-left"
       >
@@ -78,8 +78,8 @@ const handleUpload = async () => {
       </p>
     </div>
 
-    <KnowledgeBaseSelector 
-      :show="showKbSelector" 
+    <KnowledgeBaseSelector
+      :show="showKbSelector"
       @close="showKbSelector = false"
       @select="handleKbSelect"
     />
@@ -122,7 +122,7 @@ const handleUpload = async () => {
           class="px-4 py-3 flex items-center justify-between hover:bg-slate-50"
         >
           <div class="flex items-center gap-3 min-w-0">
-            <div class="w-8 h-8 bg-slate-100 rounded-lg flex items-center justify-center flex-shrink-0">
+            <div class="w-8 h-8 bg-slate-100 rounded-lg flex items-center justify-center shrink-0">
               <span class="text-sm">📄</span>
             </div>
             <div class="min-w-0">
@@ -150,7 +150,7 @@ const handleUpload = async () => {
         'w-full mt-4 py-4 rounded-xl font-medium transition-all duration-200',
         files.length === 0 || uploading
           ? 'bg-slate-100 text-slate-400 cursor-not-allowed'
-          : 'bg-gradient-to-r from-blue-500 to-indigo-600 text-white hover:from-blue-600 hover:to-indigo-700 shadow-sm'
+          : 'bg-linear-to-r from-blue-500 to-indigo-600 text-white hover:from-blue-600 hover:to-indigo-700 shadow-sm'
       ]"
     >
       <span v-if="uploading" class="flex items-center justify-center gap-2">

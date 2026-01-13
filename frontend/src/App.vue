@@ -31,13 +31,13 @@ const handleSearchEnd = () => {
 </script>
 
 <template>
-  <div class="min-h-screen flex flex-col bg-gradient-to-br from-slate-50 to-slate-100">
+  <div class="min-h-screen flex flex-col bg-linear-to-br from-slate-50 to-slate-100">
     <!-- Header -->
     <header class="bg-white border-b border-slate-200 sticky top-0 z-50">
       <div class="max-w-6xl mx-auto px-6 py-4">
         <div class="flex items-center justify-between">
           <div class="flex items-center gap-3">
-            <div class="w-10 h-10 bg-gradient-to-br from-blue-500 to-indigo-600 rounded-xl flex items-center justify-center">
+            <div class="w-10 h-10 bg-linear-to-br from-blue-500 to-indigo-600 rounded-xl flex items-center justify-center">
               <span class="text-white text-xl">📖</span>
             </div>
             <h1 class="text-xl font-semibold text-slate-800">知识库</h1>
