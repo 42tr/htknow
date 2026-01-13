@@ -90,10 +90,13 @@ export const api = {
   },
 
   // 文件
-  async uploadFiles(knowledgeBaseId, files) {
+  async uploadFiles(knowledgeBaseId, files, tags = []) {
     const formData = new FormData()
     if (knowledgeBaseId) {
       formData.append('kb_id', knowledgeBaseId)
+    }
+    if (tags.length > 0) {
+      formData.append('tags', JSON.stringify(tags))
     }
     for (const file of files) {
       formData.append('file', file)
@@ -117,16 +120,22 @@ export const api = {
     return
   },
 
-  async getFiles(kbId) {
+  async getFiles(kbId, tag = null) {
     let url = `${API_BASE}/files/`
+    const params = []
     if (kbId === null) {
       // 明确传递null时，获取未分配知识库的文件
-      url += `?kb_id=null`
+      params.push('kb_id=null')
     } else if (kbId !== undefined) {
       // 传递具体的知识库ID
-      url += `?kb_id=${kbId}`
+      params.push(`kb_id=${kbId}`)
     }
-    // 不传参数时，获取所有文件
+    if (tag) {
+      params.push(`tag=${encodeURIComponent(tag)}`)
+    }
+    if (params.length > 0) {
+      url += `?${params.join('&')}`
+    }
     const response = await fetch(url, {
       headers: getHeaders(),
     })
@@ -149,6 +158,16 @@ export const api = {
       body: JSON.stringify(data),
     })
     if (!response.ok) throw new Error('更新文件失败')
+    return response.json()
+  },
+
+  async updateFileTags(id, tags) {
+    const response = await fetch(`${API_BASE}/files/${id}/tags`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify({ tags }),
+    })
+    if (!response.ok) throw new Error('更新标签失败')
     return response.json()
   },
 

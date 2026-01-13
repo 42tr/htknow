@@ -57,6 +57,7 @@ pub async fn upload(
     let mut filepath = String::new();
     let mut slice_type = String::new();
     let mut kb_id = None;
+    let mut tags: Vec<String> = Vec::new();
 
     loop {
         match multipart.next_field().await {
@@ -88,6 +89,13 @@ pub async fn upload(
                         debug!("KB ID text: {}", kb_id_text);
                         kb_id = Some(kb_id_text.parse::<i64>()?);
                     }
+                    Some("tags") => {
+                        let tags_text = field.text().await?;
+                        debug!("Tags text: {}", tags_text);
+                        if !tags_text.is_empty() {
+                            tags = serde_json::from_str(&tags_text).unwrap_or_default();
+                        }
+                    }
                     _ => {
                         debug!("Skipping unknown field: {:?}", field_name);
                     }
@@ -108,7 +116,8 @@ pub async fn upload(
     if filename.is_empty() {
         return Err(ApiError::BadRequest("file is required".to_string()));
     }
-    let sql = "INSERT INTO files (user_id, hash, filename, path, slice_type, kb_id) VALUES (?, ?, ?, ?, ?, ?)";
+    let tags_json = serde_json::to_string(&tags)?;
+    let sql = "INSERT INTO files (user_id, hash, filename, path, slice_type, kb_id, tags) VALUES (?, ?, ?, ?, ?, ?, ?)";
     let id = sqlx::query(sql)
         .bind(auth_user.user_id)
         .bind(hash)
@@ -116,6 +125,7 @@ pub async fn upload(
         .bind(filepath)
         .bind(slice_type)
         .bind(kb_id)
+        .bind(tags_json)
         .execute(&pool)
         .await?
         .last_insert_rowid();
@@ -147,6 +157,11 @@ pub struct UpdateFileReq {
     pub slice_type: String,
 }
 
+#[derive(Deserialize, ToSchema)]
+pub struct UpdateTagsReq {
+    pub tags: Vec<String>,
+}
+
 /// 更新文件（重新切片）
 #[utoipa::path(
     put,
@@ -175,6 +190,36 @@ pub async fn update(
     sqlx::query(sql).bind(id).execute(&pool).await?;
     let sql = "UPDATE files SET slice_type = ?, status = ? WHERE id = ?";
     sqlx::query(sql).bind(req.slice_type).bind(0).bind(id).execute(&pool).await?;
+    let file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+    Ok(Json(file))
+}
+
+/// 更新文件标签
+#[utoipa::path(
+    put,
+    path = "/api/v1/knowledge/files/{id}/tags",
+    tag = "file",
+    params(
+        ("id" = i64, Path, description = "文件 ID")
+    ),
+    request_body = UpdateTagsReq,
+    responses(
+        (status = 200, description = "成功更新标签", body = File),
+        (status = 400, description = "请求参数错误"),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn update_tags(
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Json(req): Json<UpdateTagsReq>,
+) -> ApiResult<Json<File>> {
+    let tags_json = serde_json::to_string(&req.tags)?;
+    let sql = "UPDATE files SET tags = ?, updated_at = ? WHERE id = ?";
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    sqlx::query(sql).bind(tags_json).bind(now).bind(id).execute(&pool).await?;
     let file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
     Ok(Json(file))
 }
@@ -227,6 +272,7 @@ pub async fn delete(
 #[derive(Deserialize, IntoParams)]
 pub struct ListQuery {
     pub kb_id: Option<String>,
+    pub tag: Option<String>,
 }
 
 /// 获取文件列表
@@ -247,7 +293,7 @@ pub struct ListQuery {
 pub async fn list(
     State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Query(query): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<File>>> {
-    let files = match query.kb_id.as_deref() {
+    let mut files = match query.kb_id.as_deref() {
         // 明确指定查询未分配知识库的文件
         Some("null") | Some("unassigned") => {
             sqlx::query_as("SELECT * FROM files WHERE user_id = ? AND kb_id IS NULL ORDER BY created_at DESC")
@@ -272,6 +318,14 @@ pub async fn list(
                 .await?
         }
     };
+
+    // 如果指定了标签，进行过滤
+    if let Some(tag) = &query.tag {
+        files.retain(|file: &File| {
+            if let Ok(tags) = serde_json::from_str::<Vec<String>>(&file.tags) { tags.contains(tag) } else { false }
+        });
+    }
+
     Ok(Json(files))
 }
 

@@ -16,8 +16,11 @@ const emit = defineEmits(['updated', 'deleted'])
 const showSlices = ref(false)
 const showSettings = ref(false)
 const showGraph = ref(false)
+const showTagsEditor = ref(false)
 const selectedSliceType = ref(props.file.slice_type || 'paragraph')
 const updating = ref(false)
+const editingTags = ref([])
+const newTag = ref('')
 
 const sliceTypes = [
   { value: 'paragraph', label: '按段落', desc: '以双换行符分隔' },
@@ -44,6 +47,15 @@ const statusInfo = computed(() => {
 const sliceTypeLabel = computed(() => {
   const type = sliceTypes.find(t => t.value === props.file.slice_type)
   return type ? type.label : '按段落'
+})
+
+const fileTags = computed(() => {
+  if (!props.file.tags) return []
+  try {
+    return JSON.parse(props.file.tags)
+  } catch {
+    return []
+  }
 })
 
 const formatDate = (timestamp) => {
@@ -79,6 +91,37 @@ const handleDelete = async () => {
     alert('删除失败：' + e.message)
   }
 }
+
+const openTagsEditor = () => {
+  editingTags.value = [...fileTags.value]
+  newTag.value = ''
+  showTagsEditor.value = true
+}
+
+const addTag = () => {
+  const tag = newTag.value.trim()
+  if (tag && !editingTags.value.includes(tag)) {
+    editingTags.value.push(tag)
+    newTag.value = ''
+  }
+}
+
+const removeTag = (index) => {
+  editingTags.value.splice(index, 1)
+}
+
+const handleSaveTags = async () => {
+  updating.value = true
+  try {
+    await api.updateFileTags(props.file.id, editingTags.value)
+    showTagsEditor.value = false
+    emit('updated')
+  } catch (e) {
+    alert('更新标签失败：' + e.message)
+  } finally {
+    updating.value = false
+  }
+}
 </script>
 
 <template>
@@ -87,7 +130,7 @@ const handleDelete = async () => {
     <div class="p-4">
       <div class="flex items-start gap-4">
         <!-- File Icon -->
-        <div class="w-10 h-10 bg-gradient-to-br from-amber-100 to-orange-100 rounded-lg flex items-center justify-center flex-shrink-0">
+        <div class="w-10 h-10 bg-linear-to-br from-amber-100 to-orange-100 rounded-lg flex items-center justify-center shrink-0">
           <span class="text-lg">📄</span>
         </div>
 
@@ -105,6 +148,17 @@ const handleDelete = async () => {
             <span>创建时间：{{ formatDate(file.created_at) }}</span>
           </div>
 
+          <!-- Tags -->
+          <div v-if="fileTags.length > 0" class="flex items-center gap-2 mt-2 flex-wrap">
+            <span
+              v-for="tag in fileTags"
+              :key="tag"
+              class="px-2 py-0.5 text-xs bg-blue-50 text-blue-600 rounded-full border border-blue-100"
+            >
+              🏷️ {{ tag }}
+            </span>
+          </div>
+
           <!-- Error Log -->
           <div v-if="file.status === -1 && file.log" class="mt-2 p-2 bg-red-50 rounded-lg">
             <p class="text-xs text-red-600">{{ file.log }}</p>
@@ -113,6 +167,15 @@ const handleDelete = async () => {
 
         <!-- Actions -->
         <div class="flex items-center gap-1">
+          <button
+            @click="openTagsEditor"
+            class="p-2 text-slate-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all"
+            title="管理标签"
+          >
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z" />
+            </svg>
+          </button>
           <button
             v-if="file.status === 1"
             @click="showGraph = true"
@@ -164,8 +227,87 @@ const handleDelete = async () => {
       </div>
     </div>
 
-    <!-- Slice Settings Modal -->
+    <!-- Modals -->
     <Teleport to="body">
+      <!-- Tags Editor Modal -->
+      <div v-if="showTagsEditor" class="fixed inset-0 z-50 flex items-center justify-center p-4">
+        <div @click="showTagsEditor = false" class="absolute inset-0 bg-black/50 backdrop-blur-sm"></div>
+        <div class="relative bg-white rounded-2xl shadow-xl w-full max-w-md p-6">
+          <div class="flex items-center justify-between mb-5">
+            <h3 class="text-lg font-semibold text-slate-800">管理标签</h3>
+            <button @click="showTagsEditor = false" class="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg">
+              <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+              </svg>
+            </button>
+          </div>
+
+          <!-- Add Tag Input -->
+          <div class="mb-4">
+            <div class="flex gap-2">
+              <input
+                v-model="newTag"
+                @keyup.enter="addTag"
+                type="text"
+                placeholder="输入标签名称..."
+                class="flex-1 px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500"
+              />
+              <button
+                @click="addTag"
+                class="px-4 py-2 bg-blue-500 text-white rounded-lg font-medium hover:bg-blue-600 transition-all"
+              >
+                添加
+              </button>
+            </div>
+          </div>
+
+          <!-- Tags List -->
+          <div class="mb-6">
+            <p class="text-sm text-slate-600 mb-2">当前标签：</p>
+            <div v-if="editingTags.length === 0" class="text-center py-8 text-slate-400">
+              <svg class="w-12 h-12 mx-auto mb-2 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 7h.01M7 3h5c.512 0 1.024.195 1.414.586l7 7a2 2 0 010 2.828l-7 7a2 2 0 01-2.828 0l-7-7A1.994 1.994 0 013 12V7a4 4 0 014-4z" />
+              </svg>
+              <p>暂无标签</p>
+            </div>
+            <div v-else class="flex flex-wrap gap-2">
+              <div
+                v-for="(tag, index) in editingTags"
+                :key="index"
+                class="flex items-center gap-1 px-3 py-1.5 bg-blue-50 text-blue-600 rounded-lg border border-blue-100 group"
+              >
+                <span class="text-sm">{{ tag }}</span>
+                <button
+                  @click="removeTag(index)"
+                  class="ml-1 p-0.5 text-blue-400 hover:text-red-500 hover:bg-red-50 rounded transition-all"
+                >
+                  <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                  </svg>
+                </button>
+              </div>
+            </div>
+          </div>
+
+          <div class="flex gap-3">
+            <button
+              @click="showTagsEditor = false"
+              class="flex-1 py-3 bg-slate-100 text-slate-700 rounded-xl font-medium hover:bg-slate-200"
+            >
+              取消
+            </button>
+            <button
+              @click="handleSaveTags"
+              :disabled="updating"
+              class="flex-1 py-3 bg-linear-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-medium hover:from-blue-600 hover:to-indigo-700 disabled:opacity-50"
+            >
+              {{ updating ? '保存中...' : '保存' }}
+            </button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Slice Settings Modal -->
       <div v-if="showSettings" class="fixed inset-0 z-50 flex items-center justify-center p-4">
         <div @click="showSettings = false" class="absolute inset-0 bg-black/50 backdrop-blur-sm"></div>
         <div class="relative bg-white rounded-2xl shadow-xl w-full max-w-md p-6">
@@ -218,7 +360,7 @@ const handleDelete = async () => {
             <button
               @click="handleUpdateSliceType"
               :disabled="updating"
-              class="flex-1 py-3 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-medium hover:from-blue-600 hover:to-indigo-700 disabled:opacity-50"
+              class="flex-1 py-3 bg-linear-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-medium hover:from-blue-600 hover:to-indigo-700 disabled:opacity-50"
             >
               {{ updating ? '更新中...' : '确认修改' }}
             </button>

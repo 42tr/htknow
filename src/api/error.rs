@@ -66,6 +66,12 @@ impl From<anyhow::Error> for ApiError {
     }
 }
 
+impl From<serde_json::Error> for ApiError {
+    fn from(e: serde_json::Error) -> Self {
+        ApiError::BadRequest(format!("JSON error: {}", e))
+    }
+}
+
 /// Standardized JSON body returned for errors.
 #[derive(Serialize)]
 struct ErrorBody {

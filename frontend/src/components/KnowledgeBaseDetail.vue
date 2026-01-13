@@ -58,7 +58,7 @@ watch(() => props.kb.id, () => {
         </svg>
       </button>
       <div class="flex items-center gap-3">
-        <div class="w-12 h-12 bg-gradient-to-br from-blue-100 to-indigo-100 rounded-xl flex items-center justify-center">
+        <div class="w-12 h-12 bg-linear-to-br from-blue-100 to-indigo-100 rounded-xl flex items-center justify-center">
           <span class="text-2xl">📚</span>
         </div>
         <div>

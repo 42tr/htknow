@@ -27,6 +27,7 @@ use crate::search::SearchEngine;
         file::list,
         file::get,
         file::update,
+        file::update_tags,
         file::delete,
         file::get_slices,
         file::get_images,
@@ -47,6 +48,7 @@ use crate::search::SearchEngine;
             knowledge_base::KnowledgeUpdateReq,
             file::File,
             file::UpdateFileReq,
+            file::UpdateTagsReq,
             file::Slice,
             file::PdfImage,
             search::SearchResult,
@@ -86,6 +88,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
     let file_router = Router::new()
         .route("/", get(file::list).post(file::upload))
         .route("/{id}", get(file::get).put(file::update).delete(file::delete))
+        .route("/{id}/tags", axum::routing::put(file::update_tags))
         .route("/{id}/slices", get(file::get_slices))
         .route("/{id}/images", get(file::get_images))
         .route("/{file_id}/images/{image_id}", get(file::get_image));

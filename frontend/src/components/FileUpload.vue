@@ -11,6 +11,8 @@ const uploading = ref(false)
 const uploadStatus = ref('')
 const uploadError = ref('')
 const isDragging = ref(false)
+const tags = ref([])
+const newTag = ref('')
 
 const handleKbSelect = (kb) => {
   if (kb) {
@@ -43,6 +45,18 @@ const formatFileSize = (bytes) => {
   return parseFloat((bytes / Math.pow(k, i)).toFixed(1)) + ' ' + sizes[i]
 }
 
+const addTag = () => {
+  const tag = newTag.value.trim()
+  if (tag && !tags.value.includes(tag)) {
+    tags.value.push(tag)
+    newTag.value = ''
+  }
+}
+
+const removeTag = (index) => {
+  tags.value.splice(index, 1)
+}
+
 const handleUpload = async () => {
   if (files.value.length === 0) return
 
@@ -51,9 +65,10 @@ const handleUpload = async () => {
   uploadError.value = ''
 
   try {
-    await api.uploadFiles(selectedKb.value?.id, files.value)
+    await api.uploadFiles(selectedKb.value?.id, files.value, tags.value)
     uploadStatus.value = `成功上传 ${files.value.length} 个文件到 "${selectedKb.value.name}"`
     files.value = []
+    tags.value = []
   } catch (e) {
     uploadError.value = e.message
   } finally {
@@ -83,6 +98,46 @@ const handleUpload = async () => {
       @close="showKbSelector = false"
       @select="handleKbSelect"
     />
+
+    <!-- Tags Input -->
+    <div class="bg-white rounded-xl p-5 border border-slate-200 mb-4">
+      <label class="block text-sm font-medium text-slate-700 mb-2">文件标签（可选）</label>
+      <div class="flex gap-2 mb-3">
+        <input
+          v-model="newTag"
+          @keyup.enter="addTag"
+          type="text"
+          placeholder="输入标签名称..."
+          class="flex-1 px-3 py-2 border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 text-sm"
+        />
+        <button
+          @click="addTag"
+          class="px-4 py-2 bg-blue-500 text-white rounded-lg text-sm font-medium hover:bg-blue-600 transition-all"
+        >
+          添加
+        </button>
+      </div>
+      <div v-if="tags.length > 0" class="flex flex-wrap gap-2">
+        <div
+          v-for="(tag, index) in tags"
+          :key="index"
+          class="flex items-center gap-1 px-3 py-1.5 bg-blue-50 text-blue-600 rounded-lg border border-blue-100 text-sm"
+        >
+          <span>{{ tag }}</span>
+          <button
+            @click="removeTag(index)"
+            class="ml-1 p-0.5 text-blue-400 hover:text-red-500 hover:bg-red-50 rounded transition-all"
+          >
+            <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+            </svg>
+          </button>
+        </div>
+      </div>
+      <p class="mt-2 text-xs text-slate-500">
+        为上传的文件添加标签，方便分类和搜索
+      </p>
+    </div>
 
     <!-- Drop Zone -->
     <div
