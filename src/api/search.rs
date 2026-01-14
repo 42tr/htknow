@@ -27,6 +27,7 @@ pub struct FileInfo {
     pub kb_id: Option<i64>,
     pub is_public: i32,
     pub user_id: String,
+    pub created_at: i64,
 }
 
 /// 知识库信息
@@ -264,7 +265,8 @@ async fn get_files_by_ids(pool: &SqlitePool, file_ids: &[i64]) -> Result<HashMap
     }
 
     let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let query = format!("SELECT id, filename, kb_id, is_public, user_id FROM files WHERE id IN ({})", placeholders);
+    let query =
+        format!("SELECT id, filename, kb_id, is_public, user_id, created_at FROM files WHERE id IN ({})", placeholders);
 
     let mut q = sqlx::query_as::<_, FileInfo>(&query);
     for id in file_ids {
