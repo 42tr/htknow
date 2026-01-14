@@ -1,5 +1,5 @@
 use axum::{
-    Extension, Router, routing::{get, put}
+    Extension, Router, routing::{get, post, put}
 };
 use sqlx::SqlitePool;
 use utoipa::OpenApi;
@@ -24,6 +24,7 @@ use crate::search::SearchEngine;
         knowledge_base::get,
         knowledge_base::update,
         knowledge_base::update_public,
+        knowledge_base::reparse,
         knowledge_base::delete,
         // File
         file::upload,
@@ -52,6 +53,7 @@ use crate::search::SearchEngine;
             knowledge_base::KnowledgeCreateReq,
             knowledge_base::KnowledgeUpdateReq,
             knowledge_base::UpdateKbPublicReq,
+            knowledge_base::ReparseKnowledgeBaseResponse,
             file::File,
             file::UpdateFileReq,
             file::UpdateTagsReq,
@@ -93,6 +95,7 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
 pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
     let knowledge_router = Router::new()
         .route("/", get(knowledge_base::list).post(knowledge_base::create))
+        .route("/reparse", post(knowledge_base::reparse))
         .route("/{id}", get(knowledge_base::get).put(knowledge_base::update).delete(knowledge_base::delete))
         .route("/{id}/public", put(knowledge_base::update_public));
     let file_router = Router::new()

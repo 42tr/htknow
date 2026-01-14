@@ -114,6 +114,15 @@ export const api = {
     return
   },
 
+  async reparseKnowledgeBases() {
+    const response = await fetch(`${API_BASE}/knowledge_base/reparse`, {
+      method: 'POST',
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error('重新解析失败')
+    return response.json()
+  },
+
   // 文件
   async uploadFiles(knowledgeBaseId, files, tags = [], isPublic = false, sliceType = 'smart') {
     const formData = new FormData()

@@ -12,6 +12,7 @@ const files = ref([])
 const breadcrumbs = ref([])
 const loading = ref(true)
 const error = ref('')
+const reparseLoading = ref(false)
 
 const loadKbContent = async (kbId) => {
   loading.value = true
@@ -84,6 +85,22 @@ const handleTogglePublic = async (e, kbId, currentPublic) => {
   }
 }
 
+const handleReparse = async () => {
+  if (!confirm('确定要重新解析所有知识库及未分配文件吗？')) return
+
+  reparseLoading.value = true
+  try {
+    const result = await api.reparseKnowledgeBases()
+    const count = result?.file_count ?? 0
+    alert(`已提交重新解析任务，共 ${count} 个文件`)
+    await loadKbContent(currentKb.value?.id)
+  } catch (e) {
+    alert('重新解析失败：' + e.message)
+  } finally {
+    reparseLoading.value = false
+  }
+}
+
 // Expose refresh method to parent component
 defineExpose({
   refresh: () => loadKbContent(currentKb.value?.id),
@@ -110,7 +127,26 @@ onMounted(() => {
             <span class="font-semibold text-slate-700">{{ currentKb.name }}</span>
         </template>
       </nav>
-      <CreateKnowledgeBase :parent-id="currentKb?.id" @created="handleKbCreated" />
+      <div class="flex items-center gap-3">
+        <button
+          v-if="currentKb && currentKb.id === null"
+          @click="handleReparse"
+          :disabled="reparseLoading"
+          title="重新解析所有知识库及未分配文件"
+          :class="[
+            'px-4 py-2.5 rounded-xl font-medium transition-all duration-200 border flex items-center gap-2',
+            reparseLoading
+              ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+              : 'bg-white text-slate-700 border-slate-200 hover:border-blue-300 hover:text-blue-600'
+          ]"
+        >
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v6h6M20 20v-6h-6M5 19a9 9 0 0014-7M19 5a9 9 0 00-14 7" />
+          </svg>
+          {{ reparseLoading ? '解析中...' : '全部重新解析' }}
+        </button>
+        <CreateKnowledgeBase :parent-id="currentKb?.id" @created="handleKbCreated" />
+      </div>
     </div>
 
     <!-- Loading -->

@@ -573,6 +573,12 @@ pub struct UpdateKbPublicReq {
     pub is_public: bool,
 }
 
+#[derive(Serialize, ToSchema)]
+pub struct ReparseKnowledgeBaseResponse {
+    pub kb_count: i64,
+    pub file_count: i64,
+}
+
 /// 更新知识库公开/私有状态
 #[utoipa::path(
     put,
@@ -608,4 +614,107 @@ pub async fn update_public(
     .fetch_one(&pool)
     .await?;
     Ok(Json(kb))
+}
+
+/// 重新解析所有知识库
+#[utoipa::path(
+    post,
+    path = "/api/v1/knowledge/knowledge_base/reparse",
+    tag = "knowledge_base",
+    responses(
+        (status = 200, description = "已提交重新解析", body = ReparseKnowledgeBaseResponse),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn reparse(
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<ReparseKnowledgeBaseResponse>> {
+    let analysis_kb_ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM knowledge_bases WHERE user_id = ? AND kb_type != ?")
+            .bind(auth_user.user_id.clone())
+            .bind(KB_TYPE_STORAGE)
+            .fetch_all(&pool)
+            .await?;
+
+    let unassigned_file_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM files WHERE user_id = ? AND kb_id IS NULL")
+        .bind(auth_user.user_id.clone())
+        .fetch_all(&pool)
+        .await?;
+
+    let mut kb_file_ids: Vec<i64> = Vec::new();
+    if !analysis_kb_ids.is_empty() {
+        // 获取这些知识库下的文件
+        let mut file_qb = QueryBuilder::<Sqlite>::new("SELECT id FROM files WHERE user_id = ");
+        file_qb.push_bind(auth_user.user_id.clone());
+        file_qb.push(" AND kb_id IN (");
+        let mut file_sep = file_qb.separated(", ");
+        for kb_id in &analysis_kb_ids {
+            file_sep.push_bind(kb_id);
+        }
+        file_qb.push(")");
+        kb_file_ids = file_qb.build_query_scalar().fetch_all(&pool).await?;
+    }
+
+    let mut file_ids = kb_file_ids.clone();
+    file_ids.extend(unassigned_file_ids.iter().copied());
+    if analysis_kb_ids.is_empty() && unassigned_file_ids.is_empty() {
+        return Ok(Json(ReparseKnowledgeBaseResponse { kb_count: 0, file_count: 0 }));
+    }
+
+    // 清理搜索索引
+    for kb_id in &analysis_kb_ids {
+        search_engine.delete(None, Some(*kb_id)).await?;
+    }
+    for file_id in &unassigned_file_ids {
+        search_engine.delete(Some(*file_id), None).await?;
+    }
+
+    // 清理知识图谱数据（节点会级联删除边和提及）
+    if !analysis_kb_ids.is_empty() {
+        let mut del_nodes_qb = QueryBuilder::<Sqlite>::new("DELETE FROM graph_nodes WHERE kb_id IN (");
+        let mut del_nodes_sep = del_nodes_qb.separated(", ");
+        for kb_id in &analysis_kb_ids {
+            del_nodes_sep.push_bind(kb_id);
+        }
+        del_nodes_qb.push(")");
+        del_nodes_qb.build().execute(&pool).await?;
+
+        let mut del_snapshots_qb = QueryBuilder::<Sqlite>::new("DELETE FROM graph_snapshots WHERE kb_id IN (");
+        let mut del_snapshots_sep = del_snapshots_qb.separated(", ");
+        for kb_id in &analysis_kb_ids {
+            del_snapshots_sep.push_bind(kb_id);
+        }
+        del_snapshots_qb.push(")");
+        del_snapshots_qb.build().execute(&pool).await?;
+    }
+    sqlx::query("DELETE FROM graph_nodes WHERE kb_id IS NULL").execute(&pool).await?;
+    sqlx::query("DELETE FROM graph_snapshots WHERE kb_id IS NULL").execute(&pool).await?;
+
+    if !file_ids.is_empty() {
+        let mut del_slices_qb = QueryBuilder::<Sqlite>::new("DELETE FROM slices WHERE file_id IN (");
+        let mut del_slices_sep = del_slices_qb.separated(", ");
+        for file_id in &file_ids {
+            del_slices_sep.push_bind(file_id);
+        }
+        del_slices_qb.push(")");
+        del_slices_qb.build().execute(&pool).await?;
+
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+        let mut update_qb = QueryBuilder::<Sqlite>::new("UPDATE files SET status = 0, log = '', updated_at = ");
+        update_qb.push_bind(now);
+        update_qb.push(" WHERE id IN (");
+        let mut update_sep = update_qb.separated(", ");
+        for file_id in &file_ids {
+            update_sep.push_bind(file_id);
+        }
+        update_qb.push(")");
+        update_qb.build().execute(&pool).await?;
+    }
+
+    Ok(Json(ReparseKnowledgeBaseResponse { kb_count: analysis_kb_ids.len() as i64, file_count: file_ids.len() as i64 }))
 }
