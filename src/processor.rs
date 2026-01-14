@@ -461,6 +461,10 @@ impl FileProcessor {
             full_content.push_str("\n\n");
         }
 
+        self.search_engine
+            .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, full_content.clone()))
+            .await?;
+
         // 更新文件状态
         let sql = "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
         sqlx::query(sql)
@@ -490,6 +494,10 @@ impl FileProcessor {
             let id = sqlx::query(sql).bind(file.id).bind(&slice).execute(&self.pool).await?.last_insert_rowid();
             self.search_engine.write(tantivy_engine::Document::new(id, file.id, file.kb_id, slice)).await?;
         }
+
+        self.search_engine
+            .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, content.clone()))
+            .await?;
 
         // 更新文件状态为已处理，并保存内容
         let sql = "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";

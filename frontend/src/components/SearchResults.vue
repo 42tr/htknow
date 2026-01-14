@@ -62,7 +62,12 @@ defineProps({
             <h3 class="font-semibold text-slate-800 mb-1 truncate">
               {{ result.file?.filename || '未命名文档' }}
             </h3>
-            <p class="text-slate-600 text-sm line-clamp-2 mb-2">
+            <p
+              v-if="result.snippet"
+              class="text-slate-600 text-sm line-clamp-2 mb-2 search-snippet"
+              v-html="result.snippet"
+            ></p>
+            <p v-else class="text-slate-600 text-sm line-clamp-2 mb-2">
               {{ result.content || '无内容预览' }}
             </p>
             <div class="flex items-center gap-4 text-xs text-slate-400">
@@ -91,3 +96,13 @@ defineProps({
     </div>
   </div>
 </template>
+
+<style scoped>
+.search-snippet :deep(b) {
+  font-weight: 600;
+  color: #b45309;
+  background-color: rgba(251, 191, 36, 0.25);
+  padding: 0 2px;
+  border-radius: 2px;
+}
+</style>

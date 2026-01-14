@@ -13,7 +13,9 @@ mod embedding;
 mod lancedb;
 pub mod tantivy_engine;
 
-pub use tantivy_engine::SearchResultItem;
+pub use tantivy_engine::{FullSearchResultItem, SearchResultItem};
+
+const FULL_SNIPPET_MAX_CHARS: usize = 400;
 
 #[derive(Debug, Serialize)]
 struct RerankRequest {
@@ -37,6 +39,8 @@ struct RerankResult {
 pub struct SearchEngine {
     index: Index,
     schema: Schema,
+    full_index: Index,
+    full_schema: Schema,
     pool: Option<SqlitePool>,
 }
 
@@ -44,7 +48,8 @@ impl SearchEngine {
     pub async fn init() -> Self {
         lancedb::init().await.expect("init lancedb failed");
         let (schema, index) = tantivy_engine::init().unwrap();
-        Self { index, schema, pool: None }
+        let (full_schema, full_index) = tantivy_engine::init_full().unwrap();
+        Self { index, schema, full_index, full_schema, pool: None }
     }
 
     pub fn with_pool(mut self, pool: SqlitePool) -> Self {
@@ -63,14 +68,21 @@ impl SearchEngine {
         Ok(())
     }
 
+    pub async fn write_full(&self, doc: tantivy_engine::Document) -> anyhow::Result<()> {
+        tantivy_engine::write_documents(&self.full_index, &self.full_schema, doc).await?;
+        Ok(())
+    }
+
     pub async fn delete(&self, file_id: Option<i64>, kb_id: Option<i64>) -> anyhow::Result<()> {
         if let Some(file_id) = file_id {
             tantivy_engine::delete_by_file(&self.index, &self.schema, file_id).await?;
             lancedb::delete_by_file(file_id).await?;
+            tantivy_engine::delete_by_file(&self.full_index, &self.full_schema, file_id).await?;
         }
         if let Some(kb_id) = kb_id {
             tantivy_engine::delete_by_kb(&self.index, &self.schema, kb_id).await?;
             lancedb::delete_by_kb(kb_id).await?;
+            tantivy_engine::delete_by_kb(&self.full_index, &self.full_schema, kb_id).await?;
         }
         Ok(())
     }
@@ -125,6 +137,20 @@ impl SearchEngine {
         info!("Reranked results count: {}", reranked_results.len());
 
         Ok(reranked_results)
+    }
+
+    pub async fn search_full(
+        &self, query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>,
+    ) -> anyhow::Result<Vec<FullSearchResultItem>> {
+        tantivy_engine::search_with_snippet(
+            &self.full_index,
+            &self.full_schema,
+            query,
+            file_id,
+            kb_ids,
+            FULL_SNIPPET_MAX_CHARS,
+        )
+        .await
     }
 
     async fn rerank(&self, query: &str, results: Vec<SearchResultItem>) -> anyhow::Result<Vec<SearchResultItem>> {

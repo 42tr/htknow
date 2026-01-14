@@ -38,6 +38,7 @@ use crate::search::SearchEngine;
         file::get_image,
         // Search
         search::search,
+        search::search_full,
         search::search_with_graph,
         // Graph
         graph::search_entities,
@@ -59,6 +60,8 @@ use crate::search::SearchEngine;
             file::PdfImage,
             search::SearchResult,
             search::SearchResultItem,
+            search::FullSearchResult,
+            search::FullSearchResultItem,
             search::FileInfo,
             search::KbInfo,
             graph::EntityInfo,
@@ -100,7 +103,10 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/{id}/slices", get(file::get_slices))
         .route("/{id}/images", get(file::get_images))
         .route("/{file_id}/images/{image_id}", get(file::get_image));
-    let search_router = Router::new().route("/", get(search::search)).route("/graph", get(search::search_with_graph));
+    let search_router = Router::new()
+        .route("/", get(search::search))
+        .route("/full", get(search::search_full))
+        .route("/graph", get(search::search_with_graph));
     let graph_router = Router::new()
         .route("/entities", get(graph::search_entities))
         .route("/entities/{id}", get(graph::get_entity))

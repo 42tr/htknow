@@ -3,7 +3,7 @@ use std::path::Path;
 use log::info;
 use serde::Serialize;
 use tantivy::{
-    Index, Result, TantivyDocument, Term, collector::TopDocs, doc, query::{BooleanQuery, Occur, Query, TermQuery}, schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _}
+    Index, Result, SnippetGenerator, TantivyDocument, Term, collector::TopDocs, doc, query::{BooleanQuery, Occur, Query, TermQuery}, schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _}
 };
 
 use super::chinese_tokenizer;
@@ -29,6 +29,15 @@ pub struct SearchResultItem {
     pub score: f32,         // 搜索得分
 }
 
+/// 全文索引搜索结果项
+#[derive(Debug, Clone, Serialize)]
+pub struct FullSearchResultItem {
+    pub file_id: i64,       // 文件 ID
+    pub kb_id: Option<i64>, // 知识库 ID
+    pub snippet: String,    // 高亮片段
+    pub score: f32,         // 搜索得分
+}
+
 impl Document {
     pub fn new(id: i64, file_id: i64, kb_id: Option<i64>, content: String) -> Self {
         Document { id, file_id, kb_id, content }
@@ -40,8 +49,17 @@ impl Document {
 /// delete if it exists
 pub fn init() -> Result<(Schema, Index)> {
     let cfg = config::get();
+    init_with_path(&cfg.search.tantivy_index_path)
+}
+
+pub fn init_full() -> Result<(Schema, Index)> {
+    let cfg = config::get();
+    init_with_path(&cfg.search.tantivy_full_index_path)
+}
+
+fn init_with_path(path: &str) -> Result<(Schema, Index)> {
     let schema = build_schema();
-    let path = Path::new(&cfg.search.tantivy_index_path);
+    let path = Path::new(path);
     let index = if path.exists() {
         Index::open_in_dir(path)?
     } else {
@@ -80,6 +98,29 @@ pub async fn search(
             .map(|s| s.to_string())
             .unwrap_or_default();
         results.push(SearchResultItem { id, file_id, kb_id, content, score });
+    }
+
+    Ok(results)
+}
+
+pub async fn search_with_snippet(
+    index: &Index, schema: &Schema, query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>, max_chars: usize,
+) -> anyhow::Result<Vec<FullSearchResultItem>> {
+    let cfg = config::get();
+    let searcher = index.reader()?.searcher();
+    let tantivy_query = build_query(query, file_id, kb_ids, schema)?;
+    let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(cfg.search.limit))?;
+
+    let mut snippet_generator = SnippetGenerator::create(&searcher, &*tantivy_query, get_field(schema, "content"))?;
+    snippet_generator.set_max_num_chars(max_chars);
+
+    let mut results = vec![];
+    for (score, doc_address) in top_docs {
+        let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
+        let file_id = retrieved_doc.get_first(get_field(schema, "file_id")).and_then(|v| v.as_i64()).unwrap_or(0);
+        let kb_id = retrieved_doc.get_first(get_field(schema, "kb_id")).and_then(|v| v.as_i64());
+        let snippet = snippet_generator.snippet_from_doc(&retrieved_doc).to_html();
+        results.push(FullSearchResultItem { file_id, kb_id, snippet, score });
     }
 
     Ok(results)

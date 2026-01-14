@@ -32,6 +32,21 @@ export const api = {
     const data = await response.json()
     return data.results || []
   },
+  async searchFull(query, kbId = null, fileId = null) {
+    let url = `${API_BASE}/search/full?query=${encodeURIComponent(query)}`
+    if (kbId) {
+      url += `&kb_id=${kbId}`
+    }
+    if (fileId) {
+      url += `&file_id=${fileId}`
+    }
+    const response = await fetch(url, {
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error('全文搜索失败')
+    const data = await response.json()
+    return data.results || []
+  },
 
   // 知识库
   async getKnowledgeBases(parentId = null) {

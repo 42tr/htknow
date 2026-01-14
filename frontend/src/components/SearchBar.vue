@@ -8,6 +8,7 @@ const emit = defineEmits(['search', 'search-start', 'search-end'])
 
 const query = ref('')
 const error = ref('')
+const searchMode = ref('full')
 
 // Local state for search scope
 const localSelectedKb = ref({ id: null, name: '所有知识库' })
@@ -35,7 +36,10 @@ const handleSearch = async () => {
   emit('search-start')
 
   try {
-    const results = await api.search(query.value, localSelectedKb.value?.id)
+    const results =
+      searchMode.value === 'slice'
+        ? await api.search(query.value, localSelectedKb.value?.id)
+        : await api.searchFull(query.value, localSelectedKb.value?.id)
     emit('search', results)
   } catch (e) {
     error.value = e.message
@@ -68,6 +72,32 @@ const handleKeydown = (e) => {
       </button>
       <p class="mt-2 text-xs text-slate-500">
         当前搜索将在 <span class="font-medium text-blue-600">{{ localSelectedKb.name }}</span> 及其子知识库中进行。
+      </p>
+    </div>
+
+    <!-- Search Mode Selection -->
+    <div class="mb-4">
+      <label class="block text-xs font-medium text-slate-600 mb-2">搜索模式</label>
+      <div class="inline-flex rounded-xl border border-slate-200 bg-white p-1 shadow-sm">
+        <button
+          type="button"
+          class="px-4 py-2 text-sm rounded-lg transition-colors"
+          :class="searchMode === 'full' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:text-slate-900'"
+          @click="searchMode = 'full'"
+        >
+          文件搜索
+        </button>
+        <button
+          type="button"
+          class="px-4 py-2 text-sm rounded-lg transition-colors"
+          :class="searchMode === 'slice' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:text-slate-900'"
+          @click="searchMode = 'slice'"
+        >
+          切片搜索
+        </button>
+      </div>
+      <p class="mt-2 text-xs text-slate-500">
+        文件搜索返回高亮片段；切片搜索返回命中的切片内容。
       </p>
     </div>
 

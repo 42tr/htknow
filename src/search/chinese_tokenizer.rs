@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use jieba_rs::Jieba;
+use jieba_rs::{Jieba, TokenizeMode};
 use lazy_static::lazy_static;
 use log::info;
 use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
@@ -61,33 +61,56 @@ impl FastChineseTokenizer {
         info!("Segmented words: {:?}", words);
         words
     }
+
+    fn tokenize_with_offsets(&self, text: &str) -> Vec<TokenInfo> {
+        let mode = match self.mode {
+            SegmentationMode::Search => TokenizeMode::Search,
+            SegmentationMode::All => TokenizeMode::Search,
+        };
+        JIEBA
+            .tokenize(text, mode, false)
+            .into_iter()
+            .map(|t| TokenInfo { text: t.word.to_string(), start: t.start, end: t.end })
+            .collect()
+    }
 }
 
 impl Tokenizer for FastChineseTokenizer {
     type TokenStream<'a> = ChineseTokenStream<'a>;
 
     fn token_stream<'a>(&'a mut self, text: &'a str) -> Self::TokenStream<'a> {
-        let tokens = self.segment(text);
-        ChineseTokenStream::new(tokens)
+        let tokens = self.tokenize_with_offsets(text);
+        ChineseTokenStream::new(text, tokens)
     }
 }
 
 /// Token stream for Chinese text
 pub struct ChineseTokenStream<'a> {
-    tokens: Vec<String>,
+    tokens: Vec<TokenInfo>,
     current_index: usize,
-    current_offset: usize,
     token: Token,
+    char_to_byte: Vec<usize>,
     _phantom: std::marker::PhantomData<&'a ()>,
 }
 
+struct TokenInfo {
+    text: String,
+    start: usize,
+    end: usize,
+}
+
 impl<'a> ChineseTokenStream<'a> {
-    fn new(tokens: Vec<String>) -> Self {
+    fn new(text: &'a str, tokens: Vec<TokenInfo>) -> Self {
+        let mut char_to_byte = Vec::with_capacity(text.chars().count() + 1);
+        for (byte_idx, _) in text.char_indices() {
+            char_to_byte.push(byte_idx);
+        }
+        char_to_byte.push(text.len());
         ChineseTokenStream {
             tokens,
             current_index: 0,
-            current_offset: 0,
             token: Token::default(),
+            char_to_byte,
             _phantom: std::marker::PhantomData,
         }
     }
@@ -96,25 +119,26 @@ impl<'a> ChineseTokenStream<'a> {
 impl<'a> TokenStream for ChineseTokenStream<'a> {
     fn advance(&mut self) -> bool {
         while self.current_index < self.tokens.len() {
-            let token_text = &self.tokens[self.current_index];
+            let token_info = &self.tokens[self.current_index];
             self.current_index += 1;
 
             // 跳过空的token
-            if token_text.trim().is_empty() {
-                self.current_offset += token_text.len();
+            if token_info.text.trim().is_empty() {
                 continue;
             }
 
-            let start = self.current_offset;
-            let end = start + token_text.len();
+            let char_len = self.char_to_byte.len().saturating_sub(1);
+            if token_info.start >= char_len || token_info.end > char_len || token_info.start >= token_info.end {
+                continue;
+            }
+            let start = self.char_to_byte[token_info.start];
+            let end = self.char_to_byte[token_info.end];
 
             self.token.text.clear();
-            self.token.text.push_str(token_text);
+            self.token.text.push_str(&token_info.text);
             self.token.offset_from = start;
             self.token.offset_to = end;
             self.token.position = self.token.position.wrapping_add(1);
-
-            self.current_offset = end;
             return true;
         }
         false
