@@ -14,6 +14,7 @@ const isDragging = ref(false)
 const tags = ref([])
 const newTag = ref('')
 const isPublic = ref(false)
+const sliceType = ref('smart')
 
 const handleKbSelect = (kb) => {
   if (kb) {
@@ -60,17 +61,18 @@ const removeTag = (index) => {
 
 const handleUpload = async () => {
   if (files.value.length === 0) return
-  
+
   uploading.value = true
   uploadStatus.value = ''
   uploadError.value = ''
-  
+
   try {
-    await api.uploadFiles(selectedKb.value?.id, files.value, tags.value, isPublic.value)
+    await api.uploadFiles(selectedKb.value?.id, files.value, tags.value, isPublic.value, sliceType.value)
     uploadStatus.value = `成功上传 ${files.value.length} 个文件到 "${selectedKb.value.name}"`
     files.value = []
     tags.value = []
     isPublic.value = false
+    sliceType.value = 'smart'
   } catch (e) {
     uploadError.value = e.message
   } finally {
@@ -173,6 +175,47 @@ const handleUpload = async () => {
               <span class="font-medium text-slate-800">公开</span>
             </div>
             <p class="text-xs text-slate-500">所有人可见</p>
+          </div>
+        </label>
+      </div>
+    </div>
+
+    <!-- Slice Type Selection -->
+    <div class="bg-white rounded-xl p-5 border border-slate-200 mb-4">
+      <label class="block text-sm font-medium text-slate-700 mb-3">切片方式</label>
+      <div class="space-y-3">
+        <label
+          :class="[
+            'flex items-start gap-3 p-4 rounded-xl border-2 cursor-pointer transition-all',
+            sliceType === 'smart' ? 'border-purple-500 bg-purple-50' : 'border-slate-200 hover:border-slate-300'
+          ]"
+        >
+          <input type="radio" v-model="sliceType" value="smart" class="mt-1 w-4 h-4 text-purple-500" />
+          <div class="flex-1">
+            <div class="flex items-center gap-2 mb-1">
+              <span class="text-lg">🧠</span>
+              <span class="font-medium text-slate-800">智能切片（推荐）</span>
+            </div>
+            <p class="text-xs text-slate-500 leading-relaxed">
+              根据文档结构智能切分。PDF文件会保留标题层级，每个切片包含其所在章节标题，内容超过8000字时自动按句子切分
+            </p>
+          </div>
+        </label>
+        <label
+          :class="[
+            'flex items-start gap-3 p-4 rounded-xl border-2 cursor-pointer transition-all',
+            sliceType === 'fixed' ? 'border-orange-500 bg-orange-50' : 'border-slate-200 hover:border-slate-300'
+          ]"
+        >
+          <input type="radio" v-model="sliceType" value="fixed" class="mt-1 w-4 h-4 text-orange-500" />
+          <div class="flex-1">
+            <div class="flex items-center gap-2 mb-1">
+              <span class="text-lg">📏</span>
+              <span class="font-medium text-slate-800">固定长度切片</span>
+            </div>
+            <p class="text-xs text-slate-500 leading-relaxed">
+              按固定字数（8000字）切分，切片之间重叠100字以保证上下文连贯性
+            </p>
           </div>
         </label>
       </div>

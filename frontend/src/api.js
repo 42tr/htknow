@@ -100,7 +100,7 @@ export const api = {
   },
 
   // 文件
-  async uploadFiles(knowledgeBaseId, files, tags = [], isPublic = false) {
+  async uploadFiles(knowledgeBaseId, files, tags = [], isPublic = false, sliceType = 'smart') {
     const formData = new FormData()
     if (knowledgeBaseId) {
       formData.append('kb_id', knowledgeBaseId)
@@ -109,6 +109,7 @@ export const api = {
       formData.append('tags', JSON.stringify(tags))
     }
     formData.append('is_public', isPublic ? '1' : '0')
+    formData.append('slice_type', sliceType)
     for (const file of files) {
       formData.append('file', file)
     }

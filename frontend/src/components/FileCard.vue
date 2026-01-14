@@ -23,10 +23,8 @@ const editingTags = ref([])
 const newTag = ref('')
 
 const sliceTypes = [
-  { value: 'paragraph', label: '按段落', desc: '以双换行符分隔' },
-  { value: 'sentence', label: '按句子', desc: '以句号、问号、感叹号分隔' },
-  { value: 'fixed', label: '固定长度', desc: '每 1000 字符一个切片' },
-  { value: 'default', label: '不切片', desc: '整个文件作为一个切片' },
+  { value: 'smart', label: '智能切片', desc: '根据文档结构智能切分（推荐）' },
+  { value: 'fixed', label: '固定长度', desc: '每 8000 字符一个切片，重叠 100 字' },
 ]
 
 const statusInfo = computed(() => {
@@ -55,7 +53,7 @@ const publicInfo = computed(() => {
 
 const sliceTypeLabel = computed(() => {
   const type = sliceTypes.find(t => t.value === props.file.slice_type)
-  return type ? type.label : '按段落'
+  return type ? type.label : '智能切片'
 })
 
 const fileTags = computed(() => {
@@ -244,7 +242,7 @@ const handleTogglePublic = async () => {
             </svg>
           </button>
           <button
-            @click="showSettings = true; selectedSliceType = file.slice_type || 'paragraph'"
+            @click="showSettings = true; selectedSliceType = file.slice_type || 'smart'"
             class="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-all"
             title="修改切片方式"
           >

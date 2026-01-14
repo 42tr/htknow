@@ -38,6 +38,7 @@ pub struct AppConfig {
     pub database: DatabaseConfig,
     pub storage: StorageConfig,
     pub search: SearchConfig,
+    pub slice: SliceConfig,
     pub llm: LLMConfig,
 }
 
@@ -111,6 +112,15 @@ pub struct SearchConfig {
     pub tantivy_memory_mb: usize,
 }
 
+/// 切片配置
+#[derive(Debug, Clone)]
+pub struct SliceConfig {
+    /// 智能切片每个切片的最大字数
+    pub smart_slice_max_chars: usize,
+    /// 固定长度切片的重叠字数
+    pub fixed_slice_overlap_chars: usize,
+}
+
 /// LLM 配置
 #[derive(Debug, Clone)]
 pub struct LLMConfig {
@@ -132,6 +142,7 @@ impl AppConfig {
             database: DatabaseConfig::from_env(),
             storage: StorageConfig::from_env(),
             search: SearchConfig::from_env(),
+            slice: SliceConfig::from_env(),
             llm: LLMConfig::from_env(),
         }
     }
@@ -197,6 +208,15 @@ impl SearchConfig {
             limit: env_or_parse("HTKNOW_SEARCH_LIMIT", 10),
             tantivy_index_path: env_or("HTKNOW_TANTIVY_INDEX_PATH", &format!("{}/tantivy_index", data_dir)),
             tantivy_memory_mb: env_or_parse("HTKNOW_TANTIVY_MEMORY_MB", 50),
+        }
+    }
+}
+
+impl SliceConfig {
+    fn from_env() -> Self {
+        Self {
+            smart_slice_max_chars: env_or_parse("HTKNOW_SMART_SLICE_MAX_CHARS", 8000),
+            fixed_slice_overlap_chars: env_or_parse("HTKNOW_FIXED_SLICE_OVERLAP_CHARS", 100),
         }
     }
 }

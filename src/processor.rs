@@ -362,7 +362,64 @@ impl FileProcessor {
             }
         }
 
-        // 根据 slice_type 分片并保存
+        // 根据 slice_type 决定切片方式
+        let slices = if file.slice_type == "smart" || file.slice_type.is_empty() {
+            // 智能切片：使用 content_list
+            self.smart_slice_content(&content_list)?
+        } else {
+            // 其他方式：先拼接成完整内容再切片
+            let mut full_content = String::new();
+            for pdf_content in &content_list {
+                if pdf_content.typ == "discarded" {
+                    continue;
+                }
+                if pdf_content.typ == "text" {
+                    if let Some(text) = &pdf_content.text {
+                        if let Some(lv) = pdf_content.text_level {
+                            full_content.push_str("#".repeat(lv as usize).as_str());
+                            full_content.push_str(" ");
+                        }
+                        full_content.push_str(&text);
+                    }
+                } else if pdf_content.typ == "image" {
+                    if let Some(img_name) = &pdf_content.img_path {
+                        full_content.push_str(&format!("![{}](images/{})", img_name, img_name,));
+                    }
+                    if let Some(captions) = &pdf_content.image_caption {
+                        for caption in captions {
+                            full_content.push_str(&format!("{}", caption));
+                        }
+                    }
+                } else if pdf_content.typ == "table" {
+                    if let Some(table_caption) = &pdf_content.table_caption {
+                        for caption in table_caption {
+                            full_content.push_str(&format!("{}", caption));
+                        }
+                    }
+                    if let Some(table_body) = &pdf_content.table_body {
+                        full_content.push_str(&table_body);
+                    }
+                }
+                full_content.push_str("\n\n");
+            }
+            self.slice_content(&full_content, &file.slice_type)?
+        };
+
+        let slice_count = slices.len();
+
+        for slice in slices {
+            let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
+            let id = sqlx::query(sql).bind(file.id).bind(&slice).execute(&self.pool).await?.last_insert_rowid();
+            self.search_engine.write(tantivy_engine::Document::new(id, file.id, file.kb_id, slice)).await?;
+        }
+
+        // 构建知识图谱
+        if let Err(e) = self.build_knowledge_graph(file).await {
+            error!("Failed to build knowledge graph for file {}: {}", file.id, e);
+            // 不影响主流程，仅记录错误
+        }
+
+        // 构建完整内容用于存储
         let mut full_content = String::new();
         for pdf_content in &content_list {
             if pdf_content.typ == "discarded" {
@@ -396,20 +453,6 @@ impl FileProcessor {
                 }
             }
             full_content.push_str("\n\n");
-        }
-        let slices = self.slice_content(&full_content, &file.slice_type)?;
-        let slice_count = slices.len();
-
-        for slice in slices {
-            let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
-            let id = sqlx::query(sql).bind(file.id).bind(&slice).execute(&self.pool).await?.last_insert_rowid();
-            self.search_engine.write(tantivy_engine::Document::new(id, file.id, file.kb_id, slice)).await?;
-        }
-
-        // 构建知识图谱
-        if let Err(e) = self.build_knowledge_graph(file).await {
-            error!("Failed to build knowledge graph for file {}: {}", file.id, e);
-            // 不影响主流程，仅记录错误
         }
 
         // 更新文件状态
@@ -477,14 +520,32 @@ impl FileProcessor {
                 Ok(content.split("\n\n").map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
             }
             "fixed" => {
-                // 固定长度分片（每1000字符）
-                let chunk_size = 1000;
-                Ok(content
-                    .chars()
-                    .collect::<Vec<_>>()
-                    .chunks(chunk_size)
-                    .map(|chunk| chunk.iter().collect::<String>())
-                    .collect())
+                // 固定长度分片（每8000字符，重叠100字符）
+                let cfg = config::get();
+                let chunk_size = cfg.slice.smart_slice_max_chars;
+                let overlap = cfg.slice.fixed_slice_overlap_chars;
+
+                let chars: Vec<char> = content.chars().collect();
+                let mut slices = Vec::new();
+                let mut start = 0;
+
+                while start < chars.len() {
+                    let end = std::cmp::min(start + chunk_size, chars.len());
+                    let slice: String = chars[start..end].iter().collect();
+                    slices.push(slice);
+
+                    if end >= chars.len() {
+                        break;
+                    }
+
+                    // 下一个切片从 end - overlap 开始，以实现重叠
+                    start = end.saturating_sub(overlap);
+                    if start >= end {
+                        break;
+                    }
+                }
+
+                Ok(slices)
             }
             "sentence" => {
                 // 按句子分片（简单实现：以句号、问号、感叹号分隔）
@@ -500,6 +561,160 @@ impl FileProcessor {
                 Ok(vec![content.to_string()])
             }
         }
+    }
+
+    /// 智能切片：针对 MinerU 处理的内容
+    /// 有标题的情况下，每个切片需要包含其所在的标题
+    /// 切片内容拼接组成，加起来超过配置的字数就按句子再切成多个切片
+    /// 没有标题的情况下直接按拼接，超过配置的字数就按句子再切成多个切片
+    fn smart_slice_content(&self, content_list: &[ContentItem]) -> anyhow::Result<Vec<String>> {
+        let cfg = config::get();
+        let max_chars = cfg.slice.smart_slice_max_chars;
+
+        let mut slices = Vec::new();
+        let mut current_slice = String::new();
+        let mut current_header = String::new(); // 当前所在的标题
+
+        for item in content_list {
+            if item.typ == "discarded" {
+                continue;
+            }
+
+            let mut item_content = String::new();
+
+            // 处理文本内容
+            if item.typ == "text" {
+                if let Some(text) = &item.text {
+                    // 如果是标题，更新当前标题
+                    if let Some(level) = item.text_level {
+                        // 这是一个标题
+                        let header_text = format!("{} {}", "#".repeat(level as usize), text);
+
+                        // 如果当前有累积的内容，先保存
+                        if !current_slice.trim().is_empty() {
+                            slices.extend(self.split_by_sentence_if_needed(&current_slice, max_chars)?);
+                            current_slice.clear();
+                        }
+
+                        // 更新当前标题
+                        current_header = header_text.clone();
+                        // 开始新的切片，包含标题
+                        current_slice = format!("{}\n\n", current_header);
+                        continue;
+                    } else {
+                        // 普通文本
+                        item_content.push_str(text);
+                    }
+                }
+            } else if item.typ == "image" {
+                if let Some(img_name) = &item.img_path {
+                    item_content.push_str(&format!("![{}](images/{})", img_name, img_name));
+                }
+                if let Some(captions) = &item.image_caption {
+                    for caption in captions {
+                        item_content.push_str(&format!("{}", caption));
+                    }
+                }
+            } else if item.typ == "table" {
+                if let Some(table_caption) = &item.table_caption {
+                    for caption in table_caption {
+                        item_content.push_str(&format!("{}", caption));
+                    }
+                }
+                if let Some(table_body) = &item.table_body {
+                    item_content.push_str(table_body);
+                }
+            }
+
+            if item_content.is_empty() {
+                continue;
+            }
+
+            // 检查加入这个内容后是否超过字数限制
+            let test_content = if current_slice.is_empty() {
+                // 如果当前切片为空，但有标题，先加上标题
+                if !current_header.is_empty() {
+                    format!("{}\n\n{}", current_header, item_content)
+                } else {
+                    item_content.clone()
+                }
+            } else {
+                format!("{}{}\n\n", current_slice, item_content)
+            };
+
+            if test_content.chars().count() > max_chars {
+                // 超过限制，保存当前切片
+                if !current_slice.trim().is_empty() {
+                    slices.extend(self.split_by_sentence_if_needed(&current_slice, max_chars)?);
+                }
+
+                // 开始新的切片
+                if !current_header.is_empty() {
+                    current_slice = format!("{}\n\n{}\n\n", current_header, item_content);
+                } else {
+                    current_slice = format!("{}\n\n", item_content);
+                }
+            } else {
+                // 没有超过限制，继续累积
+                current_slice = test_content;
+            }
+        }
+
+        // 保存最后的切片
+        if !current_slice.trim().is_empty() {
+            slices.extend(self.split_by_sentence_if_needed(&current_slice, max_chars)?);
+        }
+
+        Ok(slices)
+    }
+
+    /// 如果内容超过字数限制，按句子切分
+    fn split_by_sentence_if_needed(&self, content: &str, max_chars: usize) -> anyhow::Result<Vec<String>> {
+        let char_count = content.chars().count();
+
+        if char_count <= max_chars {
+            return Ok(vec![content.to_string()]);
+        }
+
+        // 按句子分割
+        let sentences: Vec<&str> = content
+            .split(|c| c == '。' || c == '.' || c == '?' || c == '!' || c == '？' || c == '！')
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+
+        let mut result = Vec::new();
+        let mut current = String::new();
+
+        for sentence in sentences {
+            let sentence = sentence.trim();
+            if sentence.is_empty() {
+                continue;
+            }
+
+            // 测试加入这个句子后的长度
+            let test_content =
+                if current.is_empty() { sentence.to_string() } else { format!("{}。{}", current, sentence) };
+
+            if test_content.chars().count() > max_chars && !current.is_empty() {
+                // 超过限制，保存当前内容
+                result.push(current);
+                current = sentence.to_string();
+            } else {
+                current = test_content;
+            }
+        }
+
+        // 保存最后的内容
+        if !current.trim().is_empty() {
+            result.push(current);
+        }
+
+        // 如果结果为空，至少返回原内容（即使超长）
+        if result.is_empty() {
+            result.push(content.to_string());
+        }
+
+        Ok(result)
     }
 
     /// 构建知识图谱（完全由LLM生成）
