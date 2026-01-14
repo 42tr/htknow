@@ -26,14 +26,14 @@ const loadKbContent = async (kbId) => {
       ]);
       childrenKbs.value = topLevelKbs
       files.value = unassignedFiles
-      newCurrentKb = { id: null, name: '所有知识库' }
+      newCurrentKb = { id: null, name: '所有知识库', kb_type: null }
       breadcrumbs.value = []
     } else {
       // Inside a specific KB
       const data = await api.getKnowledgeBase(kbId)
       childrenKbs.value = data.children_kbs || []
       files.value = data.files || []
-      newCurrentKb = { id: data.id, name: data.name, description: data.description }
+      newCurrentKb = { id: data.id, name: data.name, description: data.description, kb_type: data.kb_type }
       breadcrumbs.value = data.path || []
     }
     currentKb.value = newCurrentKb;
@@ -181,6 +181,12 @@ onMounted(() => {
              ]">
                {{ kb.is_public === 1 ? '🌐 公开' : '🔒 私有' }}
              </span>
+             <span :class="[
+               'px-2 py-0.5 text-xs rounded-full border',
+               kb.kb_type === 'storage' ? 'bg-amber-50 text-amber-600 border-amber-200' : 'bg-indigo-50 text-indigo-600 border-indigo-200'
+             ]">
+               {{ kb.kb_type === 'storage' ? '🗄️ 存储型' : '🧠 分析型' }}
+             </span>
            </h3>
            <p class="text-sm text-slate-500 line-clamp-2 mb-3">{{ kb.description || '暂无描述' }}</p>
            <div class="flex items-center justify-between text-xs text-slate-400">
@@ -197,6 +203,7 @@ onMounted(() => {
             v-for="file in files"
             :key="`file-${file.id}`"
             :file="file"
+            :kb-type="currentKb?.kb_type"
             @updated="handleFileAction"
             @deleted="handleFileAction"
         />

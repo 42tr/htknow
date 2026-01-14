@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS knowledge_bases (
     user_id TEXT, -- 归属用户ID
     name TEXT NOT NULL, -- 知识库名称
     description TEXT DEFAULT '', -- 知识库描述
+    kb_type TEXT NOT NULL DEFAULT 'analysis', -- 知识库类型: analysis-分析型, storage-存储型
     parent_id INTEGER, -- 父级知识库ID
     is_public INTEGER NOT NULL DEFAULT 0, -- 是否公开: 0-私有, 1-公开
     created_at INTEGER DEFAULT (strftime('%s','now')),

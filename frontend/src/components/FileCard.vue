@@ -8,6 +8,10 @@ const props = defineProps({
   file: {
     type: Object,
     required: true
+  },
+  kbType: {
+    type: String,
+    default: null
   }
 })
 
@@ -27,6 +31,8 @@ const sliceTypes = [
   { value: 'fixed', label: '固定长度', desc: '每 8000 字符一个切片，重叠 100 字' },
 ]
 
+const isStorageKb = computed(() => props.kbType === 'storage')
+
 const statusInfo = computed(() => {
   switch (props.file.status) {
     case 0:
@@ -35,6 +41,8 @@ const statusInfo = computed(() => {
       return { text: '处理中', color: 'bg-blue-100 text-blue-700', icon: '⚙️' }
     case 1:
       return { text: '已完成', color: 'bg-green-100 text-green-700', icon: '✓' }
+    case 3:
+      return { text: '不解析', color: 'bg-amber-100 text-amber-700', icon: '🗄️' }
     case -1:
       return { text: '处理失败', color: 'bg-red-100 text-red-700', icon: '✗' }
     default:
@@ -52,6 +60,9 @@ const publicInfo = computed(() => {
 })
 
 const sliceTypeLabel = computed(() => {
+  if (isStorageKb.value) {
+    return '存储模式'
+  }
   const type = sliceTypes.find(t => t.value === props.file.slice_type)
   return type ? type.label : '智能切片'
 })
@@ -214,7 +225,7 @@ const handleTogglePublic = async () => {
             </svg>
           </button>
           <button
-            v-if="file.status === 1"
+            v-if="file.status === 1 && !isStorageKb"
             @click="showGraph = true"
             class="p-2 text-slate-400 hover:text-purple-500 hover:bg-purple-50 rounded-lg transition-all"
             title="查看知识图谱"
@@ -232,7 +243,7 @@ const handleTogglePublic = async () => {
             </svg>
           </button>
           <button
-            v-if="file.status === 1"
+            v-if="file.status === 1 && !isStorageKb"
             @click="showSlices = true"
             class="p-2 text-slate-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all"
             title="查看切片"
@@ -242,6 +253,7 @@ const handleTogglePublic = async () => {
             </svg>
           </button>
           <button
+            v-if="!isStorageKb"
             @click="showSettings = true; selectedSliceType = file.slice_type || 'smart'"
             class="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-all"
             title="修改切片方式"

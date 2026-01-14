@@ -4,7 +4,7 @@ use std::{
 
 use anyhow::Context;
 use log::info;
-use sqlx::{SqlitePool, sqlite::SqlitePoolOptions};
+use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 
 use crate::config;
 
@@ -39,6 +39,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
 
     // 自动创建表
     create_tables(&pool).await?;
+    ensure_kb_type_column(&pool).await?;
 
     info!("Database initialized successfully");
 
@@ -58,6 +59,19 @@ async fn create_tables(pool: &SqlitePool) -> anyhow::Result<()> {
     }
 
     info!("Tables created successfully");
+
+    Ok(())
+}
+
+async fn ensure_kb_type_column(pool: &SqlitePool) -> anyhow::Result<()> {
+    let columns = sqlx::query("PRAGMA table_info(knowledge_bases);").fetch_all(pool).await?;
+    let has_kb_type = columns.iter().any(|row| row.get::<String, _>("name") == "kb_type");
+
+    if !has_kb_type {
+        sqlx::query("ALTER TABLE knowledge_bases ADD COLUMN kb_type TEXT NOT NULL DEFAULT 'analysis'")
+            .execute(pool)
+            .await?;
+    }
 
     Ok(())
 }

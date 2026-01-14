@@ -160,6 +160,12 @@ impl FileProcessor {
     /// 处理单个文件
     async fn process_file(&self, file: &File) -> anyhow::Result<()> {
         info!("Processing file: {} ({})", file.filename, file.id);
+        if self.is_storage_kb(file.kb_id).await? {
+            info!("Skipping parsing for storage knowledge base file {}", file.id);
+            self.mark_file_storage_skipped(file.id).await?;
+            return Ok(());
+        }
+
         let sql = "UPDATE files SET status = 2, updated_at = strftime('%s','now') WHERE id = ?";
         sqlx::query(sql).bind(file.id).execute(&self.pool).await?;
 
@@ -510,6 +516,21 @@ impl FileProcessor {
         let sql = "UPDATE files SET status = -1, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
         sqlx::query(sql).bind(error_msg).bind(file_id).execute(&self.pool).await?;
         Ok(())
+    }
+
+    async fn mark_file_storage_skipped(&self, file_id: i64) -> anyhow::Result<()> {
+        let sql = "UPDATE files SET status = 3, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
+        sqlx::query(sql).bind("Storage mode: not parsed").bind(file_id).execute(&self.pool).await?;
+        Ok(())
+    }
+
+    async fn is_storage_kb(&self, kb_id: Option<i64>) -> anyhow::Result<bool> {
+        let Some(kb_id) = kb_id else { return Ok(false) };
+        let kb_type: Option<String> = sqlx::query_scalar("SELECT kb_type FROM knowledge_bases WHERE id = ?")
+            .bind(kb_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        Ok(matches!(kb_type.as_deref(), Some("storage")))
     }
 
     /// 根据 slice_type 对内容进行分片

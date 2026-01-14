@@ -8,7 +8,21 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use tokio::fs;
 use utoipa::{IntoParams, ToSchema};
 
-use crate::{AuthUser, api::error::ApiResult, search::SearchEngine};
+use crate::{
+    AuthUser, api::error::{ApiError, ApiResult}, search::SearchEngine
+};
+
+const KB_TYPE_ANALYSIS: &str = "analysis";
+const KB_TYPE_STORAGE: &str = "storage";
+
+fn normalize_kb_type(kb_type: Option<String>) -> Result<String, ApiError> {
+    let raw = kb_type.unwrap_or_else(|| KB_TYPE_ANALYSIS.to_string());
+    let normalized = raw.trim().to_lowercase();
+    match normalized.as_str() {
+        KB_TYPE_ANALYSIS | KB_TYPE_STORAGE => Ok(normalized),
+        _ => Err(ApiError::BadRequest("Invalid kb_type. Use 'analysis' or 'storage'.".to_string())),
+    }
+}
 
 #[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
 pub struct Knowledge {
@@ -16,6 +30,7 @@ pub struct Knowledge {
     pub user_id: String,
     pub name: String,
     pub description: String,
+    pub kb_type: String,
     pub parent_id: Option<i64>,
     pub is_public: i32,
 }
@@ -26,6 +41,7 @@ pub struct KnowledgeResponse {
     pub user_id: String,
     pub name: String,
     pub description: String,
+    pub kb_type: String,
     pub parent_id: Option<i64>,
     pub is_public: i32,
     pub file_count: i64,
@@ -38,6 +54,7 @@ pub struct KnowledgeDetailResponse {
     pub user_id: String,
     pub name: String,
     pub description: String,
+    pub kb_type: String,
     pub parent_id: Option<i64>,
     pub is_public: i32,
     pub children_kbs: Vec<Knowledge>,
@@ -87,7 +104,7 @@ pub async fn list(
 
     // Start building the query
     let mut qb = QueryBuilder::<Sqlite>::new(
-        "SELECT id, user_id, name, description, parent_id, is_public FROM knowledge_bases WHERE 1=1 ",
+        "SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE 1=1 ",
     );
     qb.push(" AND user_id = ").push_bind(auth_user.user_id);
 
@@ -131,6 +148,7 @@ pub async fn list(
             user_id: kb.user_id.clone(),
             name: kb.name.clone(),
             description: kb.description.clone(),
+            kb_type: kb.kb_type.clone(),
             parent_id: kb.parent_id,
             is_public: kb.is_public,
             file_count: *file_counts.get(&kb.id).unwrap_or(&0),
@@ -202,6 +220,7 @@ async fn get_file_counts(pool: &SqlitePool, knowledge_ids: &[i64]) -> anyhow::Re
 pub struct KnowledgeCreateReq {
     pub name: String,
     pub description: String,
+    pub kb_type: Option<String>,
     pub parent_id: Option<i64>,
     pub is_public: Option<bool>,
 }
@@ -227,21 +246,24 @@ pub async fn create(
     Json(knowledge): Json<KnowledgeCreateReq>,
 ) -> ApiResult<Json<Knowledge>> {
     let is_public = if knowledge.is_public.unwrap_or(false) { 1 } else { 0 };
-    let query = "INSERT INTO knowledge_bases (user_id, name, description, parent_id, is_public) VALUES (?, ?, ?, ?, ?)";
+    let kb_type = normalize_kb_type(knowledge.kb_type)?;
+    let query = "INSERT INTO knowledge_bases (user_id, name, description, kb_type, parent_id, is_public) VALUES (?, ?, ?, ?, ?, ?)";
     let id = sqlx::query(query)
         .bind(auth_user.user_id)
         .bind(knowledge.name)
         .bind(knowledge.description.clone())
+        .bind(kb_type)
         .bind(knowledge.parent_id)
         .bind(is_public)
         .execute(&pool)
         .await?
         .last_insert_rowid();
-    let kb =
-        sqlx::query_as("SELECT id, user_id, name, description, parent_id, is_public FROM knowledge_bases WHERE id = ?")
-            .bind(id)
-            .fetch_one(&pool)
-            .await?;
+    let kb = sqlx::query_as(
+        "SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await?;
     Ok(Json(kb))
 }
 
@@ -249,6 +271,7 @@ pub async fn create(
 pub struct KnowledgeUpdateReq {
     pub name: Option<String>,
     pub description: Option<String>,
+    pub kb_type: Option<String>,
     #[serde(default, with = "::serde_with::rust::double_option")]
     pub parent_id: Option<Option<i64>>,
     pub is_public: Option<bool>,
@@ -302,6 +325,12 @@ pub async fn update(
         separated.push_bind(description);
         has_update = true;
     }
+    if let Some(kb_type) = knowledge.kb_type {
+        let kb_type = normalize_kb_type(Some(kb_type))?;
+        separated.push("kb_type = ");
+        separated.push_bind(kb_type);
+        has_update = true;
+    }
     // With double_option, this correctly distinguishes "not present" from "present and null"
     if let Some(parent_id) = knowledge.parent_id {
         separated.push("parent_id = ");
@@ -317,7 +346,7 @@ pub async fn update(
     if !has_update {
         // If nothing is being updated, just return the current state of kb, ensuring it exists and belongs to user.
         let kb = sqlx::query_as(
-            "SELECT id, user_id, name, description, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
+            "SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
         )
         .bind(id)
         .bind(auth_user.user_id)
@@ -340,7 +369,7 @@ pub async fn update(
     }
 
     let kb = sqlx::query_as(
-        "SELECT id, user_id, name, description, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
+        "SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
     )
     .bind(id)
     .bind(auth_user.user_id)
@@ -372,7 +401,7 @@ pub async fn get(
 ) -> ApiResult<Json<KnowledgeDetailResponse>> {
     // 1. Fetch the main knowledge base and verify ownership
     let main_kb: Knowledge = sqlx::query_as(
-        "SELECT id, user_id, name, description, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
+        "SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
     )
     .bind(id)
     .bind(auth_user.user_id.clone())
@@ -382,7 +411,7 @@ pub async fn get(
     // 2. Fetch children KBs and files in parallel
     let (children_kbs_res, files_res) = tokio::join!(
         // Fetch children KBs
-        sqlx::query_as("SELECT id, user_id, name, description, parent_id, is_public FROM knowledge_bases WHERE parent_id = ? AND user_id = ? ORDER BY name")
+        sqlx::query_as("SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE parent_id = ? AND user_id = ? ORDER BY name")
             .bind(id)
             .bind(auth_user.user_id.clone())
             .fetch_all(&pool),
@@ -402,7 +431,7 @@ pub async fn get(
         // In a high-depth scenario, this could be slow. A recursive CTE would be faster.
         // But for typical UI breadcrumbs, this iterative approach is simpler and often sufficient.
         let parent_kb: Knowledge = sqlx::query_as(
-            "SELECT id, user_id, name, description, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
+            "SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
         )
         .bind(parent_id)
         .bind(auth_user.user_id.clone())
@@ -419,6 +448,7 @@ pub async fn get(
         user_id: main_kb.user_id,
         name: main_kb.name,
         description: main_kb.description,
+        kb_type: main_kb.kb_type,
         parent_id: main_kb.parent_id,
         is_public: main_kb.is_public,
         children_kbs,
@@ -571,7 +601,7 @@ pub async fn update_public(
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     sqlx::query(sql).bind(is_public).bind(now).bind(id).bind(&auth_user.user_id).execute(&pool).await?;
     let kb = sqlx::query_as(
-        "SELECT id, user_id, name, description, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
+        "SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
     )
     .bind(id)
     .bind(&auth_user.user_id)

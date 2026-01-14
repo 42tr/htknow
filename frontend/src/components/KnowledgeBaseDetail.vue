@@ -70,6 +70,12 @@ watch(() => props.kb.id, () => {
              ]">
                {{ kb.is_public === 1 ? '🌐 公开' : '🔒 私有' }}
              </span>
+             <span :class="[
+               'px-2 py-0.5 text-xs rounded-full border',
+               kb.kb_type === 'storage' ? 'bg-amber-50 text-amber-600 border-amber-200' : 'bg-indigo-50 text-indigo-600 border-indigo-200'
+             ]">
+               {{ kb.kb_type === 'storage' ? '🗄️ 存储型' : '🧠 分析型' }}
+             </span>
            </h2>
            <p class="text-sm text-slate-500">{{ kb.description || '暂无描述' }}</p>
          </div>
@@ -120,6 +126,7 @@ watch(() => props.kb.id, () => {
         v-for="file in files"
         :key="file.id"
         :file="file"
+        :kb-type="kb.kb_type"
         @updated="handleFileUpdated"
         @deleted="handleFileDeleted"
       />

@@ -14,6 +14,7 @@ const emit = defineEmits(['created'])
 const showModal = ref(false)
 const name = ref('')
 const description = ref('')
+const kbType = ref('analysis')
 const isPublic = ref(false)
 const creating = ref(false)
 const error = ref('')
@@ -31,12 +32,14 @@ const handleCreate = async () => {
     await api.createKnowledgeBase({
       name: name.value.trim(),
       description: description.value.trim(),
+      kb_type: kbType.value,
       parent_id: props.parentId,
       is_public: isPublic.value
     })
     showModal.value = false
     name.value = ''
     description.value = ''
+    kbType.value = 'analysis'
     isPublic.value = false
     emit('created')
   } catch (e) {
@@ -50,6 +53,7 @@ const closeModal = () => {
   showModal.value = false
   name.value = ''
   description.value = ''
+  kbType.value = 'analysis'
   error.value = ''
 }
 </script>
@@ -150,6 +154,44 @@ const closeModal = () => {
                        <span class="font-medium text-slate-800">公开</span>
                      </div>
                      <p class="text-xs text-slate-500">所有人可见</p>
+                   </div>
+                 </label>
+               </div>
+             </div>
+
+             <div>
+               <label class="block text-sm font-medium text-slate-700 mb-2">
+                 类型
+               </label>
+               <div class="flex gap-4">
+                 <label
+                   :class="[
+                     'flex-1 flex items-center gap-3 p-4 rounded-xl border-2 cursor-pointer transition-all',
+                     kbType === 'analysis' ? 'border-indigo-500 bg-indigo-50' : 'border-slate-200 hover:border-slate-300'
+                   ]"
+                 >
+                   <input type="radio" v-model="kbType" value="analysis" class="w-4 h-4 text-indigo-500" />
+                   <div>
+                     <div class="flex items-center gap-2 mb-1">
+                       <span class="text-lg">🧠</span>
+                       <span class="font-medium text-slate-800">分析型</span>
+                     </div>
+                     <p class="text-xs text-slate-500">解析并切片，支持搜索与知识图谱</p>
+                   </div>
+                 </label>
+                 <label
+                   :class="[
+                     'flex-1 flex items-center gap-3 p-4 rounded-xl border-2 cursor-pointer transition-all',
+                     kbType === 'storage' ? 'border-amber-500 bg-amber-50' : 'border-slate-200 hover:border-slate-300'
+                   ]"
+                 >
+                   <input type="radio" v-model="kbType" value="storage" class="w-4 h-4 text-amber-500" />
+                   <div>
+                     <div class="flex items-center gap-2 mb-1">
+                       <span class="text-lg">🗄️</span>
+                       <span class="font-medium text-slate-800">存储型</span>
+                     </div>
+                     <p class="text-xs text-slate-500">仅存储文件，不进行解析</p>
                    </div>
                  </label>
                </div>

@@ -123,8 +123,26 @@ pub async fn upload(
     if filename.is_empty() {
         return Err(ApiError::BadRequest("file is required".to_string()));
     }
+
+    let mut kb_type: Option<String> = None;
+    if let Some(kb_id_value) = kb_id {
+        let kb: Option<(String, Option<String>)> =
+            sqlx::query_as("SELECT user_id, kb_type FROM knowledge_bases WHERE id = ?")
+                .bind(kb_id_value)
+                .fetch_optional(&pool)
+                .await?;
+        let (kb_owner, kb_type_value) = kb.ok_or_else(|| ApiError::NotFound("Knowledge base not found".to_string()))?;
+        if kb_owner != auth_user.user_id {
+            return Err(ApiError::NotFound("Knowledge base not found or permission denied".to_string()));
+        }
+        kb_type = kb_type_value;
+    }
+
+    let is_storage_kb = matches!(kb_type.as_deref(), Some("storage"));
     let tags_json = serde_json::to_string(&tags)?;
-    let sql = "INSERT INTO files (user_id, hash, filename, path, slice_type, kb_id, is_public, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
+    let status = if is_storage_kb { 3 } else { 0 };
+    let log_message = if is_storage_kb { "Storage mode: not parsed" } else { "" };
+    let sql = "INSERT INTO files (user_id, hash, filename, path, slice_type, kb_id, is_public, tags, status, log) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     let id = sqlx::query(sql)
         .bind(auth_user.user_id)
         .bind(hash)
@@ -134,6 +152,8 @@ pub async fn upload(
         .bind(kb_id)
         .bind(is_public)
         .bind(tags_json)
+        .bind(status)
+        .bind(log_message)
         .execute(&pool)
         .await?
         .last_insert_rowid();
@@ -204,6 +224,15 @@ pub async fn update(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>, Path(id): Path<i64>,
     Json(req): Json<UpdateFileReq>,
 ) -> ApiResult<Json<File>> {
+    let kb_type: Option<String> =
+        sqlx::query_scalar("SELECT kb_type FROM knowledge_bases WHERE id = (SELECT kb_id FROM files WHERE id = ?)")
+            .bind(id)
+            .fetch_optional(&pool)
+            .await?;
+    if matches!(kb_type.as_deref(), Some("storage")) {
+        return Err(ApiError::BadRequest("Storage knowledge base files do not support parsing.".to_string()));
+    }
+
     search_engine.delete(Some(id), None).await?;
     let sql = "DELETE FROM slices WHERE file_id = ?";
     sqlx::query(sql).bind(id).execute(&pool).await?;

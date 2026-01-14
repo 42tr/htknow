@@ -11,18 +11,24 @@ const currentParent = ref(null);
 const breadcrumbs = ref([]);
 const childrenKbs = ref([]);
 const loading = ref(true);
+const currentKbInfo = ref(null);
 
 const loadPath = async (kbId) => {
   if (!kbId) {
     breadcrumbs.value = [];
-    return;
+    currentKbInfo.value = null;
+    return null;
   }
   try {
     const data = await api.getKnowledgeBase(kbId);
     breadcrumbs.value = [...data.path, { id: data.id, name: data.name }];
+    currentKbInfo.value = data;
+    return data;
   } catch (e) {
     console.error('Failed to load path', e);
+    currentKbInfo.value = null;
   }
+  return null;
 };
 
 const loadChildren = async (parentId) => {
@@ -32,6 +38,7 @@ const loadChildren = async (parentId) => {
     await loadPath(parentId);
   } else {
     breadcrumbs.value = [];
+    currentKbInfo.value = null;
   }
 
   try {
@@ -77,7 +84,15 @@ onMounted(() => {
           <div v-if="loading" class="text-center p-8">Loading...</div>
           <ul v-else class="divide-y divide-slate-100">
             <li v-for="kb in childrenKbs" :key="kb.id" class="p-3 flex justify-between items-center group">
-              <span class="text-slate-700">{{ kb.name }}</span>
+              <div class="flex items-center gap-2">
+                <span class="text-slate-700">{{ kb.name }}</span>
+                <span :class="[
+                  'px-2 py-0.5 text-xs rounded-full border',
+                  kb.kb_type === 'storage' ? 'bg-amber-50 text-amber-600 border-amber-200' : 'bg-indigo-50 text-indigo-600 border-indigo-200'
+                ]">
+                  {{ kb.kb_type === 'storage' ? '🗄️ 存储型' : '🧠 分析型' }}
+                </span>
+              </div>
               <div class="flex items-center gap-2">
                 <button @click="selectKb(kb)" class="text-sm text-blue-500 hover:underline">Select</button>
                 <button @click="navigate(kb.id)" class="text-sm text-slate-500 hover:underline opacity-50 group-hover:opacity-100">Open</button>
@@ -89,7 +104,10 @@ onMounted(() => {
 
         <!-- Current Folder Selection -->
         <div class="mt-4 pt-4 border-t border-slate-200">
-          <button @click="selectKb(currentParent ? {id: currentParent, name: breadcrumbs[breadcrumbs.length-1]?.name || 'Root'} : null)" class="w-full py-2 bg-slate-100 rounded-lg hover:bg-slate-200">
+          <button
+            @click="selectKb(currentParent ? {id: currentParent, name: breadcrumbs[breadcrumbs.length-1]?.name || 'Root', kb_type: currentKbInfo?.kb_type} : null)"
+            class="w-full py-2 bg-slate-100 rounded-lg hover:bg-slate-200"
+          >
             Select current folder: <span class="font-semibold">{{ currentParent ? (breadcrumbs[breadcrumbs.length-1]?.name || 'Root') : 'None (Top Level)' }}</span>
           </button>
         </div>

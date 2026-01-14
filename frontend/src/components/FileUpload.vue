@@ -1,9 +1,9 @@
 <script setup>
-import { ref } from 'vue'
+import { ref, computed } from 'vue'
 import { api } from '../api'
 import KnowledgeBaseSelector from './KnowledgeBaseSelector.vue'
 
-const selectedKb = ref({ id: null, name: '不分配到知识库' })
+const selectedKb = ref({ id: null, name: '不分配到知识库', kb_type: 'analysis' })
 const showKbSelector = ref(false)
 
 const files = ref([])
@@ -15,12 +15,13 @@ const tags = ref([])
 const newTag = ref('')
 const isPublic = ref(false)
 const sliceType = ref('smart')
+const isStorageKb = computed(() => selectedKb.value?.kb_type === 'storage')
 
 const handleKbSelect = (kb) => {
   if (kb) {
     selectedKb.value = kb
   } else {
-    selectedKb.value = { id: null, name: '不分配到知识库' }
+    selectedKb.value = { id: null, name: '不分配到知识库', kb_type: 'analysis' }
   }
 }
 
@@ -181,7 +182,17 @@ const handleUpload = async () => {
     </div>
 
     <!-- Slice Type Selection -->
-    <div class="bg-white rounded-xl p-5 border border-slate-200 mb-4">
+    <div v-if="isStorageKb" class="bg-white rounded-xl p-5 border border-slate-200 mb-4">
+      <label class="block text-sm font-medium text-slate-700 mb-3">切片方式</label>
+      <div class="flex items-center gap-3 p-4 rounded-xl border border-amber-200 bg-amber-50 text-amber-700 text-sm">
+        <span class="text-lg">🗄️</span>
+        <div>
+          <p class="font-medium">存储型知识库不进行解析</p>
+          <p class="text-xs text-amber-600">文件将直接保存，不会生成切片或知识图谱</p>
+        </div>
+      </div>
+    </div>
+    <div v-else class="bg-white rounded-xl p-5 border border-slate-200 mb-4">
       <label class="block text-sm font-medium text-slate-700 mb-3">切片方式</label>
       <div class="space-y-3">
         <label
