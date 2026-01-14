@@ -26,10 +26,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
 
     info!("Connecting to SQLite database...");
 
-    let pool = SqlitePoolOptions::new()
-        .max_connections(cfg.database.max_connections)
-        .connect(database_url)
-        .await?;
+    let pool = SqlitePoolOptions::new().max_connections(cfg.database.max_connections).connect(database_url).await?;
 
     info!("SQLite database connected successfully");
 

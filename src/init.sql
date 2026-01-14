@@ -10,6 +10,7 @@ CREATE TABLE IF NOT EXISTS files (
     log TEXT DEFAULT '', -- 日志
     slice_type TEXT DEFAULT '', -- 切片类型
     kb_id INTEGER DEFAULT NULL, -- 知识库ID
+    is_public INTEGER NOT NULL DEFAULT 0, -- 是否公开: 0-私有, 1-公开
     created_at INTEGER DEFAULT (strftime('%s','now')),
     updated_at INTEGER DEFAULT (strftime('%s','now'))
 );
@@ -20,6 +21,7 @@ CREATE TABLE IF NOT EXISTS knowledge_bases (
     name TEXT NOT NULL, -- 知识库名称
     description TEXT DEFAULT '', -- 知识库描述
     parent_id INTEGER, -- 父级知识库ID
+    is_public INTEGER NOT NULL DEFAULT 0, -- 是否公开: 0-私有, 1-公开
     created_at INTEGER DEFAULT (strftime('%s','now')),
     updated_at INTEGER DEFAULT (strftime('%s','now')),
     FOREIGN KEY(parent_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE
@@ -66,6 +68,7 @@ CREATE TABLE IF NOT EXISTS graph_nodes (
     embedding BLOB,                         -- 实体embedding向量
     file_id INTEGER,                        -- 来源文件ID
     kb_id INTEGER,                          -- 所属知识库ID
+    is_public INTEGER NOT NULL DEFAULT 0,   -- 是否公开: 0-私有, 1-公开
     created_at INTEGER DEFAULT (strftime('%s','now')),
     updated_at INTEGER DEFAULT (strftime('%s','now')),
     UNIQUE(name, entity_type, kb_id)       -- 同一知识库内，同类型实体名称唯一

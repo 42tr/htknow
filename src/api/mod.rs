@@ -1,4 +1,6 @@
-use axum::{Extension, Router, routing::get};
+use axum::{
+    Extension, Router, routing::{get, put}
+};
 use sqlx::SqlitePool;
 use utoipa::OpenApi;
 
@@ -21,6 +23,7 @@ use crate::search::SearchEngine;
         knowledge_base::create,
         knowledge_base::get,
         knowledge_base::update,
+        knowledge_base::update_public,
         knowledge_base::delete,
         // File
         file::upload,
@@ -28,6 +31,7 @@ use crate::search::SearchEngine;
         file::get,
         file::update,
         file::update_tags,
+        file::update_public,
         file::delete,
         file::get_slices,
         file::get_images,
@@ -46,9 +50,11 @@ use crate::search::SearchEngine;
             knowledge_base::KnowledgeResponse,
             knowledge_base::KnowledgeCreateReq,
             knowledge_base::KnowledgeUpdateReq,
+            knowledge_base::UpdateKbPublicReq,
             file::File,
             file::UpdateFileReq,
             file::UpdateTagsReq,
+            file::UpdatePublicReq,
             file::Slice,
             file::PdfImage,
             search::SearchResult,
@@ -84,11 +90,13 @@ pub fn openapi() -> utoipa::openapi::OpenApi {
 pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
     let knowledge_router = Router::new()
         .route("/", get(knowledge_base::list).post(knowledge_base::create))
-        .route("/{id}", get(knowledge_base::get).put(knowledge_base::update).delete(knowledge_base::delete));
+        .route("/{id}", get(knowledge_base::get).put(knowledge_base::update).delete(knowledge_base::delete))
+        .route("/{id}/public", put(knowledge_base::update_public));
     let file_router = Router::new()
         .route("/", get(file::list).post(file::upload))
         .route("/{id}", get(file::get).put(file::update).delete(file::delete))
-        .route("/{id}/tags", axum::routing::put(file::update_tags))
+        .route("/{id}/tags", put(file::update_tags))
+        .route("/{id}/public", put(file::update_public))
         .route("/{id}/slices", get(file::get_slices))
         .route("/{id}/images", get(file::get_images))
         .route("/{file_id}/images/{image_id}", get(file::get_image));

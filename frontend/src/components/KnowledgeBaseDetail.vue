@@ -61,10 +61,18 @@ watch(() => props.kb.id, () => {
         <div class="w-12 h-12 bg-linear-to-br from-blue-100 to-indigo-100 rounded-xl flex items-center justify-center">
           <span class="text-2xl">📚</span>
         </div>
-        <div>
-          <h2 class="text-xl font-bold text-slate-800">{{ kb.name }}</h2>
-          <p class="text-sm text-slate-500">{{ kb.description || '暂无描述' }}</p>
-        </div>
+         <div>
+           <h2 class="text-xl font-bold text-slate-800 flex items-center gap-2">
+             {{ kb.name }}
+             <span :class="[
+               'px-2 py-0.5 text-xs rounded-full border',
+               kb.is_public === 1 ? 'bg-green-50 text-green-600 border-green-200' : 'bg-slate-50 text-slate-600 border-slate-200'
+             ]">
+               {{ kb.is_public === 1 ? '🌐 公开' : '🔒 私有' }}
+             </span>
+           </h2>
+           <p class="text-sm text-slate-500">{{ kb.description || '暂无描述' }}</p>
+         </div>
       </div>
     </div>
 

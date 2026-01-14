@@ -25,6 +25,7 @@ pub struct File {
     pub log: String,
     pub slice_type: String,
     pub kb_id: Option<i64>,
+    pub is_public: i32,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -57,6 +58,7 @@ pub async fn upload(
     let mut filepath = String::new();
     let mut slice_type = String::new();
     let mut kb_id = None;
+    let mut is_public = 0i32;
     let mut tags: Vec<String> = Vec::new();
 
     loop {
@@ -96,6 +98,11 @@ pub async fn upload(
                             tags = serde_json::from_str(&tags_text).unwrap_or_default();
                         }
                     }
+                    Some("is_public") => {
+                        let is_public_text = field.text().await?;
+                        debug!("Is public text: {}", is_public_text);
+                        is_public = is_public_text.parse::<i32>().unwrap_or(0);
+                    }
                     _ => {
                         debug!("Skipping unknown field: {:?}", field_name);
                     }
@@ -117,7 +124,7 @@ pub async fn upload(
         return Err(ApiError::BadRequest("file is required".to_string()));
     }
     let tags_json = serde_json::to_string(&tags)?;
-    let sql = "INSERT INTO files (user_id, hash, filename, path, slice_type, kb_id, tags) VALUES (?, ?, ?, ?, ?, ?, ?)";
+    let sql = "INSERT INTO files (user_id, hash, filename, path, slice_type, kb_id, is_public, tags) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
     let id = sqlx::query(sql)
         .bind(auth_user.user_id)
         .bind(hash)
@@ -125,6 +132,7 @@ pub async fn upload(
         .bind(filepath)
         .bind(slice_type)
         .bind(kb_id)
+        .bind(is_public)
         .bind(tags_json)
         .execute(&pool)
         .await?
@@ -144,11 +152,22 @@ pub async fn upload(
     responses(
         (status = 200, description = "成功返回文件详情", body = File),
         (status = 404, description = "文件不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
-pub async fn get(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> ApiResult<Json<File>> {
+pub async fn get(
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<File>> {
     let query = "SELECT * FROM files WHERE id = ?";
-    let file = sqlx::query_as(query).bind(id).fetch_one(&pool).await?;
+    let file: File = sqlx::query_as(query).bind(id).fetch_one(&pool).await?;
+
+    if file.is_public == 0 && file.user_id != auth_user.user_id {
+        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
+    }
+
     Ok(Json(file))
 }
 
@@ -221,6 +240,46 @@ pub async fn update_tags(
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     sqlx::query(sql).bind(tags_json).bind(now).bind(id).execute(&pool).await?;
     let file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+    Ok(Json(file))
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct UpdatePublicReq {
+    pub is_public: bool,
+}
+
+/// 更新文件公开/私有状态
+#[utoipa::path(
+    put,
+    path = "/api/v1/knowledge/files/{id}/public",
+    tag = "file",
+    params(
+        ("id" = i64, Path, description = "文件 ID")
+    ),
+    request_body = UpdatePublicReq,
+    responses(
+        (status = 200, description = "成功更新公开/私有状态", body = File),
+        (status = 400, description = "请求参数错误"),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn update_public(
+    State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Path(id): Path<i64>,
+    Json(req): Json<UpdatePublicReq>,
+) -> ApiResult<Json<File>> {
+    let is_public = if req.is_public { 1 } else { 0 };
+    let sql = "UPDATE files SET is_public = ?, updated_at = ? WHERE id = ? AND user_id = ?";
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    sqlx::query(sql).bind(is_public).bind(now).bind(id).bind(&auth_user.user_id).execute(&pool).await?;
+    let file = sqlx::query_as("SELECT * FROM files WHERE id = ? AND user_id = ?")
+        .bind(id)
+        .bind(&auth_user.user_id)
+        .fetch_one(&pool)
+        .await?;
     Ok(Json(file))
 }
 
@@ -304,6 +363,21 @@ pub async fn list(
         // 查询特定知识库的文件
         Some(kb_id_str) => {
             let kb_id = kb_id_str.parse::<i64>().map_err(|_| ApiError::internal("Invalid kb_id format"))?;
+            // 检查知识库权限
+            let kb: Option<(String, i32)> =
+                sqlx::query_as("SELECT user_id, is_public FROM knowledge_bases WHERE id = ?")
+                    .bind(kb_id)
+                    .fetch_optional(&pool)
+                    .await?;
+
+            if let Some((kb_owner, is_public)) = kb {
+                if is_public == 0 && kb_owner != auth_user.user_id {
+                    return Err(ApiError::NotFound("Knowledge base not found or permission denied".to_string()));
+                }
+            } else {
+                return Err(ApiError::NotFound("Knowledge base not found".to_string()));
+            }
+
             sqlx::query_as("SELECT * FROM files WHERE user_id = ? AND kb_id = ? ORDER BY created_at DESC")
                 .bind(&auth_user.user_id)
                 .bind(kb_id)

@@ -17,6 +17,7 @@ pub struct Knowledge {
     pub name: String,
     pub description: String,
     pub parent_id: Option<i64>,
+    pub is_public: i32,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
@@ -26,6 +27,7 @@ pub struct KnowledgeResponse {
     pub name: String,
     pub description: String,
     pub parent_id: Option<i64>,
+    pub is_public: i32,
     pub file_count: i64,
     pub children_kb_count: i64,
 }
@@ -37,6 +39,7 @@ pub struct KnowledgeDetailResponse {
     pub name: String,
     pub description: String,
     pub parent_id: Option<i64>,
+    pub is_public: i32,
     pub children_kbs: Vec<Knowledge>,
     pub files: Vec<super::file::File>,
     pub path: Vec<Knowledge>, // For breadcrumbs
@@ -83,7 +86,9 @@ pub async fn list(
     let offset = (page - 1) * size;
 
     // Start building the query
-    let mut qb = QueryBuilder::<Sqlite>::new("SELECT id, user_id, name, description, parent_id FROM knowledge_bases WHERE 1=1 ");
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "SELECT id, user_id, name, description, parent_id, is_public FROM knowledge_bases WHERE 1=1 ",
+    );
     qb.push(" AND user_id = ").push_bind(auth_user.user_id);
 
     // Filter by parent_id
@@ -114,10 +119,8 @@ pub async fn list(
     let knowledge_ids: Vec<i64> = knowledges.iter().map(|kb| kb.id).collect();
 
     // Get file counts and children counts in parallel
-    let (file_counts_res, children_counts_res) = tokio::join!(
-        get_file_counts(&pool, &knowledge_ids),
-        get_children_kb_counts(&pool, &knowledge_ids)
-    );
+    let (file_counts_res, children_counts_res) =
+        tokio::join!(get_file_counts(&pool, &knowledge_ids), get_children_kb_counts(&pool, &knowledge_ids));
     let file_counts = file_counts_res?;
     let children_counts = children_counts_res?;
 
@@ -129,6 +132,7 @@ pub async fn list(
             name: kb.name.clone(),
             description: kb.description.clone(),
             parent_id: kb.parent_id,
+            is_public: kb.is_public,
             file_count: *file_counts.get(&kb.id).unwrap_or(&0),
             children_kb_count: *children_counts.get(&kb.id).unwrap_or(&0),
         })
@@ -183,7 +187,8 @@ async fn get_file_counts(pool: &SqlitePool, knowledge_ids: &[i64]) -> anyhow::Re
 
     let file_counts = rows
         .into_iter()
-        .filter_map(|row| { // Use filter_map for safety
+        .filter_map(|row| {
+            // Use filter_map for safety
             let kb_id: Option<i64> = row.get("kb_id"); // Get as Option
             let cnt: i64 = row.get("cnt");
             kb_id.map(|id| (id, cnt)) // Discard if kb_id is NULL
@@ -198,6 +203,7 @@ pub struct KnowledgeCreateReq {
     pub name: String,
     pub description: String,
     pub parent_id: Option<i64>,
+    pub is_public: Option<bool>,
 }
 
 /// 创建知识库
@@ -220,19 +226,22 @@ pub async fn create(
     State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
     Json(knowledge): Json<KnowledgeCreateReq>,
 ) -> ApiResult<Json<Knowledge>> {
-    let query = "INSERT INTO knowledge_bases (user_id, name, description, parent_id) VALUES (?, ?, ?, ?)";
+    let is_public = if knowledge.is_public.unwrap_or(false) { 1 } else { 0 };
+    let query = "INSERT INTO knowledge_bases (user_id, name, description, parent_id, is_public) VALUES (?, ?, ?, ?, ?)";
     let id = sqlx::query(query)
         .bind(auth_user.user_id)
         .bind(knowledge.name)
         .bind(knowledge.description.clone())
         .bind(knowledge.parent_id)
+        .bind(is_public)
         .execute(&pool)
         .await?
         .last_insert_rowid();
-    let kb = sqlx::query_as("SELECT id, user_id, name, description, parent_id FROM knowledge_bases WHERE id = ?")
-        .bind(id)
-        .fetch_one(&pool)
-        .await?;
+    let kb =
+        sqlx::query_as("SELECT id, user_id, name, description, parent_id, is_public FROM knowledge_bases WHERE id = ?")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
     Ok(Json(kb))
 }
 
@@ -242,6 +251,7 @@ pub struct KnowledgeUpdateReq {
     pub description: Option<String>,
     #[serde(default, with = "::serde_with::rust::double_option")]
     pub parent_id: Option<Option<i64>>,
+    pub is_public: Option<bool>,
 }
 
 /// 更新知识库
@@ -270,7 +280,9 @@ pub async fn update(
     // Prevent moving a knowledge base into itself.
     if let Some(Some(parent_id)) = knowledge.parent_id {
         if parent_id == id {
-            return Err(crate::api::error::ApiError::BadRequest("Cannot move a knowledge base into itself.".to_string()));
+            return Err(crate::api::error::ApiError::BadRequest(
+                "Cannot move a knowledge base into itself.".to_string(),
+            ));
         }
         // A full descendant check would be needed for production to prevent moving a KB into its own child.
         // This requires a recursive query and is omitted for this iteration.
@@ -296,14 +308,21 @@ pub async fn update(
         separated.push_bind(parent_id); // This binds Option<i64> which sqlx handles (None becomes NULL)
         has_update = true;
     }
+    if let Some(is_public) = knowledge.is_public {
+        separated.push("is_public = ");
+        separated.push_bind(if is_public { 1 } else { 0 });
+        has_update = true;
+    }
 
     if !has_update {
-        // If nothing is being updated, just return the current state of the kb, ensuring it exists and belongs to user.
-        let kb = sqlx::query_as("SELECT id, user_id, name, description, parent_id FROM knowledge_bases WHERE id = ? AND user_id = ?")
-            .bind(id)
-            .bind(auth_user.user_id)
-            .fetch_one(&pool)
-            .await?;
+        // If nothing is being updated, just return the current state of kb, ensuring it exists and belongs to user.
+        let kb = sqlx::query_as(
+            "SELECT id, user_id, name, description, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
+        )
+        .bind(id)
+        .bind(auth_user.user_id)
+        .fetch_one(&pool)
+        .await?;
         return Ok(Json(kb));
     }
 
@@ -315,14 +334,18 @@ pub async fn update(
     let result = qb.build().execute(&pool).await?;
 
     if result.rows_affected() == 0 {
-        return Err(crate::api::error::ApiError::NotFound("Knowledge base not found or permission denied.".to_string()));
+        return Err(crate::api::error::ApiError::NotFound(
+            "Knowledge base not found or permission denied.".to_string(),
+        ));
     }
 
-    let kb = sqlx::query_as("SELECT id, user_id, name, description, parent_id FROM knowledge_bases WHERE id = ? AND user_id = ?")
-        .bind(id)
-        .bind(auth_user.user_id)
-        .fetch_one(&pool)
-        .await?;
+    let kb = sqlx::query_as(
+        "SELECT id, user_id, name, description, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
+    )
+    .bind(id)
+    .bind(auth_user.user_id)
+    .fetch_one(&pool)
+    .await?;
     Ok(Json(kb))
 }
 
@@ -345,21 +368,21 @@ pub async fn update(
     )
 )]
 pub async fn get(
-    State(pool): State<SqlitePool>, 
-    Path(id): Path<i64>,
-    Extension(auth_user): Extension<AuthUser>
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<KnowledgeDetailResponse>> {
     // 1. Fetch the main knowledge base and verify ownership
-    let main_kb: Knowledge = sqlx::query_as("SELECT id, user_id, name, description, parent_id FROM knowledge_bases WHERE id = ? AND user_id = ?")
-        .bind(id)
-        .bind(auth_user.user_id.clone())
-        .fetch_one(&pool)
-        .await?;
+    let main_kb: Knowledge = sqlx::query_as(
+        "SELECT id, user_id, name, description, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
+    )
+    .bind(id)
+    .bind(auth_user.user_id.clone())
+    .fetch_one(&pool)
+    .await?;
 
     // 2. Fetch children KBs and files in parallel
     let (children_kbs_res, files_res) = tokio::join!(
         // Fetch children KBs
-        sqlx::query_as("SELECT id, user_id, name, description, parent_id FROM knowledge_bases WHERE parent_id = ? AND user_id = ? ORDER BY name")
+        sqlx::query_as("SELECT id, user_id, name, description, parent_id, is_public FROM knowledge_bases WHERE parent_id = ? AND user_id = ? ORDER BY name")
             .bind(id)
             .bind(auth_user.user_id.clone())
             .fetch_all(&pool),
@@ -378,11 +401,13 @@ pub async fn get(
     while let Some(parent_id) = current_parent_id {
         // In a high-depth scenario, this could be slow. A recursive CTE would be faster.
         // But for typical UI breadcrumbs, this iterative approach is simpler and often sufficient.
-        let parent_kb: Knowledge = sqlx::query_as("SELECT id, user_id, name, description, parent_id FROM knowledge_bases WHERE id = ? AND user_id = ?")
-            .bind(parent_id)
-            .bind(auth_user.user_id.clone())
-            .fetch_one(&pool)
-            .await?;
+        let parent_kb: Knowledge = sqlx::query_as(
+            "SELECT id, user_id, name, description, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
+        )
+        .bind(parent_id)
+        .bind(auth_user.user_id.clone())
+        .fetch_one(&pool)
+        .await?;
         current_parent_id = parent_kb.parent_id;
         path.push(parent_kb);
     }
@@ -395,6 +420,7 @@ pub async fn get(
         name: main_kb.name,
         description: main_kb.description,
         parent_id: main_kb.parent_id,
+        is_public: main_kb.is_public,
         children_kbs,
         files,
         path,
@@ -422,10 +448,8 @@ pub async fn get(
     )
 )]
 pub async fn delete(
-    State(pool): State<SqlitePool>, 
-    Extension(search_engine): Extension<SearchEngine>, 
-    Path(id): Path<i64>,
-    Extension(auth_user): Extension<AuthUser>
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>, Path(id): Path<i64>,
+    Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<()> {
     // 1. Get the list of all KB IDs to delete (the given one and all its descendants)
     // Use a recursive CTE to find all descendant knowledge bases, ensuring the root belongs to the user.
@@ -447,11 +471,13 @@ pub async fn delete(
 
     if all_kb_ids.is_empty() {
         // This means the initial ID was not found or didn't belong to the user
-        return Err(crate::api::error::ApiError::NotFound("Knowledge base not found or permission denied.".to_string()));
+        return Err(crate::api::error::ApiError::NotFound(
+            "Knowledge base not found or permission denied.".to_string(),
+        ));
     }
 
     // 2. Delete all associated data for these KBs
-    
+
     // Find all files in all these KBs
     let mut files_qb = QueryBuilder::new("SELECT * FROM files WHERE kb_id IN (");
     let mut files_separated = files_qb.separated(", ");
@@ -494,7 +520,7 @@ pub async fn delete(
     for kb_id in &all_kb_ids {
         search_engine.delete(None, Some(*kb_id)).await?;
     }
-    
+
     // 3. Delete the top-level KB. The ON DELETE CASCADE will handle the rest in knowledge_bases table.
     let result = sqlx::query("DELETE FROM knowledge_bases WHERE id = ? AND user_id = ?")
         .bind(id)
@@ -504,8 +530,52 @@ pub async fn delete(
 
     if result.rows_affected() == 0 {
         // This case should theoretically be caught by the descendant check, but as a safeguard:
-        return Err(crate::api::error::ApiError::NotFound("Knowledge base not found or permission denied.".to_string()));
+        return Err(crate::api::error::ApiError::NotFound(
+            "Knowledge base not found or permission denied.".to_string(),
+        ));
     }
 
     Ok(())
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct UpdateKbPublicReq {
+    pub is_public: bool,
+}
+
+/// 更新知识库公开/私有状态
+#[utoipa::path(
+    put,
+    path = "/api/v1/knowledge/knowledge_base/{id}/public",
+    tag = "knowledge_base",
+    params(
+        ("id" = i64, Path, description = "知识库 ID")
+    ),
+    request_body = UpdateKbPublicReq,
+    responses(
+        (status = 200, description = "成功更新公开/私有状态", body = Knowledge),
+        (status = 400, description = "请求参数错误"),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn update_public(
+    Path(id): Path<i64>, State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
+    Json(req): Json<UpdateKbPublicReq>,
+) -> ApiResult<Json<Knowledge>> {
+    let is_public = if req.is_public { 1 } else { 0 };
+    let sql = "UPDATE knowledge_bases SET is_public = ?, updated_at = ? WHERE id = ? AND user_id = ?";
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+    sqlx::query(sql).bind(is_public).bind(now).bind(id).bind(&auth_user.user_id).execute(&pool).await?;
+    let kb = sqlx::query_as(
+        "SELECT id, user_id, name, description, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
+    )
+    .bind(id)
+    .bind(&auth_user.user_id)
+    .fetch_one(&pool)
+    .await?;
+    Ok(Json(kb))
 }

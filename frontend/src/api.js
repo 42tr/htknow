@@ -70,13 +70,23 @@ export const api = {
     return response.json()
   },
 
-  async updateKnowledgeBase(id, data) { // data may include { name, description, parent_id }
+  async updateKnowledgeBase(id, data) { // data may include { name, description, parent_id, is_public }
     const response = await fetch(`${API_BASE}/knowledge_base/${id}`, {
       method: 'PUT',
       headers: getHeaders(),
       body: JSON.stringify(data),
     })
     if (!response.ok) throw new Error('更新知识库失败')
+    return response.json()
+  },
+
+  async updateKnowledgeBasePublic(id, isPublic) {
+    const response = await fetch(`${API_BASE}/knowledge_base/${id}/public`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify({ is_public: isPublic }),
+    })
+    if (!response.ok) throw new Error('更新公开/私有状态失败')
     return response.json()
   },
 
@@ -90,7 +100,7 @@ export const api = {
   },
 
   // 文件
-  async uploadFiles(knowledgeBaseId, files, tags = []) {
+  async uploadFiles(knowledgeBaseId, files, tags = [], isPublic = false) {
     const formData = new FormData()
     if (knowledgeBaseId) {
       formData.append('kb_id', knowledgeBaseId)
@@ -98,6 +108,7 @@ export const api = {
     if (tags.length > 0) {
       formData.append('tags', JSON.stringify(tags))
     }
+    formData.append('is_public', isPublic ? '1' : '0')
     for (const file of files) {
       formData.append('file', file)
     }
@@ -168,6 +179,16 @@ export const api = {
       body: JSON.stringify({ tags }),
     })
     if (!response.ok) throw new Error('更新标签失败')
+    return response.json()
+  },
+
+  async updateFilePublic(id, isPublic) {
+    const response = await fetch(`${API_BASE}/files/${id}/public`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify({ is_public: isPublic }),
+    })
+    if (!response.ok) throw new Error('更新公开/私有状态失败')
     return response.json()
   },
 

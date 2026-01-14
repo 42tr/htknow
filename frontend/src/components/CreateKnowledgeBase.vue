@@ -14,6 +14,7 @@ const emit = defineEmits(['created'])
 const showModal = ref(false)
 const name = ref('')
 const description = ref('')
+const isPublic = ref(false)
 const creating = ref(false)
 const error = ref('')
 
@@ -30,11 +31,13 @@ const handleCreate = async () => {
     await api.createKnowledgeBase({
       name: name.value.trim(),
       description: description.value.trim(),
-      parent_id: props.parentId
+      parent_id: props.parentId,
+      is_public: isPublic.value
     })
     showModal.value = false
     name.value = ''
     description.value = ''
+    isPublic.value = false
     emit('created')
   } catch (e) {
     error.value = e.message
@@ -102,17 +105,55 @@ const closeModal = () => {
               />
             </div>
 
-            <div>
-              <label class="block text-sm font-medium text-slate-700 mb-1.5">
-                描述
-              </label>
-              <textarea
-                v-model="description"
-                placeholder="输入知识库描述（可选）"
-                rows="3"
-                class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none"
-              ></textarea>
-            </div>
+             <div>
+               <label class="block text-sm font-medium text-slate-700 mb-1.5">
+                 描述
+               </label>
+               <textarea
+                 v-model="description"
+                 placeholder="输入知识库描述（可选）"
+                 rows="3"
+                 class="w-full px-4 py-3 bg-slate-50 border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent resize-none"
+               ></textarea>
+             </div>
+
+             <div>
+               <label class="block text-sm font-medium text-slate-700 mb-2">
+                 可见性
+               </label>
+               <div class="flex gap-4">
+                 <label
+                   :class="[
+                     'flex-1 flex items-center gap-3 p-4 rounded-xl border-2 cursor-pointer transition-all',
+                     !isPublic ? 'border-blue-500 bg-blue-50' : 'border-slate-200 hover:border-slate-300'
+                   ]"
+                 >
+                   <input type="radio" v-model="isPublic" :value="false" class="w-4 h-4 text-blue-500" />
+                   <div>
+                     <div class="flex items-center gap-2 mb-1">
+                       <span class="text-lg">🔒</span>
+                       <span class="font-medium text-slate-800">私有</span>
+                     </div>
+                     <p class="text-xs text-slate-500">仅自己可见</p>
+                   </div>
+                 </label>
+                 <label
+                   :class="[
+                     'flex-1 flex items-center gap-3 p-4 rounded-xl border-2 cursor-pointer transition-all',
+                     isPublic ? 'border-green-500 bg-green-50' : 'border-slate-200 hover:border-slate-300'
+                   ]"
+                 >
+                   <input type="radio" v-model="isPublic" :value="true" class="w-4 h-4 text-green-500" />
+                   <div>
+                     <div class="flex items-center gap-2 mb-1">
+                       <span class="text-lg">🌐</span>
+                       <span class="font-medium text-slate-800">公开</span>
+                     </div>
+                     <p class="text-xs text-slate-500">所有人可见</p>
+                   </div>
+                 </label>
+               </div>
+             </div>
 
             <p v-if="error" class="text-sm text-red-500">{{ error }}</p>
 

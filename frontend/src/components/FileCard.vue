@@ -44,6 +44,15 @@ const statusInfo = computed(() => {
   }
 })
 
+const publicInfo = computed(() => {
+  return {
+    isPublic: props.file.is_public === 1,
+    text: props.file.is_public === 1 ? '公开' : '私有',
+    color: props.file.is_public === 1 ? 'bg-green-50 text-green-600 border-green-200' : 'bg-slate-50 text-slate-600 border-slate-200',
+    icon: props.file.is_public === 1 ? '🌐' : '🔒'
+  }
+})
+
 const sliceTypeLabel = computed(() => {
   const type = sliceTypes.find(t => t.value === props.file.slice_type)
   return type ? type.label : '按段落'
@@ -122,6 +131,21 @@ const handleSaveTags = async () => {
     updating.value = false
   }
 }
+
+const handleTogglePublic = async () => {
+  const newPublic = !publicInfo.value.isPublic
+  if (!confirm(`确定要将文件设置为${newPublic ? '公开' : '私有'}吗？`)) return
+
+  updating.value = true
+  try {
+    await api.updateFilePublic(props.file.id, newPublic)
+    emit('updated')
+  } catch (e) {
+    alert('更新失败：' + e.message)
+  } finally {
+    updating.value = false
+  }
+}
 </script>
 
 <template>
@@ -140,6 +164,9 @@ const handleSaveTags = async () => {
             <h3 class="font-medium text-slate-800 truncate">{{ file.filename }}</h3>
             <span :class="['px-2 py-0.5 text-xs rounded-full', statusInfo.color]">
               {{ statusInfo.icon }} {{ statusInfo.text }}
+            </span>
+            <span :class="['px-2 py-0.5 text-xs rounded-full border', publicInfo.color]">
+              {{ publicInfo.icon }} {{ publicInfo.text }}
             </span>
           </div>
 
@@ -167,6 +194,18 @@ const handleSaveTags = async () => {
 
         <!-- Actions -->
         <div class="flex items-center gap-1">
+          <button
+            @click="handleTogglePublic"
+            class="p-2 text-slate-400 hover:text-green-500 hover:bg-green-50 rounded-lg transition-all"
+            :title="publicInfo.isPublic ? '设置为私有' : '设置为公开'"
+          >
+            <svg v-if="publicInfo.isPublic" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
+            </svg>
+            <svg v-else class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 002 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+            </svg>
+          </button>
           <button
             @click="openTagsEditor"
             class="p-2 text-slate-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all"

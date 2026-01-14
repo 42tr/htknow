@@ -13,6 +13,7 @@ const uploadError = ref('')
 const isDragging = ref(false)
 const tags = ref([])
 const newTag = ref('')
+const isPublic = ref(false)
 
 const handleKbSelect = (kb) => {
   if (kb) {
@@ -59,16 +60,17 @@ const removeTag = (index) => {
 
 const handleUpload = async () => {
   if (files.value.length === 0) return
-
+  
   uploading.value = true
   uploadStatus.value = ''
   uploadError.value = ''
-
+  
   try {
-    await api.uploadFiles(selectedKb.value?.id, files.value, tags.value)
+    await api.uploadFiles(selectedKb.value?.id, files.value, tags.value, isPublic.value)
     uploadStatus.value = `成功上传 ${files.value.length} 个文件到 "${selectedKb.value.name}"`
     files.value = []
     tags.value = []
+    isPublic.value = false
   } catch (e) {
     uploadError.value = e.message
   } finally {
@@ -137,6 +139,43 @@ const handleUpload = async () => {
       <p class="mt-2 text-xs text-slate-500">
         为上传的文件添加标签，方便分类和搜索
       </p>
+    </div>
+
+    <!-- Public/Private Toggle -->
+    <div class="bg-white rounded-xl p-5 border border-slate-200 mb-4">
+      <label class="block text-sm font-medium text-slate-700 mb-3">文件可见性</label>
+      <div class="flex gap-4">
+        <label
+          :class="[
+            'flex-1 flex items-center gap-3 p-4 rounded-xl border-2 cursor-pointer transition-all',
+            !isPublic ? 'border-blue-500 bg-blue-50' : 'border-slate-200 hover:border-slate-300'
+          ]"
+        >
+          <input type="radio" v-model="isPublic" :value="false" class="w-4 h-4 text-blue-500" />
+          <div>
+            <div class="flex items-center gap-2 mb-1">
+              <span class="text-lg">🔒</span>
+              <span class="font-medium text-slate-800">私有</span>
+            </div>
+            <p class="text-xs text-slate-500">仅自己可见</p>
+          </div>
+        </label>
+        <label
+          :class="[
+            'flex-1 flex items-center gap-3 p-4 rounded-xl border-2 cursor-pointer transition-all',
+            isPublic ? 'border-green-500 bg-green-50' : 'border-slate-200 hover:border-slate-300'
+          ]"
+        >
+          <input type="radio" v-model="isPublic" :value="true" class="w-4 h-4 text-green-500" />
+          <div>
+            <div class="flex items-center gap-2 mb-1">
+              <span class="text-lg">🌐</span>
+              <span class="font-medium text-slate-800">公开</span>
+            </div>
+            <p class="text-xs text-slate-500">所有人可见</p>
+          </div>
+        </label>
+      </div>
     </div>
 
     <!-- Drop Zone -->

@@ -22,7 +22,8 @@ impl KnowledgeGraph {
         let mut node_index = HashMap::new();
         let mut node_id_to_index = HashMap::new();
 
-        let nodes_where_clause = if let Some(kb_id) = kb_id { format!("WHERE kb_id = {}", kb_id) } else { "".to_string() };
+        let nodes_where_clause =
+            if let Some(kb_id) = kb_id { format!("WHERE kb_id = {}", kb_id) } else { "".to_string() };
 
         // 加载节点
         let nodes_sql = format!("SELECT id, name, entity_type, properties FROM graph_nodes {}", nodes_where_clause);
@@ -44,7 +45,8 @@ impl KnowledgeGraph {
         }
 
         // 加载边（使用 n1.kb_id 避免歧义）
-        let edges_where_clause = if let Some(kb_id) = kb_id { format!("WHERE n1.kb_id = {}", kb_id) } else { "".to_string() };
+        let edges_where_clause =
+            if let Some(kb_id) = kb_id { format!("WHERE n1.kb_id = {}", kb_id) } else { "".to_string() };
         let edges_sql = format!(
             "SELECT e.id, e.source_node_id, e.target_node_id, e.relation_type, e.properties, e.weight \
              FROM graph_edges e \

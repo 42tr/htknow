@@ -125,7 +125,7 @@ fn build_query(
             TermQuery::new(Term::from_field_i64(get_field(schema, "file_id"), file_id), IndexRecordOption::Basic);
         subqueries.push((Occur::Must, Box::new(file_id_query)));
     }
-    
+
     if let Some(ids) = kb_ids {
         if !ids.is_empty() {
             let mut kb_id_queries = Vec::new();

@@ -1,9 +1,5 @@
 use axum::{
-    body::Body,
-    http::{header, StatusCode, Uri},
-    response::{IntoResponse, Response},
-    Router,
-    routing::get,
+    Router, body::Body, http::{StatusCode, Uri, header}, response::{IntoResponse, Response}, routing::get
 };
 use rust_embed::Embed;
 
@@ -27,9 +23,7 @@ async fn index_handler() -> impl IntoResponse {
 fn serve_file(path: &str) -> Response {
     match Assets::get(path) {
         Some(content) => {
-            let mime = mime_guess::from_path(path)
-                .first_or_octet_stream()
-                .to_string();
+            let mime = mime_guess::from_path(path).first_or_octet_stream().to_string();
 
             Response::builder()
                 .status(StatusCode::OK)
@@ -37,15 +31,10 @@ fn serve_file(path: &str) -> Response {
                 .body(Body::from(content.data.into_owned()))
                 .unwrap()
         }
-        None => Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::from("Not Found"))
-            .unwrap(),
+        None => Response::builder().status(StatusCode::NOT_FOUND).body(Body::from("Not Found")).unwrap(),
     }
 }
 
 pub fn router() -> Router {
-    Router::new()
-        .route("/", get(index_handler))
-        .route("/{*path}", get(static_handler))
+    Router::new().route("/", get(index_handler)).route("/{*path}", get(static_handler))
 }
