@@ -461,8 +461,9 @@ impl FileProcessor {
             full_content.push_str("\n\n");
         }
 
+        let index_full_content = format!("{}\n\n{}", file.filename, full_content);
         self.search_engine
-            .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, full_content.clone()))
+            .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
             .await?;
 
         // 更新文件状态
@@ -495,8 +496,9 @@ impl FileProcessor {
             self.search_engine.write(tantivy_engine::Document::new(id, file.id, file.kb_id, slice)).await?;
         }
 
+        let index_full_content = format!("{}\n\n{}", file.filename, content);
         self.search_engine
-            .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, content.clone()))
+            .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
             .await?;
 
         // 更新文件状态为已处理，并保存内容
