@@ -4,12 +4,12 @@ use axum::{
 use log::debug;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tokio::{fs, io::AsyncWriteExt as _};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    AuthUser, api::error::{ApiError, ApiResult}, search::SearchEngine
+    AuthUser, api::error::{ApiError, ApiResult}, config, search::SearchEngine
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
@@ -332,6 +332,12 @@ pub async fn delete(
     let file: File = sqlx::query_as(query).bind(id).fetch_one(&pool).await?;
     fs::remove_file(file.path).await?;
 
+    let cfg = config::get();
+    let pdf_path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", id));
+    if let Err(e) = fs::remove_file(&pdf_path).await {
+        log::warn!("Failed to delete converted pdf {}: {}", pdf_path.display(), e);
+    }
+
     // 删除 PDF 图片
     let images: Vec<PdfImage> =
         sqlx::query_as("SELECT * FROM pdf_images WHERE file_id = ?").bind(id).fetch_all(&pool).await?;
@@ -432,13 +438,31 @@ pub async fn list(
     Ok(Json(files))
 }
 
-#[derive(Serialize, sqlx::FromRow, ToSchema)]
+#[derive(Debug, Clone, Serialize, sqlx::FromRow, ToSchema)]
 pub struct Slice {
     pub id: i64,
     pub file_id: i64,
     pub content: String,
     pub created_at: i64,
     pub updated_at: i64,
+    #[sqlx(skip)]
+    pub positions: Option<Vec<SlicePosition>>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SlicePosition {
+    pub page_idx: i32,
+    pub bbox: [i32; 4],
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct SlicePositionRow {
+    slice_id: i64,
+    page_idx: i32,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
 }
 
 /// 获取文件的所有切片
@@ -455,7 +479,35 @@ pub struct Slice {
     )
 )]
 pub async fn get_slices(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> ApiResult<Json<Vec<Slice>>> {
-    let slices = sqlx::query_as("SELECT * FROM slices WHERE file_id = ? ORDER BY id").bind(id).fetch_all(&pool).await?;
+    let mut slices: Vec<Slice> =
+        sqlx::query_as("SELECT * FROM slices WHERE file_id = ? ORDER BY id").bind(id).fetch_all(&pool).await?;
+    if slices.is_empty() {
+        return Ok(Json(slices));
+    }
+
+    let slice_ids: Vec<i64> = slices.iter().map(|s| s.id).collect();
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "SELECT slice_id, page_idx, x1, y1, x2, y2 FROM slice_positions WHERE slice_id IN (",
+    );
+    let mut separated = qb.separated(", ");
+    for slice_id in slice_ids {
+        separated.push_bind(slice_id);
+    }
+    qb.push(") ORDER BY slice_id, page_idx, id");
+
+    let rows: Vec<SlicePositionRow> = qb.build_query_as().fetch_all(&pool).await?;
+    let mut position_map: std::collections::HashMap<i64, Vec<SlicePosition>> = std::collections::HashMap::new();
+    for row in rows {
+        position_map
+            .entry(row.slice_id)
+            .or_default()
+            .push(SlicePosition { page_idx: row.page_idx, bbox: [row.x1, row.y1, row.x2, row.y2] });
+    }
+
+    for slice in &mut slices {
+        slice.positions = position_map.get(&slice.id).cloned();
+    }
+
     Ok(Json(slices))
 }
 
@@ -514,6 +566,50 @@ pub async fn get_image(
 
     let file_content = tokio::fs::read(&image.path).await?;
     let mime_type = mime_guess::from_path(&image.filename).first_or_octet_stream().to_string();
+
+    Ok((StatusCode::OK, [(header::CONTENT_TYPE, mime_type)], Body::from(file_content)))
+}
+
+/// 获取文件内容
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/files/{id}/content",
+    tag = "file",
+    params(
+        ("id" = i64, Path, description = "文件 ID")
+    ),
+    responses(
+        (status = 200, description = "成功返回文件内容", content_type = "application/octet-stream"),
+        (status = 404, description = "文件不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn get_content(
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
+) -> Result<(StatusCode, [(header::HeaderName, String); 1], Body), ApiError> {
+    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+
+    if file.is_public == 0 && file.user_id != auth_user.user_id {
+        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
+    }
+
+    let filename_lower = file.filename.to_lowercase();
+    let (path, filename) = if filename_lower.ends_with(".doc") || filename_lower.ends_with(".docx") {
+        let cfg = config::get();
+        let pdf_path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", file.id));
+        if !tokio::fs::try_exists(&pdf_path).await? {
+            return Err(ApiError::NotFound("Converted PDF not found".to_string()));
+        }
+        (pdf_path, format!("{}.pdf", file.id))
+    } else {
+        (std::path::PathBuf::from(&file.path), file.filename.clone())
+    };
+
+    let file_content = tokio::fs::read(&path).await?;
+    let mime_type = mime_guess::from_path(&filename).first_or_octet_stream().to_string();
 
     Ok((StatusCode::OK, [(header::CONTENT_TYPE, mime_type)], Body::from(file_content)))
 }

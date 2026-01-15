@@ -4,7 +4,7 @@ use axum::{
     Extension, extract::{Multipart, Query, State}, response::Json
 };
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
@@ -54,11 +54,29 @@ pub struct SearchResultItem {
     pub file: Option<FileInfo>,
     /// 知识库信息
     pub kb: Option<KbInfo>,
+    /// 切片位置
+    pub positions: Option<Vec<SlicePosition>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SearchResult {
     pub results: Vec<SearchResultItem>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SlicePosition {
+    pub page_idx: i32,
+    pub bbox: [i32; 4],
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct SlicePositionRow {
+    slice_id: i64,
+    page_idx: i32,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
 }
 
 /// 全文搜索结果项
@@ -142,15 +160,17 @@ pub async fn search(
         return Ok(Json(SearchResult { results: vec![] }));
     }
 
-    // 收集所有 file_id 和 kb_id
+    // 收集所有 file_id、kb_id 和 slice_id
     let file_ids: Vec<i64> = raw_results.iter().map(|r| r.file_id).collect();
     let kb_ids: Vec<i64> = raw_results.iter().filter_map(|r| r.kb_id).collect();
+    let slice_ids: Vec<i64> = raw_results.iter().map(|r| r.id).collect();
 
     // 批量查询文件信息
     let file_map = get_files_by_ids(&pool, &file_ids).await?;
 
     // 批量查询知识库信息
     let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(&pool, &kb_ids).await? } else { HashMap::new() };
+    let slice_positions = get_slice_positions(&pool, &slice_ids).await?;
 
     // 克隆 user_id 用于闭包
     let user_id = auth_user.user_id.clone();
@@ -177,7 +197,14 @@ pub async fn search(
             };
 
             if has_permission {
-                Some(SearchResultItem { id: r.id, content: r.content, score: r.score, file, kb })
+                Some(SearchResultItem {
+                    id: r.id,
+                    content: r.content,
+                    score: r.score,
+                    file,
+                    kb,
+                    positions: slice_positions.get(&r.id).cloned(),
+                })
             } else {
                 None
             }
@@ -342,15 +369,18 @@ pub async fn search_with_graph(
         return Ok(Json(SearchResult { results: vec![] }));
     }
 
-    // 收集所有 file_id 和 kb_id
+    // 收集所有 file_id、kb_id 和 slice_id
     let file_ids: Vec<i64> = raw_results.iter().map(|r| r.file_id).collect();
     let kb_ids: Vec<i64> = raw_results.iter().filter_map(|r| r.kb_id).collect();
+    let slice_ids: Vec<i64> = raw_results.iter().map(|r| r.id).collect();
 
     // 批量查询文件信息
     let file_map = get_files_by_ids(&pool, &file_ids).await?;
 
     // 批量查询知识库信息
     let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(&pool, &kb_ids).await? } else { HashMap::new() };
+
+    let slice_positions = get_slice_positions(&pool, &slice_ids).await?;
 
     // 克隆 user_id 用于闭包
     let user_id = auth_user.user_id.clone();
@@ -377,7 +407,14 @@ pub async fn search_with_graph(
             };
 
             if has_permission {
-                Some(SearchResultItem { id: r.id, content: r.content, score: r.score, file, kb })
+                Some(SearchResultItem {
+                    id: r.id,
+                    content: r.content,
+                    score: r.score,
+                    file,
+                    kb,
+                    positions: slice_positions.get(&r.id).cloned(),
+                })
             } else {
                 None
             }
@@ -489,9 +526,11 @@ pub async fn search_image(
 
     let file_ids: Vec<i64> = raw_results.iter().map(|r| r.file_id).collect();
     let kb_ids: Vec<i64> = raw_results.iter().filter_map(|r| r.kb_id).collect();
+    let slice_ids: Vec<i64> = raw_results.iter().map(|r| r.id).collect();
 
     let file_map = get_files_by_ids(&pool, &file_ids).await?;
     let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(&pool, &kb_ids).await? } else { HashMap::new() };
+    let slice_positions = get_slice_positions(&pool, &slice_ids).await?;
 
     let user_id = auth_user.user_id.clone();
     let results = raw_results
@@ -509,7 +548,14 @@ pub async fn search_image(
             };
 
             if has_permission {
-                Some(SearchResultItem { id: r.id, content: r.content, score: r.score, file, kb })
+                Some(SearchResultItem {
+                    id: r.id,
+                    content: r.content,
+                    score: r.score,
+                    file,
+                    kb,
+                    positions: slice_positions.get(&r.id).cloned(),
+                })
             } else {
                 None
             }
@@ -535,6 +581,34 @@ async fn get_files_by_ids(pool: &SqlitePool, file_ids: &[i64]) -> Result<HashMap
 
     let files: Vec<FileInfo> = q.fetch_all(pool).await?;
     Ok(files.into_iter().map(|f| (f.id, f)).collect())
+}
+
+async fn get_slice_positions(
+    pool: &SqlitePool, slice_ids: &[i64],
+) -> Result<HashMap<i64, Vec<SlicePosition>>, sqlx::Error> {
+    if slice_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "SELECT slice_id, page_idx, x1, y1, x2, y2 FROM slice_positions WHERE slice_id IN (",
+    );
+    let mut separated = qb.separated(", ");
+    for slice_id in slice_ids {
+        separated.push_bind(slice_id);
+    }
+    qb.push(") ORDER BY slice_id, page_idx, id");
+    let rows: Vec<SlicePositionRow> = qb.build_query_as().fetch_all(pool).await?;
+
+    let mut slice_positions: HashMap<i64, Vec<SlicePosition>> = HashMap::new();
+    for row in rows {
+        slice_positions
+            .entry(row.slice_id)
+            .or_default()
+            .push(SlicePosition { page_idx: row.page_idx, bbox: [row.x1, row.y1, row.x2, row.y2] });
+    }
+
+    Ok(slice_positions)
 }
 
 async fn get_kbs_by_ids(pool: &SqlitePool, kb_ids: &[i64]) -> Result<HashMap<i64, KbInfo>, sqlx::Error> {

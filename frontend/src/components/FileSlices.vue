@@ -32,6 +32,27 @@ const toggleExpand = (id) => {
   expandedSlice.value = expandedSlice.value === id ? null : id
 }
 
+const isPdfOrWordFile = (filename) => {
+  if (!filename) return false
+  return /\.(pdf|doc|docx)$/i.test(filename)
+}
+
+const canHighlight = (slice) =>
+  isPdfOrWordFile(props.file?.filename) && Array.isArray(slice?.positions) && slice.positions.length > 0
+
+const openViewer = (slice) => {
+  if (!canHighlight(slice)) return
+  const params = new URLSearchParams({
+    file_id: String(props.file.id),
+    slice_id: String(slice.id),
+  })
+  if (Array.isArray(slice.positions) && slice.positions.length > 0) {
+    params.set('positions', btoa(JSON.stringify(slice.positions)))
+  }
+  const url = `/pdf-highlight.html?${params.toString()}`
+  window.open(url, '_blank', 'noopener')
+}
+
 const truncateText = (text, maxLength = 200) => {
   if (!text || text.length <= maxLength) return text
   return text.substring(0, maxLength) + '...'
@@ -96,21 +117,32 @@ onMounted(() => {
               :key="slice.id"
               class="bg-slate-50 rounded-xl border border-slate-200 overflow-hidden"
             >
-              <div
-                @click="toggleExpand(slice.id)"
-                class="p-4 cursor-pointer hover:bg-slate-100 transition-colors"
-              >
+              <div class="p-4 hover:bg-slate-100 transition-colors">
                 <div class="flex items-start gap-3">
-                  <span class="flex-shrink-0 w-8 h-8 bg-white border border-slate-200 rounded-lg flex items-center justify-center text-sm font-medium text-slate-600">
+                  <span class="shrink-0 w-8 h-8 bg-white border border-slate-200 rounded-lg flex items-center justify-center text-sm font-medium text-slate-600">
                     {{ index + 1 }}
                   </span>
                   <div class="flex-1 min-w-0">
-                    <p class="text-sm text-slate-700 whitespace-pre-wrap break-words">
+                    <p
+                      class="text-sm text-slate-700 whitespace-pre-wrap wrap-break-words cursor-pointer"
+                      @click="toggleExpand(slice.id)"
+                    >
                       {{ expandedSlice === slice.id ? slice.content : truncateText(slice.content) }}
                     </p>
                     <p v-if="slice.content && slice.content.length > 200" class="mt-2 text-xs text-blue-500">
                       {{ expandedSlice === slice.id ? '点击收起' : '点击展开全部' }}
                     </p>
+                    <div v-if="canHighlight(slice)" class="mt-3">
+                      <button
+                        class="inline-flex items-center gap-1 text-xs font-medium text-amber-700 bg-amber-50 px-2.5 py-1 rounded-full hover:bg-amber-100"
+                        @click="openViewer(slice)"
+                      >
+                        <span>定位原文</span>
+                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                        </svg>
+                      </button>
+                    </div>
                   </div>
                 </div>
               </div>
@@ -130,4 +162,5 @@ onMounted(() => {
       </div>
     </div>
   </Teleport>
+
 </template>

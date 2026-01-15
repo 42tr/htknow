@@ -103,6 +103,8 @@ pub struct StorageConfig {
     pub temp_path: String,
     /// 图片保存路径
     pub images_path: String,
+    /// 转换后的 PDF 保存路径
+    pub pdf_path: String,
 }
 
 /// 搜索配置
@@ -206,6 +208,7 @@ impl StorageConfig {
             lancedb_path: env_or("HTKNOW_LANCEDB_PATH", &format!("{}/lancedb_data", data_dir)),
             temp_path: env_or("HTKNOW_TEMP_PATH", &format!("{}/temp", data_dir)),
             images_path: env_or("HTKNOW_IMAGES_PATH", &format!("{}/images", data_dir)),
+            pdf_path: env_or("HTKNOW_PDF_PATH", &format!("{}/pdfs", data_dir)),
         }
     }
 }

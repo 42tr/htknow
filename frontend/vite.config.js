@@ -4,6 +4,12 @@ import tailwindcss from '@tailwindcss/vite'
 
 export default defineConfig({
   plugins: [vue(), tailwindcss()],
+  optimizeDeps: {
+    include: ['pdfjs-dist'],
+  },
+  resolve: {
+    dedupe: ['pdfjs-dist'],
+  },
   build: {
     outDir: 'dist',
     emptyOutDir: true,

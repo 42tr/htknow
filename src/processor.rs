@@ -1,4 +1,6 @@
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::{HashMap, HashSet}, time::Duration
+};
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use log::{debug, error, info, warn};
@@ -75,6 +77,25 @@ struct ContentItem {
     table_body: Option<String>,
     #[serde(default)]
     table_caption: Option<Vec<String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+struct SlicePosition {
+    page_idx: i32,
+    bbox: [i32; 4],
+}
+
+#[derive(Debug, Clone)]
+struct SliceWithPositions {
+    content: String,
+    positions: Vec<SlicePosition>,
+}
+
+#[derive(Debug, Clone)]
+struct Segment {
+    start: usize,
+    end: usize,
+    positions: Vec<SlicePosition>,
 }
 
 /// 文件处理器：定时从数据库读取未处理的文件并处理
@@ -202,6 +223,8 @@ impl FileProcessor {
         let cfg = config::get();
         let temp_dir = std::path::Path::new(&cfg.storage.temp_path);
         fs::create_dir_all(temp_dir).await?;
+        let pdf_dir = std::path::Path::new(&cfg.storage.pdf_path);
+        fs::create_dir_all(pdf_dir).await?;
 
         // 生成临时 PDF 文件路径
         let pdf_filename = format!("{}.pdf", file.id);
@@ -221,15 +244,19 @@ impl FileProcessor {
         // 查找生成的 PDF 文件
         // LibreOffice 会使用原文件名（不含扩展名）+ .pdf
         let converted_pdf_path = temp_dir.join(format!("{}.pdf", file.path.split("/").last().unwrap()));
+        let stored_pdf_path = pdf_dir.join(&pdf_filename);
 
         // 检查转换后的 PDF 是否存在
         if !tokio::fs::try_exists(&converted_pdf_path).await? {
             return Err(anyhow::anyhow!("Converted PDF file not found: {:?}", converted_pdf_path));
         }
 
+        // 保存转换后的 PDF 以便溯源高亮
+        fs::copy(&converted_pdf_path, &stored_pdf_path).await?;
+
         // 创建临时 File 结构用于处理 PDF
         let mut temp_file = file.clone();
-        temp_file.path = converted_pdf_path.to_string_lossy().to_string();
+        temp_file.path = stored_pdf_path.to_string_lossy().to_string();
         temp_file.filename = pdf_filename;
 
         // 使用 process_pdf_file 处理转换后的 PDF
@@ -250,41 +277,47 @@ impl FileProcessor {
         // 先检查 pdf_contents 表中是否已有该文件的数据
         let check_sql = "SELECT COUNT(*) as count FROM pdf_contents WHERE file_id = ?";
         let count: (i64,) = sqlx::query_as(check_sql).bind(file.id).fetch_one(&self.pool).await?;
+        let bbox_sql =
+            "SELECT COUNT(*) as count FROM pdf_contents WHERE file_id = ? AND bbox IS NOT NULL AND bbox != ''";
+        let bbox_count: (i64,) = sqlx::query_as(bbox_sql).bind(file.id).fetch_one(&self.pool).await?;
 
         let content_list: Vec<ContentItem>;
 
-        if count.0 > 0 {
+        if count.0 > 0 && bbox_count.0 > 0 {
             // 已有数据，直接从数据库读取
             info!("Found existing PDF contents in database for file {}, skipping MinerU API call", file.id);
 
-            let fetch_sql = "SELECT page_idx, text, text_level, img_path, table_body FROM pdf_contents WHERE file_id = ? ORDER BY page_idx, id";
-            let rows: Vec<(i32, Option<String>, Option<i32>, Option<String>, Option<String>)> =
+            let fetch_sql = "SELECT page_idx, bbox, text, text_level, img_path, table_body FROM pdf_contents WHERE file_id = ? ORDER BY page_idx, id";
+            let rows: Vec<(i32, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>)> =
                 sqlx::query_as(fetch_sql).bind(file.id).fetch_all(&self.pool).await?;
 
             // 将数据库记录转换为 ContentItem
             content_list = rows
                 .iter()
                 .map(|row| {
-                    let typ = if row.1.is_some() {
+                    let typ = if row.2.is_some() {
                         "text".to_string()
-                    } else if row.3.is_some() {
-                        "image".to_string()
                     } else if row.4.is_some() {
+                        "image".to_string()
+                    } else if row.5.is_some() {
                         "table".to_string()
                     } else {
                         "unknown".to_string()
                     };
 
+                    let bbox =
+                        row.1.as_ref().and_then(|bbox| serde_json::from_str::<Vec<i32>>(bbox).ok()).unwrap_or_default();
+
                     ContentItem {
                         typ,
-                        bbox: vec![],
+                        bbox,
                         page_idx: row.0,
-                        text: row.1.clone(),
-                        text_level: row.2,
+                        text: row.2.clone(),
+                        text_level: row.3,
                         text_format: None,
-                        img_path: row.3.clone(),
+                        img_path: row.4.clone(),
                         image_caption: None,
-                        table_body: row.4.clone(),
+                        table_body: row.5.clone(),
                         table_caption: None,
                     }
                 })
@@ -342,12 +375,21 @@ impl FileProcessor {
 
             // 只有在有有效内容时才插入数据库
             if !valid_content_items.is_empty() {
+                if count.0 > 0 {
+                    sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(file.id).execute(&self.pool).await?;
+                }
                 let mut pdf_sql = QueryBuilder::<Sqlite>::new(
-                    "insert into pdf_contents(file_id, page_idx, text, text_level, img_path, table_body) ",
+                    "insert into pdf_contents(file_id, page_idx, bbox, text, text_level, img_path, table_body) ",
                 );
                 pdf_sql.push_values(valid_content_items.iter(), |mut b, item| {
+                    let bbox = if item.bbox.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::to_string(&item.bbox).unwrap_or_default())
+                    };
                     b.push_bind(file.id)
                         .push_bind(item.page_idx)
+                        .push_bind(bbox)
                         .push_bind(&item.text)
                         .push_bind(item.text_level)
                         .push_bind(&item.img_path)
@@ -369,99 +411,55 @@ impl FileProcessor {
             }
         }
 
+        let (full_content, full_segments) = self.build_full_content_and_segments(&content_list);
+
         // 根据 slice_type 决定切片方式
         let slices = if file.slice_type == "smart" || file.slice_type.is_empty() {
             // 智能切片：使用 content_list
-            self.smart_slice_content(&content_list)?
+            self.smart_slice_content_with_positions(&content_list)?
+        } else if file.slice_type == "fixed" {
+            self.fixed_slice_content_with_positions(&full_content, &full_segments)?
         } else {
-            // 其他方式：先拼接成完整内容再切片
-            let mut full_content = String::new();
-            for pdf_content in &content_list {
-                if pdf_content.typ == "discarded" {
-                    continue;
-                }
-                if pdf_content.typ == "text" {
-                    if let Some(text) = &pdf_content.text {
-                        if let Some(lv) = pdf_content.text_level {
-                            full_content.push_str("#".repeat(lv as usize).as_str());
-                            full_content.push_str(" ");
-                        }
-                        full_content.push_str(&text);
-                    }
-                } else if pdf_content.typ == "image" {
-                    if let Some(img_name) = &pdf_content.img_path {
-                        full_content.push_str(&format!("![{}](images/{})", img_name, img_name,));
-                    }
-                    if let Some(captions) = &pdf_content.image_caption {
-                        for caption in captions {
-                            full_content.push_str(&format!("{}", caption));
-                        }
-                    }
-                } else if pdf_content.typ == "table" {
-                    if let Some(table_caption) = &pdf_content.table_caption {
-                        for caption in table_caption {
-                            full_content.push_str(&format!("{}", caption));
-                        }
-                    }
-                    if let Some(table_body) = &pdf_content.table_body {
-                        full_content.push_str(&table_body);
-                    }
-                }
-                full_content.push_str("\n\n");
-            }
             self.slice_content(&full_content, &file.slice_type)?
+                .into_iter()
+                .map(|content| SliceWithPositions { content, positions: vec![] })
+                .collect()
         };
 
         let slice_count = slices.len();
+        let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
 
         for slice in slices {
             let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
-            let id = sqlx::query(sql).bind(file.id).bind(&slice).execute(&self.pool).await?.last_insert_rowid();
+            let id = sqlx::query(sql).bind(file.id).bind(&slice.content).execute(&self.pool).await?.last_insert_rowid();
+            if !slice.positions.is_empty() {
+                for position in slice.positions {
+                    position_rows.push((id, position));
+                }
+            }
             self.search_engine
-                .write(tantivy_engine::Document::new(id, file.id, file.kb_id, slice), image_embedding.clone())
+                .write(tantivy_engine::Document::new(id, file.id, file.kb_id, slice.content), image_embedding.clone())
                 .await?;
+        }
+
+        if !position_rows.is_empty() {
+            let mut pos_sql =
+                QueryBuilder::<Sqlite>::new("insert into slice_positions(slice_id, page_idx, x1, y1, x2, y2) ");
+            pos_sql.push_values(position_rows.iter(), |mut b, (slice_id, position)| {
+                b.push_bind(slice_id)
+                    .push_bind(position.page_idx)
+                    .push_bind(position.bbox[0])
+                    .push_bind(position.bbox[1])
+                    .push_bind(position.bbox[2])
+                    .push_bind(position.bbox[3]);
+            });
+            pos_sql.build().execute(&self.pool).await?;
         }
 
         // 构建知识图谱
         if let Err(e) = self.build_knowledge_graph(file).await {
             error!("Failed to build knowledge graph for file {}: {}", file.id, e);
             // 不影响主流程，仅记录错误
-        }
-
-        // 构建完整内容用于存储
-        let mut full_content = String::new();
-        for pdf_content in &content_list {
-            if pdf_content.typ == "discarded" {
-                continue;
-            }
-            if pdf_content.typ == "text" {
-                if let Some(text) = &pdf_content.text {
-                    if let Some(lv) = pdf_content.text_level {
-                        full_content.push_str("#".repeat(lv as usize).as_str());
-                        full_content.push_str(" ");
-                    }
-                    full_content.push_str(&text);
-                }
-            } else if pdf_content.typ == "image" {
-                if let Some(img_name) = &pdf_content.img_path {
-                    full_content.push_str(&format!("![{}](images/{})", img_name, img_name,));
-                }
-                if let Some(captions) = &pdf_content.image_caption {
-                    for caption in captions {
-                        full_content.push_str(&format!("{}", caption));
-                    }
-                }
-            } else if pdf_content.typ == "table" {
-                if let Some(table_caption) = &pdf_content.table_caption {
-                    for caption in table_caption {
-                        full_content.push_str(&format!("{}", caption));
-                    }
-                }
-                if let Some(table_body) = &pdf_content.table_body {
-                    full_content.push_str(&table_body);
-                }
-            }
-            full_content.push_str("\n\n");
         }
 
         let index_full_content = format!("{}\n\n{}", file.filename, full_content);
@@ -612,17 +610,107 @@ impl FileProcessor {
         }
     }
 
-    /// 智能切片：针对 MinerU 处理的内容
-    /// 有标题的情况下，每个切片需要包含其所在的标题
-    /// 切片内容拼接组成，加起来超过配置的字数就按句子再切成多个切片
-    /// 没有标题的情况下直接按拼接，超过配置的字数就按句子再切成多个切片
-    fn smart_slice_content(&self, content_list: &[ContentItem]) -> anyhow::Result<Vec<String>> {
+    fn build_full_content_and_segments(&self, content_list: &[ContentItem]) -> (String, Vec<Segment>) {
+        let mut full_content = String::new();
+        let mut segments = Vec::new();
+        let mut current_len = 0usize;
+
+        for pdf_content in content_list {
+            if pdf_content.typ == "discarded" {
+                continue;
+            }
+            let mut item_content = String::new();
+            if pdf_content.typ == "text" {
+                if let Some(text) = &pdf_content.text {
+                    if let Some(lv) = pdf_content.text_level {
+                        item_content.push_str("#".repeat(lv as usize).as_str());
+                        item_content.push_str(" ");
+                    }
+                    item_content.push_str(text);
+                }
+            } else if pdf_content.typ == "image" {
+                if let Some(img_name) = &pdf_content.img_path {
+                    item_content.push_str(&format!("![{}](images/{})", img_name, img_name));
+                }
+                if let Some(captions) = &pdf_content.image_caption {
+                    for caption in captions {
+                        item_content.push_str(&format!("{}", caption));
+                    }
+                }
+            } else if pdf_content.typ == "table" {
+                if let Some(table_caption) = &pdf_content.table_caption {
+                    for caption in table_caption {
+                        item_content.push_str(&format!("{}", caption));
+                    }
+                }
+                if let Some(table_body) = &pdf_content.table_body {
+                    item_content.push_str(table_body);
+                }
+            }
+
+            if item_content.is_empty() {
+                continue;
+            }
+
+            let start = current_len;
+            full_content.push_str(&item_content);
+            current_len += item_content.chars().count();
+            let end = current_len;
+
+            let positions = Self::positions_from_item(pdf_content);
+            if !positions.is_empty() {
+                segments.push(Segment { start, end, positions });
+            }
+
+            full_content.push_str("\n\n");
+            current_len += 2;
+        }
+
+        (full_content, segments)
+    }
+
+    fn fixed_slice_content_with_positions(
+        &self, content: &str, segments: &[Segment],
+    ) -> anyhow::Result<Vec<SliceWithPositions>> {
+        let cfg = config::get();
+        let chunk_size = cfg.slice.smart_slice_max_chars;
+        let overlap = cfg.slice.fixed_slice_overlap_chars;
+
+        let chars: Vec<char> = content.chars().collect();
+        let mut slices = Vec::new();
+        let mut start = 0;
+
+        while start < chars.len() {
+            let end = std::cmp::min(start + chunk_size, chars.len());
+            let slice: String = chars[start..end].iter().collect();
+            let positions = Self::positions_for_range(segments, start, end);
+            slices.push(SliceWithPositions { content: slice, positions });
+
+            if end >= chars.len() {
+                break;
+            }
+
+            start = end.saturating_sub(overlap);
+            if start >= end {
+                break;
+            }
+        }
+
+        Ok(slices)
+    }
+
+    fn smart_slice_content_with_positions(
+        &self, content_list: &[ContentItem],
+    ) -> anyhow::Result<Vec<SliceWithPositions>> {
         let cfg = config::get();
         let max_chars = cfg.slice.smart_slice_max_chars;
 
         let mut slices = Vec::new();
         let mut current_slice = String::new();
+        let mut current_segments: Vec<Segment> = Vec::new();
+        let mut current_len = 0usize;
         let mut current_header = String::new(); // 当前所在的标题
+        let mut current_header_positions: Vec<SlicePosition> = Vec::new();
 
         for item in content_list {
             if item.typ == "discarded" {
@@ -630,6 +718,7 @@ impl FileProcessor {
             }
 
             let mut item_content = String::new();
+            let item_positions = Self::positions_from_item(item);
 
             // 处理文本内容
             if item.typ == "text" {
@@ -641,14 +730,29 @@ impl FileProcessor {
 
                         // 如果当前有累积的内容，先保存
                         if !current_slice.trim().is_empty() {
-                            slices.extend(self.split_by_sentence_if_needed(&current_slice, max_chars)?);
-                            current_slice.clear();
+                            self.flush_slice_with_positions(
+                                &mut slices,
+                                &mut current_slice,
+                                &mut current_segments,
+                                max_chars,
+                            );
+                            current_len = 0;
                         }
 
                         // 更新当前标题
-                        current_header = header_text.clone();
+                        current_header = header_text;
+                        current_header_positions = item_positions.clone();
                         // 开始新的切片，包含标题
-                        current_slice = format!("{}\n\n", current_header);
+                        current_slice.clear();
+                        current_segments.clear();
+                        Self::append_segment(
+                            &mut current_slice,
+                            &mut current_len,
+                            &mut current_segments,
+                            &current_header,
+                            current_header_positions.clone(),
+                        );
+                        Self::append_separator(&mut current_slice, &mut current_len);
                         continue;
                     } else {
                         // 普通文本
@@ -680,90 +784,205 @@ impl FileProcessor {
             }
 
             // 检查加入这个内容后是否超过字数限制
-            let test_content = if current_slice.is_empty() {
+            let test_len = if current_slice.is_empty() {
                 // 如果当前切片为空，但有标题，先加上标题
                 if !current_header.is_empty() {
-                    format!("{}\n\n{}", current_header, item_content)
+                    current_header.chars().count() + 2 + item_content.chars().count()
                 } else {
-                    item_content.clone()
+                    item_content.chars().count()
                 }
             } else {
-                format!("{}{}\n\n", current_slice, item_content)
+                current_len + item_content.chars().count() + 2
             };
 
-            if test_content.chars().count() > max_chars {
+            if test_len > max_chars {
                 // 超过限制，保存当前切片
                 if !current_slice.trim().is_empty() {
-                    slices.extend(self.split_by_sentence_if_needed(&current_slice, max_chars)?);
+                    self.flush_slice_with_positions(&mut slices, &mut current_slice, &mut current_segments, max_chars);
+                    current_len = 0;
                 }
 
                 // 开始新的切片
+                current_slice.clear();
+                current_segments.clear();
                 if !current_header.is_empty() {
-                    current_slice = format!("{}\n\n{}\n\n", current_header, item_content);
-                } else {
-                    current_slice = format!("{}\n\n", item_content);
+                    Self::append_segment(
+                        &mut current_slice,
+                        &mut current_len,
+                        &mut current_segments,
+                        &current_header,
+                        current_header_positions.clone(),
+                    );
+                    Self::append_separator(&mut current_slice, &mut current_len);
                 }
+                Self::append_segment(
+                    &mut current_slice,
+                    &mut current_len,
+                    &mut current_segments,
+                    &item_content,
+                    item_positions.clone(),
+                );
+                Self::append_separator(&mut current_slice, &mut current_len);
             } else {
                 // 没有超过限制，继续累积
-                current_slice = test_content;
+                if current_slice.is_empty() {
+                    current_slice.clear();
+                    current_segments.clear();
+                    current_len = 0;
+                    if !current_header.is_empty() {
+                        Self::append_segment(
+                            &mut current_slice,
+                            &mut current_len,
+                            &mut current_segments,
+                            &current_header,
+                            current_header_positions.clone(),
+                        );
+                        Self::append_separator(&mut current_slice, &mut current_len);
+                    }
+                    Self::append_segment(
+                        &mut current_slice,
+                        &mut current_len,
+                        &mut current_segments,
+                        &item_content,
+                        item_positions.clone(),
+                    );
+                } else {
+                    Self::append_segment(
+                        &mut current_slice,
+                        &mut current_len,
+                        &mut current_segments,
+                        &item_content,
+                        item_positions.clone(),
+                    );
+                    Self::append_separator(&mut current_slice, &mut current_len);
+                }
             }
         }
 
         // 保存最后的切片
         if !current_slice.trim().is_empty() {
-            slices.extend(self.split_by_sentence_if_needed(&current_slice, max_chars)?);
+            self.flush_slice_with_positions(&mut slices, &mut current_slice, &mut current_segments, max_chars);
         }
 
         Ok(slices)
     }
 
-    /// 如果内容超过字数限制，按句子切分
-    fn split_by_sentence_if_needed(&self, content: &str, max_chars: usize) -> anyhow::Result<Vec<String>> {
+    fn flush_slice_with_positions(
+        &self, slices: &mut Vec<SliceWithPositions>, current_slice: &mut String, segments: &mut Vec<Segment>,
+        max_chars: usize,
+    ) {
+        if current_slice.trim().is_empty() {
+            return;
+        }
+        let content = std::mem::take(current_slice);
+        let segment_data = std::mem::take(segments);
+        let mut new_slices = self.split_slice_with_positions(&content, &segment_data, max_chars);
+        slices.append(&mut new_slices);
+    }
+
+    fn split_slice_with_positions(
+        &self, content: &str, segments: &[Segment], max_chars: usize,
+    ) -> Vec<SliceWithPositions> {
         let char_count = content.chars().count();
-
-        if char_count <= max_chars {
-            return Ok(vec![content.to_string()]);
+        if char_count == 0 {
+            return Vec::new();
         }
 
-        // 按句子分割
-        let sentences: Vec<&str> = content
-            .split(|c| c == '。' || c == '.' || c == '?' || c == '!' || c == '？' || c == '！')
-            .filter(|s| !s.trim().is_empty())
-            .collect();
-
-        let mut result = Vec::new();
-        let mut current = String::new();
-
-        for sentence in sentences {
-            let sentence = sentence.trim();
-            if sentence.is_empty() {
-                continue;
-            }
-
-            // 测试加入这个句子后的长度
-            let test_content =
-                if current.is_empty() { sentence.to_string() } else { format!("{}。{}", current, sentence) };
-
-            if test_content.chars().count() > max_chars && !current.is_empty() {
-                // 超过限制，保存当前内容
-                result.push(current);
-                current = sentence.to_string();
+        let ranges = if char_count <= max_chars {
+            vec![(0, char_count)]
+        } else {
+            let sentence_ranges = Self::sentence_ranges(content);
+            if sentence_ranges.is_empty() {
+                vec![(0, char_count)]
             } else {
-                current = test_content;
+                let mut ranges = Vec::new();
+                let mut slice_start = sentence_ranges[0].0;
+                let mut slice_end = sentence_ranges[0].1;
+                for (start, end) in sentence_ranges.iter().skip(1) {
+                    if end - slice_start > max_chars && slice_end > slice_start {
+                        ranges.push((slice_start, slice_end));
+                        slice_start = *start;
+                    }
+                    slice_end = *end;
+                }
+                ranges.push((slice_start, slice_end));
+                ranges
+            }
+        };
+
+        let chars: Vec<char> = content.chars().collect();
+        ranges
+            .into_iter()
+            .filter_map(|(start, end)| {
+                if start >= end || end > chars.len() {
+                    return None;
+                }
+                let slice: String = chars[start..end].iter().collect();
+                let positions = Self::positions_for_range(segments, start, end);
+                Some(SliceWithPositions { content: slice, positions })
+            })
+            .collect()
+    }
+
+    fn sentence_ranges(content: &str) -> Vec<(usize, usize)> {
+        let mut ranges = Vec::new();
+        let mut start = 0usize;
+        for (idx, ch) in content.chars().enumerate() {
+            if matches!(ch, '。' | '.' | '?' | '!' | '？' | '！') {
+                let end = idx + 1;
+                if end > start {
+                    ranges.push((start, end));
+                }
+                start = end;
             }
         }
-
-        // 保存最后的内容
-        if !current.trim().is_empty() {
-            result.push(current);
+        let total = content.chars().count();
+        if start < total {
+            ranges.push((start, total));
         }
+        ranges
+    }
 
-        // 如果结果为空，至少返回原内容（即使超长）
-        if result.is_empty() {
-            result.push(content.to_string());
+    fn append_segment(
+        current_slice: &mut String, current_len: &mut usize, segments: &mut Vec<Segment>, text: &str,
+        positions: Vec<SlicePosition>,
+    ) {
+        if text.is_empty() {
+            return;
         }
+        let start = *current_len;
+        current_slice.push_str(text);
+        *current_len += text.chars().count();
+        let end = *current_len;
+        if !positions.is_empty() {
+            segments.push(Segment { start, end, positions });
+        }
+    }
 
-        Ok(result)
+    fn append_separator(current_slice: &mut String, current_len: &mut usize) {
+        current_slice.push_str("\n\n");
+        *current_len += 2;
+    }
+
+    fn positions_from_item(item: &ContentItem) -> Vec<SlicePosition> {
+        if item.bbox.len() == 4 {
+            let bbox = [item.bbox[0], item.bbox[1], item.bbox[2], item.bbox[3]];
+            vec![SlicePosition { page_idx: item.page_idx, bbox }]
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn positions_for_range(segments: &[Segment], start: usize, end: usize) -> Vec<SlicePosition> {
+        let mut set: HashSet<SlicePosition> = HashSet::new();
+        for segment in segments {
+            if segment.end > start && segment.start < end {
+                for position in &segment.positions {
+                    set.insert(position.clone());
+                }
+            }
+        }
+        set.into_iter().collect()
     }
 
     /// 构建知识图谱（完全由LLM生成）

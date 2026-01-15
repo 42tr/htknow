@@ -1,0 +1,493 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>PDF Highlight Viewer</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=Fira+Sans:wght@400;600&family=Space+Grotesk:wght@400;600&display=swap"
+      rel="stylesheet"
+    />
+    <style>
+      :root {
+        color-scheme: only light;
+        --bg: #f3efe7;
+        --paper: #ffffff;
+        --ink: #151515;
+        --muted: #6b6661;
+        --accent: #d76f1d;
+        --accent-soft: rgba(215, 111, 29, 0.18);
+        --border: rgba(0, 0, 0, 0.08);
+        --shadow: 0 20px 45px rgba(0, 0, 0, 0.12);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        font-family: "Space Grotesk", "Fira Sans", sans-serif;
+        color: var(--ink);
+        background: radial-gradient(circle at top, #fff7e7, var(--bg));
+      }
+
+      #app {
+        min-height: 100vh;
+        display: flex;
+        flex-direction: column;
+      }
+
+      .topbar {
+        position: sticky;
+        top: 0;
+        z-index: 10;
+        display: flex;
+        gap: 16px;
+        align-items: center;
+        justify-content: space-between;
+        padding: 16px 24px;
+        background: rgba(255, 255, 255, 0.9);
+        backdrop-filter: blur(12px);
+        border-bottom: 1px solid var(--border);
+      }
+
+      .brand {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+      }
+
+      .badge {
+        width: 42px;
+        height: 42px;
+        border-radius: 14px;
+        background: linear-gradient(135deg, #ffb347, #ff7a18);
+        color: #fff;
+        font-weight: 600;
+        letter-spacing: 0.08em;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+      }
+
+      .title {
+        font-weight: 600;
+        font-size: 18px;
+      }
+
+      .meta {
+        font-size: 13px;
+        color: var(--muted);
+      }
+
+      .stats {
+        display: flex;
+        gap: 20px;
+        align-items: center;
+      }
+
+      .stat {
+        text-align: right;
+      }
+
+      .stat-label {
+        font-size: 11px;
+        text-transform: uppercase;
+        letter-spacing: 0.12em;
+        color: var(--muted);
+      }
+
+      .stat-value {
+        font-size: 16px;
+        font-weight: 600;
+      }
+
+      main {
+        flex: 1;
+        padding: 24px 24px 48px;
+      }
+
+      .status {
+        padding: 12px 16px;
+        background: rgba(255, 255, 255, 0.85);
+        border: 1px solid var(--border);
+        border-radius: 12px;
+        margin-bottom: 18px;
+        color: var(--muted);
+      }
+
+      .status[data-kind="error"] {
+        color: #a62b2b;
+        border-color: rgba(166, 43, 43, 0.3);
+        background: rgba(255, 240, 240, 0.9);
+      }
+
+      .pages {
+        display: flex;
+        flex-direction: column;
+        gap: 26px;
+      }
+
+      .page-card {
+        background: var(--paper);
+        border-radius: 18px;
+        box-shadow: var(--shadow);
+        padding: 18px;
+        border: 1px solid var(--border);
+        animation: lift-in 0.4s ease both;
+      }
+
+      @keyframes lift-in {
+        from {
+          opacity: 0;
+          transform: translateY(12px);
+        }
+        to {
+          opacity: 1;
+          transform: translateY(0);
+        }
+      }
+
+      .page-header {
+        font-size: 13px;
+        text-transform: uppercase;
+        letter-spacing: 0.18em;
+        color: var(--muted);
+        margin-bottom: 12px;
+      }
+
+      .page-canvas {
+        position: relative;
+        border-radius: 12px;
+        overflow: hidden;
+        background: #f8f8f8;
+        border: 1px solid rgba(0, 0, 0, 0.06);
+        width: fit-content;
+        max-width: 100%;
+      }
+
+      .page-canvas canvas {
+        display: block;
+      }
+
+      .highlight {
+        position: absolute;
+        border: 2px solid rgba(215, 111, 29, 0.9);
+        background: var(--accent-soft);
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.7) inset;
+        pointer-events: none;
+      }
+
+      @media (max-width: 720px) {
+        .topbar {
+          flex-direction: column;
+          align-items: flex-start;
+        }
+
+        .stats {
+          width: 100%;
+          justify-content: space-between;
+        }
+
+        main {
+          padding: 18px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="app">
+      <header class="topbar">
+        <div class="brand">
+          <div class="badge">PDF</div>
+          <div>
+            <div class="title">Source Viewer</div>
+            <div id="fileMeta" class="meta">File</div>
+          </div>
+        </div>
+        <div class="stats">
+          <div class="stat">
+            <div class="stat-label">Pages</div>
+            <div id="pageCount" class="stat-value">--</div>
+          </div>
+          <div class="stat">
+            <div class="stat-label">Highlights</div>
+            <div id="highlightCount" class="stat-value">--</div>
+          </div>
+        </div>
+      </header>
+      <main>
+        <div id="status" class="status" hidden></div>
+        <div id="pages" class="pages"></div>
+      </main>
+    </div>
+
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+    <script>
+      (function () {
+        const API_BASE = "/api/v1/knowledge";
+        const HEADERS = {
+          "x-user-id": "user1",
+          "x-role": "admin",
+        };
+
+        const statusEl = document.getElementById("status");
+        const pagesEl = document.getElementById("pages");
+        const fileMetaEl = document.getElementById("fileMeta");
+        const pageCountEl = document.getElementById("pageCount");
+        const highlightCountEl = document.getElementById("highlightCount");
+
+        const setStatus = (message, kind = "info") => {
+          statusEl.textContent = message || "";
+          statusEl.dataset.kind = kind;
+          statusEl.hidden = !message;
+        };
+
+        const params = new URLSearchParams(window.location.search);
+        const fileId = params.get("file_id") || params.get("fileId");
+        const sliceId = params.get("slice_id") || params.get("sliceId");
+        const positionsParam = params.get("positions");
+
+        if (!fileId) {
+          setStatus("Missing file_id in query string.", "error");
+          return;
+        }
+
+        if (!window.pdfjsLib) {
+          setStatus("PDF.js failed to load.", "error");
+          return;
+        }
+
+        window.pdfjsLib.GlobalWorkerOptions.workerSrc =
+          "https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+        const fetchJson = async (url) => {
+          const res = await fetch(url, { headers: HEADERS });
+          if (!res.ok) {
+            throw new Error(`Request failed: ${res.status}`);
+          }
+          return res.json();
+        };
+
+        const fetchArrayBuffer = async (url) => {
+          const res = await fetch(url, { headers: HEADERS });
+          if (!res.ok) {
+            throw new Error(`Request failed: ${res.status}`);
+          }
+          return res.arrayBuffer();
+        };
+
+        const parsePositionsParam = () => {
+          if (!positionsParam) return null;
+          try {
+            return JSON.parse(atob(positionsParam));
+          } catch (err) {
+            try {
+              return JSON.parse(decodeURIComponent(positionsParam));
+            } catch (err2) {
+              return null;
+            }
+          }
+        };
+
+        const loadPositions = async () => {
+          const parsed = parsePositionsParam();
+          if (Array.isArray(parsed)) return parsed;
+          if (!sliceId) return [];
+          const slices = await fetchJson(`${API_BASE}/files/${fileId}/slices`);
+          const match = slices.find((slice) => String(slice.id) === String(sliceId));
+          return match && Array.isArray(match.positions) ? match.positions : [];
+        };
+
+        const loadFileInfo = async () => {
+          try {
+            return await fetchJson(`${API_BASE}/files/${fileId}`);
+          } catch (err) {
+            return null;
+          }
+        };
+
+        const groupByPage = (positions) => {
+          const map = new Map();
+          for (const pos of positions) {
+            if (!pos || pos.page_idx === undefined || !Array.isArray(pos.bbox)) continue;
+            const pageIdx = Number(pos.page_idx);
+            if (!map.has(pageIdx)) map.set(pageIdx, []);
+            map.get(pageIdx).push(pos);
+          }
+          return map;
+        };
+
+        const detectOffset = (indices, pageCount) => {
+          if (indices.some((v) => v === 0)) return 1;
+          const max = indices.length ? Math.max.apply(null, indices) : 0;
+          return max === pageCount ? 0 : 1;
+        };
+
+        const normalizeBox = (bbox) => {
+          const x1 = Math.min(bbox[0], bbox[2]);
+          const x2 = Math.max(bbox[0], bbox[2]);
+          const y1 = Math.min(bbox[1], bbox[3]);
+          const y2 = Math.max(bbox[1], bbox[3]);
+          return { x1, x2, y1, y2 };
+        };
+
+        const computeTransform = (positions, baseWidth, baseHeight) => {
+          let maxX = 0;
+          let maxY = 0;
+          for (const pos of positions) {
+            if (!pos || !Array.isArray(pos.bbox)) continue;
+            const box = normalizeBox(pos.bbox);
+            maxX = Math.max(maxX, box.x1, box.x2);
+            maxY = Math.max(maxY, box.y1, box.y2);
+          }
+
+          let adjustX = 1;
+          let adjustY = 1;
+          if (maxX > baseWidth * 1.1) adjustX = baseWidth / maxX;
+          if (maxY > baseHeight * 1.1) adjustY = baseHeight / maxY;
+
+          const score = (flipY) => {
+            let count = 0;
+            for (const pos of positions) {
+              if (!pos || !Array.isArray(pos.bbox)) continue;
+              const box = normalizeBox(pos.bbox);
+              let x1 = box.x1 * adjustX;
+              let x2 = box.x2 * adjustX;
+              let y1 = box.y1 * adjustY;
+              let y2 = box.y2 * adjustY;
+              if (flipY) {
+                const top = baseHeight - y2;
+                const bottom = baseHeight - y1;
+                y1 = top;
+                y2 = bottom;
+              }
+              if (x1 >= -2 && y1 >= -2 && x2 <= baseWidth + 2 && y2 <= baseHeight + 2) {
+                count += 1;
+              }
+            }
+            return count;
+          };
+
+          const flipY = score(true) > score(false);
+          return { adjustX, adjustY, flipY };
+        };
+
+        const layoutHighlight = (pos, transform, scale, baseHeight) => {
+          if (!pos || !Array.isArray(pos.bbox)) return null;
+          const box = normalizeBox(pos.bbox);
+          let x1 = box.x1 * transform.adjustX;
+          let x2 = box.x2 * transform.adjustX;
+          let y1 = box.y1 * transform.adjustY;
+          let y2 = box.y2 * transform.adjustY;
+
+          if (transform.flipY) {
+            const top = baseHeight - y2;
+            const bottom = baseHeight - y1;
+            y1 = top;
+            y2 = bottom;
+          }
+
+          const width = (x2 - x1) * scale;
+          const height = (y2 - y1) * scale;
+          if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) {
+            return null;
+          }
+
+          return {
+            left: `${x1 * scale}px`,
+            top: `${y1 * scale}px`,
+            width: `${width}px`,
+            height: `${height}px`,
+          };
+        };
+
+        const computeScale = (pageWidth) => {
+          const containerWidth = Math.min(1180, pagesEl.clientWidth || 1180);
+          const target = (containerWidth - 32) / pageWidth;
+          if (!Number.isFinite(target) || target <= 0) return 1.2;
+          return Math.min(1.6, Math.max(0.6, target));
+        };
+
+        const run = async () => {
+          setStatus("Loading PDF...");
+          const [fileInfo, positions] = await Promise.all([loadFileInfo(), loadPositions()]);
+          fileMetaEl.textContent = fileInfo && fileInfo.filename ? fileInfo.filename : `File ${fileId}`;
+          highlightCountEl.textContent = positions.length.toString();
+
+          const pdfData = await fetchArrayBuffer(`${API_BASE}/files/${fileId}/content`);
+          const pdf = await window.pdfjsLib.getDocument({ data: pdfData }).promise;
+          pageCountEl.textContent = pdf.numPages.toString();
+
+          const positionsByPage = groupByPage(positions);
+          const pageIndices = Array.from(positionsByPage.keys());
+          const offset = detectOffset(pageIndices, pdf.numPages);
+
+          let firstHighlight = null;
+
+          for (let pageNum = 1; pageNum <= pdf.numPages; pageNum += 1) {
+            setStatus(`Rendering page ${pageNum}/${pdf.numPages}...`);
+            const page = await pdf.getPage(pageNum);
+            const baseViewport = page.getViewport({ scale: 1 });
+            const scale = computeScale(baseViewport.width);
+            const viewport = page.getViewport({ scale });
+
+            const pageCard = document.createElement("section");
+            pageCard.className = "page-card";
+
+            const pageHeader = document.createElement("div");
+            pageHeader.className = "page-header";
+            pageHeader.textContent = `Page ${pageNum}`;
+
+            const canvasWrap = document.createElement("div");
+            canvasWrap.className = "page-canvas";
+            canvasWrap.style.width = `${viewport.width}px`;
+            canvasWrap.style.height = `${viewport.height}px`;
+
+            const canvas = document.createElement("canvas");
+            canvas.width = viewport.width;
+            canvas.height = viewport.height;
+            canvasWrap.appendChild(canvas);
+
+            pageCard.appendChild(pageHeader);
+            pageCard.appendChild(canvasWrap);
+            pagesEl.appendChild(pageCard);
+
+            await page.render({ canvasContext: canvas.getContext("2d"), viewport }).promise;
+
+            const pageIdx = pageNum - offset;
+            const pagePositions = positionsByPage.get(pageIdx) || [];
+            if (pagePositions.length) {
+              const transform = computeTransform(pagePositions, baseViewport.width, baseViewport.height);
+              for (const pos of pagePositions) {
+                const style = layoutHighlight(pos, transform, scale, baseViewport.height);
+                if (!style) continue;
+                const highlight = document.createElement("div");
+                highlight.className = "highlight";
+                highlight.style.left = style.left;
+                highlight.style.top = style.top;
+                highlight.style.width = style.width;
+                highlight.style.height = style.height;
+                canvasWrap.appendChild(highlight);
+              }
+              if (!firstHighlight) firstHighlight = pageCard;
+            }
+          }
+
+          setStatus("");
+          if (firstHighlight) {
+            firstHighlight.scrollIntoView({ behavior: "smooth", block: "start" });
+          }
+        };
+
+        run().catch((err) => {
+          setStatus(err && err.message ? err.message : "Failed to load PDF.", "error");
+        });
+      })();
+    </script>
+  </body>
+</html>

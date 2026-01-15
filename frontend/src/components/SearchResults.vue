@@ -15,7 +15,28 @@ const isImageFile = (filename) => {
   return /\.(jpg|jpeg|png|gif|bmp|webp|tiff|tif|svg|ico|heic|heif)$/i.test(filename)
 }
 
+const isPdfOrWordFile = (filename) => {
+  if (!filename) return false
+  return /\.(pdf|doc|docx)$/i.test(filename)
+}
+
 const getFileEmoji = (filename) => (isImageFile(filename) ? '🖼️' : '📄')
+
+const canHighlight = (result) =>
+  Boolean(result?.positions?.length) && isPdfOrWordFile(result.file?.filename)
+
+const openViewer = (result) => {
+  if (!canHighlight(result)) return
+  const params = new URLSearchParams({
+    file_id: String(result.file?.id || ''),
+    slice_id: String(result.id),
+  })
+  if (Array.isArray(result.positions) && result.positions.length > 0) {
+    params.set('positions', btoa(JSON.stringify(result.positions)))
+  }
+  const url = `/pdf-highlight.html?${params.toString()}`
+  window.open(url, '_blank', 'noopener')
+}
 
 defineProps({
   results: {
@@ -59,10 +80,12 @@ defineProps({
       <div
         v-for="(result, index) in results"
         :key="index"
-        class="bg-white rounded-xl p-5 border border-slate-200 hover:border-slate-300 hover:shadow-md transition-all duration-200 cursor-pointer"
+        class="bg-white rounded-xl p-5 border border-slate-200 hover:border-slate-300 hover:shadow-md transition-all duration-200"
+        :class="canHighlight(result) ? 'cursor-pointer' : 'cursor-default'"
+        @click="openViewer(result)"
       >
         <div class="flex items-start gap-4">
-          <div class="w-10 h-10 bg-gradient-to-br from-amber-100 to-orange-100 rounded-lg flex items-center justify-center flex-shrink-0">
+          <div class="w-10 h-10 bg-linear-to-br from-amber-100 to-orange-100 rounded-lg flex items-center justify-center shrink-0">
             <span class="text-lg">{{ getFileEmoji(result.file?.filename) }}</span>
           </div>
           <div class="flex-1 min-w-0">
@@ -97,11 +120,23 @@ defineProps({
                 上传时间: {{ formatDate(result.file.created_at) }}
               </span>
             </div>
+            <div v-if="canHighlight(result)" class="mt-3">
+              <button
+                class="inline-flex items-center gap-1 text-xs font-medium text-amber-700 bg-amber-50 px-2.5 py-1 rounded-full hover:bg-amber-100"
+                @click.stop="openViewer(result)"
+              >
+                <span>定位原文</span>
+                <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                </svg>
+              </button>
+            </div>
           </div>
         </div>
       </div>
     </div>
   </div>
+
 </template>
 
 <style scoped>

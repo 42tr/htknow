@@ -40,6 +40,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     // 自动创建表
     create_tables(&pool).await?;
     ensure_kb_type_column(&pool).await?;
+    ensure_pdf_contents_bbox_column(&pool).await?;
 
     info!("Database initialized successfully");
 
@@ -71,6 +72,17 @@ async fn ensure_kb_type_column(pool: &SqlitePool) -> anyhow::Result<()> {
         sqlx::query("ALTER TABLE knowledge_bases ADD COLUMN kb_type TEXT NOT NULL DEFAULT 'analysis'")
             .execute(pool)
             .await?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_pdf_contents_bbox_column(pool: &SqlitePool) -> anyhow::Result<()> {
+    let columns = sqlx::query("PRAGMA table_info(pdf_contents);").fetch_all(pool).await?;
+    let has_bbox = columns.iter().any(|row| row.get::<String, _>("name") == "bbox");
+
+    if !has_bbox {
+        sqlx::query("ALTER TABLE pdf_contents ADD COLUMN bbox TEXT DEFAULT NULL").execute(pool).await?;
     }
 
     Ok(())

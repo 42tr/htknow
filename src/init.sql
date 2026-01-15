@@ -40,12 +40,25 @@ CREATE TABLE IF NOT EXISTS pdf_contents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id INTEGER NOT NULL, -- 文件ID
     page_idx INTEGER NOT NULL, -- 所在页码
+    bbox TEXT DEFAULT NULL, -- 位置坐标 (JSON)
     text TEXT DEFAULT NULL, -- 文本内容
     text_level INTEGER DEFAULT NULL, -- 文本级别
     img_path TEXT DEFAULT NULL, -- 图片路径
     table_body TEXT DEFAULT NULL, -- 表格内容
     created_at INTEGER DEFAULT (strftime('%s','now')),
     updated_at INTEGER DEFAULT (strftime('%s','now'))
+);
+
+CREATE TABLE IF NOT EXISTS slice_positions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    slice_id INTEGER NOT NULL, -- 切片ID
+    page_idx INTEGER NOT NULL, -- 所在页码
+    x1 INTEGER NOT NULL,
+    y1 INTEGER NOT NULL,
+    x2 INTEGER NOT NULL,
+    y2 INTEGER NOT NULL,
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    FOREIGN KEY (slice_id) REFERENCES slices(id) ON DELETE CASCADE
 );
 
 -- CREATE TABLE IF NOT EXISTS pdf_images (
@@ -124,3 +137,4 @@ CREATE INDEX IF NOT EXISTS idx_edges_target ON graph_edges(target_node_id);
 CREATE INDEX IF NOT EXISTS idx_edges_relation ON graph_edges(relation_type);
 CREATE INDEX IF NOT EXISTS idx_mentions_node ON entity_mentions(node_id);
 CREATE INDEX IF NOT EXISTS idx_mentions_slice ON entity_mentions(slice_id);
+CREATE INDEX IF NOT EXISTS idx_slice_positions_slice ON slice_positions(slice_id);
