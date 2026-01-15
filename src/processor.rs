@@ -171,19 +171,8 @@ impl FileProcessor {
 
         // 检查文件是否为 PDF 或图片
         let filename_lower = file.filename.to_lowercase();
-        let is_pdf_or_img = filename_lower.ends_with(".pdf")
-            || filename_lower.ends_with(".jpg")
-            || filename_lower.ends_with(".jpeg")
-            || filename_lower.ends_with(".png")
-            || filename_lower.ends_with(".gif")
-            || filename_lower.ends_with(".bmp")
-            || filename_lower.ends_with(".webp")
-            || filename_lower.ends_with(".tiff")
-            || filename_lower.ends_with(".tif")
-            || filename_lower.ends_with(".svg")
-            || filename_lower.ends_with(".ico")
-            || filename_lower.ends_with(".heic")
-            || filename_lower.ends_with(".heif");
+        let is_pdf = filename_lower.ends_with(".pdf");
+        let is_image = Self::is_image_file(&filename_lower);
 
         // 检查文件是否为 Word 文档
         let is_word = filename_lower.ends_with(".doc") || filename_lower.ends_with(".docx");
@@ -192,9 +181,13 @@ impl FileProcessor {
             // Word 文档：先转换为 PDF，再使用 process_pdf_file 处理
             info!("Detected Word document, converting to PDF: {}", file.filename);
             self.convert_word_to_pdf_and_process(file).await?;
-        } else if is_pdf_or_img {
+        } else if is_pdf {
             // 处理 PDF 或图片文件
-            self.process_pdf_file(file).await?;
+            self.process_pdf_file(file, None, false).await?;
+        } else if is_image {
+            let image_embedding =
+                search::embedding::get_image_embedding_from_path(&file.path, Some(&file.filename)).await?;
+            self.process_pdf_file(file, Some(image_embedding), true).await?;
         } else {
             // 处理普通文本文件
             self.process_text_file(file).await?;
@@ -240,7 +233,7 @@ impl FileProcessor {
         temp_file.filename = pdf_filename;
 
         // 使用 process_pdf_file 处理转换后的 PDF
-        let result = self.process_pdf_file(&temp_file).await;
+        let result = self.process_pdf_file(&temp_file, None, false).await;
 
         // 清理临时 PDF 文件
         let _ = fs::remove_file(&converted_pdf_path).await;
@@ -249,7 +242,9 @@ impl FileProcessor {
     }
 
     /// 处理 PDF 文件，调用 MinerU API
-    async fn process_pdf_file(&self, file: &File) -> anyhow::Result<()> {
+    async fn process_pdf_file(
+        &self, file: &File, image_embedding: Option<Vec<f32>>, is_image: bool,
+    ) -> anyhow::Result<()> {
         info!("Processing PDF file: {}", file.filename);
 
         // 先检查 pdf_contents 表中是否已有该文件的数据
@@ -300,6 +295,12 @@ impl FileProcessor {
             let file_bytes = tokio::fs::read(&file.path).await?;
 
             // 构建 multipart form
+            let mime_type = if is_image {
+                mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string()
+            } else {
+                "application/pdf".to_string()
+            };
+
             let form = multipart::Form::new()
                 .text("return_middle_json", "false")
                 .text("return_model_output", "false")
@@ -318,7 +319,7 @@ impl FileProcessor {
                 .text("formula_enable", "true")
                 .part(
                     "files",
-                    multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str("application/pdf")?,
+                    multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str(&mime_type)?,
                 );
 
             // 调用 MinerU API
@@ -416,7 +417,9 @@ impl FileProcessor {
         for slice in slices {
             let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
             let id = sqlx::query(sql).bind(file.id).bind(&slice).execute(&self.pool).await?.last_insert_rowid();
-            self.search_engine.write(tantivy_engine::Document::new(id, file.id, file.kb_id, slice)).await?;
+            self.search_engine
+                .write(tantivy_engine::Document::new(id, file.id, file.kb_id, slice), image_embedding.clone())
+                .await?;
         }
 
         // 构建知识图谱
@@ -493,7 +496,7 @@ impl FileProcessor {
         for slice in slices {
             let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
             let id = sqlx::query(sql).bind(file.id).bind(&slice).execute(&self.pool).await?.last_insert_rowid();
-            self.search_engine.write(tantivy_engine::Document::new(id, file.id, file.kb_id, slice)).await?;
+            self.search_engine.write(tantivy_engine::Document::new(id, file.id, file.kb_id, slice), None).await?;
         }
 
         let index_full_content = format!("{}\n\n{}", file.filename, content);
@@ -541,6 +544,21 @@ impl FileProcessor {
             .fetch_optional(&self.pool)
             .await?;
         Ok(matches!(kb_type.as_deref(), Some("storage")))
+    }
+
+    fn is_image_file(filename_lower: &str) -> bool {
+        filename_lower.ends_with(".jpg")
+            || filename_lower.ends_with(".jpeg")
+            || filename_lower.ends_with(".png")
+            || filename_lower.ends_with(".gif")
+            || filename_lower.ends_with(".bmp")
+            || filename_lower.ends_with(".webp")
+            || filename_lower.ends_with(".tiff")
+            || filename_lower.ends_with(".tif")
+            || filename_lower.ends_with(".svg")
+            || filename_lower.ends_with(".ico")
+            || filename_lower.ends_with(".heic")
+            || filename_lower.ends_with(".heif")
     }
 
     /// 根据 slice_type 对内容进行分片

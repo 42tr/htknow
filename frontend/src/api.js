@@ -47,6 +47,30 @@ export const api = {
     const data = await response.json()
     return data.results || []
   },
+  async searchImage(file, text = '', kbId = null, fileId = null) {
+    const formData = new FormData()
+    formData.append('file', file)
+    formData.append('text', text)
+    let url = `${API_BASE}/search/image`
+    const params = []
+    if (kbId) {
+      params.push(`kb_id=${kbId}`)
+    }
+    if (fileId) {
+      params.push(`file_id=${fileId}`)
+    }
+    if (params.length > 0) {
+      url += `?${params.join('&')}`
+    }
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: getHeaders(false),
+      body: formData,
+    })
+    if (!response.ok) throw new Error('图片搜索失败')
+    const data = await response.json()
+    return data.results || []
+  },
 
   // 知识库
   async getKnowledgeBases(parentId = null) {

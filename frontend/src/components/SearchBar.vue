@@ -9,6 +9,8 @@ const emit = defineEmits(['search', 'search-start', 'search-end'])
 const query = ref('')
 const error = ref('')
 const searchMode = ref('full')
+const imageFile = ref(null)
+const fileInput = ref(null)
 
 // Local state for search scope
 const localSelectedKb = ref({ id: null, name: '所有知识库' })
@@ -30,22 +32,47 @@ const handleKbSelect = (kb) => {
 }
 
 const handleSearch = async () => {
-  if (!query.value.trim()) return
+  if (searchMode.value === 'image') {
+    if (!imageFile.value) {
+      error.value = '请先选择图片'
+      emit('search', [])
+      return
+    }
+  } else if (!query.value.trim()) {
+    return
+  }
 
   error.value = ''
   emit('search-start')
 
   try {
-    const results =
-      searchMode.value === 'slice'
-        ? await api.search(query.value, localSelectedKb.value?.id)
-        : await api.searchFull(query.value, localSelectedKb.value?.id)
+    let results = []
+    if (searchMode.value === 'image') {
+      results = await api.searchImage(imageFile.value, query.value, localSelectedKb.value?.id)
+    } else {
+      results =
+        searchMode.value === 'slice'
+          ? await api.search(query.value, localSelectedKb.value?.id)
+          : await api.searchFull(query.value, localSelectedKb.value?.id)
+    }
     emit('search', results)
   } catch (e) {
     error.value = e.message
     emit('search', [])
   } finally {
     emit('search-end')
+  }
+}
+
+const handleImageChange = (e) => {
+  const file = e.target.files?.[0] || null
+  imageFile.value = file
+}
+
+const clearImage = () => {
+  imageFile.value = null
+  if (fileInput.value) {
+    fileInput.value.value = ''
   }
 }
 
@@ -95,9 +122,17 @@ const handleKeydown = (e) => {
         >
           切片搜索
         </button>
+        <button
+          type="button"
+          class="px-4 py-2 text-sm rounded-lg transition-colors"
+          :class="searchMode === 'image' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:text-slate-900'"
+          @click="searchMode = 'image'"
+        >
+          图片搜索
+        </button>
       </div>
       <p class="mt-2 text-xs text-slate-500">
-        文件搜索返回高亮片段；切片搜索返回命中的切片内容。
+        文件搜索返回高亮片段；切片搜索返回命中的切片内容；图片搜索支持以图搜图。
       </p>
     </div>
 
@@ -108,8 +143,60 @@ const handleKeydown = (e) => {
       @select="handleKbSelect"
     />
 
-    <!-- 搜索输入框 -->
-    <div class="relative">
+    <!-- 图片搜索上传 -->
+    <div v-if="searchMode === 'image'" class="space-y-4">
+      <div class="flex items-center gap-3">
+        <input
+          ref="fileInput"
+          type="file"
+          accept="image/*"
+          class="hidden"
+          @change="handleImageChange"
+        />
+        <button
+          type="button"
+          class="px-4 py-2.5 bg-white border border-slate-200 rounded-xl text-sm font-medium text-slate-700 hover:border-blue-300 transition-colors"
+          @click="fileInput && fileInput.click()"
+        >
+          选择图片
+        </button>
+        <span class="text-sm text-slate-600 truncate max-w-xs">
+          {{ imageFile ? imageFile.name : '未选择图片' }}
+        </span>
+        <button
+          v-if="imageFile"
+          type="button"
+          class="text-xs text-slate-500 hover:text-slate-700"
+          @click="clearImage"
+        >
+          清除
+        </button>
+      </div>
+
+      <div class="relative">
+        <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
+          <svg class="h-5 w-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+          </svg>
+        </div>
+        <input
+          v-model="query"
+          @keydown="handleKeydown"
+          type="text"
+          placeholder="图片描述（可选）..."
+          class="w-full pl-12 pr-24 py-4 bg-white border border-slate-200 rounded-2xl text-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
+        />
+        <button
+          @click="handleSearch"
+          class="absolute right-2 top-1/2 -translate-y-1/2 px-6 py-2.5 bg-linear-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-medium hover:from-blue-600 hover:to-indigo-700 transition-all duration-200 shadow-sm"
+        >
+          搜索
+        </button>
+      </div>
+    </div>
+
+    <!-- 文本搜索输入框 -->
+    <div v-else class="relative">
       <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
         <svg class="h-5 w-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />

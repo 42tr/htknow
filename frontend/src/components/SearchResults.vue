@@ -10,6 +10,13 @@ const formatDate = (timestamp) => {
   })
 }
 
+const isImageFile = (filename) => {
+  if (!filename) return false
+  return /\.(jpg|jpeg|png|gif|bmp|webp|tiff|tif|svg|ico|heic|heif)$/i.test(filename)
+}
+
+const getFileEmoji = (filename) => (isImageFile(filename) ? '🖼️' : '📄')
+
 defineProps({
   results: {
     type: Array,
@@ -56,7 +63,7 @@ defineProps({
       >
         <div class="flex items-start gap-4">
           <div class="w-10 h-10 bg-gradient-to-br from-amber-100 to-orange-100 rounded-lg flex items-center justify-center flex-shrink-0">
-            <span class="text-lg">📄</span>
+            <span class="text-lg">{{ getFileEmoji(result.file?.filename) }}</span>
           </div>
           <div class="flex-1 min-w-0">
             <h3 class="font-semibold text-slate-800 mb-1 truncate">
@@ -68,7 +75,7 @@ defineProps({
               v-html="result.snippet"
             ></p>
             <p v-else class="text-slate-600 text-sm line-clamp-2 mb-2">
-              {{ result.content || '无内容预览' }}
+              {{ result.content || (isImageFile(result.file?.filename) ? '图片匹配结果' : '无内容预览') }}
             </p>
             <div class="flex items-center gap-4 text-xs text-slate-400">
               <span class="flex items-center gap-1">

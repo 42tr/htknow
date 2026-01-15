@@ -9,7 +9,7 @@ use tantivy::{Index, schema::Schema};
 use crate::config;
 
 mod chinese_tokenizer;
-mod embedding;
+pub mod embedding;
 mod lancedb;
 pub mod tantivy_engine;
 
@@ -57,12 +57,15 @@ impl SearchEngine {
         self
     }
 
-    pub async fn write(&self, doc: tantivy_engine::Document) -> anyhow::Result<()> {
+    pub async fn write(&self, doc: tantivy_engine::Document, image_embedding: Option<Vec<f32>>) -> anyhow::Result<()> {
         // 写入 tantivy
         tantivy_engine::write_documents(&self.index, &self.schema, doc.clone()).await?;
 
         // 写入 lancedb
-        let lancedb_doc = lancedb::Document::new(doc.id, doc.file_id, doc.kb_id, doc.content);
+        let mut lancedb_doc = lancedb::Document::new(doc.id, doc.file_id, doc.kb_id, doc.content);
+        if let Some(image_embedding) = image_embedding {
+            lancedb_doc = lancedb_doc.with_image_embedding(image_embedding);
+        }
         lancedb::write_documents(lancedb_doc).await?;
 
         Ok(())
@@ -151,6 +154,12 @@ impl SearchEngine {
             FULL_SNIPPET_MAX_CHARS,
         )
         .await
+    }
+
+    pub async fn search_image(
+        &self, image_embedding: Vec<f32>, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>,
+    ) -> anyhow::Result<Vec<SearchResultItem>> {
+        lancedb::search_image(image_embedding, file_id, kb_ids).await
     }
 
     async fn rerank(&self, query: &str, results: Vec<SearchResultItem>) -> anyhow::Result<Vec<SearchResultItem>> {

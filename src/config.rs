@@ -62,6 +62,8 @@ pub struct ServicesConfig {
     pub mineru_url: String,
     /// Embedding 服务地址
     pub embedding_url: String,
+    /// 图片 Embedding 服务地址
+    pub image_embedding_url: String,
     /// Rerank 服务地址
     pub rerank_url: String,
 }
@@ -73,6 +75,8 @@ pub struct AIConfig {
     pub embedding_model: String,
     /// Embedding 向量维度
     pub embedding_dim: i32,
+    /// 图片 Embedding 向量维度
+    pub image_embedding_dim: i32,
     /// Rerank 模型名称
     pub rerank_model: String,
     /// Rerank 分数阈值
@@ -166,6 +170,7 @@ impl ServicesConfig {
         Self {
             mineru_url: env_or("HTKNOW_MINERU_URL", "http://192.168.0.46:10001/file_parse"),
             embedding_url: env_or("HTKNOW_EMBEDDING_URL", "http://222.190.139.186:59700/v1/embeddings"),
+            image_embedding_url: env_or("HTKNOW_IMAGE_EMBEDDING_URL", "http://192.168.0.46:59802/v1/embeddings/file"),
             rerank_url: env_or("HTKNOW_RERANK_URL", "http://222.190.139.186:59600/v1/rerank"),
         }
     }
@@ -173,9 +178,11 @@ impl ServicesConfig {
 
 impl AIConfig {
     fn from_env() -> Self {
+        let embedding_dim = env_or_parse("HTKNOW_EMBEDDING_DIM", 1024);
         Self {
             embedding_model: env_or("HTKNOW_EMBEDDING_MODEL", "bge-m3"),
-            embedding_dim: env_or_parse("HTKNOW_EMBEDDING_DIM", 1024),
+            embedding_dim,
+            image_embedding_dim: env_or_parse("HTKNOW_IMAGE_EMBEDDING_DIM", 2048),
             rerank_model: env_or("HTKNOW_RERANK_MODEL", "bge-rerank"),
             rerank_threshold: env_or_parse("HTKNOW_RERANK_THRESHOLD", 0.1),
         }
@@ -326,6 +333,7 @@ mod tests {
         assert_eq!(config.server.upload_limit_mb, 500);
         assert_eq!(config.ai.embedding_model, "bge-m3");
         assert_eq!(config.ai.embedding_dim, 1024);
+        assert_eq!(config.ai.image_embedding_dim, 1024);
     }
 
     #[test]

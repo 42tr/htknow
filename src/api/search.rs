@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 
 use axum::{
-    Extension, extract::{Query, State}, response::Json
+    Extension, extract::{Multipart, Query, State}, response::Json
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use utoipa::{IntoParams, ToSchema};
 
-use crate::{AuthUser, api::error::ApiResult, search::SearchEngine};
+use crate::{
+    AuthUser, api::error::{ApiError, ApiResult}, search::SearchEngine
+};
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct SearchQuery {
@@ -75,6 +77,14 @@ pub struct FullSearchResultItem {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FullSearchResult {
     pub results: Vec<FullSearchResultItem>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ImageSearchQuery {
+    /// 文件 ID（可选）
+    pub file_id: Option<i64>,
+    /// 知识库 ID（可选）
+    pub kb_id: Option<i64>,
 }
 
 /// 搜索内容
@@ -363,6 +373,138 @@ pub async fn search_with_graph(
                 if kb_info.is_public == 0 && kb_info.user_id != user_id { false } else { true }
             } else {
                 // 没有文件和知识库信息，默认允许
+                true
+            };
+
+            if has_permission {
+                Some(SearchResultItem { id: r.id, content: r.content, score: r.score, file, kb })
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    Ok(Json(SearchResult { results }))
+}
+
+/// 以图搜图
+#[utoipa::path(
+    post,
+    path = "/api/v1/knowledge/search/image",
+    tag = "search",
+    params(ImageSearchQuery),
+    request_body(content_type = "multipart/form-data"),
+    responses(
+        (status = 200, description = "图片搜索成功", body = SearchResult),
+        (status = 400, description = "请求参数错误")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn search_image(
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
+    Query(params): Query<ImageSearchQuery>, Extension(auth_user): Extension<AuthUser>, mut multipart: Multipart,
+) -> ApiResult<Json<SearchResult>> {
+    let mut file_bytes: Option<Vec<u8>> = None;
+    let mut file_name = "image".to_string();
+    let mut content_type: Option<String> = None;
+    let mut text: Option<String> = None;
+
+    loop {
+        match multipart.next_field().await {
+            Ok(Some(field)) => {
+                let name = field.name().unwrap_or_default().to_string();
+                match name.as_str() {
+                    "file" => {
+                        file_name = field.file_name().unwrap_or("image").to_string();
+                        content_type = field.content_type().map(|ct| ct.to_string());
+                        file_bytes = Some(field.bytes().await?.to_vec());
+                    }
+                    "text" => {
+                        let value = field.text().await?;
+                        if !value.trim().is_empty() {
+                            text = Some(value);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            Ok(None) => break,
+            Err(e) => {
+                return Err(ApiError::Internal(format!("Multipart error: {}", e)));
+            }
+        }
+    }
+
+    let Some(file_bytes) = file_bytes else {
+        return Err(ApiError::BadRequest("file is required".to_string()));
+    };
+
+    // If a kb_id is specified, find all its descendants to search within.
+    let user_id = auth_user.user_id.clone();
+    let kb_ids_to_search = if let Some(root_kb_id) = params.kb_id {
+        let descendant_ids: Vec<i64> = sqlx::query_scalar(
+            r#"
+            WITH RECURSIVE kb_hierarchy AS (
+                SELECT id FROM knowledge_bases WHERE id = ? AND user_id = ?
+                UNION ALL
+                SELECT kb.id FROM knowledge_bases kb
+                INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
+            )
+            SELECT id FROM kb_hierarchy;
+            "#,
+        )
+        .bind(root_kb_id)
+        .bind(&user_id)
+        .fetch_all(&pool)
+        .await?;
+
+        if descendant_ids.is_empty() {
+            return Ok(Json(SearchResult { results: vec![] }));
+        }
+        Some(descendant_ids)
+    } else {
+        None
+    };
+
+    let image_embedding = crate::search::embedding::get_image_embedding_from_bytes(
+        &file_name,
+        content_type.as_deref(),
+        file_bytes,
+        text.as_deref(),
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Image embedding failed: {}", e)))?;
+
+    let raw_results = search_engine
+        .search_image(image_embedding, params.file_id, kb_ids_to_search.as_ref())
+        .await
+        .map_err(|e| ApiError::internal(format!("Image search failed: {}", e)))?;
+
+    if raw_results.is_empty() {
+        return Ok(Json(SearchResult { results: vec![] }));
+    }
+
+    let file_ids: Vec<i64> = raw_results.iter().map(|r| r.file_id).collect();
+    let kb_ids: Vec<i64> = raw_results.iter().filter_map(|r| r.kb_id).collect();
+
+    let file_map = get_files_by_ids(&pool, &file_ids).await?;
+    let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(&pool, &kb_ids).await? } else { HashMap::new() };
+
+    let user_id = auth_user.user_id.clone();
+    let results = raw_results
+        .into_iter()
+        .filter_map(|r| {
+            let file = file_map.get(&r.file_id).cloned();
+            let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
+
+            let has_permission = if let Some(ref file_info) = file {
+                if file_info.is_public == 0 && file_info.user_id != user_id { false } else { true }
+            } else if let Some(ref kb_info) = kb {
+                if kb_info.is_public == 0 && kb_info.user_id != user_id { false } else { true }
+            } else {
                 true
             };
 
