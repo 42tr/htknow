@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use utoipa::{IntoParams, ToSchema};
 
+use super::File;
 use crate::{
     AuthUser, api::error::{ApiError, ApiResult}, search::SearchEngine
 };
@@ -87,7 +88,7 @@ pub struct FullSearchResultItem {
     /// 搜索得分
     pub score: f32,
     /// 文件信息
-    pub file: Option<FileInfo>,
+    pub file: Option<File>,
     /// 知识库信息
     pub kb: Option<KbInfo>,
 }
@@ -277,8 +278,8 @@ pub async fn search_full(
     let file_ids: Vec<i64> = raw_results.iter().map(|r| r.file_id).collect();
     let kb_ids: Vec<i64> = raw_results.iter().filter_map(|r| r.kb_id).collect();
 
-    // 批量查询文件信息
-    let file_map = get_files_by_ids(&pool, &file_ids).await?;
+    // 批量查询文件信息（完整字段）
+    let file_map = get_full_files_by_ids(&pool, &file_ids).await?;
 
     // 批量查询知识库信息
     let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(&pool, &kb_ids).await? } else { HashMap::new() };
@@ -588,6 +589,23 @@ async fn get_files_by_ids(pool: &SqlitePool, file_ids: &[i64]) -> Result<HashMap
     }
 
     let files: Vec<FileInfo> = q.fetch_all(pool).await?;
+    Ok(files.into_iter().map(|f| (f.id, f)).collect())
+}
+
+async fn get_full_files_by_ids(pool: &SqlitePool, file_ids: &[i64]) -> Result<HashMap<i64, File>, sqlx::Error> {
+    if file_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let placeholders: String = file_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let query = format!("SELECT * FROM files WHERE id IN ({})", placeholders);
+
+    let mut q = sqlx::query_as::<_, File>(&query);
+    for id in file_ids {
+        q = q.bind(id);
+    }
+
+    let files: Vec<File> = q.fetch_all(pool).await?;
     Ok(files.into_iter().map(|f| (f.id, f)).collect())
 }
 
