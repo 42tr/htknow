@@ -1,6 +1,7 @@
 CREATE TABLE IF NOT EXISTS files (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT, -- 归属用户ID
+    user_name TEXT, -- 归属用户名
     hash TEXT NOT NULL, -- 文件HASH
     filename TEXT NOT NULL, -- 文件名称
     path TEXT NOT NULL, -- 文件路径
@@ -18,6 +19,7 @@ CREATE TABLE IF NOT EXISTS files (
 CREATE TABLE IF NOT EXISTS knowledge_bases (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     user_id TEXT, -- 归属用户ID
+    user_name TEXT, -- 归属用户名
     name TEXT NOT NULL, -- 知识库名称
     description TEXT DEFAULT '', -- 知识库描述
     kb_type TEXT NOT NULL DEFAULT 'analysis', -- 知识库类型: analysis-分析型, storage-存储型

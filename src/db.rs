@@ -40,6 +40,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     // 自动创建表
     create_tables(&pool).await?;
     ensure_kb_type_column(&pool).await?;
+    ensure_user_name_columns(&pool).await?;
     ensure_pdf_contents_bbox_column(&pool).await?;
 
     info!("Database initialized successfully");
@@ -72,6 +73,28 @@ async fn ensure_kb_type_column(pool: &SqlitePool) -> anyhow::Result<()> {
         sqlx::query("ALTER TABLE knowledge_bases ADD COLUMN kb_type TEXT NOT NULL DEFAULT 'analysis'")
             .execute(pool)
             .await?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_user_name_columns(pool: &SqlitePool) -> anyhow::Result<()> {
+    ensure_user_name_column(pool, "files").await?;
+    ensure_user_name_column(pool, "knowledge_bases").await?;
+    Ok(())
+}
+
+async fn ensure_user_name_column(pool: &SqlitePool, table: &str) -> anyhow::Result<()> {
+    let pragma_sql = format!("PRAGMA table_info({});", table);
+    let columns = sqlx::query(&pragma_sql).fetch_all(pool).await?;
+    let has_user_name = columns.iter().any(|row| row.get::<String, _>("name") == "user_name");
+
+    if !has_user_name {
+        let alter_sql = format!("ALTER TABLE {} ADD COLUMN user_name TEXT NOT NULL DEFAULT ''", table);
+        sqlx::query(&alter_sql).execute(pool).await?;
+    } else {
+        let backfill_sql = format!("UPDATE {} SET user_name = '' WHERE user_name IS NULL", table);
+        sqlx::query(&backfill_sql).execute(pool).await?;
     }
 
     Ok(())

@@ -2,11 +2,13 @@ const API_BASE = '/api/v1/knowledge'
 
 // 用户认证信息（实际应用中应该从登录获取）
 const USER_ID = 'user1'
+const USER_NAME = '42tr'
 const ROLE = 'admin'
 
 const getHeaders = (contentType = true) => {
   const headers = {
     'x-user-id': USER_ID,
+    'x-user-name': USER_NAME,
     'x-role': ROLE,
   }
   if (contentType) {

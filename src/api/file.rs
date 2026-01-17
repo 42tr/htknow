@@ -16,6 +16,7 @@ use crate::{
 pub struct File {
     pub id: i64,
     pub user_id: String,
+    pub user_name: String,
     pub hash: String,
     pub filename: String,
     pub path: String,
@@ -139,9 +140,10 @@ pub async fn upload(
     let tags_json = serde_json::to_string(&tags)?;
     let status = if is_storage_kb { 3 } else { 0 };
     let log_message = if is_storage_kb { "Storage mode: not parsed" } else { "" };
-    let sql = "INSERT INTO files (user_id, hash, filename, path, slice_type, kb_id, is_public, tags, status, log) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    let sql = "INSERT INTO files (user_id, user_name, hash, filename, path, slice_type, kb_id, is_public, tags, status, log) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     let id = sqlx::query(sql)
         .bind(auth_user.user_id)
+        .bind(auth_user.user_name)
         .bind(hash)
         .bind(filename)
         .bind(filepath)

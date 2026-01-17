@@ -18,6 +18,7 @@ mod search;
 #[derive(Clone, Debug)]
 pub struct AuthUser {
     pub user_id: String,
+    pub user_name: String,
     pub role: String,
 }
 
@@ -28,16 +29,19 @@ async fn auth<B>(mut req: Request<Body>, next: Next) -> Response {
     // Extract header values into owned Strings
     let user_id_opt = req.headers().get("x-user-id").and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
 
+    let user_name_opt = req.headers().get("x-user-name").and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
+
     let role_opt = req.headers().get("x-role").and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
 
-    match (user_id_opt, role_opt) {
-        (Some(user_id), Some(role)) => {
-            let auth_user = AuthUser { user_id, role };
+    match (user_id_opt, user_name_opt, role_opt) {
+        (Some(user_id), Some(user_name), Some(role)) => {
+            let auth_user = AuthUser { user_id, user_name, role };
             req.extensions_mut().insert(auth_user);
             next.run(req).await
         }
-        (None, _) => (StatusCode::UNAUTHORIZED, "Missing x-user-id header").into_response(),
-        (_, None) => (StatusCode::UNAUTHORIZED, "Missing x-role header").into_response(),
+        (None, _, _) => (StatusCode::UNAUTHORIZED, "Missing x-user-id header").into_response(),
+        (_, None, _) => (StatusCode::UNAUTHORIZED, "Missing x-user-name header").into_response(),
+        (_, _, None) => (StatusCode::UNAUTHORIZED, "Missing x-role header").into_response(),
     }
 }
 
