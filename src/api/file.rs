@@ -613,3 +613,40 @@ pub async fn get_content(
 
     Ok((StatusCode::OK, [(header::CONTENT_TYPE, mime_type)], Body::from(file_content)))
 }
+
+/// 下载文件
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/files/{id}/download",
+    tag = "file",
+    params(
+        ("id" = i64, Path, description = "文件 ID")
+    ),
+    responses(
+        (status = 200, description = "成功下载文件", content_type = "application/octet-stream"),
+        (status = 404, description = "文件不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn download(
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
+) -> Result<(StatusCode, [(header::HeaderName, String); 2], Body), ApiError> {
+    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+
+    if file.is_public == 0 && file.user_id != auth_user.user_id {
+        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
+    }
+
+    let file_content = tokio::fs::read(&file.path).await?;
+    let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().to_string();
+    let content_disposition = format!("attachment; filename=\"{}\"", file.filename);
+
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, mime_type), (header::CONTENT_DISPOSITION, content_disposition)],
+        Body::from(file_content),
+    ))
+}

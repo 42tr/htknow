@@ -38,6 +38,7 @@ use crate::search::SearchEngine;
         file::get_images,
         file::get_image,
         file::get_content,
+        file::download,
         // Search
         search::search,
         search::search_full,
@@ -109,6 +110,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/{id}/public", put(file::update_public))
         .route("/{id}/slices", get(file::get_slices))
         .route("/{id}/content", get(file::get_content))
+        .route("/{id}/download", get(file::download))
         .route("/{id}/images", get(file::get_images))
         .route("/{file_id}/images/{image_id}", get(file::get_image));
     let search_router = Router::new()
