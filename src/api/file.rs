@@ -131,10 +131,7 @@ pub async fn upload(
                 .bind(kb_id_value)
                 .fetch_optional(&pool)
                 .await?;
-        let (kb_owner, kb_type_value) = kb.ok_or_else(|| ApiError::NotFound("Knowledge base not found".to_string()))?;
-        if kb_owner != auth_user.user_id {
-            return Err(ApiError::NotFound("Knowledge base not found or permission denied".to_string()));
-        }
+        let (_, kb_type_value) = kb.ok_or_else(|| ApiError::NotFound("Knowledge base not found".to_string()))?;
         kb_type = kb_type_value;
     }
 
