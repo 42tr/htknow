@@ -401,7 +401,7 @@ pub async fn get(
 ) -> ApiResult<Json<KnowledgeDetailResponse>> {
     // 1. Fetch the main knowledge base and verify ownership
     let main_kb: Knowledge = sqlx::query_as(
-        "SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
+        "SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
     )
     .bind(id)
     .bind(auth_user.user_id.clone())
@@ -411,7 +411,7 @@ pub async fn get(
     // 2. Fetch children KBs and files in parallel
     let (children_kbs_res, files_res) = tokio::join!(
         // Fetch children KBs
-        sqlx::query_as("SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE parent_id = ? AND user_id = ? ORDER BY name")
+        sqlx::query_as("SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE parent_id = ? AND (user_id = ? OR is_public = 1) ORDER BY name")
             .bind(id)
             .bind(auth_user.user_id.clone())
             .fetch_all(&pool),
@@ -431,7 +431,7 @@ pub async fn get(
         // In a high-depth scenario, this could be slow. A recursive CTE would be faster.
         // But for typical UI breadcrumbs, this iterative approach is simpler and often sufficient.
         let parent_kb: Knowledge = sqlx::query_as(
-            "SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
+            "SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
         )
         .bind(parent_id)
         .bind(auth_user.user_id.clone())
@@ -486,7 +486,7 @@ pub async fn delete(
     let all_kb_ids: Vec<i64> = sqlx::query_scalar(
         r#"
         WITH RECURSIVE kb_hierarchy AS (
-            SELECT id FROM knowledge_bases WHERE id = ? AND user_id = ?
+            SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
             UNION ALL
             SELECT kb.id FROM knowledge_bases kb
             INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
@@ -552,7 +552,7 @@ pub async fn delete(
     }
 
     // 3. Delete the top-level KB. The ON DELETE CASCADE will handle the rest in knowledge_bases table.
-    let result = sqlx::query("DELETE FROM knowledge_bases WHERE id = ? AND user_id = ?")
+    let result = sqlx::query("DELETE FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)")
         .bind(id)
         .bind(auth_user.user_id)
         .execute(&pool)
@@ -603,11 +603,12 @@ pub async fn update_public(
     Json(req): Json<UpdateKbPublicReq>,
 ) -> ApiResult<Json<Knowledge>> {
     let is_public = if req.is_public { 1 } else { 0 };
-    let sql = "UPDATE knowledge_bases SET is_public = ?, updated_at = ? WHERE id = ? AND user_id = ?";
+    let sql =
+        "UPDATE knowledge_bases SET is_public = ?, updated_at = ? WHERE id = ? AND (user_id = ? OR is_public = 1)";
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
     sqlx::query(sql).bind(is_public).bind(now).bind(id).bind(&auth_user.user_id).execute(&pool).await?;
     let kb = sqlx::query_as(
-        "SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
+        "SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
     )
     .bind(id)
     .bind(&auth_user.user_id)
