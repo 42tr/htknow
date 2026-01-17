@@ -31,8 +31,6 @@ use crate::search::SearchEngine;
         file::list,
         file::get,
         file::update,
-        file::update_tags,
-        file::update_public,
         file::delete,
         file::get_slices,
         file::get_images,
@@ -59,8 +57,6 @@ use crate::search::SearchEngine;
             knowledge_base::ReparseKnowledgeBaseResponse,
             file::File,
             file::UpdateFileReq,
-            file::UpdateTagsReq,
-            file::UpdatePublicReq,
             file::Slice,
             file::SlicePosition,
             file::PdfImage,
@@ -106,8 +102,6 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
     let file_router = Router::new()
         .route("/", get(file::list).post(file::upload))
         .route("/{id}", get(file::get).put(file::update).delete(file::delete))
-        .route("/{id}/tags", put(file::update_tags))
-        .route("/{id}/public", put(file::update_public))
         .route("/{id}/slices", get(file::get_slices))
         .route("/{id}/content", get(file::get_content))
         .route("/{id}/download", get(file::download))

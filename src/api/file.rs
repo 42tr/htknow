@@ -190,15 +190,13 @@ pub async fn get(
 
 #[derive(Deserialize, ToSchema)]
 pub struct UpdateFileReq {
-    pub slice_type: String,
+    pub slice_type: Option<String>,
+    pub filename: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub is_public: Option<bool>,
 }
 
-#[derive(Deserialize, ToSchema)]
-pub struct UpdateTagsReq {
-    pub tags: Vec<String>,
-}
-
-/// 更新文件（重新切片）
+/// 更新文件
 #[utoipa::path(
     put,
     path = "/api/v1/knowledge/files/{id}",
@@ -218,94 +216,82 @@ pub struct UpdateTagsReq {
     )
 )]
 pub async fn update(
-    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>, Path(id): Path<i64>,
-    Json(req): Json<UpdateFileReq>,
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
+    Extension(auth_user): Extension<AuthUser>, Path(id): Path<i64>, Json(req): Json<UpdateFileReq>,
 ) -> ApiResult<Json<File>> {
-    let kb_type: Option<String> =
-        sqlx::query_scalar("SELECT kb_type FROM knowledge_bases WHERE id = (SELECT kb_id FROM files WHERE id = ?)")
-            .bind(id)
-            .fetch_optional(&pool)
-            .await?;
-    if matches!(kb_type.as_deref(), Some("storage")) {
-        return Err(ApiError::BadRequest("Storage knowledge base files do not support parsing.".to_string()));
+    let mut has_updates = false;
+    let update_is_public = req.is_public.is_some();
+    if update_is_public {
+        let owner: Option<String> =
+            sqlx::query_scalar("SELECT user_id FROM files WHERE id = ?").bind(id).fetch_optional(&pool).await?;
+        let owner = owner.ok_or_else(|| ApiError::NotFound("File not found or permission denied".to_string()))?;
+        if owner != auth_user.user_id {
+            return Err(ApiError::NotFound("File not found or permission denied".to_string()));
+        }
+    }
+    let mut qb = QueryBuilder::<Sqlite>::new("UPDATE files SET ");
+    let mut separated = qb.separated(", ");
+
+    if let Some(slice_type) = req.slice_type.as_deref() {
+        let kb_type: Option<String> =
+            sqlx::query_scalar("SELECT kb_type FROM knowledge_bases WHERE id = (SELECT kb_id FROM files WHERE id = ?)")
+                .bind(id)
+                .fetch_optional(&pool)
+                .await?;
+        if matches!(kb_type.as_deref(), Some("storage")) {
+            return Err(ApiError::BadRequest("Storage knowledge base files do not support parsing.".to_string()));
+        }
+
+        search_engine.delete(Some(id), None).await?;
+        let sql = "DELETE FROM slices WHERE file_id = ?";
+        sqlx::query(sql).bind(id).execute(&pool).await?;
+
+        separated.push("slice_type = ").push_bind_unseparated(slice_type);
+        separated.push("status = ").push_bind_unseparated(0);
+        has_updates = true;
     }
 
-    search_engine.delete(Some(id), None).await?;
-    let sql = "DELETE FROM slices WHERE file_id = ?";
-    sqlx::query(sql).bind(id).execute(&pool).await?;
-    let sql = "UPDATE files SET slice_type = ?, status = ? WHERE id = ?";
-    sqlx::query(sql).bind(req.slice_type).bind(0).bind(id).execute(&pool).await?;
-    let file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
-    Ok(Json(file))
-}
+    if let Some(filename) = req.filename.as_deref() {
+        separated.push("filename = ").push_bind_unseparated(filename);
+        has_updates = true;
+    }
 
-/// 更新文件标签
-#[utoipa::path(
-    put,
-    path = "/api/v1/knowledge/files/{id}/tags",
-    tag = "file",
-    params(
-        ("id" = i64, Path, description = "文件 ID")
-    ),
-    request_body = UpdateTagsReq,
-    responses(
-        (status = 200, description = "成功更新标签", body = File),
-        (status = 400, description = "请求参数错误"),
-        (status = 401, description = "未授权")
-    ),
-    security(
-        ("x-user-id" = []),
-        ("x-role" = [])
-    )
-)]
-pub async fn update_tags(
-    State(pool): State<SqlitePool>, Path(id): Path<i64>, Json(req): Json<UpdateTagsReq>,
-) -> ApiResult<Json<File>> {
-    let tags_json = serde_json::to_string(&req.tags)?;
-    let sql = "UPDATE files SET tags = ?, updated_at = ? WHERE id = ?";
+    if let Some(tags) = req.tags.as_ref() {
+        let tags_json = serde_json::to_string(tags)?;
+        debug!("tags_json: {}", tags_json);
+        separated.push("tags = ").push_bind_unseparated(tags_json);
+        has_updates = true;
+    }
+
+    if let Some(is_public) = req.is_public {
+        let is_public = if is_public { 1 } else { 0 };
+        separated.push("is_public = ").push_bind_unseparated(is_public);
+        has_updates = true;
+    }
+
+    if !has_updates {
+        return Err(ApiError::BadRequest("No fields to update".to_string()));
+    }
+
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-    sqlx::query(sql).bind(tags_json).bind(now).bind(id).execute(&pool).await?;
-    let file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
-    Ok(Json(file))
-}
+    separated.push("updated_at = ").push_bind_unseparated(now);
+    qb.push(" WHERE id = ");
+    qb.push_bind(id);
+    if update_is_public {
+        qb.push(" AND user_id = ");
+        qb.push_bind(&auth_user.user_id);
+    }
+    qb.build().execute(&pool).await?;
 
-#[derive(Deserialize, ToSchema)]
-pub struct UpdatePublicReq {
-    pub is_public: bool,
-}
-
-/// 更新文件公开/私有状态
-#[utoipa::path(
-    put,
-    path = "/api/v1/knowledge/files/{id}/public",
-    tag = "file",
-    params(
-        ("id" = i64, Path, description = "文件 ID")
-    ),
-    request_body = UpdatePublicReq,
-    responses(
-        (status = 200, description = "成功更新公开/私有状态", body = File),
-        (status = 400, description = "请求参数错误"),
-        (status = 401, description = "未授权")
-    ),
-    security(
-        ("x-user-id" = []),
-        ("x-role" = [])
-    )
-)]
-pub async fn update_public(
-    State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Path(id): Path<i64>,
-    Json(req): Json<UpdatePublicReq>,
-) -> ApiResult<Json<File>> {
-    let is_public = if req.is_public { 1 } else { 0 };
-    let sql = "UPDATE files SET is_public = ?, updated_at = ? WHERE id = ? AND user_id = ?";
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-    sqlx::query(sql).bind(is_public).bind(now).bind(id).bind(&auth_user.user_id).execute(&pool).await?;
-    let file = sqlx::query_as("SELECT * FROM files WHERE id = ? AND user_id = ?")
-        .bind(id)
-        .bind(&auth_user.user_id)
-        .fetch_one(&pool)
-        .await?;
+    let file = if update_is_public {
+        sqlx::query_as("SELECT * FROM files WHERE id = ? AND user_id = ?")
+            .bind(id)
+            .bind(&auth_user.user_id)
+            .fetch_one(&pool)
+            .await?
+    } else {
+        sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?
+    };
     Ok(Json(file))
 }
 

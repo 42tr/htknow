@@ -131,7 +131,7 @@ const removeTag = (index) => {
 const handleSaveTags = async () => {
   updating.value = true
   try {
-    await api.updateFileTags(props.file.id, editingTags.value)
+    await api.updateFile(props.file.id, { tags: editingTags.value })
     showTagsEditor.value = false
     emit('updated')
   } catch (e) {
@@ -147,7 +147,7 @@ const handleTogglePublic = async () => {
 
   updating.value = true
   try {
-    await api.updateFilePublic(props.file.id, newPublic)
+    await api.updateFile(props.file.id, { is_public: newPublic })
     emit('updated')
   } catch (e) {
     alert('更新失败：' + e.message)
