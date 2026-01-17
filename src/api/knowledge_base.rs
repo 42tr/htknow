@@ -136,8 +136,10 @@ pub async fn list(
     let knowledge_ids: Vec<i64> = knowledges.iter().map(|kb| kb.id).collect();
 
     // Get file counts and children counts in parallel
-    let (file_counts_res, children_counts_res) =
-        tokio::join!(get_file_counts(&pool, &knowledge_ids), get_children_kb_counts(&pool, &knowledge_ids));
+    let (file_counts_res, children_counts_res) = tokio::join!(
+        get_file_counts(&pool, &knowledge_ids, &auth_user.user_id),
+        get_children_kb_counts(&pool, &knowledge_ids, &auth_user.user_id)
+    );
     let file_counts = file_counts_res?;
     let children_counts = children_counts_res?;
 
@@ -159,7 +161,9 @@ pub async fn list(
     Ok(Json(knowledge_responses))
 }
 
-async fn get_children_kb_counts(pool: &SqlitePool, knowledge_ids: &[i64]) -> anyhow::Result<HashMap<i64, i64>> {
+async fn get_children_kb_counts(
+    pool: &SqlitePool, knowledge_ids: &[i64], user_id: &str,
+) -> anyhow::Result<HashMap<i64, i64>> {
     if knowledge_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -169,7 +173,9 @@ async fn get_children_kb_counts(pool: &SqlitePool, knowledge_ids: &[i64]) -> any
     for id in knowledge_ids {
         separated.push_bind(id);
     }
-    qb.push(") GROUP BY parent_id");
+    qb.push(") AND (user_id = ");
+    qb.push_bind(user_id);
+    qb.push(" OR is_public = 1) GROUP BY parent_id");
 
     let rows = qb.build().fetch_all(pool).await?;
 
@@ -186,7 +192,7 @@ async fn get_children_kb_counts(pool: &SqlitePool, knowledge_ids: &[i64]) -> any
     Ok(children_counts)
 }
 
-async fn get_file_counts(pool: &SqlitePool, knowledge_ids: &[i64]) -> anyhow::Result<HashMap<i64, i64>> {
+async fn get_file_counts(pool: &SqlitePool, knowledge_ids: &[i64], user_id: &str) -> anyhow::Result<HashMap<i64, i64>> {
     if knowledge_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -199,7 +205,9 @@ async fn get_file_counts(pool: &SqlitePool, knowledge_ids: &[i64]) -> anyhow::Re
         separated.push_bind(id);
     }
 
-    qb.push(") GROUP BY kb_id");
+    qb.push(") AND (user_id = ");
+    qb.push_bind(user_id);
+    qb.push(" OR is_public = 1) GROUP BY kb_id");
 
     let rows = qb.build().fetch_all(pool).await?;
 
@@ -416,12 +424,12 @@ pub async fn get(
             .bind(auth_user.user_id.clone())
             .fetch_all(&pool),
         // Fetch files in this KB
-        sqlx::query_as("SELECT * FROM files WHERE kb_id = ? ORDER BY filename")
+        sqlx::query_as("SELECT * FROM files WHERE kb_id = ? AND (user_id = ? OR is_public = 1) ORDER BY filename")
             .bind(id)
+            .bind(auth_user.user_id.clone())
             .fetch_all(&pool)
     );
     let children_kbs: Vec<Knowledge> = children_kbs_res?;
-    // The File struct from file.rs might not have a user_id check, but it's implicitly checked by kb_id belonging to the user.
     let files: Vec<super::file::File> = files_res?;
 
     // 3. Fetch the breadcrumb path

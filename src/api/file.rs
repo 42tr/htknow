@@ -387,46 +387,49 @@ pub struct ListQuery {
 pub async fn list(
     State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Query(query): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<File>>> {
-    let mut files = match query.kb_id.as_deref() {
-        // 明确指定查询未分配知识库的文件
-        Some("null") | Some("unassigned") => {
-            sqlx::query_as("SELECT * FROM files WHERE user_id = ? AND kb_id IS NULL ORDER BY created_at DESC")
-                .bind(&auth_user.user_id)
-                .fetch_all(&pool)
-                .await?
-        }
-        // 查询特定知识库的文件
-        Some(kb_id_str) => {
-            let kb_id = kb_id_str.parse::<i64>().map_err(|_| ApiError::internal("Invalid kb_id format"))?;
-            // 检查知识库权限
-            let kb: Option<(String, i32)> =
-                sqlx::query_as("SELECT user_id, is_public FROM knowledge_bases WHERE id = ?")
-                    .bind(kb_id)
-                    .fetch_optional(&pool)
-                    .await?;
+    let mut files =
+        match query.kb_id.as_deref() {
+            // 明确指定查询未分配知识库的文件
+            Some("null") | Some("unassigned") => sqlx::query_as(
+                "SELECT * FROM files WHERE kb_id IS NULL AND (user_id = ? OR is_public = 1) ORDER BY created_at DESC",
+            )
+            .bind(&auth_user.user_id)
+            .fetch_all(&pool)
+            .await?,
+            // 查询特定知识库的文件
+            Some(kb_id_str) => {
+                let kb_id = kb_id_str.parse::<i64>().map_err(|_| ApiError::internal("Invalid kb_id format"))?;
+                // 检查知识库权限
+                let kb: Option<(String, i32)> =
+                    sqlx::query_as("SELECT user_id, is_public FROM knowledge_bases WHERE id = ?")
+                        .bind(kb_id)
+                        .fetch_optional(&pool)
+                        .await?;
 
-            if let Some((kb_owner, is_public)) = kb {
-                if is_public == 0 && kb_owner != auth_user.user_id {
-                    return Err(ApiError::NotFound("Knowledge base not found or permission denied".to_string()));
+                if let Some((kb_owner, is_public)) = kb {
+                    if is_public == 0 && kb_owner != auth_user.user_id {
+                        return Err(ApiError::NotFound("Knowledge base not found or permission denied".to_string()));
+                    }
+                } else {
+                    return Err(ApiError::NotFound("Knowledge base not found".to_string()));
                 }
-            } else {
-                return Err(ApiError::NotFound("Knowledge base not found".to_string()));
-            }
 
-            sqlx::query_as("SELECT * FROM files WHERE user_id = ? AND kb_id = ? ORDER BY created_at DESC")
-                .bind(&auth_user.user_id)
+                sqlx::query_as(
+                    "SELECT * FROM files WHERE kb_id = ? AND (user_id = ? OR is_public = 1) ORDER BY created_at DESC",
+                )
                 .bind(kb_id)
-                .fetch_all(&pool)
-                .await?
-        }
-        // 不传参数，查询所有文件
-        None => {
-            sqlx::query_as("SELECT * FROM files WHERE user_id = ? ORDER BY created_at DESC")
                 .bind(&auth_user.user_id)
                 .fetch_all(&pool)
                 .await?
-        }
-    };
+            }
+            // 不传参数，查询所有文件
+            None => {
+                sqlx::query_as("SELECT * FROM files WHERE (user_id = ? OR is_public = 1) ORDER BY created_at DESC")
+                    .bind(&auth_user.user_id)
+                    .fetch_all(&pool)
+                    .await?
+            }
+        };
 
     // 如果指定了标签，进行过滤
     if let Some(tag) = &query.tag {

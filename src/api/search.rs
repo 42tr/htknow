@@ -130,15 +130,17 @@ pub async fn search(
         let descendant_ids: Vec<i64> = sqlx::query_scalar(
             r#"
             WITH RECURSIVE kb_hierarchy AS (
-                SELECT id FROM knowledge_bases WHERE id = ? AND user_id = ?
+                SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
                 UNION ALL
                 SELECT kb.id FROM knowledge_bases kb
                 INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
+                WHERE kb.user_id = ? OR kb.is_public = 1
             )
             SELECT id FROM kb_hierarchy;
             "#,
         )
         .bind(root_kb_id)
+        .bind(&user_id)
         .bind(&user_id)
         .fetch_all(&pool)
         .await?;
@@ -239,15 +241,17 @@ pub async fn search_full(
         let descendant_ids: Vec<i64> = sqlx::query_scalar(
             r#"
             WITH RECURSIVE kb_hierarchy AS (
-                SELECT id FROM knowledge_bases WHERE id = ? AND user_id = ?
+                SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
                 UNION ALL
                 SELECT kb.id FROM knowledge_bases kb
                 INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
+                WHERE kb.user_id = ? OR kb.is_public = 1
             )
             SELECT id FROM kb_hierarchy;
             "#,
         )
         .bind(root_kb_id)
+        .bind(&user_id)
         .bind(&user_id)
         .fetch_all(&pool)
         .await?;
@@ -339,15 +343,17 @@ pub async fn search_with_graph(
         let descendant_ids: Vec<i64> = sqlx::query_scalar(
             r#"
             WITH RECURSIVE kb_hierarchy AS (
-                SELECT id FROM knowledge_bases WHERE id = ? AND user_id = ?
+                SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
                 UNION ALL
                 SELECT kb.id FROM knowledge_bases kb
                 INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
+                WHERE kb.user_id = ? OR kb.is_public = 1
             )
             SELECT id FROM kb_hierarchy;
             "#,
         )
         .bind(root_kb_id)
+        .bind(&user_id)
         .bind(&user_id)
         .fetch_all(&pool)
         .await?;
@@ -485,15 +491,17 @@ pub async fn search_image(
         let descendant_ids: Vec<i64> = sqlx::query_scalar(
             r#"
             WITH RECURSIVE kb_hierarchy AS (
-                SELECT id FROM knowledge_bases WHERE id = ? AND user_id = ?
+                SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
                 UNION ALL
                 SELECT kb.id FROM knowledge_bases kb
                 INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
+                WHERE kb.user_id = ? OR kb.is_public = 1
             )
             SELECT id FROM kb_hierarchy;
             "#,
         )
         .bind(root_kb_id)
+        .bind(&user_id)
         .bind(&user_id)
         .fetch_all(&pool)
         .await?;
