@@ -106,7 +106,7 @@ pub async fn list(
     let mut qb = QueryBuilder::<Sqlite>::new(
         "SELECT id, user_id, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE 1=1 ",
     );
-    qb.push(" AND user_id = ").push_bind(auth_user.user_id);
+    qb.push(" AND (user_id = ").push_bind(auth_user.user_id).push(" OR is_public = 1)");
 
     // Filter by parent_id
     if let Some(parent_id) = params.parent_id {
