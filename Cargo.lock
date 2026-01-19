@@ -2566,6 +2566,7 @@ dependencies = [
  "etcd-client",
  "futures",
  "hex",
+ "http-body-util",
  "jieba-rs",
  "lancedb",
  "lazy_static",
@@ -2585,6 +2586,7 @@ dependencies = [
  "sqlx",
  "tantivy",
  "tokio",
+ "tower 0.5.2",
  "utoipa",
  "uuid",
 ]

@@ -1,49 +1,8 @@
 use std::net::SocketAddr;
 
-use axum::{
-    Router, body::Body, extract::DefaultBodyLimit, http::{Request, StatusCode}, middleware::{self, Next}, response::{Html, IntoResponse, Response}, routing::get
-};
+use axum::{Router, extract::DefaultBodyLimit, middleware, response::Html, routing::get};
+use htknow::{api, auth, config, db, frontend, log4rs, processor, search};
 use tokio::net::TcpListener;
-
-mod api;
-mod config;
-mod db;
-mod frontend;
-mod graph;
-mod log4rs;
-mod processor;
-mod search;
-
-/// User authentication info extracted from request headers
-#[derive(Clone, Debug)]
-pub struct AuthUser {
-    pub user_id: String,
-    pub user_name: String,
-    pub role: String,
-}
-
-/// Auth middleware: extract `x-user-id` and `x-role` from headers and put them
-/// into request extensions as `AuthUser` so handlers can extract `Extension<AuthUser>`.
-/// Returns 401 if required headers are missing or invalid.
-async fn auth<B>(mut req: Request<Body>, next: Next) -> Response {
-    // Extract header values into owned Strings
-    let user_id_opt = req.headers().get("x-user-id").and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
-
-    let user_name_opt = req.headers().get("x-user-name").and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
-
-    let role_opt = req.headers().get("x-role").and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
-
-    match (user_id_opt, user_name_opt, role_opt) {
-        (Some(user_id), Some(user_name), Some(role)) => {
-            let auth_user = AuthUser { user_id, user_name, role };
-            req.extensions_mut().insert(auth_user);
-            next.run(req).await
-        }
-        (None, _, _) => (StatusCode::UNAUTHORIZED, "Missing x-user-id header").into_response(),
-        (_, None, _) => (StatusCode::UNAUTHORIZED, "Missing x-user-name header").into_response(),
-        (_, _, None) => (StatusCode::UNAUTHORIZED, "Missing x-role header").into_response(),
-    }
-}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -64,7 +23,7 @@ async fn main() -> anyhow::Result<()> {
     let upload_limit = cfg.server.upload_limit_mb * 1024 * 1024;
     let api_router = Router::new()
         .nest("/api/v1/knowledge/", api::app(pool, search_engine))
-        .layer(middleware::from_fn(auth::<Body>))
+        .layer(middleware::from_fn(auth))
         .layer(DefaultBodyLimit::max(upload_limit));
 
     // Swagger 路由（不需要认证）

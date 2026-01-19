@@ -51,3 +51,7 @@ serde_with = "3.16.1"
 [features]
 default = []
 etcd = ["etcd-client"]
+
+[dev-dependencies]
+http-body-util = "0.1"
+tower = "0.5"

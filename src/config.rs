@@ -339,7 +339,7 @@ mod tests {
         assert_eq!(config.server.upload_limit_mb, 500);
         assert_eq!(config.ai.embedding_model, "bge-m3");
         assert_eq!(config.ai.embedding_dim, 1024);
-        assert_eq!(config.ai.image_embedding_dim, 1024);
+        assert_eq!(config.ai.image_embedding_dim, 2048);
     }
 
     #[test]
