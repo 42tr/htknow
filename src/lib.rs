@@ -28,13 +28,13 @@ pub async fn auth(mut req: Request<Body>, next: Next) -> Response {
     let role_opt = req.headers().get("x-role").and_then(|v| v.to_str().ok()).map(|s| s.to_owned());
 
     match (user_id_opt, user_name_opt, role_opt) {
-        (Some(user_id), Some(user_name), Some(role)) => {
+        (Some(user_id), _, Some(role)) => {
+            let user_name = user_name_opt.unwrap_or_default();
             let auth_user = AuthUser { user_id, user_name, role };
             req.extensions_mut().insert(auth_user);
             next.run(req).await
         }
         (None, _, _) => (StatusCode::UNAUTHORIZED, "Missing x-user-id header").into_response(),
-        (_, None, _) => (StatusCode::UNAUTHORIZED, "Missing x-user-name header").into_response(),
         (_, _, None) => (StatusCode::UNAUTHORIZED, "Missing x-role header").into_response(),
     }
 }
