@@ -92,6 +92,8 @@ pub struct DatabaseConfig {
     pub max_connections: u32,
     /// 忙超时（毫秒）
     pub busy_timeout_ms: u64,
+    /// 是否初始化默认知识库
+    pub init_default_kbs: bool,
 }
 
 /// 存储路径配置
@@ -197,6 +199,7 @@ impl DatabaseConfig {
             url: env_or("DATABASE_URL", "sqlite://data/app.sqlite"),
             max_connections: env_or_parse("HTKNOW_DB_MAX_CONNECTIONS", 10),
             busy_timeout_ms: env_or_parse("HTKNOW_DB_BUSY_TIMEOUT_MS", 5000),
+            init_default_kbs: env_or_parse("HTKNOW_DB_INIT_DEFAULT_KBS", true),
         }
     }
 }

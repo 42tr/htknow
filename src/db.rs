@@ -1,5 +1,5 @@
 use std::{
-    fs::OpenOptions, path::{Path, PathBuf}
+    collections::HashSet, fs::OpenOptions, path::{Path, PathBuf}
 };
 
 use anyhow::Context;
@@ -42,11 +42,30 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     ensure_kb_type_column(&pool).await?;
     ensure_user_name_columns(&pool).await?;
     ensure_pdf_contents_bbox_column(&pool).await?;
+    if cfg.database.init_default_kbs {
+        ensure_default_knowledge_bases(&pool).await?;
+    } else {
+        info!("Skipping default knowledge base initialization");
+    }
 
     info!("Database initialized successfully");
 
     Ok(pool)
 }
+
+const DEFAULT_KNOWLEDGE_BASES: &[(i64, &str, &str, &str, i32)] = &[
+    (1, "文档资料", "技术手册、法规标准。", "analysis", 1),
+    (2, "方案报告", "诊断报告与维修案例", "analysis", 1),
+    (3, "图库", "设备结构与故障样本", "analysis", 1),
+    (4, "VDR数据仓", "全船航行与运行数据回放", "storage", 1),
+    (
+        5,
+        "个人空间",
+        "您的私有工作区。管理个人草稿、收藏的文档以及发布的方案报告。支持跨设备同步与离线访问。",
+        "analysis",
+        1,
+    ),
+];
 
 /// 自动创建所有需要的表
 async fn create_tables(pool: &SqlitePool) -> anyhow::Result<()> {
@@ -61,6 +80,40 @@ async fn create_tables(pool: &SqlitePool) -> anyhow::Result<()> {
     }
 
     info!("Tables created successfully");
+
+    Ok(())
+}
+
+async fn ensure_default_knowledge_bases(pool: &SqlitePool) -> anyhow::Result<()> {
+    let existing_ids: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM knowledge_bases WHERE id IN (1, 2, 3, 4, 5)").fetch_all(pool).await?;
+    let existing_set: HashSet<i64> = existing_ids.into_iter().collect();
+    let mut inserted = 0;
+
+    for &(id, name, description, kb_type, is_public) in DEFAULT_KNOWLEDGE_BASES {
+        if existing_set.contains(&id) {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO knowledge_bases \
+            (id, user_id, user_name, name, description, kb_type, parent_id, is_public) \
+            VALUES (?, ?, ?, ?, ?, ?, NULL, ?)",
+        )
+        .bind(id)
+        .bind("")
+        .bind("")
+        .bind(name)
+        .bind(description)
+        .bind(kb_type)
+        .bind(is_public)
+        .execute(pool)
+        .await?;
+        inserted += 1;
+    }
+
+    if inserted > 0 {
+        info!("Inserted {} default knowledge bases", inserted);
+    }
 
     Ok(())
 }
