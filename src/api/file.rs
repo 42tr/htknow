@@ -29,6 +29,7 @@ pub struct File {
     pub slice_type: String,
     pub kb_id: Option<i64>,
     pub is_public: i32,
+    pub meta: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -63,6 +64,7 @@ pub async fn upload(
     let mut kb_id = None;
     let mut is_public = 0i32;
     let mut tags: Vec<String> = Vec::new();
+    let mut meta: Option<String> = None;
 
     loop {
         match multipart.next_field().await {
@@ -106,6 +108,13 @@ pub async fn upload(
                         debug!("Is public text: {}", is_public_text);
                         is_public = is_public_text.parse::<i32>().unwrap_or(0);
                     }
+                    Some("meta") => {
+                        let meta_text = field.text().await?;
+                        debug!("Meta text: {}", meta_text);
+                        if !meta_text.is_empty() {
+                            meta = Some(meta_text);
+                        }
+                    }
                     _ => {
                         debug!("Skipping unknown field: {:?}", field_name);
                     }
@@ -142,7 +151,7 @@ pub async fn upload(
     let tags_json = serde_json::to_string(&tags)?;
     let status = if is_storage_kb { 3 } else { 0 };
     let log_message = if is_storage_kb { "Storage mode: not parsed" } else { "" };
-    let sql = "INSERT INTO files (user_id, user_name, hash, filename, path, slice_type, kb_id, is_public, tags, status, log) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    let sql = "INSERT INTO files (user_id, user_name, hash, filename, path, slice_type, kb_id, is_public, tags, status, log, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
     let id = sqlx::query(sql)
         .bind(auth_user.user_id)
         .bind(auth_user.user_name)
@@ -155,6 +164,7 @@ pub async fn upload(
         .bind(tags_json)
         .bind(status)
         .bind(log_message)
+        .bind(meta)
         .execute(&pool)
         .await?
         .last_insert_rowid();
@@ -198,6 +208,7 @@ pub struct UpdateFileReq {
     pub filename: Option<String>,
     pub tags: Option<Vec<String>>,
     pub is_public: Option<bool>,
+    pub meta: Option<serde_json::Value>,
 }
 
 /// 更新文件
@@ -225,6 +236,7 @@ pub async fn update(
 ) -> ApiResult<Json<File>> {
     let mut has_updates = false;
     let update_is_public = req.is_public.is_some();
+    debug!("update_is_public: {}", update_is_public);
     if update_is_public {
         let owner: Option<String> =
             sqlx::query_scalar("SELECT user_id FROM files WHERE id = ?").bind(id).fetch_optional(&pool).await?;
@@ -270,6 +282,13 @@ pub async fn update(
     if let Some(is_public) = req.is_public {
         let is_public = if is_public { 1 } else { 0 };
         separated.push("is_public = ").push_bind_unseparated(is_public);
+        has_updates = true;
+    }
+
+    if let Some(meta) = req.meta {
+        let meta_json = serde_json::to_string(&meta)?;
+        debug!("meta_json: {}", meta_json);
+        separated.push("meta = ").push_bind_unseparated(meta_json);
         has_updates = true;
     }
 

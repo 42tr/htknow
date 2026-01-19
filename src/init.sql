@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS files (
     slice_type TEXT DEFAULT '', -- 切片类型
     kb_id INTEGER DEFAULT NULL, -- 知识库ID
     is_public INTEGER NOT NULL DEFAULT 0, -- 是否公开: 0-私有, 1-公开
+    meta TEXT DEFAULT NULL, -- 元数据，存储任意JSON数据
     created_at INTEGER DEFAULT (strftime('%s','now')),
     updated_at INTEGER DEFAULT (strftime('%s','now'))
 );
@@ -130,3 +131,4 @@ CREATE INDEX IF NOT EXISTS idx_edges_relation ON graph_edges(relation_type);
 CREATE INDEX IF NOT EXISTS idx_mentions_node ON entity_mentions(node_id);
 CREATE INDEX IF NOT EXISTS idx_mentions_slice ON entity_mentions(slice_id);
 CREATE INDEX IF NOT EXISTS idx_slice_positions_slice ON slice_positions(slice_id);
+CREATE INDEX IF NOT EXISTS idx_files_meta ON files(meta);
