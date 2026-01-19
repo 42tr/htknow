@@ -221,6 +221,14 @@ export const api = {
     return response.blob()
   },
 
+  async downloadFile(id) {
+    const response = await fetch(`${API_BASE}/files/${id}/download`, {
+      headers: getHeaders(false),
+    })
+    if (!response.ok) throw new Error('下载文件失败')
+    return response.blob()
+  },
+
   async updateFile(id, data) {
     const response = await fetch(`${API_BASE}/files/${id}`, {
       method: 'PUT',
