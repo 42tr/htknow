@@ -67,9 +67,33 @@ async fn swagger_ui_handler() -> Html<&'static str> {
                     SwaggerUIBundle.presets.apis,
                     SwaggerUIStandalonePreset
                 ],
-                layout: "StandaloneLayout"
+                layout: "StandaloneLayout",
+                requestInterceptor: (req) => {
+                    req.headers['x-user-id'] = localStorage.getItem('swagger-x-user-id') || '1';
+                    req.headers['x-user-name'] = localStorage.getItem('swagger-x-user-name') || 'testuser';
+                    req.headers['x-role'] = localStorage.getItem('swagger-x-role') || 'admin';
+                    return req;
+                }
             });
         };
+    </script>
+    <div id="swagger-auth-config" style="position:fixed;top:10px;right:80px;z-index:1000;background:#fff;padding:10px;border:1px solid #ddd;border-radius:4px;box-shadow:0 2px 5px rgba(0,0,0,0.1);">
+        <input type="text" id="auth-user-id" placeholder="x-user-id" style="width:80px;padding:4px;margin-right:5px;border:1px solid #ccc;border-radius:3px;">
+        <input type="text" id="auth-user-name" placeholder="x-user-name" style="width:100px;padding:4px;margin-right:5px;border:1px solid #ccc;border-radius:3px;">
+        <input type="text" id="auth-role" placeholder="x-role" style="width:60px;padding:4px;margin-right:5px;border:1px solid #ccc;border-radius:3px;">
+        <button onclick="saveAuthConfig()" style="padding:4px 10px;background:#007bff;color:#fff;border:none;border-radius:3px;cursor:pointer;">保存认证</button>
+    </div>
+    <script>
+        document.getElementById('auth-user-id').value = localStorage.getItem('swagger-x-user-id') || '1';
+        document.getElementById('auth-user-name').value = localStorage.getItem('swagger-x-user-name') || 'testuser';
+        document.getElementById('auth-role').value = localStorage.getItem('swagger-x-role') || 'admin';
+
+        function saveAuthConfig() {
+            localStorage.setItem('swagger-x-user-id', document.getElementById('auth-user-id').value);
+            localStorage.setItem('swagger-x-user-name', document.getElementById('auth-user-name').value);
+            localStorage.setItem('swagger-x-role', document.getElementById('auth-role').value);
+            location.reload();
+        }
     </script>
 </body>
 </html>
