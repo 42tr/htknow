@@ -630,7 +630,7 @@ impl FileProcessor {
                 }
             } else if pdf_content.typ == "image" {
                 if let Some(img_name) = &pdf_content.img_path {
-                    item_content.push_str(&format!("![{}](images/{})", img_name, img_name));
+                    item_content.push_str(&format!("![{}](/api/v1/knowledge/files/{})", img_name, img_name));
                 }
                 if let Some(captions) = &pdf_content.image_caption {
                     for caption in captions {

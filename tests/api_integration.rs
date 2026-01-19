@@ -184,37 +184,6 @@ async fn insert_slice_position(pool: &SqlitePool, slice_id: i64, page_idx: i32, 
         .unwrap();
 }
 
-async fn ensure_pdf_images_table(pool: &SqlitePool) {
-    sqlx::query(
-        "CREATE TABLE IF NOT EXISTS pdf_images (\
-            id INTEGER PRIMARY KEY AUTOINCREMENT,\
-            file_id INTEGER NOT NULL,\
-            filename TEXT NOT NULL,\
-            path TEXT NOT NULL,\
-            page_num INTEGER,\
-            created_at INTEGER DEFAULT (strftime('%s','now')),\
-            updated_at INTEGER DEFAULT (strftime('%s','now'))\
-        )",
-    )
-    .execute(pool)
-    .await
-    .unwrap();
-}
-
-async fn insert_pdf_image(
-    pool: &SqlitePool, file_id: i64, filename: &str, path: &PathBuf, page_num: Option<i64>,
-) -> i64 {
-    sqlx::query("INSERT INTO pdf_images (file_id, filename, path, page_num) VALUES (?, ?, ?, ?)")
-        .bind(file_id)
-        .bind(filename)
-        .bind(path.to_string_lossy().as_ref())
-        .bind(page_num)
-        .execute(pool)
-        .await
-        .unwrap()
-        .last_insert_rowid()
-}
-
 async fn insert_graph_node(
     pool: &SqlitePool, name: &str, entity_type: &str, properties: Option<Value>, file_id: Option<i64>,
     kb_id: Option<i64>,
@@ -355,8 +324,6 @@ async fn file_endpoints_flow() {
     let env = setup_env();
     let user = TestUser::new("file");
 
-    ensure_pdf_images_table(&pool).await;
-
     let kb_id = insert_kb(&pool, &user, "File KB", "analysis", None, false).await;
 
     let file_suffix = next_seq();
@@ -379,12 +346,6 @@ async fn file_endpoints_flow() {
 
     let slice_id = insert_slice(&pool, file_id, "slice content").await;
     insert_slice_position(&pool, slice_id, 1, [1, 2, 3, 4]).await;
-
-    let image_dir = env.data_dir.join("pdf_images");
-    fs::create_dir_all(&image_dir).unwrap();
-    let image_path = image_dir.join(format!("image-{}.png", file_suffix));
-    fs::write(&image_path, b"png").unwrap();
-    let image_id = insert_pdf_image(&pool, file_id, "image.png", &image_path, Some(1)).await;
 
     let list_req = authed_empty_request("GET", "/api/v1/knowledge/files/", &user);
     let list_res = app.clone().oneshot(list_req).await.unwrap();
@@ -453,27 +414,10 @@ async fn file_endpoints_flow() {
     assert_eq!(positions[0]["page_idx"].as_i64(), Some(1));
     assert_eq!(positions[0]["bbox"].as_array().unwrap().len(), 4);
 
-    let images_req = authed_empty_request("GET", format!("/api/v1/knowledge/files/{}/images", file_id), &user);
-    let images_res = app.clone().oneshot(images_req).await.unwrap();
-    assert_eq!(images_res.status(), StatusCode::OK);
-    let images_json = response_json(images_res).await;
-    let images = images_json.as_array().expect("image list");
-    assert!(images.iter().any(|image| image["id"].as_i64() == Some(image_id)));
-
-    let image_req =
-        authed_empty_request("GET", format!("/api/v1/knowledge/files/{}/images/{}", file_id, image_id), &user);
-    let image_res = app.clone().oneshot(image_req).await.unwrap();
-    assert_eq!(image_res.status(), StatusCode::OK);
-    let image_type = image_res.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
-    assert!(image_type.contains("image/png"));
-    let image_bytes = image_res.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(image_bytes.as_ref(), b"png");
-
     let delete_req = authed_empty_request("DELETE", format!("/api/v1/knowledge/files/{}", file_id), &user);
     let delete_res = app.clone().oneshot(delete_req).await.unwrap();
     assert_eq!(delete_res.status(), StatusCode::OK);
     assert!(!file_path.exists());
-    assert!(!image_path.exists());
 }
 
 #[tokio::test]

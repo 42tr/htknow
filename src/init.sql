@@ -63,16 +63,6 @@ CREATE TABLE IF NOT EXISTS slice_positions (
     FOREIGN KEY (slice_id) REFERENCES slices(id) ON DELETE CASCADE
 );
 
--- CREATE TABLE IF NOT EXISTS pdf_images (
---     id INTEGER PRIMARY KEY AUTOINCREMENT,
---     file_id INTEGER NOT NULL, -- 文件ID
---     filename TEXT NOT NULL, -- 图片文件名
---     path TEXT NOT NULL, -- 图片路径
---     page_num INTEGER, -- 所在页码
---     created_at INTEGER DEFAULT (strftime('%s','now')),
---     updated_at INTEGER DEFAULT (strftime('%s','now'))
--- );
-
 -- 知识图谱相关表
 
 -- 图节点表（实体）

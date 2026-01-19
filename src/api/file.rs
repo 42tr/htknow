@@ -1,3 +1,5 @@
+use std::path::Component;
+
 use axum::{
     Extension, body::Body, extract::{Multipart, Path, Query, State}, http::{StatusCode, header}, response::Json
 };
@@ -323,25 +325,6 @@ pub async fn delete(
         log::warn!("Failed to delete converted pdf {}: {}", pdf_path.display(), e);
     }
 
-    // 删除 PDF 图片
-    let images: Vec<PdfImage> =
-        sqlx::query_as("SELECT * FROM pdf_images WHERE file_id = ?").bind(id).fetch_all(&pool).await?;
-
-    for image in images {
-        // 删除图片文件
-        if let Err(e) = fs::remove_file(&image.path).await {
-            log::warn!("Failed to delete image file {}: {}", image.path, e);
-        }
-    }
-
-    // 删除图片目录（如果存在）
-    let image_dir = format!("data/pdf_images/{}", id);
-    if let Err(e) = fs::remove_dir_all(&image_dir).await {
-        log::warn!("Failed to delete image directory {}: {}", image_dir, e);
-    }
-
-    // 删除数据库记录
-    sqlx::query("DELETE FROM pdf_images WHERE file_id = ?").bind(id).execute(&pool).await?;
     search_engine.delete(Some(id), None).await?;
     sqlx::query("DELETE FROM slices WHERE file_id = ?").bind(id).execute(&pool).await?;
     sqlx::query("DELETE FROM files WHERE id = ?").bind(id).execute(&pool).await?;
@@ -499,61 +482,37 @@ pub async fn get_slices(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> 
     Ok(Json(slices))
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
-pub struct PdfImage {
-    pub id: i64,
-    pub file_id: i64,
-    pub filename: String,
-    pub path: String,
-    pub page_num: Option<i64>,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-/// 获取文件的所有图片列表
+/// 获取存储目录中的图片
 #[utoipa::path(
     get,
-    path = "/api/v1/knowledge/files/{file_id}/images",
+    path = "/api/v1/knowledge/files/images/{filename}",
     tag = "file",
     params(
-        ("file_id" = i64, Path, description = "文件 ID")
-    ),
-    responses(
-        (status = 200, description = "成功返回图片列表", body = Vec<PdfImage>),
-        (status = 404, description = "文件不存在")
-    )
-)]
-pub async fn get_images(State(pool): State<SqlitePool>, Path(file_id): Path<i64>) -> ApiResult<Json<Vec<PdfImage>>> {
-    let images =
-        sqlx::query_as("SELECT * FROM pdf_images WHERE file_id = ? ORDER BY id").bind(file_id).fetch_all(&pool).await?;
-    Ok(Json(images))
-}
-
-/// 获取单个图片文件
-#[utoipa::path(
-    get,
-    path = "/api/v1/knowledge/files/{file_id}/images/{image_id}",
-    tag = "file",
-    params(
-        ("file_id" = i64, Path, description = "文件 ID"),
-        ("image_id" = i64, Path, description = "图片 ID")
+        ("filename" = String, Path, description = "图片文件名")
     ),
     responses(
         (status = 200, description = "成功返回图片文件", content_type = "image/*"),
+        (status = 400, description = "请求参数错误"),
         (status = 404, description = "图片不存在")
     )
 )]
-pub async fn get_image(
-    State(pool): State<SqlitePool>, Path((file_id, image_id)): Path<(i64, i64)>,
+pub async fn get_image_by_filename(
+    Path(filename): Path<String>,
 ) -> Result<(StatusCode, [(header::HeaderName, String); 1], Body), ApiError> {
-    let image: PdfImage = sqlx::query_as("SELECT * FROM pdf_images WHERE id = ? AND file_id = ?")
-        .bind(image_id)
-        .bind(file_id)
-        .fetch_one(&pool)
-        .await?;
+    let mut components = std::path::Path::new(&filename).components();
+    match components.next() {
+        Some(Component::Normal(_)) if components.next().is_none() => {}
+        _ => return Err(ApiError::BadRequest("Invalid filename".to_string())),
+    }
 
-    let file_content = tokio::fs::read(&image.path).await?;
-    let mime_type = mime_guess::from_path(&image.filename).first_or_octet_stream().to_string();
+    let cfg = config::get();
+    let image_path = std::path::Path::new(&cfg.storage.images_path).join(&filename);
+    if !fs::try_exists(&image_path).await? {
+        return Err(ApiError::NotFound("Image not found".to_string()));
+    }
+
+    let file_content = fs::read(&image_path).await?;
+    let mime_type = mime_guess::from_path(&filename).first_or_octet_stream().to_string();
 
     Ok((StatusCode::OK, [(header::CONTENT_TYPE, mime_type)], Body::from(file_content)))
 }
