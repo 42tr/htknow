@@ -105,6 +105,7 @@ pub struct TreeQuery {
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/knowledge_base/",
+    operation_id = "knowledge_base_list",
     tag = "knowledge_base",
     params(ListQuery),
     responses(
@@ -261,6 +262,7 @@ pub struct KnowledgeCreateReq {
 #[utoipa::path(
     post,
     path = "/api/v1/knowledge/knowledge_base/",
+    operation_id = "knowledge_base_create",
     tag = "knowledge_base",
     request_body = KnowledgeCreateReq,
     responses(
@@ -314,6 +316,7 @@ pub struct KnowledgeUpdateReq {
 #[utoipa::path(
     put,
     path = "/api/v1/knowledge/knowledge_base/{id}",
+    operation_id = "knowledge_base_update",
     tag = "knowledge_base",
     params(
         ("id" = i64, Path, description = "知识库 ID")
@@ -429,6 +432,7 @@ pub async fn update(
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/knowledge_base/{id}",
+    operation_id = "knowledge_base_get",
     tag = "knowledge_base",
     params(
         ("id" = i64, Path, description = "知识库 ID")
@@ -511,6 +515,7 @@ pub async fn get(
 #[utoipa::path(
     delete,
     path = "/api/v1/knowledge/knowledge_base/{id}",
+    operation_id = "knowledge_base_delete",
     tag = "knowledge_base",
     params(
         ("id" = i64, Path, description = "知识库 ID")
@@ -631,6 +636,7 @@ pub struct ReparseKnowledgeBaseResponse {
 #[utoipa::path(
     put,
     path = "/api/v1/knowledge/knowledge_base/{id}/public",
+    operation_id = "knowledge_base_update_public",
     tag = "knowledge_base",
     params(
         ("id" = i64, Path, description = "知识库 ID")
@@ -669,6 +675,7 @@ pub async fn update_public(
 #[utoipa::path(
     post,
     path = "/api/v1/knowledge/knowledge_base/reparse",
+    operation_id = "knowledge_base_reparse",
     tag = "knowledge_base",
     responses(
         (status = 200, description = "已提交重新解析", body = ReparseKnowledgeBaseResponse),
@@ -831,6 +838,7 @@ async fn build_subtree_recursive(
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/knowledge_base/tree",
+    operation_id = "knowledge_base_tree",
     tag = "knowledge_base",
     params(TreeQuery),
     responses(

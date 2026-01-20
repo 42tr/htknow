@@ -35,6 +35,7 @@ pub struct EntitySearchParams {
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/graph/entities",
+    operation_id = "graph_search_entities",
     tag = "graph",
     params(EntitySearchParams),
     responses(
@@ -131,6 +132,7 @@ pub struct MentionInfo {
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/graph/entities/{id}",
+    operation_id = "graph_get_entity",
     tag = "graph",
     params(
         ("id" = i64, Path, description = "实体 ID")
@@ -253,6 +255,7 @@ pub struct StatsParams {
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/graph/stats",
+    operation_id = "graph_get_graph_stats",
     tag = "graph",
     params(StatsParams),
     responses(

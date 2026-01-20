@@ -110,6 +110,7 @@ pub struct ImageSearchQuery {
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/search/",
+    operation_id = "search_query",
     tag = "search",
     params(SearchQuery),
     responses(
@@ -221,6 +222,7 @@ pub async fn search(
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/search/full",
+    operation_id = "search_full",
     tag = "search",
     params(SearchQuery),
     responses(
@@ -323,6 +325,7 @@ pub async fn search_full(
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/search/graph",
+    operation_id = "search_with_graph",
     tag = "search",
     params(SearchQuery),
     responses(
@@ -435,6 +438,7 @@ pub async fn search_with_graph(
 #[utoipa::path(
     post,
     path = "/api/v1/knowledge/search/image",
+    operation_id = "search_image",
     tag = "search",
     params(ImageSearchQuery),
     request_body(content_type = "multipart/form-data"),

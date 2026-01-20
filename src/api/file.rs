@@ -38,6 +38,7 @@ pub struct File {
 #[utoipa::path(
     post,
     path = "/api/v1/knowledge/files/",
+    operation_id = "file_upload",
     tag = "file",
     request_body(content_type = "multipart/form-data"),
     responses(
@@ -212,6 +213,7 @@ pub async fn upload(
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/files/{id}",
+    operation_id = "file_get",
     tag = "file",
     params(
         ("id" = i64, Path, description = "文件 ID")
@@ -251,6 +253,7 @@ pub struct UpdateFileReq {
 #[utoipa::path(
     put,
     path = "/api/v1/knowledge/files/{id}",
+    operation_id = "file_update",
     tag = "file",
     params(
         ("id" = i64, Path, description = "文件 ID")
@@ -358,6 +361,7 @@ pub async fn update(
 #[utoipa::path(
     delete,
     path = "/api/v1/knowledge/files/{id}",
+    operation_id = "file_delete",
     tag = "file",
     params(
         ("id" = i64, Path, description = "文件 ID")
@@ -396,6 +400,7 @@ pub struct ListQuery {
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/files/",
+    operation_id = "file_list",
     tag = "file",
     params(ListQuery),
     responses(
@@ -500,6 +505,7 @@ struct PageBBoxRow {
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/files/{id}/slices",
+    operation_id = "file_get_slices",
     tag = "file",
     params(
         ("id" = i64, Path, description = "文件 ID")
@@ -546,6 +552,7 @@ pub async fn get_slices(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> 
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/files/images/{filename}",
+    operation_id = "file_get_image_by_filename",
     tag = "file",
     params(
         ("filename" = String, Path, description = "图片文件名")
@@ -581,6 +588,7 @@ pub async fn get_image_by_filename(
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/files/{id}/content",
+    operation_id = "file_get_content",
     tag = "file",
     params(
         ("id" = i64, Path, description = "文件 ID")
@@ -625,6 +633,7 @@ pub async fn get_content(
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/files/{id}/download",
+    operation_id = "file_download",
     tag = "file",
     params(
         ("id" = i64, Path, description = "文件 ID")
@@ -670,6 +679,7 @@ pub struct HighlightQuery {
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/files/{id}/highlighted-pdf",
+    operation_id = "file_get_highlighted_pdf",
     tag = "file",
     params(
         ("id" = i64, Path, description = "文件 ID"),
