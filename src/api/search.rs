@@ -47,6 +47,8 @@ pub struct KbInfo {
 pub struct SearchResultItem {
     /// 切片 ID
     pub id: i64,
+    /// 文件 ID
+    pub file_id: i64,
     /// 切片内容
     pub content: String,
     /// 搜索得分
@@ -203,6 +205,7 @@ pub async fn search(
             if has_permission {
                 Some(SearchResultItem {
                     id: r.id,
+                    file_id: r.file_id,
                     content: r.content,
                     score: r.score,
                     file,
@@ -419,6 +422,7 @@ pub async fn search_with_graph(
             if has_permission {
                 Some(SearchResultItem {
                     id: r.id,
+                    file_id: r.file_id,
                     content: r.content,
                     score: r.score,
                     file,
@@ -563,6 +567,7 @@ pub async fn search_image(
             if has_permission {
                 Some(SearchResultItem {
                     id: r.id,
+                    file_id: r.file_id,
                     content: r.content,
                     score: r.score,
                     file,
