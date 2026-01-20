@@ -8,6 +8,7 @@ pub mod db;
 pub mod frontend;
 pub mod graph;
 pub mod log4rs;
+pub mod pdf_highlight;
 pub mod processor;
 pub mod search;
 

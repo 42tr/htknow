@@ -44,6 +44,9 @@ aho-corasick = "1.0"      # 高效字符串匹配（词典）
 regex = "1"               # 正则表达式
 lru = "0.12"              # LRU缓存
 
+# PDF 操作
+lopdf = "0.36"
+
 # etcd 配置中心（可选）
 etcd-client = { version = "0.14", optional = true }
 serde_with = "3.16.1"

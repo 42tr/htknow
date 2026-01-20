@@ -1,4 +1,4 @@
-use std::path::Component;
+use std::{collections::HashMap, path::Component};
 
 use axum::{
     Extension, body::Body, extract::{Multipart, Path, Query, State}, http::{StatusCode, header}, response::Json
@@ -11,7 +11,7 @@ use tokio::{fs, io::AsyncWriteExt as _, spawn};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    AuthUser, api::error::{ApiError, ApiResult}, config, processor, search::SearchEngine
+    AuthUser, api::error::{ApiError, ApiResult}, config, pdf_highlight, processor, search::SearchEngine
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
@@ -491,6 +491,12 @@ struct SlicePositionRow {
     y2: i32,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct PageBBoxRow {
+    page_idx: i32,
+    bbox: String,
+}
+
 /// 获取文件的所有切片
 #[utoipa::path(
     get,
@@ -650,5 +656,153 @@ pub async fn download(
         StatusCode::OK,
         [(header::CONTENT_TYPE, mime_type), (header::CONTENT_DISPOSITION, content_disposition)],
         Body::from(file_content),
+    ))
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct HighlightQuery {
+    /// Base64 编码的 positions JSON 数组
+    pub positions: Option<String>,
+    /// 切片 ID（如果不传 positions，则从数据库查询）
+    pub slice_id: Option<i64>,
+}
+
+/// 获取带高亮标注的 PDF
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/files/{id}/highlighted-pdf",
+    tag = "file",
+    params(
+        ("id" = i64, Path, description = "文件 ID"),
+        HighlightQuery,
+    ),
+    responses(
+        (status = 200, description = "成功返回带高亮的 PDF", content_type = "application/pdf"),
+        (status = 400, description = "请求参数错误"),
+        (status = 404, description = "文件不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn get_highlighted_pdf(
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Query(params): Query<HighlightQuery>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> Result<(StatusCode, [(header::HeaderName, String); 2], Body), ApiError> {
+    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+
+    if !file.is_public && file.user_id != auth_user.user_id {
+        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
+    }
+
+    // 解析高亮位置
+    let positions: Vec<pdf_highlight::HighlightPosition> = if let Some(positions_b64) = &params.positions {
+        // 从 Base64 解码 positions
+        let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, positions_b64)
+            .map_err(|e| ApiError::BadRequest(format!("Invalid base64 positions: {}", e)))?;
+
+        serde_json::from_slice(&decoded).map_err(|e| ApiError::BadRequest(format!("Invalid positions JSON: {}", e)))?
+    } else if let Some(slice_id) = params.slice_id {
+        // 从数据库查询 slice 的 positions
+        let rows: Vec<SlicePositionRow> = sqlx::query_as(
+            "SELECT slice_id, page_idx, x1, y1, x2, y2 FROM slice_positions WHERE slice_id = ? ORDER BY page_idx, id",
+        )
+        .bind(slice_id)
+        .fetch_all(&pool)
+        .await?;
+
+        rows.iter()
+            .map(|row| pdf_highlight::HighlightPosition {
+                page_idx: row.page_idx,
+                bbox: [row.x1, row.y1, row.x2, row.y2],
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    let coord_bounds_by_page = if positions.is_empty() {
+        None
+    } else {
+        let rows: Vec<PageBBoxRow> = sqlx::query_as(
+            "SELECT page_idx, bbox FROM pdf_contents WHERE file_id = ? AND bbox IS NOT NULL AND bbox != ''",
+        )
+        .bind(file.id)
+        .fetch_all(&pool)
+        .await?;
+
+        let mut global_min_x = f32::MAX;
+        let mut global_min_y = f32::MAX;
+        let mut global_max_x = f32::MIN;
+        let mut global_max_y = f32::MIN;
+        for row in rows {
+            if let Ok(bbox) = serde_json::from_str::<Vec<i32>>(&row.bbox) {
+                if bbox.len() == 4 {
+                    let x1 = bbox[0] as f32;
+                    let y1 = bbox[1] as f32;
+                    let x2 = bbox[2] as f32;
+                    let y2 = bbox[3] as f32;
+                    global_min_x = global_min_x.min(x1.min(x2));
+                    global_min_y = global_min_y.min(y1.min(y2));
+                    global_max_x = global_max_x.max(x1.max(x2));
+                    global_max_y = global_max_y.max(y1.max(y2));
+                }
+            }
+        }
+
+        if !global_min_x.is_finite()
+            || !global_min_y.is_finite()
+            || !global_max_x.is_finite()
+            || !global_max_y.is_finite()
+        {
+            None
+        } else {
+            let global_bounds = pdf_highlight::PageCoordBounds {
+                min_x: global_min_x,
+                min_y: global_min_y,
+                max_x: global_max_x,
+                max_y: global_max_y,
+            };
+            let mut bounds: HashMap<i32, pdf_highlight::PageCoordBounds> = HashMap::new();
+            for page_idx in positions.iter().map(|pos| pos.page_idx) {
+                bounds.entry(page_idx).or_insert(global_bounds);
+            }
+            Some(bounds)
+        }
+    };
+
+    // 确定 PDF 文件路径
+    let filename_lower = file.filename.to_lowercase();
+    let pdf_path = if filename_lower.ends_with(".doc") || filename_lower.ends_with(".docx") {
+        let cfg = config::get();
+        let path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", file.id));
+        if !tokio::fs::try_exists(&path).await? {
+            return Err(ApiError::NotFound("Converted PDF not found".to_string()));
+        }
+        path
+    } else if filename_lower.ends_with(".pdf") {
+        std::path::PathBuf::from(&file.path)
+    } else {
+        return Err(ApiError::BadRequest("File is not a PDF or Word document".to_string()));
+    };
+
+    // 读取原始 PDF
+    let pdf_bytes = tokio::fs::read(&pdf_path).await?;
+
+    // 添加高亮标注
+    let highlighted_pdf = if positions.is_empty() {
+        pdf_bytes
+    } else {
+        pdf_highlight::add_highlights_to_pdf_with_bounds(&pdf_bytes, &positions, coord_bounds_by_page.as_ref())
+            .map_err(|e| ApiError::Internal(format!("Failed to add highlights: {}", e)))?
+    };
+
+    let content_disposition = format!("inline; filename=\"highlighted_{}.pdf\"", file.id);
+
+    Ok((
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "application/pdf".to_string()), (header::CONTENT_DISPOSITION, content_disposition)],
+        Body::from(highlighted_pdf),
     ))
 }
