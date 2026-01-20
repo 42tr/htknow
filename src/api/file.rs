@@ -55,7 +55,8 @@ pub async fn upload(
     Extension(auth_user): Extension<AuthUser>, mut multipart: Multipart,
 ) -> ApiResult<Json<Vec<File>>> {
     debug!("Starting file upload for user: {}", auth_user.user_id);
-    let dir = "data/files";
+    let cfg = config::get();
+    let dir = &cfg.storage.files_path;
     tokio::fs::create_dir_all(dir).await?;
 
     let mut files_data: Vec<(String, String, String)> = Vec::new();
