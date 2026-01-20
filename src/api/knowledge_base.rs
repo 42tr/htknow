@@ -33,7 +33,7 @@ pub struct Knowledge {
     pub description: String,
     pub kb_type: String,
     pub parent_id: Option<i64>,
-    pub is_public: i32,
+    pub is_public: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
@@ -45,7 +45,7 @@ pub struct KnowledgeResponse {
     pub description: String,
     pub kb_type: String,
     pub parent_id: Option<i64>,
-    pub is_public: i32,
+    pub is_public: bool,
     pub file_count: i64,
     pub children_kb_count: i64,
 }
@@ -59,7 +59,7 @@ pub struct KnowledgeDetailResponse {
     pub description: String,
     pub kb_type: String,
     pub parent_id: Option<i64>,
-    pub is_public: i32,
+    pub is_public: bool,
     pub children_kbs: Vec<Knowledge>,
     pub files: Vec<super::file::File>,
     pub path: Vec<Knowledge>, // For breadcrumbs

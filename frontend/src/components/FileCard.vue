@@ -53,10 +53,10 @@ const statusInfo = computed(() => {
 
 const publicInfo = computed(() => {
   return {
-    isPublic: props.file.is_public === 1,
-    text: props.file.is_public === 1 ? '公开' : '私有',
-    color: props.file.is_public === 1 ? 'bg-green-50 text-green-600 border-green-200' : 'bg-slate-50 text-slate-600 border-slate-200',
-    icon: props.file.is_public === 1 ? '🌐' : '🔒'
+    isPublic: props.file.is_public,
+    text: props.file.is_public ? '公开' : '私有',
+    color: props.file.is_public ? 'bg-green-50 text-green-600 border-green-200' : 'bg-slate-50 text-slate-600 border-slate-200',
+    icon: props.file.is_public ? '🌐' : '🔒'
   }
 })
 

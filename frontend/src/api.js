@@ -158,7 +158,7 @@ export const api = {
     if (tags.length > 0) {
       formData.append('tags', JSON.stringify(tags))
     }
-    formData.append('is_public', isPublic ? '1' : '0')
+    formData.append('is_public', isPublic ? 'true' : 'false')
     formData.append('slice_type', sliceType)
     for (const file of files) {
       formData.append('file', file)

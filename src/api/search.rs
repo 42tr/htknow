@@ -28,7 +28,7 @@ pub struct FileInfo {
     pub id: i64,
     pub filename: String,
     pub kb_id: Option<i64>,
-    pub is_public: i32,
+    pub is_public: bool,
     pub user_id: String,
     pub created_at: i64,
 }
@@ -38,7 +38,7 @@ pub struct FileInfo {
 pub struct KbInfo {
     pub id: i64,
     pub name: String,
-    pub is_public: i32,
+    pub is_public: bool,
     pub user_id: String,
 }
 
@@ -189,11 +189,11 @@ pub async fn search(
             let has_permission = if let Some(ref file_info) = file {
                 // 如果文件存在，检查文件权限
                 // 规则：私有文件（is_public=0）只有所有者可以查看
-                if file_info.is_public == 0 && file_info.user_id != user_id { false } else { true }
+                if !file_info.is_public && file_info.user_id != user_id { false } else { true }
             } else if let Some(ref kb_info) = kb {
                 // 如果没有文件信息但有知识库信息，检查知识库权限
                 // 规则：私有知识库（is_public=0）只有所有者可以查看
-                if kb_info.is_public == 0 && kb_info.user_id != user_id { false } else { true }
+                if !kb_info.is_public && kb_info.user_id != user_id { false } else { true }
             } else {
                 // 没有文件和知识库信息，默认允许
                 true
@@ -298,11 +298,11 @@ pub async fn search_full(
             let has_permission = if let Some(ref file_info) = file {
                 // 如果文件存在，检查文件权限
                 // 规则：私有文件（is_public=0）只有所有者可以查看
-                if file_info.is_public == 0 && file_info.user_id != user_id { false } else { true }
+                if !file_info.is_public && file_info.user_id != user_id { false } else { true }
             } else if let Some(ref kb_info) = kb {
                 // 如果没有文件信息但有知识库信息，检查知识库权限
                 // 规则：私有知识库（is_public=0）只有所有者可以查看
-                if kb_info.is_public == 0 && kb_info.user_id != user_id { false } else { true }
+                if !kb_info.is_public && kb_info.user_id != user_id { false } else { true }
             } else {
                 // 没有文件和知识库信息，默认允许
                 true
@@ -403,11 +403,11 @@ pub async fn search_with_graph(
             let has_permission = if let Some(ref file_info) = file {
                 // 如果文件存在，检查文件权限
                 // 规则：私有文件（is_public=0）只有所有者可以查看
-                if file_info.is_public == 0 && file_info.user_id != user_id { false } else { true }
+                if !file_info.is_public && file_info.user_id != user_id { false } else { true }
             } else if let Some(ref kb_info) = kb {
                 // 如果没有文件信息但有知识库信息，检查知识库权限
                 // 规则：私有知识库（is_public=0）只有所有者可以查看
-                if kb_info.is_public == 0 && kb_info.user_id != user_id { false } else { true }
+                if !kb_info.is_public && kb_info.user_id != user_id { false } else { true }
             } else {
                 // 没有文件和知识库信息，默认允许
                 true
@@ -549,9 +549,9 @@ pub async fn search_image(
             let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
 
             let has_permission = if let Some(ref file_info) = file {
-                if file_info.is_public == 0 && file_info.user_id != user_id { false } else { true }
+                if !file_info.is_public && file_info.user_id != user_id { false } else { true }
             } else if let Some(ref kb_info) = kb {
-                if kb_info.is_public == 0 && kb_info.user_id != user_id { false } else { true }
+                if !kb_info.is_public && kb_info.user_id != user_id { false } else { true }
             } else {
                 true
             };

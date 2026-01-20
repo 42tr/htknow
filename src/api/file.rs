@@ -28,7 +28,7 @@ pub struct File {
     pub log: String,
     pub slice_type: String,
     pub kb_id: Option<i64>,
-    pub is_public: i32,
+    pub is_public: bool,
     pub meta: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -108,7 +108,11 @@ pub async fn upload(
                     Some("is_public") => {
                         let is_public_text = field.text().await?;
                         debug!("Is public text: {}", is_public_text);
-                        is_public = is_public_text.parse::<i32>().unwrap_or(0);
+                        is_public = match is_public_text.as_str() {
+                            "true" | "1" => 1,
+                            "false" | "0" => 0,
+                            _ => is_public_text.parse::<bool>().map_or(0, |b| if b { 1 } else { 0 }),
+                        };
                     }
                     Some("meta") => {
                         let meta_text = field.text().await?;
@@ -214,7 +218,7 @@ pub async fn get(
     let query = "SELECT * FROM files WHERE id = ?";
     let file: File = sqlx::query_as(query).bind(id).fetch_one(&pool).await?;
 
-    if file.is_public == 0 && file.user_id != auth_user.user_id {
+    if !file.is_public && file.user_id != auth_user.user_id {
         return Err(ApiError::NotFound("File not found or permission denied".to_string()));
     }
 
@@ -406,14 +410,14 @@ pub async fn list(
             Some(kb_id_str) => {
                 let kb_id = kb_id_str.parse::<i64>().map_err(|_| ApiError::internal("Invalid kb_id format"))?;
                 // 检查知识库权限
-                let kb: Option<(String, i32)> =
+                let kb: Option<(String, bool)> =
                     sqlx::query_as("SELECT user_id, is_public FROM knowledge_bases WHERE id = ?")
                         .bind(kb_id)
                         .fetch_optional(&pool)
                         .await?;
 
                 if let Some((kb_owner, is_public)) = kb {
-                    if is_public == 0 && kb_owner != auth_user.user_id {
+                    if !is_public && kb_owner != auth_user.user_id {
                         return Err(ApiError::NotFound("Knowledge base not found or permission denied".to_string()));
                     }
                 } else {
@@ -421,7 +425,7 @@ pub async fn list(
                 }
 
                 sqlx::query_as(
-                    "SELECT * FROM files WHERE kb_id = ? AND (user_id = ? OR is_public = 1) ORDER BY created_at DESC",
+                    "SELECT * FROM files WHERE kb_id = ? AND (user_id = ? OR is_public) ORDER BY created_at DESC",
                 )
                 .bind(kb_id)
                 .bind(&auth_user.user_id)
@@ -577,7 +581,7 @@ pub async fn get_content(
 ) -> Result<(StatusCode, [(header::HeaderName, String); 1], Body), ApiError> {
     let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
 
-    if file.is_public == 0 && file.user_id != auth_user.user_id {
+    if !file.is_public && file.user_id != auth_user.user_id {
         return Err(ApiError::NotFound("File not found or permission denied".to_string()));
     }
 
@@ -621,7 +625,7 @@ pub async fn download(
 ) -> Result<(StatusCode, [(header::HeaderName, String); 2], Body), ApiError> {
     let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
 
-    if file.is_public == 0 && file.user_id != auth_user.user_id {
+    if !file.is_public && file.user_id != auth_user.user_id {
         return Err(ApiError::NotFound("File not found or permission denied".to_string()));
     }
 

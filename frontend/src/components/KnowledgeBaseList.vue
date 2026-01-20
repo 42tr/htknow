@@ -183,15 +183,15 @@ onMounted(() => {
                <span class="text-2xl">📚</span>
              </div>
              <div class="flex items-center gap-1">
-               <button
-                 @click="(e) => handleTogglePublic(e, kb.id, kb.is_public === 1)"
-                 :class="[
-                   'opacity-0 group-hover:opacity-100 p-2 rounded-lg transition-all',
-                   kb.is_public === 1 ? 'text-green-500 hover:bg-green-50' : 'text-slate-500 hover:bg-slate-100'
-                 ]"
-                 :title="kb.is_public === 1 ? '设置为私有' : '设置为公开'"
-               >
-                 <svg v-if="kb.is_public === 1" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <button
+                  @click="(e) => handleTogglePublic(e, kb.id, kb.is_public)"
+                  :class="[
+                    'opacity-0 group-hover:opacity-100 p-2 rounded-lg transition-all',
+                    kb.is_public ? 'text-green-500 hover:bg-green-50' : 'text-slate-500 hover:bg-slate-100'
+                  ]"
+                  :title="kb.is_public ? '设置为私有' : '设置为公开'"
+                >
+                  <svg v-if="kb.is_public" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
                  </svg>
                  <svg v-else class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -211,12 +211,12 @@ onMounted(() => {
            </div>
            <h3 class="font-semibold text-slate-800 mb-1 flex items-center gap-2">
              {{ kb.name }}
-             <span :class="[
-               'px-2 py-0.5 text-xs rounded-full border',
-               kb.is_public === 1 ? 'bg-green-50 text-green-600 border-green-200' : 'bg-slate-50 text-slate-600 border-slate-200'
-             ]">
-               {{ kb.is_public === 1 ? '🌐 公开' : '🔒 私有' }}
-             </span>
+              <span :class="[
+                'px-2 py-0.5 text-xs rounded-full border',
+                kb.is_public ? 'bg-green-50 text-green-600 border-green-200' : 'bg-slate-50 text-slate-600 border-slate-200'
+              ]">
+                {{ kb.is_public ? '🌐 公开' : '🔒 私有' }}
+              </span>
              <span :class="[
                'px-2 py-0.5 text-xs rounded-full border',
                kb.kb_type === 'storage' ? 'bg-amber-50 text-amber-600 border-amber-200' : 'bg-indigo-50 text-indigo-600 border-indigo-200'

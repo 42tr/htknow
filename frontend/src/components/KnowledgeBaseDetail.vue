@@ -64,12 +64,12 @@ watch(() => props.kb.id, () => {
          <div>
            <h2 class="text-xl font-bold text-slate-800 flex items-center gap-2">
              {{ kb.name }}
-             <span :class="[
-               'px-2 py-0.5 text-xs rounded-full border',
-               kb.is_public === 1 ? 'bg-green-50 text-green-600 border-green-200' : 'bg-slate-50 text-slate-600 border-slate-200'
-             ]">
-               {{ kb.is_public === 1 ? '🌐 公开' : '🔒 私有' }}
-             </span>
+              <span :class="[
+                'px-2 py-0.5 text-xs rounded-full border',
+                kb.is_public ? 'bg-green-50 text-green-600 border-green-200' : 'bg-slate-50 text-slate-600 border-slate-200'
+              ]">
+                {{ kb.is_public ? '🌐 公开' : '🔒 私有' }}
+              </span>
              <span :class="[
                'px-2 py-0.5 text-xs rounded-full border',
                kb.kb_type === 'storage' ? 'bg-amber-50 text-amber-600 border-amber-200' : 'bg-indigo-50 text-indigo-600 border-indigo-200'
