@@ -83,9 +83,11 @@ const formatDate = (timestamp) => {
 }
 
 const handleUpdateSliceType = async () => {
-  if (selectedSliceType.value === props.file.slice_type) {
-    showSettings.value = false
-    return
+  const currentSliceType = props.file.slice_type || 'smart'
+  const isSameSliceType = selectedSliceType.value === currentSliceType
+  if (isSameSliceType) {
+    const shouldReparse = confirm('切片方式未变化，是否重新解析该文件？')
+    if (!shouldReparse) return
   }
 
   updating.value = true
