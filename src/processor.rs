@@ -10,7 +10,7 @@ use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tokio::{fs, time};
 
 use crate::{
-    api::File, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, tantivy_engine}
+    api::File, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, SearchEngine, tantivy_engine}
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -1062,4 +1062,12 @@ impl FileProcessor {
 
         Ok(())
     }
+}
+
+pub async fn process_file_immediate(pool: SqlitePool, search_engine: SearchEngine, file_id: i64) -> anyhow::Result<()> {
+    let sql = "SELECT * FROM files WHERE id = ?";
+    let file: File = sqlx::query_as(sql).bind(file_id).fetch_one(&pool).await?;
+
+    let processor = FileProcessor::new(pool, search_engine, 0);
+    processor.process_file(&file).await
 }

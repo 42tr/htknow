@@ -7,11 +7,11 @@ use log::debug;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
-use tokio::{fs, io::AsyncWriteExt as _};
+use tokio::{fs, io::AsyncWriteExt as _, spawn};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    AuthUser, api::error::{ApiError, ApiResult}, config, search::SearchEngine
+    AuthUser, api::error::{ApiError, ApiResult}, config, processor, search::SearchEngine
 };
 
 #[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
@@ -51,7 +51,8 @@ pub struct File {
     )
 )]
 pub async fn upload(
-    State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, mut multipart: Multipart,
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
+    Extension(auth_user): Extension<AuthUser>, mut multipart: Multipart,
 ) -> ApiResult<Json<File>> {
     debug!("Starting file upload for user: {}", auth_user.user_id);
     let dir = "data/files";
@@ -65,6 +66,7 @@ pub async fn upload(
     let mut is_public = 0i32;
     let mut tags: Vec<String> = Vec::new();
     let mut meta: Option<String> = None;
+    let mut immediate_parse = false;
 
     loop {
         match multipart.next_field().await {
@@ -114,6 +116,11 @@ pub async fn upload(
                         if !meta_text.is_empty() {
                             meta = Some(meta_text);
                         }
+                    }
+                    Some("immediate_parse") => {
+                        let parse_text = field.text().await?;
+                        debug!("Immediate parse text: {}", parse_text);
+                        immediate_parse = parse_text == "true" || parse_text == "1";
                     }
                     _ => {
                         debug!("Skipping unknown field: {:?}", field_name);
@@ -169,6 +176,18 @@ pub async fn upload(
         .await?
         .last_insert_rowid();
     let file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+
+    if immediate_parse {
+        let file_id = id;
+        let pool = pool.clone();
+        let search_engine = search_engine.clone();
+        spawn(async move {
+            if let Err(e) = processor::process_file_immediate(pool, search_engine, file_id).await {
+                log::error!("Failed to parse file {}: {}", file_id, e);
+            }
+        });
+    }
+
     Ok(Json(file))
 }
 
