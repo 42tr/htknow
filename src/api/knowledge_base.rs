@@ -65,6 +65,19 @@ pub struct KnowledgeDetailResponse {
     pub path: Vec<Knowledge>, // For breadcrumbs
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
+pub struct KnowledgeTreeNode {
+    pub id: i64,
+    pub user_id: String,
+    pub user_name: String,
+    pub name: String,
+    pub description: String,
+    pub kb_type: String,
+    pub parent_id: Option<i64>,
+    pub is_public: bool,
+    pub children: Vec<KnowledgeTreeNode>,
+}
+
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ListQuery {
     /// 页码，从1开始
@@ -79,6 +92,12 @@ pub struct ListQuery {
     pub id: Option<String>,
     /// 根据父知识库ID筛选，若不传则获取顶级知识库
     pub parent_id: Option<i64>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct TreeQuery {
+    /// 知识库 ID（可选），传入则返回该知识库的子树，不传则返回完整树
+    pub kb_id: Option<i64>,
 }
 
 /// 获取知识库列表
@@ -732,4 +751,94 @@ pub async fn reparse(
     }
 
     Ok(Json(ReparseKnowledgeBaseResponse { kb_count: analysis_kb_ids.len() as i64, file_count: file_ids.len() as i64 }))
+}
+
+async fn build_tree_recursive(
+    pool: &SqlitePool, parent_id: Option<i64>, user_id: &str,
+) -> anyhow::Result<Vec<KnowledgeTreeNode>> {
+    let children: Vec<Knowledge> = sqlx::query_as(
+        "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE parent_id IS NOT DISTINCT FROM ? AND (user_id = ? OR is_public = 1) ORDER BY name",
+    )
+    .bind(parent_id)
+    .bind(user_id)
+    .fetch_all(pool)
+    .await?;
+
+    let mut tree_nodes = Vec::new();
+    for kb in children {
+        let sub_children = Box::pin(build_tree_recursive(pool, Some(kb.id), user_id)).await?;
+        tree_nodes.push(KnowledgeTreeNode {
+            id: kb.id,
+            user_id: kb.user_id,
+            user_name: kb.user_name,
+            name: kb.name,
+            description: kb.description,
+            kb_type: kb.kb_type,
+            parent_id: kb.parent_id,
+            is_public: kb.is_public,
+            children: sub_children,
+        });
+    }
+    Ok(tree_nodes)
+}
+
+async fn build_subtree_recursive(
+    pool: &SqlitePool, kb_id: i64, user_id: &str,
+) -> anyhow::Result<Option<KnowledgeTreeNode>> {
+    let kb: Option<Knowledge> = sqlx::query_as(
+        "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
+    )
+    .bind(kb_id)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?;
+
+    match kb {
+        Some(kb_info) => {
+            let children = Box::pin(build_tree_recursive(pool, Some(kb_info.id), user_id)).await?;
+            Ok(Some(KnowledgeTreeNode {
+                id: kb_info.id,
+                user_id: kb_info.user_id,
+                user_name: kb_info.user_name,
+                name: kb_info.name,
+                description: kb_info.description,
+                kb_type: kb_info.kb_type,
+                parent_id: kb_info.parent_id,
+                is_public: kb_info.is_public,
+                children,
+            }))
+        }
+        None => Ok(None),
+    }
+}
+
+/// 获取知识库树结构
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/knowledge_base/tree",
+    tag = "knowledge_base",
+    params(TreeQuery),
+    responses(
+        (status = 200, description = "成功返回知识库树结构", body = Vec<KnowledgeTreeNode>),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn tree(
+    State(pool): State<SqlitePool>, Query(params): Query<TreeQuery>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<Vec<KnowledgeTreeNode>>> {
+    let tree = match params.kb_id {
+        Some(kb_id) => {
+            let subtree = build_subtree_recursive(&pool, kb_id, &auth_user.user_id).await?;
+            match subtree {
+                Some(node) => vec![node],
+                None => vec![],
+            }
+        }
+        None => build_tree_recursive(&pool, None, &auth_user.user_id).await?,
+    };
+    Ok(Json(tree))
 }
