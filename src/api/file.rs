@@ -34,14 +34,14 @@ pub struct File {
     pub updated_at: i64,
 }
 
-/// 上传文件
+/// 上传文件（支持单个或多个文件）
 #[utoipa::path(
     post,
     path = "/api/v1/knowledge/files/",
     tag = "file",
     request_body(content_type = "multipart/form-data"),
     responses(
-        (status = 200, description = "文件上传成功", body = File),
+        (status = 200, description = "文件上传成功", body = Vec<File>),
         (status = 400, description = "请求参数错误"),
         (status = 401, description = "未授权")
     ),
@@ -53,14 +53,12 @@ pub struct File {
 pub async fn upload(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Extension(auth_user): Extension<AuthUser>, mut multipart: Multipart,
-) -> ApiResult<Json<File>> {
+) -> ApiResult<Json<Vec<File>>> {
     debug!("Starting file upload for user: {}", auth_user.user_id);
     let dir = "data/files";
     tokio::fs::create_dir_all(dir).await?;
 
-    let mut hash = String::new();
-    let mut filename = String::new();
-    let mut filepath = String::new();
+    let mut files_data: Vec<(String, String, String)> = Vec::new();
     let mut slice_type = String::new();
     let mut kb_id = None;
     let mut is_public = 0i32;
@@ -77,17 +75,18 @@ pub async fn upload(
                 match field_name.as_deref() {
                     Some("file") => {
                         let mut hasher = Sha256::new();
-                        filename = field.file_name().unwrap_or("unknown").to_string();
+                        let filename = field.file_name().unwrap_or("unknown").to_string();
                         debug!("Uploading file: {}", filename);
                         let tempname = uuid::Uuid::new_v4().to_string();
-                        filepath = format!("{}/{}", dir, tempname);
+                        let filepath = format!("{}/{}", dir, tempname);
                         let mut file = tokio::fs::File::create(filepath.clone()).await?;
                         while let Some(chunk) = field.chunk().await? {
                             file.write_all(&chunk).await?;
                             hasher.update(&chunk);
                         }
-                        hash = hex::encode(hasher.finalize());
+                        let hash = hex::encode(hasher.finalize());
                         debug!("File saved to: {}", filepath);
+                        files_data.push((hash, filename, filepath));
                     }
                     Some("slice_type") => {
                         slice_type = field.text().await?;
@@ -142,8 +141,8 @@ pub async fn upload(
         }
     }
 
-    debug!("File upload completed. Filename: {}", filename);
-    if filename.is_empty() {
+    debug!("File upload completed. Files count: {}", files_data.len());
+    if files_data.is_empty() {
         return Err(ApiError::BadRequest("file is required".to_string()));
     }
 
@@ -162,37 +161,50 @@ pub async fn upload(
     let tags_json = serde_json::to_string(&tags)?;
     let status = if is_storage_kb { 3 } else { 0 };
     let log_message = if is_storage_kb { "Storage mode: not parsed" } else { "" };
-    let sql = "INSERT INTO files (user_id, user_name, hash, filename, path, slice_type, kb_id, is_public, tags, status, log, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
-    let id = sqlx::query(sql)
-        .bind(auth_user.user_id)
-        .bind(auth_user.user_name)
-        .bind(hash)
-        .bind(filename)
-        .bind(filepath)
-        .bind(slice_type)
-        .bind(kb_id)
-        .bind(is_public)
-        .bind(tags_json)
-        .bind(status)
-        .bind(log_message)
-        .bind(meta)
-        .execute(&pool)
-        .await?
-        .last_insert_rowid();
-    let file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+
+    let mut uploaded_files: Vec<File> = Vec::new();
+    let mut parse_file_ids: Vec<i64> = Vec::new();
+
+    for (hash, filename, filepath) in files_data {
+        let sql = "INSERT INTO files (user_id, user_name, hash, filename, path, slice_type, kb_id, is_public, tags, status, log, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+        let id = sqlx::query(sql)
+            .bind(&auth_user.user_id)
+            .bind(&auth_user.user_name)
+            .bind(hash)
+            .bind(filename)
+            .bind(filepath)
+            .bind(&slice_type)
+            .bind(kb_id)
+            .bind(is_public)
+            .bind(&tags_json)
+            .bind(status)
+            .bind(log_message)
+            .bind(meta.clone())
+            .execute(&pool)
+            .await?
+            .last_insert_rowid();
+
+        let file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+        uploaded_files.push(file);
+
+        if immediate_parse {
+            parse_file_ids.push(id);
+        }
+    }
 
     if immediate_parse {
-        let file_id = id;
         let pool = pool.clone();
         let search_engine = search_engine.clone();
         spawn(async move {
-            if let Err(e) = processor::process_file_immediate(pool, search_engine, file_id).await {
-                log::error!("Failed to parse file {}: {}", file_id, e);
+            for file_id in parse_file_ids {
+                if let Err(e) = processor::process_file_immediate(pool.clone(), search_engine.clone(), file_id).await {
+                    log::error!("Failed to parse file {}: {}", file_id, e);
+                }
             }
         });
     }
 
-    Ok(Json(file))
+    Ok(Json(uploaded_files))
 }
 
 /// 获取文件详情
