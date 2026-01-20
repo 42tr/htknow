@@ -165,8 +165,20 @@ impl SearchEngine {
     async fn rerank(&self, query: &str, results: Vec<SearchResultItem>) -> anyhow::Result<Vec<SearchResultItem>> {
         let cfg = config::get();
 
-        // 提取所有文档内容用于重排序
-        let documents: Vec<String> = results.iter().map(|r| r.content.clone()).collect();
+        // 提取所有文档内容用于重排序，并做去重
+        let mut documents: Vec<String> = Vec::new();
+        let mut document_index_map: Vec<usize> = Vec::with_capacity(results.len());
+        let mut document_index_by_content: HashMap<String, usize> = HashMap::new();
+        for result in results.iter() {
+            if let Some(&idx) = document_index_by_content.get(&result.content) {
+                document_index_map.push(idx);
+                continue;
+            }
+            let idx = documents.len();
+            documents.push(result.content.clone());
+            document_index_by_content.insert(result.content.clone(), idx);
+            document_index_map.push(idx);
+        }
 
         // 构造请求
         let rerank_request = RerankRequest { model: cfg.ai.rerank_model.clone(), query: query.to_string(), documents };
@@ -189,12 +201,19 @@ impl SearchEngine {
         let rerank_response: RerankResponse = serde_json::from_str(&response_text)?;
 
         // 检查返回的结果数量是否匹配
-        if rerank_response.results.len() != results.len() {
+        if rerank_response.results.len() != rerank_request.documents.len() {
             anyhow::bail!(
                 "Rerank results count mismatch: expected {}, got {}",
-                results.len(),
+                rerank_request.documents.len(),
                 rerank_response.results.len()
             );
+        }
+
+        let mut rerank_scores: Vec<Option<f32>> = vec![None; rerank_request.documents.len()];
+        for rerank_result in &rerank_response.results {
+            if let Some(score) = rerank_scores.get_mut(rerank_result.index) {
+                *score = Some(rerank_result.relevance_score);
+            }
         }
 
         // 使用重排序分数更新结果
@@ -202,9 +221,11 @@ impl SearchEngine {
             .into_iter()
             .enumerate()
             .map(|(i, mut result)| {
-                // 根据 index 找到对应的重排序结果
-                if let Some(rerank_result) = rerank_response.results.iter().find(|r| r.index == i) {
-                    result.score = rerank_result.relevance_score;
+                // 根据去重后的 index 找到对应的重排序结果
+                if let Some(doc_index) = document_index_map.get(i) {
+                    if let Some(score) = rerank_scores.get(*doc_index).and_then(|s| *s) {
+                        result.score = score;
+                    }
                 }
                 result
             })
