@@ -345,34 +345,48 @@ pub async fn update(
     }
 
     let mut qb = QueryBuilder::<Sqlite>::new("UPDATE knowledge_bases SET ");
-    let mut separated = qb.separated(", ");
     let mut has_update = false;
 
     if let Some(name) = knowledge.name {
-        separated.push("name = ");
-        separated.push_bind(name);
+        if has_update {
+            qb.push(", ");
+        }
+        qb.push("name = ");
+        qb.push_bind(name);
         has_update = true;
     }
     if let Some(description) = knowledge.description {
-        separated.push("description = ");
-        separated.push_bind(description);
+        if has_update {
+            qb.push(", ");
+        }
+        qb.push("description = ");
+        qb.push_bind(description);
         has_update = true;
     }
     if let Some(kb_type) = knowledge.kb_type {
         let kb_type = normalize_kb_type(Some(kb_type))?;
-        separated.push("kb_type = ");
-        separated.push_bind(kb_type);
+        if has_update {
+            qb.push(", ");
+        }
+        qb.push("kb_type = ");
+        qb.push_bind(kb_type);
         has_update = true;
     }
     // With double_option, this correctly distinguishes "not present" from "present and null"
     if let Some(parent_id) = knowledge.parent_id {
-        separated.push("parent_id = ");
-        separated.push_bind(parent_id); // This binds Option<i64> which sqlx handles (None becomes NULL)
+        if has_update {
+            qb.push(", ");
+        }
+        qb.push("parent_id = ");
+        qb.push_bind(parent_id); // This binds Option<i64> which sqlx handles (None becomes NULL)
         has_update = true;
     }
     if let Some(is_public) = knowledge.is_public {
-        separated.push("is_public = ");
-        separated.push_bind(if is_public { 1 } else { 0 });
+        if has_update {
+            qb.push(", ");
+        }
+        qb.push("is_public = ");
+        qb.push_bind(if is_public { 1 } else { 0 });
         has_update = true;
     }
 

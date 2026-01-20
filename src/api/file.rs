@@ -493,7 +493,6 @@ struct SlicePositionRow {
 
 #[derive(Debug, sqlx::FromRow)]
 struct PageBBoxRow {
-    page_idx: i32,
     bbox: String,
 }
 
