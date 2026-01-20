@@ -101,6 +101,14 @@ pub struct TreeQuery {
     pub kb_id: Option<i64>,
 }
 
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct KnowledgeDetailQuery {
+    /// 文件名模糊搜索（%filename%）
+    pub filename: Option<String>,
+    /// 根据标签筛选
+    pub tag: Option<String>,
+}
+
 /// 获取知识库列表
 #[utoipa::path(
     get,
@@ -435,7 +443,8 @@ pub async fn update(
     operation_id = "knowledge_base_get",
     tag = "knowledge_base",
     params(
-        ("id" = i64, Path, description = "知识库 ID")
+        ("id" = i64, Path, description = "知识库 ID"),
+        KnowledgeDetailQuery
     ),
     responses(
         (status = 200, description = "成功返回知识库详情", body = KnowledgeDetailResponse),
@@ -448,7 +457,8 @@ pub async fn update(
     )
 )]
 pub async fn get(
-    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Query(query): Query<KnowledgeDetailQuery>,
+    Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<KnowledgeDetailResponse>> {
     // 1. Fetch the main knowledge base and verify ownership
     let main_kb: Knowledge = sqlx::query_as(
@@ -460,20 +470,34 @@ pub async fn get(
     .await?;
 
     // 2. Fetch children KBs and files in parallel
-    let (children_kbs_res, files_res) = tokio::join!(
-        // Fetch children KBs
-        sqlx::query_as("SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE parent_id = ? AND (user_id = ? OR is_public = 1) ORDER BY name")
-            .bind(id)
-            .bind(auth_user.user_id.clone())
-            .fetch_all(&pool),
-        // Fetch files in this KB
-        sqlx::query_as("SELECT * FROM files WHERE kb_id = ? AND (user_id = ? OR is_public = 1) ORDER BY filename")
-            .bind(id)
-            .bind(auth_user.user_id.clone())
-            .fetch_all(&pool)
-    );
+    let children_future = sqlx::query_as(
+        "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public \
+         FROM knowledge_bases WHERE parent_id = ? AND (user_id = ? OR is_public = 1) ORDER BY name",
+    )
+    .bind(id)
+    .bind(auth_user.user_id.clone())
+    .fetch_all(&pool);
+
+    let files_future = async {
+        let mut qb = QueryBuilder::<Sqlite>::new("SELECT * FROM files WHERE kb_id = ");
+        qb.push_bind(id);
+        qb.push(" AND (user_id = ").push_bind(auth_user.user_id.clone()).push(" OR is_public = 1)");
+        if let Some(filename) = query.filename.as_deref() {
+            qb.push(" AND filename LIKE ").push_bind(format!("%{}%", filename));
+        }
+        qb.push(" ORDER BY filename");
+        qb.build_query_as::<super::file::File>().fetch_all(&pool).await
+    };
+
+    let (children_kbs_res, files_res) = tokio::join!(children_future, files_future);
     let children_kbs: Vec<Knowledge> = children_kbs_res?;
-    let files: Vec<super::file::File> = files_res?;
+    let mut files: Vec<super::file::File> = files_res?;
+
+    if let Some(tag) = &query.tag {
+        files.retain(|file| {
+            if let Ok(tags) = serde_json::from_str::<Vec<String>>(&file.tags) { tags.contains(tag) } else { false }
+        });
+    }
 
     // 3. Fetch the breadcrumb path
     let mut path = Vec::new();
