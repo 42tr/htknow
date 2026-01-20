@@ -75,6 +75,7 @@ pub struct KnowledgeTreeNode {
     pub kb_type: String,
     pub parent_id: Option<i64>,
     pub is_public: bool,
+    #[schema(no_recursion)]
     pub children: Vec<KnowledgeTreeNode>,
 }
 
