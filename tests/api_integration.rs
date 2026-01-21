@@ -300,7 +300,7 @@ async fn knowledge_base_public_and_reparse() {
 
     let public_req = authed_json_request(
         "PUT",
-        format!("/api/v1/knowledge/knowledge_base/{}/public", kb_id),
+        format!("/api/v1/knowledge/knowledge_base/{}", kb_id),
         &user,
         serde_json::json!({ "is_public": true }),
     );

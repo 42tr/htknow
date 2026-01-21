@@ -121,16 +121,6 @@ export const api = {
     return response.json()
   },
 
-  async updateKnowledgeBasePublic(id, isPublic) {
-    const response = await fetch(`${API_BASE}/knowledge_base/${id}/public`, {
-      method: 'PUT',
-      headers: getHeaders(),
-      body: JSON.stringify({ is_public: isPublic }),
-    })
-    if (!response.ok) throw new Error('更新公开/私有状态失败')
-    return response.json()
-  },
-
   async deleteKnowledgeBase(id) {
     const response = await fetch(`${API_BASE}/knowledge_base/${id}`, {
       method: 'DELETE',

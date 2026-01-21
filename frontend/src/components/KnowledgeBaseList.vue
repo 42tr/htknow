@@ -78,7 +78,7 @@ const handleTogglePublic = async (e, kbId, currentPublic) => {
   if (!confirm(`确定要将知识库设置为${newPublic ? '公开' : '私有'}吗？`)) return
 
   try {
-    await api.updateKnowledgeBasePublic(kbId, newPublic)
+    await api.updateKnowledgeBase(kbId, { is_public: newPublic })
     await loadKbContent(currentKb.value?.id)
   } catch (e) {
     alert('更新失败：' + e.message)

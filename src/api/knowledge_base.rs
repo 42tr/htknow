@@ -646,54 +646,10 @@ pub async fn delete(
     Ok(())
 }
 
-#[derive(Deserialize, ToSchema)]
-pub struct UpdateKbPublicReq {
-    pub is_public: bool,
-}
-
 #[derive(Serialize, ToSchema)]
 pub struct ReparseKnowledgeBaseResponse {
     pub kb_count: i64,
     pub file_count: i64,
-}
-
-/// 更新知识库公开/私有状态
-#[utoipa::path(
-    put,
-    path = "/api/v1/knowledge/knowledge_base/{id}/public",
-    operation_id = "knowledge_base_update_public",
-    tag = "knowledge_base",
-    params(
-        ("id" = i64, Path, description = "知识库 ID")
-    ),
-    request_body = UpdateKbPublicReq,
-    responses(
-        (status = 200, description = "成功更新公开/私有状态", body = Knowledge),
-        (status = 400, description = "请求参数错误"),
-        (status = 401, description = "未授权")
-    ),
-    security(
-        ("x-user-id" = []),
-        ("x-role" = [])
-    )
-)]
-pub async fn update_public(
-    Path(id): Path<i64>, State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
-    Json(req): Json<UpdateKbPublicReq>,
-) -> ApiResult<Json<Knowledge>> {
-    let is_public = if req.is_public { 1 } else { 0 };
-    let sql =
-        "UPDATE knowledge_bases SET is_public = ?, updated_at = ? WHERE id = ? AND (user_id = ? OR is_public = 1)";
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-    sqlx::query(sql).bind(is_public).bind(now).bind(id).bind(&auth_user.user_id).execute(&pool).await?;
-    let kb = sqlx::query_as(
-        "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
-    )
-    .bind(id)
-    .bind(&auth_user.user_id)
-    .fetch_one(&pool)
-    .await?;
-    Ok(Json(kb))
 }
 
 /// 重新解析所有知识库
