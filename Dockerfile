@@ -1,7 +1,7 @@
 # Runtime image for htknow
 # Binary should be compiled outside the container using: cargo build --release
 
-FROM debian:bookworm-slim
+FROM docker.1ms.run/debian:bookworm-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
