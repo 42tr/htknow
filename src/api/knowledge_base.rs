@@ -75,6 +75,7 @@ pub struct KnowledgeTreeNode {
     pub kb_type: String,
     pub parent_id: Option<i64>,
     pub is_public: bool,
+    pub files: Vec<super::file::File>,
     #[schema(no_recursion)]
     pub children: Vec<KnowledgeTreeNode>,
 }
@@ -812,7 +813,12 @@ async fn build_tree_recursive(
 
     let mut tree_nodes = Vec::new();
     for kb in children {
-        let sub_children = Box::pin(build_tree_recursive(pool, Some(kb.id), user_id)).await?;
+        let (sub_children, files) = tokio::join!(
+            async { Box::pin(build_tree_recursive(pool, Some(kb.id), user_id)).await },
+            get_files_for_kb(pool, kb.id, user_id),
+        );
+        let sub_children = sub_children?;
+        let files = files?;
         tree_nodes.push(KnowledgeTreeNode {
             id: kb.id,
             user_id: kb.user_id,
@@ -822,6 +828,7 @@ async fn build_tree_recursive(
             kb_type: kb.kb_type,
             parent_id: kb.parent_id,
             is_public: kb.is_public,
+            files,
             children: sub_children,
         });
     }
@@ -841,7 +848,12 @@ async fn build_subtree_recursive(
 
     match kb {
         Some(kb_info) => {
-            let children = Box::pin(build_tree_recursive(pool, Some(kb_info.id), user_id)).await?;
+            let (children, files) = tokio::join!(
+                async { Box::pin(build_tree_recursive(pool, Some(kb_info.id), user_id)).await },
+                get_files_for_kb(pool, kb_info.id, user_id),
+            );
+            let children = children?;
+            let files = files?;
             Ok(Some(KnowledgeTreeNode {
                 id: kb_info.id,
                 user_id: kb_info.user_id,
@@ -851,11 +863,22 @@ async fn build_subtree_recursive(
                 kb_type: kb_info.kb_type,
                 parent_id: kb_info.parent_id,
                 is_public: kb_info.is_public,
+                files,
                 children,
             }))
         }
         None => Ok(None),
     }
+}
+
+async fn get_files_for_kb(pool: &SqlitePool, kb_id: i64, user_id: &str) -> anyhow::Result<Vec<super::file::File>> {
+    let files: Vec<super::file::File> =
+        sqlx::query_as("SELECT * FROM files WHERE kb_id = ? AND (user_id = ? OR is_public = 1) ORDER BY filename")
+            .bind(kb_id)
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?;
+    Ok(files)
 }
 
 /// 获取知识库树结构
