@@ -88,7 +88,11 @@ impl LLMGraphExtractor {
         let api_key = llm_config.api_key.clone();
         let model = llm_config.model.clone();
 
-        let client = Client::builder().timeout(Duration::from_secs(120)).build().unwrap();
+        #[cfg(test)]
+        let client_builder = Client::builder().timeout(Duration::from_secs(120)).no_proxy();
+        #[cfg(not(test))]
+        let client_builder = Client::builder().timeout(Duration::from_secs(120));
+        let client = client_builder.build().unwrap();
 
         Self { client, api_url, api_key, model, enabled }
     }

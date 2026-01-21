@@ -307,7 +307,7 @@ async fn knowledge_base_public_and_reparse() {
     let public_res = app.clone().oneshot(public_req).await.unwrap();
     assert_eq!(public_res.status(), StatusCode::OK);
     let public_json = response_json(public_res).await;
-    assert_eq!(public_json["is_public"].as_i64(), Some(1));
+    assert_eq!(public_json["is_public"].as_bool(), Some(true));
 
     let reparse_req = authed_empty_request("POST", "/api/v1/knowledge/knowledge_base/reparse", &user);
     let reparse_res = app.clone().oneshot(reparse_req).await.unwrap();
