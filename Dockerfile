@@ -10,8 +10,15 @@ RUN apt-get update && apt-get install -y \
     libreoffice-core \
     # SSL certificates for HTTPS requests
     ca-certificates \
+    # Timezone data
+    tzdata \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
+
+# Configure timezone (override at build time with --build-arg TZ=Your/Zone)
+ARG TZ=UTC
+ENV TZ=${TZ}
+RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && echo ${TZ} > /etc/timezone
 
 # Create application directory
 WORKDIR /app
