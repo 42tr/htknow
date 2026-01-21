@@ -64,7 +64,7 @@ async fn app() -> Router {
 }
 
 async fn get_pool() -> SqlitePool {
-    app().await;
+    let _ = app().await;
     db::init().await.expect("init db")
 }
 
