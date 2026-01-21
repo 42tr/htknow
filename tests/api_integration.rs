@@ -386,14 +386,6 @@ async fn file_endpoints_flow() {
     let updated_tags: Vec<String> = serde_json::from_str(update_json["tags"].as_str().unwrap()).unwrap();
     assert_eq!(updated_tags, vec!["tag3".to_string()]);
 
-    let content_req = authed_empty_request("GET", format!("/api/v1/knowledge/files/{}/content", file_id), &user);
-    let content_res = app.clone().oneshot(content_req).await.unwrap();
-    assert_eq!(content_res.status(), StatusCode::OK);
-    let content_type = content_res.headers().get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
-    assert!(content_type.contains("text/plain"));
-    let content_bytes = content_res.into_body().collect().await.unwrap().to_bytes();
-    assert_eq!(content_bytes.as_ref(), file_contents);
-
     let download_req = authed_empty_request("GET", format!("/api/v1/knowledge/files/{}/download", file_id), &user);
     let download_res = app.clone().oneshot(download_req).await.unwrap();
     assert_eq!(download_res.status(), StatusCode::OK);

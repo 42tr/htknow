@@ -203,14 +203,6 @@ export const api = {
     return response.json()
   },
 
-  async getFileContent(id) {
-    const response = await fetch(`${API_BASE}/files/${id}/content`, {
-      headers: getHeaders(false),
-    })
-    if (!response.ok) throw new Error('获取文件内容失败')
-    return response.blob()
-  },
-
   async downloadFile(id) {
     const response = await fetch(`${API_BASE}/files/${id}/download`, {
       headers: getHeaders(false),

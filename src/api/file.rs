@@ -584,51 +584,6 @@ pub async fn get_image_by_filename(
     Ok((StatusCode::OK, [(header::CONTENT_TYPE, mime_type)], Body::from(file_content)))
 }
 
-/// 获取文件内容
-#[utoipa::path(
-    get,
-    path = "/api/v1/knowledge/files/{id}/content",
-    operation_id = "file_get_content",
-    tag = "file",
-    params(
-        ("id" = i64, Path, description = "文件 ID")
-    ),
-    responses(
-        (status = 200, description = "成功返回文件内容", content_type = "application/octet-stream"),
-        (status = 404, description = "文件不存在")
-    ),
-    security(
-        ("x-user-id" = []),
-        ("x-role" = [])
-    )
-)]
-pub async fn get_content(
-    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
-) -> Result<(StatusCode, [(header::HeaderName, String); 1], Body), ApiError> {
-    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
-
-    if !file.is_public && file.user_id != auth_user.user_id {
-        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
-    }
-
-    let filename_lower = file.filename.to_lowercase();
-    let (path, filename) = if filename_lower.ends_with(".doc") || filename_lower.ends_with(".docx") {
-        let cfg = config::get();
-        let pdf_path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", file.id));
-        if !tokio::fs::try_exists(&pdf_path).await? {
-            return Err(ApiError::NotFound("Converted PDF not found".to_string()));
-        }
-        (pdf_path, format!("{}.pdf", file.id))
-    } else {
-        (std::path::PathBuf::from(&file.path), file.filename.clone())
-    };
-
-    let file_content = tokio::fs::read(&path).await?;
-    let mime_type = mime_guess::from_path(&filename).first_or_octet_stream().to_string();
-
-    Ok((StatusCode::OK, [(header::CONTENT_TYPE, mime_type)], Body::from(file_content)))
-}
-
 /// 下载文件
 #[utoipa::path(
     get,
