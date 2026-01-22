@@ -208,7 +208,12 @@ impl SearchEngine {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!("Rerank API failed with status {}: {}", status, error_text);
+            anyhow::bail!(
+                "Rerank API failed with status {}: {}; rerank_request: {:?}",
+                status,
+                error_text,
+                rerank_request
+            );
         }
 
         // 先获取响应文本用于调试
