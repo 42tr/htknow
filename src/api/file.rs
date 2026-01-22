@@ -1,4 +1,4 @@
-use std::{collections::HashMap, path::Component};
+use std::{collections::HashMap, path::Component, time::Instant};
 
 use axum::{
     Extension, body::Body, extract::{Multipart, Path, Query, State}, http::{StatusCode, header}, response::Json
@@ -378,19 +378,37 @@ pub async fn update(
 pub async fn delete(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>, Path(id): Path<i64>,
 ) -> ApiResult<()> {
+    let overall_start = Instant::now();
+    let step_start = Instant::now();
     let query = "SELECT * FROM files WHERE id = ?";
     let file: File = sqlx::query_as(query).bind(id).fetch_one(&pool).await?;
+    debug!("file_delete id={} fetch_file {}ms", id, step_start.elapsed().as_millis());
+
+    let step_start = Instant::now();
     fs::remove_file(file.path).await?;
+    debug!("file_delete id={} remove_file {}ms", id, step_start.elapsed().as_millis());
 
     let cfg = config::get();
     let pdf_path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", id));
+    let step_start = Instant::now();
     if let Err(e) = fs::remove_file(&pdf_path).await {
         log::warn!("Failed to delete converted pdf {}: {}", pdf_path.display(), e);
     }
+    debug!("file_delete id={} remove_pdf {}ms", id, step_start.elapsed().as_millis());
 
+    let step_start = Instant::now();
     search_engine.delete(Some(id), None).await?;
+    debug!("file_delete id={} search_delete {}ms", id, step_start.elapsed().as_millis());
+
+    let step_start = Instant::now();
     sqlx::query("DELETE FROM slices WHERE file_id = ?").bind(id).execute(&pool).await?;
+    debug!("file_delete id={} delete_slices {}ms", id, step_start.elapsed().as_millis());
+
+    let step_start = Instant::now();
     sqlx::query("DELETE FROM files WHERE id = ?").bind(id).execute(&pool).await?;
+    debug!("file_delete id={} delete_file_row {}ms", id, step_start.elapsed().as_millis());
+
+    debug!("file_delete id={} total {}ms", id, overall_start.elapsed().as_millis());
     Ok(())
 }
 

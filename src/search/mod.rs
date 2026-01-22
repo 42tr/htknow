@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, time::Instant};
 
 use anyhow::Ok;
 use log::{debug, info};
@@ -77,16 +77,34 @@ impl SearchEngine {
     }
 
     pub async fn delete(&self, file_id: Option<i64>, kb_id: Option<i64>) -> anyhow::Result<()> {
+        let overall_start = Instant::now();
         if let Some(file_id) = file_id {
+            let step_start = Instant::now();
             tantivy_engine::delete_by_file(&self.index, &self.schema, file_id).await?;
+            debug!("search_delete file_id={} tantivy {}ms", file_id, step_start.elapsed().as_millis());
+
+            let step_start = Instant::now();
             lancedb::delete_by_file(file_id).await?;
+            debug!("search_delete file_id={} lancedb {}ms", file_id, step_start.elapsed().as_millis());
+
+            let step_start = Instant::now();
             tantivy_engine::delete_by_file(&self.full_index, &self.full_schema, file_id).await?;
+            debug!("search_delete file_id={} tantivy_full {}ms", file_id, step_start.elapsed().as_millis());
         }
         if let Some(kb_id) = kb_id {
+            let step_start = Instant::now();
             tantivy_engine::delete_by_kb(&self.index, &self.schema, kb_id).await?;
+            debug!("search_delete kb_id={} tantivy {}ms", kb_id, step_start.elapsed().as_millis());
+
+            let step_start = Instant::now();
             lancedb::delete_by_kb(kb_id).await?;
+            debug!("search_delete kb_id={} lancedb {}ms", kb_id, step_start.elapsed().as_millis());
+
+            let step_start = Instant::now();
             tantivy_engine::delete_by_kb(&self.full_index, &self.full_schema, kb_id).await?;
+            debug!("search_delete kb_id={} tantivy_full {}ms", kb_id, step_start.elapsed().as_millis());
         }
+        debug!("search_delete total {}ms file_id={:?} kb_id={:?}", overall_start.elapsed().as_millis(), file_id, kb_id);
         Ok(())
     }
 
