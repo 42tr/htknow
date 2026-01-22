@@ -202,24 +202,29 @@ async fn get_children_kb_counts(
         return Ok(HashMap::new());
     }
 
-    let mut qb = QueryBuilder::new("SELECT parent_id, COUNT(*) AS cnt FROM knowledge_bases WHERE parent_id IN (");
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "WITH RECURSIVE descendants(root_id, kb_id) AS (SELECT id AS root_id, id AS kb_id FROM knowledge_bases WHERE id IN (",
+    );
     let mut separated = qb.separated(", ");
     for id in knowledge_ids {
         separated.push_bind(id);
     }
     qb.push(") AND (user_id = ");
     qb.push_bind(user_id);
-    qb.push(" OR is_public = 1) GROUP BY parent_id");
+    qb.push(" OR is_public = 1) UNION ALL SELECT d.root_id, kb.id FROM knowledge_bases kb ");
+    qb.push("JOIN descendants d ON kb.parent_id = d.kb_id WHERE (kb.user_id = ");
+    qb.push_bind(user_id);
+    qb.push(" OR kb.is_public = 1)) ");
+    qb.push("SELECT root_id, COUNT(*) - 1 AS cnt FROM descendants GROUP BY root_id");
 
     let rows = qb.build().fetch_all(pool).await?;
 
     let children_counts = rows
         .into_iter()
         .filter_map(|row| {
-            // Use get an Option<i64> to be safe, though it should not be None based on the WHERE clause.
-            let parent_id: Option<i64> = row.get("parent_id");
+            let root_id: Option<i64> = row.get("root_id");
             let cnt: i64 = row.get("cnt");
-            parent_id.map(|pid| (pid, cnt))
+            root_id.map(|id| (id, cnt))
         })
         .collect();
 
@@ -231,27 +236,32 @@ async fn get_file_counts(pool: &SqlitePool, knowledge_ids: &[i64], user_id: &str
         return Ok(HashMap::new());
     }
 
-    let mut qb = QueryBuilder::new("SELECT kb_id, COUNT(*) AS cnt FROM files WHERE kb_id IN (");
-
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "WITH RECURSIVE descendants(root_id, kb_id) AS (SELECT id AS root_id, id AS kb_id FROM knowledge_bases WHERE id IN (",
+    );
     let mut separated = qb.separated(", ");
-
     for id in knowledge_ids {
         separated.push_bind(id);
     }
-
     qb.push(") AND (user_id = ");
     qb.push_bind(user_id);
-    qb.push(" OR is_public = 1) GROUP BY kb_id");
+    qb.push(" OR is_public = 1) UNION ALL SELECT d.root_id, kb.id FROM knowledge_bases kb ");
+    qb.push("JOIN descendants d ON kb.parent_id = d.kb_id WHERE (kb.user_id = ");
+    qb.push_bind(user_id);
+    qb.push(" OR kb.is_public = 1)) ");
+    qb.push("SELECT d.root_id, COUNT(f.id) AS cnt FROM descendants d ");
+    qb.push("LEFT JOIN files f ON f.kb_id = d.kb_id AND (f.user_id = ");
+    qb.push_bind(user_id);
+    qb.push(" OR f.is_public = 1) GROUP BY d.root_id");
 
     let rows = qb.build().fetch_all(pool).await?;
 
     let file_counts = rows
         .into_iter()
         .filter_map(|row| {
-            // Use filter_map for safety
-            let kb_id: Option<i64> = row.get("kb_id"); // Get as Option
+            let root_id: Option<i64> = row.get("root_id");
             let cnt: i64 = row.get("cnt");
-            kb_id.map(|id| (id, cnt)) // Discard if kb_id is NULL
+            root_id.map(|id| (id, cnt))
         })
         .collect();
 
