@@ -7,7 +7,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::stream::StreamExt;
 use lancedb::{
-    Connection, connect, query::{ExecutableQuery, QueryBase}
+    Connection, connect, query::{ExecutableQuery, QueryBase}, table::NewColumnTransform
 };
 use once_cell::sync::OnceCell;
 
@@ -16,6 +16,7 @@ use crate::config;
 
 static LANCEDB: OnceCell<Arc<Connection>> = OnceCell::new();
 static TABLE_NAME: &str = "documents";
+static IS_DELETED_COLUMN: &str = "is_deleted";
 
 #[derive(Clone)]
 pub struct Document {
@@ -64,6 +65,9 @@ pub async fn init() -> Result<()> {
         conn.create_table(TABLE_NAME, Box::new(RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone())))
             .execute()
             .await?;
+    } else {
+        let table = conn.open_table(TABLE_NAME).execute().await?;
+        ensure_is_deleted_column(&table).await?;
     }
     // 如果表已存在，直接使用现有的表
 
@@ -92,6 +96,7 @@ pub async fn search(query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>
 
     // 应用过滤条件
     let mut filter_conditions = Vec::new();
+    filter_conditions.push(format!("({} = false OR {} IS NULL)", IS_DELETED_COLUMN, IS_DELETED_COLUMN));
     filter_conditions.push("is_image = false".to_string());
     if let Some(fid) = file_id {
         filter_conditions.push(format!("file_id = {}", fid));
@@ -176,7 +181,10 @@ pub async fn search_image(
 
     let mut query_builder = table.query().nearest_to(query_vector)?.column("image_vector");
 
-    let mut filter_conditions = vec!["is_image = true".to_string()];
+    let mut filter_conditions = vec![
+        format!("({} = false OR {} IS NULL)", IS_DELETED_COLUMN, IS_DELETED_COLUMN),
+        "is_image = true".to_string(),
+    ];
     if let Some(fid) = file_id {
         filter_conditions.push(format!("file_id = {}", fid));
     }
@@ -244,7 +252,7 @@ pub async fn delete_by_file(file_id: i64) -> Result<()> {
     let conn = get_connection()?;
     let table = conn.open_table(TABLE_NAME).execute().await?;
     let predicate = format!("file_id = {}", file_id);
-    table.delete(&predicate).await?;
+    table.update().only_if(predicate).column(IS_DELETED_COLUMN, "true").execute().await?;
     Ok(())
 }
 
@@ -252,7 +260,7 @@ pub async fn delete_by_kb(kb_id: i64) -> Result<()> {
     let conn = get_connection()?;
     let table = conn.open_table(TABLE_NAME).execute().await?;
     let predicate = format!("kb_id = {}", kb_id);
-    table.delete(&predicate).await?;
+    table.update().only_if(predicate).column(IS_DELETED_COLUMN, "true").execute().await?;
     Ok(())
 }
 
@@ -269,6 +277,7 @@ fn create_schema() -> Arc<ArrowSchema> {
         Field::new("kb_id", DataType::Int64, true),
         Field::new("content", DataType::Utf8, false),
         Field::new("is_image", DataType::Boolean, false),
+        Field::new(IS_DELETED_COLUMN, DataType::Boolean, true),
         // 向量字段 - 从配置获取维度
         Field::new(
             "vector",
@@ -291,6 +300,7 @@ fn create_empty_batch(schema: &Arc<ArrowSchema>) -> Result<RecordBatch> {
     let kb_id_array: ArrayRef = Arc::new(Int64Array::from(Vec::<Option<i64>>::new()));
     let content_array: ArrayRef = Arc::new(StringArray::from(Vec::<String>::new()));
     let is_image_array: ArrayRef = Arc::new(BooleanArray::from(Vec::<bool>::new()));
+    let is_deleted_array: ArrayRef = Arc::new(BooleanArray::from(Vec::<bool>::new()));
 
     // 创建空的向量数组
     let value_builder = Float32Builder::new();
@@ -307,6 +317,7 @@ fn create_empty_batch(schema: &Arc<ArrowSchema>) -> Result<RecordBatch> {
         kb_id_array,
         content_array,
         is_image_array,
+        is_deleted_array,
         vector_array,
         image_vector_array,
     ])?)
@@ -320,12 +331,14 @@ async fn create_record_batch(docs: Vec<Document>, schema: &Arc<ArrowSchema>) -> 
     let kb_ids: Vec<Option<i64>> = docs.iter().map(|d| d.kb_id).collect();
     let contents: Vec<String> = docs.iter().map(|d| d.content.clone()).collect();
     let is_images: Vec<bool> = docs.iter().map(|d| d.is_image).collect();
+    let is_deleted: Vec<bool> = vec![false; docs.len()];
 
     let id_array: ArrayRef = Arc::new(Int64Array::from(ids));
     let file_id_array: ArrayRef = Arc::new(Int64Array::from(file_ids));
     let kb_id_array: ArrayRef = Arc::new(Int64Array::from(kb_ids));
     let content_array: ArrayRef = Arc::new(StringArray::from(contents.clone()));
     let is_image_array: ArrayRef = Arc::new(BooleanArray::from(is_images));
+    let is_deleted_array: ArrayRef = Arc::new(BooleanArray::from(is_deleted));
 
     // 获取真实的 embedding 向量
     let embeddings = embedding::get_embeddings(&contents).await?;
@@ -378,7 +391,21 @@ async fn create_record_batch(docs: Vec<Document>, schema: &Arc<ArrowSchema>) -> 
         kb_id_array,
         content_array,
         is_image_array,
+        is_deleted_array,
         vector_array,
         image_vector_array,
     ])?)
+}
+
+async fn ensure_is_deleted_column(table: &lancedb::Table) -> Result<()> {
+    let schema = table.schema().await?;
+    if schema.field_with_name(IS_DELETED_COLUMN).is_err() {
+        table
+            .add_columns(
+                NewColumnTransform::SqlExpressions(vec![(IS_DELETED_COLUMN.to_string(), "false".to_string())]),
+                None,
+            )
+            .await?;
+    }
+    Ok(())
 }
