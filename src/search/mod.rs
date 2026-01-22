@@ -123,14 +123,23 @@ impl SearchEngine {
         debug!("LanceDB results count: {}", lancedb_results.len());
         debug!("LanceDB results: {:?}", lancedb_results);
 
-        // 合并结果：使用 HashMap 按 id 去重，保留最高分数
+        // 合并结果：使用 HashMap 按 id 去重，保留最高分数，同时去除内容为空的结果
         let mut merged_map: HashMap<i64, SearchResultItem> = HashMap::new();
 
         for result in tantivy_results {
+            // 跳过空内容（包括仅有空白的情况）
+            if result.content.trim().is_empty() {
+                continue;
+            }
             merged_map.insert(result.id, result);
         }
 
         for result in lancedb_results {
+            // 跳过空内容（包括仅有空白的情况）
+            if result.content.trim().is_empty() {
+                continue;
+            }
+
             merged_map
                 .entry(result.id)
                 .and_modify(|e| {
