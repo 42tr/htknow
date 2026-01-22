@@ -121,6 +121,10 @@ impl FileProcessor {
         tokio::spawn(async move {
             info!("File processor started with interval: {:?}", self.interval);
 
+            if let Err(e) = self.reset_processing_files().await {
+                error!("Failed to reset in-progress files: {}", e);
+            }
+
             loop {
                 // 持续处理直到没有待处理的文件
                 loop {
@@ -145,6 +149,53 @@ impl FileProcessor {
                 time::sleep(self.interval).await;
             }
         });
+    }
+
+    /// 重置异常退出时处于“处理中”的文件状态
+    async fn reset_processing_files(&self) -> anyhow::Result<()> {
+        let file_ids: Vec<i64> =
+            sqlx::query_scalar("SELECT id FROM files WHERE status = 2").fetch_all(&self.pool).await?;
+
+        if file_ids.is_empty() {
+            return Ok(());
+        }
+
+        info!("Found {} in-progress files from previous run, resetting", file_ids.len());
+
+        for file_id in file_ids {
+            if let Err(e) = self.reset_processing_file_data(file_id).await {
+                error!("Failed to reset processing file {}: {}", file_id, e);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn reset_processing_file_data(&self, file_id: i64) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+
+        sqlx::query("DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
+            .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM slice_positions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
+            .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM slices WHERE file_id = ?").bind(file_id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(file_id).execute(&mut *tx).await?;
+        sqlx::query("UPDATE files SET status = 0, log = '', updated_at = strftime('%s','now') WHERE id = ?")
+            .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        if let Err(e) = self.search_engine.delete(Some(file_id), None).await {
+            warn!("Failed to delete search index for file {}: {}", file_id, e);
+        }
+
+        Ok(())
     }
 
     /// 处理所有待处理的文件
