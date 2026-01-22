@@ -41,6 +41,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     create_tables(&pool).await?;
     ensure_kb_type_column(&pool).await?;
     ensure_user_name_columns(&pool).await?;
+    ensure_file_size_column(&pool).await?;
     ensure_pdf_contents_bbox_column(&pool).await?;
     if cfg.database.init_default_kbs {
         ensure_default_knowledge_bases(&pool).await?;
@@ -134,6 +135,17 @@ async fn ensure_kb_type_column(pool: &SqlitePool) -> anyhow::Result<()> {
 async fn ensure_user_name_columns(pool: &SqlitePool) -> anyhow::Result<()> {
     ensure_user_name_column(pool, "files").await?;
     ensure_user_name_column(pool, "knowledge_bases").await?;
+    Ok(())
+}
+
+async fn ensure_file_size_column(pool: &SqlitePool) -> anyhow::Result<()> {
+    let columns = sqlx::query("PRAGMA table_info(files);").fetch_all(pool).await?;
+    let has_size = columns.iter().any(|row| row.get::<String, _>("name") == "size");
+
+    if !has_size {
+        sqlx::query("ALTER TABLE files ADD COLUMN size INTEGER NOT NULL DEFAULT 0").execute(pool).await?;
+    }
+
     Ok(())
 }
 

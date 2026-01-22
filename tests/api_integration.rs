@@ -140,15 +140,17 @@ async fn insert_file(
     let is_public = if is_public { 1 } else { 0 };
     let tags_json = serde_json::to_string(&tags).unwrap();
     let hash = format!("hash-{}", next_seq());
+    let size = fs::metadata(path).map(|meta| meta.len() as i64).unwrap_or(0);
     sqlx::query(
-        "INSERT INTO files (user_id, user_name, hash, filename, path, slice_type, kb_id, is_public, tags, status, log) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "INSERT INTO files (user_id, user_name, hash, filename, path, size, slice_type, kb_id, is_public, tags, status, log) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
     )
     .bind(&user.id)
     .bind(&user.name)
     .bind(hash)
     .bind(filename)
     .bind(path.to_string_lossy().as_ref())
+    .bind(size)
     .bind("text")
     .bind(kb_id)
     .bind(is_public)

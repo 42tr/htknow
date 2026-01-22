@@ -22,6 +22,7 @@ pub struct File {
     pub hash: String,
     pub filename: String,
     pub path: String,
+    pub size: i64,
     pub content: Option<String>,
     pub tags: String,
     pub status: i32,
@@ -60,7 +61,7 @@ pub async fn upload(
     let dir = &cfg.storage.files_path;
     tokio::fs::create_dir_all(dir).await?;
 
-    let mut files_data: Vec<(String, String, String)> = Vec::new();
+    let mut files_data: Vec<(String, String, String, i64)> = Vec::new();
     let mut slice_type = String::new();
     let mut kb_id = None;
     let mut is_public = 0i32;
@@ -77,18 +78,20 @@ pub async fn upload(
                 match field_name.as_deref() {
                     Some("file") => {
                         let mut hasher = Sha256::new();
+                        let mut size: i64 = 0;
                         let filename = field.file_name().unwrap_or("unknown").to_string();
                         debug!("Uploading file: {}", filename);
                         let tempname = uuid::Uuid::new_v4().to_string();
                         let filepath = format!("{}/{}", dir, tempname);
                         let mut file = tokio::fs::File::create(filepath.clone()).await?;
                         while let Some(chunk) = field.chunk().await? {
+                            size += chunk.len() as i64;
                             file.write_all(&chunk).await?;
                             hasher.update(&chunk);
                         }
                         let hash = hex::encode(hasher.finalize());
                         debug!("File saved to: {}", filepath);
-                        files_data.push((hash, filename, filepath));
+                        files_data.push((hash, filename, filepath, size));
                     }
                     Some("slice_type") => {
                         slice_type = field.text().await?;
@@ -167,14 +170,15 @@ pub async fn upload(
     let mut uploaded_files: Vec<File> = Vec::new();
     let mut parse_file_ids: Vec<i64> = Vec::new();
 
-    for (hash, filename, filepath) in files_data {
-        let sql = "INSERT INTO files (user_id, user_name, hash, filename, path, slice_type, kb_id, is_public, tags, status, log, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    for (hash, filename, filepath, size) in files_data {
+        let sql = "INSERT INTO files (user_id, user_name, hash, filename, path, size, slice_type, kb_id, is_public, tags, status, log, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         let id = sqlx::query(sql)
             .bind(&auth_user.user_id)
             .bind(&auth_user.user_name)
             .bind(hash)
             .bind(filename)
             .bind(filepath)
+            .bind(size)
             .bind(&slice_type)
             .bind(kb_id)
             .bind(is_public)
