@@ -814,7 +814,7 @@ impl FileProcessor {
                 }
             } else if item.typ == "image" {
                 if let Some(img_name) = &item.img_path {
-                    item_content.push_str(&format!("![{}](images/{})", img_name, img_name));
+                    item_content.push_str(&format!("![{}](/api/v1/knowledge/files/{})", img_name, img_name));
                 }
                 if let Some(captions) = &item.image_caption {
                     for caption in captions {
