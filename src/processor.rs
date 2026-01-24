@@ -26,6 +26,14 @@ struct Result {
 struct MinerUResponse {
     results: HashMap<String, Result>,
 }
+
+#[derive(Debug, Deserialize, Serialize)]
+struct AudioTranscriptionResponse {
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    language: String,
+}
 /*
 "type": "text",
 "text": "维修服务信息",
@@ -245,6 +253,7 @@ impl FileProcessor {
         let filename_lower = file.filename.to_lowercase();
         let is_pdf = filename_lower.ends_with(".pdf");
         let is_image = Self::is_image_file(&filename_lower);
+        let is_audio = Self::is_audio_file(&filename_lower);
 
         // 检查文件是否为 Word 文档
         let is_word = filename_lower.ends_with(".doc") || filename_lower.ends_with(".docx");
@@ -260,6 +269,8 @@ impl FileProcessor {
             let image_embedding =
                 search::embedding::get_image_embedding_from_path(&file.path, Some(&file.filename)).await?;
             self.process_pdf_file(file, Some(image_embedding), true, None).await?;
+        } else if is_audio {
+            self.process_audio_file(file).await?;
         } else {
             // 处理普通文本文件
             self.process_text_file(file).await?;
@@ -538,9 +549,46 @@ impl FileProcessor {
     async fn process_text_file(&self, file: &File) -> anyhow::Result<()> {
         // 示例：读取文件内容
         let content = tokio::fs::read_to_string(file.path.as_str()).await?;
+        self.process_plain_text_content(file, &content, "Processing completed successfully").await
+    }
 
+    async fn process_audio_file(&self, file: &File) -> anyhow::Result<()> {
+        info!("Processing audio file: {}", file.filename);
+
+        let file_bytes = tokio::fs::read(&file.path).await?;
+        let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string();
+
+        let form = multipart::Form::new()
+            .part("file", multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str(&mime_type)?);
+
+        let client = reqwest::Client::new();
+        let cfg = config::get();
+        let mut req_builder = client.post(&cfg.services.audio_transcription_url).multipart(form);
+        if let Some(key) = &cfg.services.audio_transcription_key {
+            if !key.is_empty() {
+                req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+            }
+        }
+
+        let response = req_builder.send().await?;
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            return Err(anyhow::anyhow!("Audio transcription API failed: {}", error_text));
+        }
+
+        let AudioTranscriptionResponse { text, language } = response.json().await?;
+        let log_message = if language.is_empty() {
+            "Audio processed successfully".to_string()
+        } else {
+            format!("Audio processed successfully (language: {})", language)
+        };
+
+        self.process_plain_text_content(file, &text, &log_message).await
+    }
+
+    async fn process_plain_text_content(&self, file: &File, content: &str, log_message: &str) -> anyhow::Result<()> {
         // 示例：根据 slice_type 进行分片处理
-        let slices = self.slice_content(&content, &file.slice_type)?;
+        let slices = self.slice_content(content, &file.slice_type)?;
         let slice_count = slices.len();
 
         // 保存分片到数据库
@@ -557,12 +605,7 @@ impl FileProcessor {
 
         // 更新文件状态为已处理，并保存内容
         let sql = "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
-        sqlx::query(sql)
-            .bind(&content)
-            .bind("Processing completed successfully")
-            .bind(file.id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(sql).bind(content).bind(log_message).bind(file.id).execute(&self.pool).await?;
 
         info!("File {} processed successfully with {} slices", file.id, slice_count);
 
@@ -610,6 +653,22 @@ impl FileProcessor {
             || filename_lower.ends_with(".ico")
             || filename_lower.ends_with(".heic")
             || filename_lower.ends_with(".heif")
+    }
+
+    fn is_audio_file(filename_lower: &str) -> bool {
+        filename_lower.ends_with(".wav")
+            || filename_lower.ends_with(".mp3")
+            || filename_lower.ends_with(".m4a")
+            || filename_lower.ends_with(".aac")
+            || filename_lower.ends_with(".flac")
+            || filename_lower.ends_with(".ogg")
+            || filename_lower.ends_with(".opus")
+            || filename_lower.ends_with(".wma")
+            || filename_lower.ends_with(".amr")
+            || filename_lower.ends_with(".aiff")
+            || filename_lower.ends_with(".aif")
+            || filename_lower.ends_with(".alac")
+            || filename_lower.ends_with(".webm")
     }
 
     /// 根据 slice_type 对内容进行分片

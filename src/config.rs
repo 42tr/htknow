@@ -60,6 +60,10 @@ pub struct ServerConfig {
 pub struct ServicesConfig {
     /// MinerU PDF 解析服务地址
     pub mineru_url: String,
+    /// 音频转写服务地址
+    pub audio_transcription_url: String,
+    /// 音频转写服务 API Key（可选）
+    pub audio_transcription_key: Option<String>,
     /// Embedding 服务地址
     pub embedding_url: String,
     /// 图片 Embedding 服务地址
@@ -175,6 +179,11 @@ impl ServicesConfig {
     fn from_env() -> Self {
         Self {
             mineru_url: env_or("HTKNOW_MINERU_URL", "http://192.168.0.46:10001/file_parse"),
+            audio_transcription_url: env_or(
+                "HTKNOW_AUDIO_TRANSCRIPTION_URL",
+                "http://192.168.0.46:59805/api/v1/audio/transcriptions",
+            ),
+            audio_transcription_key: std::env::var("HTKNOW_AUDIO_TRANSCRIPTION_KEY").ok(),
             embedding_url: env_or("HTKNOW_EMBEDDING_URL", "http://222.190.139.186:59700/v1/embeddings"),
             image_embedding_url: env_or("HTKNOW_IMAGE_EMBEDDING_URL", "http://192.168.0.46:59802/v1/embeddings/file"),
             rerank_url: env_or("HTKNOW_RERANK_URL", "http://222.190.139.186:59600/v1/rerank"),
