@@ -386,51 +386,8 @@ impl FileProcessor {
                 .collect();
         } else {
             // 没有数据，调用 MinerU API
-            // 读取 PDF 文件
-            let file_bytes = tokio::fs::read(&file.path).await?;
-
-            // 构建 multipart form
-            let mime_type = if is_image {
-                mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string()
-            } else {
-                "application/pdf".to_string()
-            };
-
-            let form = multipart::Form::new()
-                .text("return_middle_json", "false")
-                .text("return_model_output", "false")
-                .text("return_md", "false")
-                .text("return_images", "true")
-                .text("end_page_id", "99999")
-                .text("parse_method", "auto")
-                .text("start_page_id", "0")
-                .text("lang_list", "ch")
-                .text("output_dir", "./output")
-                .text("server_url", "string")
-                .text("return_content_list", "true")
-                .text("backend", "pipeline")
-                .text("table_enable", "true")
-                .text("response_format_zip", "false")
-                .text("formula_enable", "true")
-                .part(
-                    "files",
-                    multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str(&mime_type)?,
-                );
-
-            // 调用 MinerU API
-            let client = reqwest::Client::new();
-            let cfg = config::get();
-            let response = client.post(&cfg.services.mineru_url).multipart(form).send().await?;
-
-            if !response.status().is_success() {
-                let error_text = response.text().await?;
-                return Err(anyhow::anyhow!("MinerU API failed: {}", error_text));
-            }
-
-            let result: MinerUResponse = response.json().await?;
-
-            let result = result.results.values().next().unwrap();
-            content_list = serde_json::from_str(&result.content_list)?;
+            let mineru_result = self.call_mineru_api(file, is_image).await?;
+            content_list = serde_json::from_str(&mineru_result.content_list)?;
 
             // 提取文本内容并过滤掉 discarded 项
             let valid_content_items: Vec<_> = content_list.iter().filter(|item| item.typ != "discarded").collect();
@@ -468,7 +425,7 @@ impl FileProcessor {
             // 保存图片到本地
             let cfg = config::get();
             fs::create_dir_all(&cfg.storage.images_path).await?;
-            for (img_name, img_base64) in &result.images {
+            for (img_name, img_base64) in &mineru_result.images {
                 // 保存图片
                 let b64 = img_base64
                     .strip_prefix("data:image/jpeg;base64,")
@@ -548,6 +505,49 @@ impl FileProcessor {
         info!("PDF file {} processed successfully with {} slices", file.id, slice_count);
 
         Ok(())
+    }
+
+    async fn call_mineru_api(&self, file: &File, is_image: bool) -> anyhow::Result<Result> {
+        // 读取 PDF 文件
+        let file_bytes = tokio::fs::read(&file.path).await?;
+
+        // 构建 multipart form
+        let mime_type = if is_image {
+            mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string()
+        } else {
+            "application/pdf".to_string()
+        };
+
+        let form = multipart::Form::new()
+            .text("return_middle_json", "false")
+            .text("return_model_output", "false")
+            .text("return_md", "false")
+            .text("return_images", "true")
+            .text("end_page_id", "99999")
+            .text("parse_method", "auto")
+            .text("start_page_id", "0")
+            .text("lang_list", "ch")
+            .text("output_dir", "./output")
+            .text("server_url", "string")
+            .text("return_content_list", "true")
+            .text("backend", "pipeline")
+            .text("table_enable", "true")
+            .text("response_format_zip", "false")
+            .text("formula_enable", "true")
+            .part("files", multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str(&mime_type)?);
+
+        // 调用 MinerU API
+        let client = reqwest::Client::new();
+        let cfg = config::get();
+        let response = client.post(&cfg.services.mineru_url).multipart(form).send().await?;
+
+        if !response.status().is_success() {
+            let error_text = response.text().await?;
+            return Err(anyhow::anyhow!("MinerU API failed: {}", error_text));
+        }
+
+        let mineru_response: MinerUResponse = response.json().await?;
+        mineru_response.results.into_values().next().ok_or_else(|| anyhow::anyhow!("MinerU API returned empty results"))
     }
 
     /// 处理普通文本文件
