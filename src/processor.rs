@@ -27,6 +27,20 @@ struct MinerUResponse {
     results: HashMap<String, Result>,
 }
 
+#[derive(Debug, Deserialize)]
+struct AnalyzePdfResponse {
+    code: i32,
+    #[serde(default)]
+    message: String,
+    data: Option<AnalyzePdfData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AnalyzePdfData {
+    #[serde(default)]
+    content_list: Vec<ContentItem>,
+}
+
 #[derive(Debug, Deserialize, Serialize)]
 struct AudioTranscriptionResponse {
     #[serde(default)]
@@ -508,46 +522,120 @@ impl FileProcessor {
     }
 
     async fn call_mineru_api(&self, file: &File, is_image: bool) -> anyhow::Result<Result> {
-        // 读取 PDF 文件
         let file_bytes = tokio::fs::read(&file.path).await?;
-
-        // 构建 multipart form
-        let mime_type = if is_image {
-            mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string()
-        } else {
-            "application/pdf".to_string()
-        };
-
-        let form = multipart::Form::new()
-            .text("return_middle_json", "false")
-            .text("return_model_output", "false")
-            .text("return_md", "false")
-            .text("return_images", "true")
-            .text("end_page_id", "99999")
-            .text("parse_method", "auto")
-            .text("start_page_id", "0")
-            .text("lang_list", "ch")
-            .text("output_dir", "./output")
-            .text("server_url", "string")
-            .text("return_content_list", "true")
-            .text("backend", "pipeline")
-            .text("table_enable", "true")
-            .text("response_format_zip", "false")
-            .text("formula_enable", "true")
-            .part("files", multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str(&mime_type)?);
-
-        // 调用 MinerU API
-        let client = reqwest::Client::new();
         let cfg = config::get();
-        let response = client.post(&cfg.services.mineru_url).multipart(form).send().await?;
+        let mineru_url = cfg.services.mineru_url.trim_end_matches('/');
 
+        let client = reqwest::Client::new();
+        if mineru_url.ends_with("/file_parse") {
+            // 构建 multipart form
+            let mime_type = if is_image {
+                mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string()
+            } else {
+                "application/pdf".to_string()
+            };
+
+            let form = multipart::Form::new()
+                .text("return_middle_json", "false")
+                .text("return_model_output", "false")
+                .text("return_md", "false")
+                .text("return_images", "true")
+                .text("end_page_id", "99999")
+                .text("parse_method", "auto")
+                .text("start_page_id", "0")
+                .text("lang_list", "ch")
+                .text("output_dir", "./output")
+                .text("server_url", "string")
+                .text("return_content_list", "true")
+                .text("backend", "pipeline")
+                .text("table_enable", "true")
+                .text("response_format_zip", "false")
+                .text("formula_enable", "true")
+                .part(
+                    "files",
+                    multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str(&mime_type)?,
+                );
+
+            // 调用 MinerU API
+            let response = client.post(mineru_url).multipart(form).send().await?;
+            if !response.status().is_success() {
+                let error_text = response.text().await?;
+                return Err(anyhow::anyhow!("MinerU API failed: {}", error_text));
+            }
+
+            let mineru_response: MinerUResponse = response.json().await?;
+            return mineru_response
+                .results
+                .into_values()
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("MinerU API returned empty results"));
+        }
+
+        let mut url = reqwest::Url::parse(mineru_url)?;
+        {
+            let mut query = url.query_pairs_mut();
+            query.append_pair("backend", "pipeline");
+            query.append_pair("method", "auto");
+            query.append_pair("lang", "ch");
+            query.append_pair("start_page", "0");
+            query.append_pair("formula_enable", "true");
+            query.append_pair("table_enable", "true");
+        }
+
+        let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string();
+        let form = multipart::Form::new()
+            .part("file", multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str(&mime_type)?);
+
+        let response = client.post(url.clone()).multipart(form).send().await?;
         if !response.status().is_success() {
             let error_text = response.text().await?;
             return Err(anyhow::anyhow!("MinerU API failed: {}", error_text));
         }
 
-        let mineru_response: MinerUResponse = response.json().await?;
-        mineru_response.results.into_values().next().ok_or_else(|| anyhow::anyhow!("MinerU API returned empty results"))
+        let analyze_response: AnalyzePdfResponse = response.json().await?;
+        if analyze_response.code != 200 {
+            return Err(anyhow::anyhow!("MinerU API failed: {}", analyze_response.message));
+        }
+
+        let Some(data) = analyze_response.data else {
+            return Err(anyhow::anyhow!("MinerU API returned empty data"));
+        };
+
+        let host = url.host_str().ok_or_else(|| anyhow::anyhow!("MinerU API URL missing host"))?;
+        let origin = if let Some(port) = url.port() {
+            format!("{}://{}:{}", url.scheme(), host, port)
+        } else {
+            format!("{}://{}", url.scheme(), host)
+        };
+
+        let mut content_list = data.content_list;
+        let mut images = HashMap::new();
+        for item in &mut content_list {
+            let Some(img_path) = item.img_path.as_deref() else { continue };
+            let filename = std::path::Path::new(img_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(img_path)
+                .to_string();
+
+            if !images.contains_key(&filename) {
+                let image_url = format!("{}/output/{}", origin, img_path.trim_start_matches('/'));
+                let image_response = client.get(&image_url).send().await?;
+                if !image_response.status().is_success() {
+                    let error_text = image_response.text().await?;
+                    return Err(anyhow::anyhow!("MinerU image download failed: {}", error_text));
+                }
+                let image_bytes = image_response.bytes().await?;
+                let image_mime = mime_guess::from_path(&filename).first_or_octet_stream().essence_str().to_string();
+                let image_base64 = STANDARD.encode(image_bytes);
+                images.insert(filename.clone(), format!("data:{};base64,{}", image_mime, image_base64));
+            }
+
+            item.img_path = Some(filename);
+        }
+
+        let content_list_json = serde_json::to_string(&content_list)?;
+        Ok(Result { content_list: content_list_json, images })
     }
 
     /// 处理普通文本文件
