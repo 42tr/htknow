@@ -255,11 +255,11 @@ impl FileProcessor {
             self.convert_word_to_pdf_and_process(file).await?;
         } else if is_pdf {
             // 处理 PDF 或图片文件
-            self.process_pdf_file(file, None, false).await?;
+            self.process_pdf_file(file, None, false, None).await?;
         } else if is_image {
             let image_embedding =
                 search::embedding::get_image_embedding_from_path(&file.path, Some(&file.filename)).await?;
-            self.process_pdf_file(file, Some(image_embedding), true).await?;
+            self.process_pdf_file(file, Some(image_embedding), true, None).await?;
         } else {
             // 处理普通文本文件
             self.process_text_file(file).await?;
@@ -311,7 +311,7 @@ impl FileProcessor {
         temp_file.filename = pdf_filename;
 
         // 使用 process_pdf_file 处理转换后的 PDF
-        let result = self.process_pdf_file(&temp_file, None, false).await;
+        let result = self.process_pdf_file(&temp_file, None, false, Some(file.filename.as_str())).await;
 
         // 清理临时 PDF 文件
         let _ = fs::remove_file(&converted_pdf_path).await;
@@ -321,7 +321,7 @@ impl FileProcessor {
 
     /// 处理 PDF 文件，调用 MinerU API
     async fn process_pdf_file(
-        &self, file: &File, image_embedding: Option<Vec<f32>>, is_image: bool,
+        &self, file: &File, image_embedding: Option<Vec<f32>>, is_image: bool, index_filename: Option<&str>,
     ) -> anyhow::Result<()> {
         info!("Processing PDF file: {}", file.filename);
 
@@ -513,7 +513,9 @@ impl FileProcessor {
             // 不影响主流程，仅记录错误
         }
 
-        let index_full_content = format!("{}\n\n{}", file.filename, full_content);
+        let index_filename = index_filename.unwrap_or(file.filename.as_str());
+        let index_full_content = format!("{}\n\n{}", index_filename, full_content);
+        debug!("write full content: {}", index_full_content);
         self.search_engine
             .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
             .await?;
