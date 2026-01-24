@@ -62,7 +62,7 @@ pub struct KnowledgeDetailResponse {
     pub is_public: bool,
     pub file_count: i64,
     pub children_kb_count: i64,
-    pub children_kbs: Vec<Knowledge>,
+    pub children_kbs: Vec<KnowledgeResponse>,
     pub files: Vec<super::file::File>,
     pub path: Vec<Knowledge>, // For breadcrumbs
 }
@@ -482,7 +482,7 @@ pub async fn get(
     .fetch_one(&pool)
     .await?;
 
-    // 2. Fetch children KBs, files, and counts in parallel
+    // 2. Fetch children KBs and files in parallel
     let children_future = sqlx::query_as(
         "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public \
          FROM knowledge_bases WHERE parent_id = ? AND (user_id = ? OR is_public = 1) ORDER BY name",
@@ -502,18 +502,35 @@ pub async fn get(
         qb.build_query_as::<super::file::File>().fetch_all(&pool).await
     };
 
-    let count_ids = vec![id];
-    let file_counts_future = get_file_counts(&pool, &count_ids, &auth_user.user_id);
-    let children_counts_future = get_children_kb_counts(&pool, &count_ids, &auth_user.user_id);
-
-    let (children_kbs_res, files_res, file_counts_res, children_counts_res) =
-        tokio::join!(children_future, files_future, file_counts_future, children_counts_future);
+    let (children_kbs_res, files_res) = tokio::join!(children_future, files_future);
     let children_kbs: Vec<Knowledge> = children_kbs_res?;
     let mut files: Vec<super::file::File> = files_res?;
+    let mut count_ids = Vec::with_capacity(children_kbs.len() + 1);
+    count_ids.push(id);
+    count_ids.extend(children_kbs.iter().map(|kb| kb.id));
+    let (file_counts_res, children_counts_res) = tokio::join!(
+        get_file_counts(&pool, &count_ids, &auth_user.user_id),
+        get_children_kb_counts(&pool, &count_ids, &auth_user.user_id)
+    );
     let file_counts = file_counts_res?;
     let children_counts = children_counts_res?;
     let file_count = *file_counts.get(&id).unwrap_or(&0);
     let children_kb_count = *children_counts.get(&id).unwrap_or(&0);
+    let children_kbs: Vec<KnowledgeResponse> = children_kbs
+        .into_iter()
+        .map(|kb| KnowledgeResponse {
+            id: kb.id,
+            user_id: kb.user_id,
+            user_name: kb.user_name,
+            name: kb.name,
+            description: kb.description,
+            kb_type: kb.kb_type,
+            parent_id: kb.parent_id,
+            is_public: kb.is_public,
+            file_count: *file_counts.get(&kb.id).unwrap_or(&0),
+            children_kb_count: *children_counts.get(&kb.id).unwrap_or(&0),
+        })
+        .collect();
 
     if let Some(tag) = &query.tag {
         files.retain(|file| {
