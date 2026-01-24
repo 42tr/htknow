@@ -440,24 +440,29 @@ impl FileProcessor {
                 if count.0 > 0 {
                     sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(file.id).execute(&self.pool).await?;
                 }
-                let mut pdf_sql = QueryBuilder::<Sqlite>::new(
-                    "insert into pdf_contents(file_id, page_idx, bbox, text, text_level, img_path, table_body) ",
-                );
-                pdf_sql.push_values(valid_content_items.iter(), |mut b, item| {
-                    let bbox = if item.bbox.is_empty() {
-                        None
-                    } else {
-                        Some(serde_json::to_string(&item.bbox).unwrap_or_default())
-                    };
-                    b.push_bind(file.id)
-                        .push_bind(item.page_idx)
-                        .push_bind(bbox)
-                        .push_bind(&item.text)
-                        .push_bind(item.text_level)
-                        .push_bind(&item.img_path)
-                        .push_bind(&item.table_body);
-                });
-                pdf_sql.build().execute(&self.pool).await?;
+                let binds_per_row = 7_usize;
+                let max_vars = 999_usize;
+                let batch_size = std::cmp::max(1, max_vars / binds_per_row);
+                for chunk in valid_content_items.chunks(batch_size) {
+                    let mut pdf_sql = QueryBuilder::<Sqlite>::new(
+                        "insert into pdf_contents(file_id, page_idx, bbox, text, text_level, img_path, table_body) ",
+                    );
+                    pdf_sql.push_values(chunk.iter(), |mut b, item| {
+                        let bbox = if item.bbox.is_empty() {
+                            None
+                        } else {
+                            Some(serde_json::to_string(&item.bbox).unwrap_or_default())
+                        };
+                        b.push_bind(file.id)
+                            .push_bind(item.page_idx)
+                            .push_bind(bbox)
+                            .push_bind(&item.text)
+                            .push_bind(item.text_level)
+                            .push_bind(&item.img_path)
+                            .push_bind(&item.table_body);
+                    });
+                    pdf_sql.build().execute(&self.pool).await?;
+                }
             }
 
             // 保存图片到本地
