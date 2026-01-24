@@ -498,7 +498,7 @@ pub async fn get(
         if let Some(filename) = query.filename.as_deref() {
             qb.push(" AND filename LIKE ").push_bind(format!("%{}%", filename));
         }
-        qb.push(" ORDER BY filename");
+        qb.push(" ORDER BY updated_at DESC");
         qb.build_query_as::<super::file::File>().fetch_all(&pool).await
     };
 
