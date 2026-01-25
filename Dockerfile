@@ -12,6 +12,8 @@ RUN apt-get update && apt-get install -y \
     ca-certificates \
     # Timezone data
     tzdata \
+    # sqlite3
+    sqlite3 \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
 
