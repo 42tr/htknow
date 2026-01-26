@@ -77,7 +77,7 @@ struct AudioTranscriptionResponse {
 "bbox": [333, 755, 634, 777],
 "page_idx": 89
 */
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 struct ContentItem {
     #[serde(default, rename = "type")]
     typ: String,
@@ -404,7 +404,8 @@ impl FileProcessor {
             content_list = serde_json::from_str(&mineru_result.content_list)?;
 
             // 提取文本内容并过滤掉 discarded 项
-            let valid_content_items: Vec<_> = content_list.iter().filter(|item| item.typ != "discarded").collect();
+            let valid_content_items: Vec<ContentItem> =
+                content_list.iter().filter(|item| item.typ != "discarded").cloned().collect();
 
             // 只有在有有效内容时才插入数据库
             if !valid_content_items.is_empty() {
@@ -985,7 +986,15 @@ impl FileProcessor {
                     }
                 }
                 if let Some(table_body) = &item.table_body {
-                    item_content.push_str(table_body);
+                    item_content.push_str(
+                        &table_body
+                            .replace(" colspan=\"1\"", "")
+                            .replace(" rowspan=\"1\"", "")
+                            .replace(" colspan='1'", "")
+                            .replace(" rowspan='1'", "")
+                            .replace(" colspan=1", "")
+                            .replace(" rowspan=1", ""),
+                    );
                 }
             }
 

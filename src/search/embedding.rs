@@ -71,7 +71,7 @@ pub async fn get_embedding(text: &str) -> Result<Vec<f32>> {
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
-        anyhow::bail!("Embedding API error: {} - {}", status, error_text);
+        anyhow::bail!("Embedding API error: {} - {}, origin_text: {}", status, error_text, text);
     }
 
     let embedding_response: EmbeddingResponse = response.json().await?;
@@ -98,7 +98,7 @@ pub async fn get_embeddings(texts: &[String]) -> Result<Vec<Vec<f32>>> {
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
-        anyhow::bail!("Embedding API error: {} - {}", status, error_text);
+        anyhow::bail!("Embedding API error: {} - {}, origin_texts: {:?}", status, error_text, texts);
     }
 
     let embedding_response: EmbeddingResponse = response.json().await?;
