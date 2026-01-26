@@ -22,9 +22,30 @@ struct Result {
 }
 
 /// MinerU API 返回的结果结构
-#[derive(Debug, Deserialize, Serialize)]
+#[derive(Debug, Deserialize)]
 struct MinerUResponse {
-    results: HashMap<String, Result>,
+    results: MinerUResults,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum MinerUResults {
+    Map(HashMap<String, Result>),
+    List(Vec<MinerUResultItem>),
+}
+
+#[derive(Debug, Deserialize)]
+struct MinerUResultItem {
+    #[serde(default)]
+    status: String,
+    #[serde(default)]
+    error: String,
+    #[serde(default)]
+    filename: String,
+    #[serde(default)]
+    content_list: String,
+    #[serde(default)]
+    images: HashMap<String, String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -441,10 +462,12 @@ impl FileProcessor {
             let cfg = config::get();
             fs::create_dir_all(&cfg.storage.images_path).await?;
             for (img_name, img_base64) in &mineru_result.images {
-                // 保存图片
-                let b64 = img_base64
-                    .strip_prefix("data:image/jpeg;base64,")
-                    .ok_or_else(|| anyhow::anyhow!("invalid base64 image"))?;
+                // 保存图片，如果以 data:image/jpeg;base64, 开头就去掉，没有也不报错
+                let b64 = if let Some(stripped) = img_base64.strip_prefix("data:image/jpeg;base64,") {
+                    stripped
+                } else {
+                    img_base64.as_str()
+                };
                 let bytes = STANDARD.decode(b64)?;
                 fs::write(format!("{}/{}", cfg.storage.images_path, img_name), bytes).await?;
             }
@@ -564,17 +587,40 @@ impl FileProcessor {
 
             // 调用 MinerU API
             let response = client.post(mineru_url).multipart(form).send().await?;
-            if !response.status().is_success() {
-                let error_text = response.text().await?;
+            let status = response.status();
+            let body_bytes = response.bytes().await?;
+            if !status.is_success() {
+                let error_text = String::from_utf8_lossy(&body_bytes);
                 return Err(anyhow::anyhow!("MinerU API failed: {}", error_text));
             }
 
-            let mineru_response: MinerUResponse = response.json().await?;
-            return mineru_response
-                .results
-                .into_values()
-                .next()
-                .ok_or_else(|| anyhow::anyhow!("MinerU API returned empty results"));
+            let mineru_response: MinerUResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
+                let body_text = String::from_utf8_lossy(&body_bytes);
+                anyhow::anyhow!("MinerU API response decode failed: {} - {}", e, body_text)
+            })?;
+            let mineru_result = match mineru_response.results {
+                MinerUResults::Map(results) => {
+                    results.into_values().next().ok_or_else(|| anyhow::anyhow!("MinerU API returned empty results"))?
+                }
+                MinerUResults::List(results) => {
+                    if let Some(item) = results.iter().find(|item| item.status == "error") {
+                        let mut error_msg = item.error.clone();
+                        if error_msg.is_empty() {
+                            error_msg = "MinerU API returned error result".to_string();
+                        }
+                        if !item.filename.is_empty() {
+                            error_msg = format!("{} (file: {})", error_msg, item.filename);
+                        }
+                        return Err(anyhow::anyhow!("MinerU API failed: {}", error_msg));
+                    }
+                    let first = results
+                        .into_iter()
+                        .next()
+                        .ok_or_else(|| anyhow::anyhow!("MinerU API returned empty results"))?;
+                    Result { content_list: first.content_list, images: first.images }
+                }
+            };
+            return Ok(mineru_result);
         }
 
         let mut url = reqwest::Url::parse(mineru_url)?;
