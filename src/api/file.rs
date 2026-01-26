@@ -36,12 +36,25 @@ pub struct File {
 }
 
 /// 上传文件（支持单个或多个文件）
+///
+/// form-data 参数：
+/// - file: 文件内容（可多次出现）
+/// - slice_type: 分片类型
+/// - kb_id: 知识库 ID
+/// - tags: JSON 数组字符串，例如 ["tag1","tag2"]
+/// - is_public: true/false 或 1/0
+/// - meta: 元数据字符串
+/// - immediate_parse: true/1 时后台解析
+/// - sync: true/1 时等待解析完成并返回最新的文件记录
 #[utoipa::path(
     post,
     path = "/api/v1/knowledge/files/",
     operation_id = "file_upload",
     tag = "file",
-    request_body(content_type = "multipart/form-data"),
+    request_body(
+        content_type = "multipart/form-data",
+        description = "form-data: file, slice_type, kb_id, tags(JSON array string), is_public, meta, immediate_parse, sync"
+    ),
     responses(
         (status = 200, description = "文件上传成功", body = Vec<File>),
         (status = 400, description = "请求参数错误"),
@@ -68,6 +81,7 @@ pub async fn upload(
     let mut tags: Vec<String> = Vec::new();
     let mut meta: Option<String> = None;
     let mut immediate_parse = false;
+    let mut sync = false;
 
     loop {
         match multipart.next_field().await {
@@ -130,6 +144,11 @@ pub async fn upload(
                         debug!("Immediate parse text: {}", parse_text);
                         immediate_parse = parse_text == "true" || parse_text == "1";
                     }
+                    Some("sync") => {
+                        let sync_text = field.text().await?;
+                        debug!("Sync parse text: {}", sync_text);
+                        sync = sync_text == "true" || sync_text == "1";
+                    }
                     _ => {
                         debug!("Skipping unknown field: {:?}", field_name);
                     }
@@ -168,6 +187,7 @@ pub async fn upload(
     let log_message = if is_storage_kb { "Storage mode: not parsed" } else { "" };
 
     let mut uploaded_files: Vec<File> = Vec::new();
+    let mut uploaded_file_ids: Vec<i64> = Vec::new();
     let mut parse_file_ids: Vec<i64> = Vec::new();
 
     for (hash, filename, filepath, size) in files_data {
@@ -192,22 +212,36 @@ pub async fn upload(
 
         let file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
         uploaded_files.push(file);
+        uploaded_file_ids.push(id);
 
-        if immediate_parse {
+        if immediate_parse || sync {
             parse_file_ids.push(id);
         }
     }
 
-    if immediate_parse {
-        let pool = pool.clone();
-        let search_engine = search_engine.clone();
-        spawn(async move {
+    if immediate_parse || sync {
+        if sync {
             for file_id in parse_file_ids {
-                if let Err(e) = processor::process_file_immediate(pool.clone(), search_engine.clone(), file_id).await {
-                    log::error!("Failed to parse file {}: {}", file_id, e);
-                }
+                processor::process_file_immediate(pool.clone(), search_engine.clone(), file_id).await?;
             }
-        });
+            uploaded_files.clear();
+            for file_id in uploaded_file_ids {
+                let file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(file_id).fetch_one(&pool).await?;
+                uploaded_files.push(file);
+            }
+        } else {
+            let pool = pool.clone();
+            let search_engine = search_engine.clone();
+            spawn(async move {
+                for file_id in parse_file_ids {
+                    if let Err(e) =
+                        processor::process_file_immediate(pool.clone(), search_engine.clone(), file_id).await
+                    {
+                        log::error!("Failed to parse file {}: {}", file_id, e);
+                    }
+                }
+            });
+        }
     }
 
     Ok(Json(uploaded_files))
