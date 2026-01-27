@@ -1,10 +1,11 @@
-use std::{collections::HashMap, time::Instant};
+use std::{collections::HashMap, sync::Arc, time::Instant};
 
 use anyhow::Ok;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, SqlitePool};
 use tantivy::{Index, schema::Schema};
+use tokio::sync::Mutex;
 
 use crate::config;
 
@@ -39,8 +40,10 @@ struct RerankResult {
 pub struct SearchEngine {
     index: Index,
     schema: Schema,
+    index_write_lock: Arc<Mutex<()>>,
     full_index: Index,
     full_schema: Schema,
+    full_index_write_lock: Arc<Mutex<()>>,
     pool: Option<SqlitePool>,
 }
 
@@ -49,7 +52,15 @@ impl SearchEngine {
         lancedb::init().await.expect("init lancedb failed");
         let (schema, index) = tantivy_engine::init().unwrap();
         let (full_schema, full_index) = tantivy_engine::init_full().unwrap();
-        Self { index, schema, full_index, full_schema, pool: None }
+        Self {
+            index,
+            schema,
+            index_write_lock: Arc::new(Mutex::new(())),
+            full_index,
+            full_schema,
+            full_index_write_lock: Arc::new(Mutex::new(())),
+            pool: None,
+        }
     }
 
     pub fn with_pool(mut self, pool: SqlitePool) -> Self {
@@ -59,7 +70,10 @@ impl SearchEngine {
 
     pub async fn write(&self, doc: tantivy_engine::Document, image_embedding: Option<Vec<f32>>) -> anyhow::Result<()> {
         // 写入 tantivy
-        tantivy_engine::write_documents(&self.index, &self.schema, doc.clone()).await?;
+        {
+            let _guard = self.index_write_lock.lock().await;
+            tantivy_engine::write_documents(&self.index, &self.schema, doc.clone()).await?;
+        }
 
         // 写入 lancedb
         let mut lancedb_doc = lancedb::Document::new(doc.id, doc.file_id, doc.kb_id, doc.content);
@@ -72,7 +86,10 @@ impl SearchEngine {
     }
 
     pub async fn write_full(&self, doc: tantivy_engine::Document) -> anyhow::Result<()> {
-        tantivy_engine::write_documents(&self.full_index, &self.full_schema, doc).await?;
+        {
+            let _guard = self.full_index_write_lock.lock().await;
+            tantivy_engine::write_documents(&self.full_index, &self.full_schema, doc).await?;
+        }
         Ok(())
     }
 
@@ -80,7 +97,10 @@ impl SearchEngine {
         let overall_start = Instant::now();
         if let Some(file_id) = file_id {
             let step_start = Instant::now();
-            tantivy_engine::delete_by_file(&self.index, &self.schema, file_id).await?;
+            {
+                let _guard = self.index_write_lock.lock().await;
+                tantivy_engine::delete_by_file(&self.index, &self.schema, file_id).await?;
+            }
             debug!("search_delete file_id={} tantivy {}ms", file_id, step_start.elapsed().as_millis());
 
             let step_start = Instant::now();
@@ -88,12 +108,18 @@ impl SearchEngine {
             debug!("search_delete file_id={} lancedb {}ms", file_id, step_start.elapsed().as_millis());
 
             let step_start = Instant::now();
-            tantivy_engine::delete_by_file(&self.full_index, &self.full_schema, file_id).await?;
+            {
+                let _guard = self.full_index_write_lock.lock().await;
+                tantivy_engine::delete_by_file(&self.full_index, &self.full_schema, file_id).await?;
+            }
             debug!("search_delete file_id={} tantivy_full {}ms", file_id, step_start.elapsed().as_millis());
         }
         if let Some(kb_id) = kb_id {
             let step_start = Instant::now();
-            tantivy_engine::delete_by_kb(&self.index, &self.schema, kb_id).await?;
+            {
+                let _guard = self.index_write_lock.lock().await;
+                tantivy_engine::delete_by_kb(&self.index, &self.schema, kb_id).await?;
+            }
             debug!("search_delete kb_id={} tantivy {}ms", kb_id, step_start.elapsed().as_millis());
 
             let step_start = Instant::now();
@@ -101,7 +127,10 @@ impl SearchEngine {
             debug!("search_delete kb_id={} lancedb {}ms", kb_id, step_start.elapsed().as_millis());
 
             let step_start = Instant::now();
-            tantivy_engine::delete_by_kb(&self.full_index, &self.full_schema, kb_id).await?;
+            {
+                let _guard = self.full_index_write_lock.lock().await;
+                tantivy_engine::delete_by_kb(&self.full_index, &self.full_schema, kb_id).await?;
+            }
             debug!("search_delete kb_id={} tantivy_full {}ms", kb_id, step_start.elapsed().as_millis());
         }
         debug!("search_delete total {}ms file_id={:?} kb_id={:?}", overall_start.elapsed().as_millis(), file_id, kb_id);
