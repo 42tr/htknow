@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     Extension, extract::{Multipart, Query, State}, response::Json
@@ -182,41 +182,46 @@ pub async fn search(
     let user_id = auth_user.user_id.clone();
 
     // 组装结果并过滤权限
-    let results = raw_results
-        .into_iter()
-        .filter_map(|r| {
-            let file = file_map.get(&r.file_id).cloned();
-            let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
+    let mut seen_contents: HashSet<String> = HashSet::new();
+    let mut results = Vec::new();
+    for r in raw_results {
+        let id = r.id;
+        let file_id = r.file_id;
+        let kb_id = r.kb_id;
+        let score = r.score;
+        let content = r.content;
 
-            // 权限检查
-            let has_permission = if let Some(ref file_info) = file {
-                // 如果文件存在，检查文件权限
-                // 规则：私有文件（is_public=0）只有所有者可以查看
-                if !file_info.is_public && file_info.user_id != user_id { false } else { true }
-            } else if let Some(ref kb_info) = kb {
-                // 如果没有文件信息但有知识库信息，检查知识库权限
-                // 规则：私有知识库（is_public=0）只有所有者可以查看
-                if !kb_info.is_public && kb_info.user_id != user_id { false } else { true }
-            } else {
-                // 没有文件和知识库信息，默认允许
-                true
-            };
+        let file = file_map.get(&file_id).cloned();
+        let kb = kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
 
-            if has_permission {
-                Some(SearchResultItem {
-                    id: r.id,
-                    file_id: r.file_id,
-                    content: r.content,
-                    score: r.score,
+        // 权限检查
+        let has_permission = if let Some(ref file_info) = file {
+            // 如果文件存在，检查文件权限
+            // 规则：私有文件（is_public=0）只有所有者可以查看
+            if !file_info.is_public && file_info.user_id != user_id { false } else { true }
+        } else if let Some(ref kb_info) = kb {
+            // 如果没有文件信息但有知识库信息，检查知识库权限
+            // 规则：私有知识库（is_public=0）只有所有者可以查看
+            if !kb_info.is_public && kb_info.user_id != user_id { false } else { true }
+        } else {
+            // 没有文件和知识库信息，默认允许
+            true
+        };
+
+        if has_permission {
+            if seen_contents.insert(content.clone()) {
+                results.push(SearchResultItem {
+                    id,
+                    file_id,
+                    content,
+                    score,
                     file,
                     kb,
-                    positions: slice_positions.get(&r.id).cloned(),
-                })
-            } else {
-                None
+                    positions: slice_positions.get(&id).cloned(),
+                });
             }
-        })
-        .collect();
+        }
+    }
 
     Ok(Json(SearchResult { results }))
 }
