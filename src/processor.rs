@@ -313,13 +313,15 @@ impl FileProcessor {
         let is_image = Self::is_image_file(&filename_lower);
         let is_audio = Self::is_audio_file(&filename_lower);
 
-        // 检查文件是否为 Word 文档
+        // 检查文件是否为 Word 或 Excel 文档
         let is_word = filename_lower.ends_with(".doc") || filename_lower.ends_with(".docx");
+        let is_excel = filename_lower.ends_with(".xls") || filename_lower.ends_with(".xlsx");
 
-        if is_word {
-            // Word 文档：先转换为 PDF，再使用 process_pdf_file 处理
-            info!("Detected Word document, converting to PDF: {}", file.filename);
-            self.convert_word_to_pdf_and_process(file).await?;
+        if is_word || is_excel {
+            // Word/Excel 文档：先转换为 PDF，再使用 process_pdf_file 处理
+            let doc_kind = if is_word { "Word" } else { "Excel" };
+            info!("Detected {} document, converting to PDF: {}", doc_kind, file.filename);
+            self.convert_office_to_pdf_and_process(file).await?;
         } else if is_pdf {
             // 处理 PDF 或图片文件
             self.process_pdf_file(file, None, false, None).await?;
@@ -337,8 +339,8 @@ impl FileProcessor {
         Ok(())
     }
 
-    /// 将 Word 文档转换为 PDF 并处理
-    async fn convert_word_to_pdf_and_process(&self, file: &File) -> anyhow::Result<()> {
+    /// 将 Word/Excel 文档转换为 PDF 并处理
+    async fn convert_office_to_pdf_and_process(&self, file: &File) -> anyhow::Result<()> {
         // 创建临时目录用于存放转换后的 PDF
         let cfg = config::get();
         let temp_dir = std::path::Path::new(&cfg.storage.temp_path);
@@ -349,7 +351,7 @@ impl FileProcessor {
         // 生成临时 PDF 文件路径
         let pdf_filename = format!("{}.pdf", file.id);
 
-        // 使用 LibreOffice 将 Word 转换为 PDF
+        // 使用 LibreOffice 将 Word/Excel 转换为 PDF
         // 注意：这需要系统中安装了 LibreOffice
         let output = tokio::process::Command::new("soffice")
             .args(&["--headless", "--convert-to", "pdf", "--outdir", temp_dir.to_str().unwrap(), &file.path])

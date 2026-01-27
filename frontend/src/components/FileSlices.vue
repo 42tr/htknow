@@ -32,13 +32,13 @@ const toggleExpand = (id) => {
   expandedSlice.value = expandedSlice.value === id ? null : id
 }
 
-const isPdfOrWordFile = (filename) => {
+const isOfficeFile = (filename) => {
   if (!filename) return false
-  return /\.(pdf|doc|docx)$/i.test(filename)
+  return /\.(pdf|doc|docx|xlsx|xls)$/i.test(filename)
 }
 
 const canHighlight = (slice) =>
-  isPdfOrWordFile(props.file?.filename) && Array.isArray(slice?.positions) && slice.positions.length > 0
+  isOfficeFile(props.file?.filename) && Array.isArray(slice?.positions) && slice.positions.length > 0
 
 const openViewer = (slice) => {
   if (!canHighlight(slice)) return

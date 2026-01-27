@@ -15,15 +15,15 @@ const isImageFile = (filename) => {
   return /\.(jpg|jpeg|png|gif|bmp|webp|tiff|tif|svg|ico|heic|heif)$/i.test(filename)
 }
 
-const isPdfOrWordFile = (filename) => {
+const isOfficeFile = (filename) => {
   if (!filename) return false
-  return /\.(pdf|doc|docx)$/i.test(filename)
+  return /\.(pdf|doc|docx|xlsx|xls)$/i.test(filename)
 }
 
 const getFileEmoji = (filename) => (isImageFile(filename) ? '🖼️' : '📄')
 
 const canHighlight = (result) =>
-  Boolean(result?.positions?.length) && isPdfOrWordFile(result.file?.filename)
+  Boolean(result?.positions?.length) && isOfficeFile(result.file?.filename)
 
 const openViewer = (result) => {
   if (!canHighlight(result)) return

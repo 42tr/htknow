@@ -794,7 +794,11 @@ pub async fn get_highlighted_pdf(
 
     // 确定 PDF 文件路径
     let filename_lower = file.filename.to_lowercase();
-    let pdf_path = if filename_lower.ends_with(".doc") || filename_lower.ends_with(".docx") {
+    let pdf_path = if filename_lower.ends_with(".doc")
+        || filename_lower.ends_with(".docx")
+        || filename_lower.ends_with(".xls")
+        || filename_lower.ends_with(".xlsx")
+    {
         let cfg = config::get();
         let path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", file.id));
         if !tokio::fs::try_exists(&path).await? {
@@ -804,7 +808,7 @@ pub async fn get_highlighted_pdf(
     } else if filename_lower.ends_with(".pdf") {
         std::path::PathBuf::from(&file.path)
     } else {
-        return Err(ApiError::BadRequest("File is not a PDF or Word document".to_string()));
+        return Err(ApiError::BadRequest("File is not a PDF, Word, or Excel document".to_string()));
     };
 
     // 读取原始 PDF
