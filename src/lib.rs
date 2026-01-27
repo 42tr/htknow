@@ -21,6 +21,12 @@ pub struct AuthUser {
     pub role: String,
 }
 
+impl AuthUser {
+    pub fn is_admin(&self) -> bool {
+        self.role == "admin"
+    }
+}
+
 fn decode_base64_if_utf8(value: &str) -> String {
     match STANDARD.decode(value) {
         Ok(bytes) => String::from_utf8(bytes).unwrap_or_else(|_| value.to_owned()),

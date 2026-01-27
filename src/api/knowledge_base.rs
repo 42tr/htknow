@@ -131,6 +131,7 @@ pub struct KnowledgeDetailQuery {
 pub async fn list(
     State(pool): State<SqlitePool>, Query(params): Query<ListQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<Vec<KnowledgeResponse>>> {
+    let is_admin = auth_user.is_admin();
     // Determine pagination: default size 10, default page 1
     let size = params.size.unwrap_or(10).max(1);
     let page = params.page.unwrap_or(1).max(1);
@@ -141,7 +142,9 @@ pub async fn list(
     let mut qb = QueryBuilder::<Sqlite>::new(
         "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE 1=1 ",
     );
-    qb.push(" AND (user_id = ").push_bind(auth_user.user_id.clone()).push(" OR is_public = 1)");
+    if !is_admin {
+        qb.push(" AND (user_id = ").push_bind(auth_user.user_id.clone()).push(" OR is_public = 1)");
+    }
 
     // Filter by parent_id
     if let Some(parent_id) = params.parent_id {
@@ -172,8 +175,8 @@ pub async fn list(
 
     // Get file counts and children counts in parallel
     let (file_counts_res, children_counts_res) = tokio::join!(
-        get_file_counts(&pool, &knowledge_ids, &auth_user.user_id),
-        get_children_kb_counts(&pool, &knowledge_ids, &auth_user.user_id)
+        get_file_counts(&pool, &knowledge_ids, &auth_user.user_id, is_admin),
+        get_children_kb_counts(&pool, &knowledge_ids, &auth_user.user_id, is_admin)
     );
     let file_counts = file_counts_res?;
     let children_counts = children_counts_res?;
@@ -198,7 +201,7 @@ pub async fn list(
 }
 
 async fn get_children_kb_counts(
-    pool: &SqlitePool, knowledge_ids: &[i64], user_id: &str,
+    pool: &SqlitePool, knowledge_ids: &[i64], user_id: &str, is_admin: bool,
 ) -> anyhow::Result<HashMap<i64, i64>> {
     if knowledge_ids.is_empty() {
         return Ok(HashMap::new());
@@ -211,12 +214,20 @@ async fn get_children_kb_counts(
     for id in knowledge_ids {
         separated.push_bind(id);
     }
-    qb.push(") AND (user_id = ");
-    qb.push_bind(user_id);
-    qb.push(" OR is_public = 1) UNION ALL SELECT d.root_id, kb.id FROM knowledge_bases kb ");
-    qb.push("JOIN descendants d ON kb.parent_id = d.kb_id WHERE (kb.user_id = ");
-    qb.push_bind(user_id);
-    qb.push(" OR kb.is_public = 1)) ");
+    qb.push(")");
+    if !is_admin {
+        qb.push(" AND (user_id = ");
+        qb.push_bind(user_id);
+        qb.push(" OR is_public = 1)");
+    }
+    qb.push(" UNION ALL SELECT d.root_id, kb.id FROM knowledge_bases kb ");
+    qb.push("JOIN descendants d ON kb.parent_id = d.kb_id");
+    if !is_admin {
+        qb.push(" WHERE (kb.user_id = ");
+        qb.push_bind(user_id);
+        qb.push(" OR kb.is_public = 1)");
+    }
+    qb.push(") ");
     qb.push("SELECT root_id, COUNT(*) - 1 AS cnt FROM descendants GROUP BY root_id");
 
     let rows = qb.build().fetch_all(pool).await?;
@@ -233,7 +244,9 @@ async fn get_children_kb_counts(
     Ok(children_counts)
 }
 
-async fn get_file_counts(pool: &SqlitePool, knowledge_ids: &[i64], user_id: &str) -> anyhow::Result<HashMap<i64, i64>> {
+async fn get_file_counts(
+    pool: &SqlitePool, knowledge_ids: &[i64], user_id: &str, is_admin: bool,
+) -> anyhow::Result<HashMap<i64, i64>> {
     if knowledge_ids.is_empty() {
         return Ok(HashMap::new());
     }
@@ -245,16 +258,28 @@ async fn get_file_counts(pool: &SqlitePool, knowledge_ids: &[i64], user_id: &str
     for id in knowledge_ids {
         separated.push_bind(id);
     }
-    qb.push(") AND (user_id = ");
-    qb.push_bind(user_id);
-    qb.push(" OR is_public = 1) UNION ALL SELECT d.root_id, kb.id FROM knowledge_bases kb ");
-    qb.push("JOIN descendants d ON kb.parent_id = d.kb_id WHERE (kb.user_id = ");
-    qb.push_bind(user_id);
-    qb.push(" OR kb.is_public = 1)) ");
+    qb.push(")");
+    if !is_admin {
+        qb.push(" AND (user_id = ");
+        qb.push_bind(user_id);
+        qb.push(" OR is_public = 1)");
+    }
+    qb.push(" UNION ALL SELECT d.root_id, kb.id FROM knowledge_bases kb ");
+    qb.push("JOIN descendants d ON kb.parent_id = d.kb_id");
+    if !is_admin {
+        qb.push(" WHERE (kb.user_id = ");
+        qb.push_bind(user_id);
+        qb.push(" OR kb.is_public = 1)");
+    }
+    qb.push(") ");
     qb.push("SELECT d.root_id, COUNT(f.id) AS cnt FROM descendants d ");
-    qb.push("LEFT JOIN files f ON f.kb_id = d.kb_id AND (f.user_id = ");
-    qb.push_bind(user_id);
-    qb.push(" OR f.is_public = 1) GROUP BY d.root_id");
+    qb.push("LEFT JOIN files f ON f.kb_id = d.kb_id");
+    if !is_admin {
+        qb.push(" AND (f.user_id = ");
+        qb.push_bind(user_id);
+        qb.push(" OR f.is_public = 1)");
+    }
+    qb.push(" GROUP BY d.root_id");
 
     let rows = qb.build().fetch_all(pool).await?;
 
@@ -473,28 +498,50 @@ pub async fn get(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Query(query): Query<KnowledgeDetailQuery>,
     Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<KnowledgeDetailResponse>> {
+    let is_admin = auth_user.is_admin();
+    let user_id = auth_user.user_id.clone();
     // 1. Fetch the main knowledge base and verify ownership
-    let main_kb: Knowledge = sqlx::query_as(
-        "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
-    )
-    .bind(id)
-    .bind(auth_user.user_id.clone())
-    .fetch_one(&pool)
-    .await?;
+    let main_kb: Knowledge = if is_admin {
+        sqlx::query_as(
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
+        )
+        .bind(id)
+        .bind(user_id.clone())
+        .fetch_one(&pool)
+        .await?
+    };
 
     // 2. Fetch children KBs and files in parallel
-    let children_future = sqlx::query_as(
-        "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public \
-         FROM knowledge_bases WHERE parent_id = ? AND (user_id = ? OR is_public = 1) ORDER BY name",
-    )
-    .bind(id)
-    .bind(auth_user.user_id.clone())
-    .fetch_all(&pool);
+    let children_future = if is_admin {
+        sqlx::query_as(
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public \
+             FROM knowledge_bases WHERE parent_id = ? ORDER BY name",
+        )
+        .bind(id)
+        .fetch_all(&pool)
+    } else {
+        sqlx::query_as(
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public \
+             FROM knowledge_bases WHERE parent_id = ? AND (user_id = ? OR is_public = 1) ORDER BY name",
+        )
+        .bind(id)
+        .bind(user_id.clone())
+        .fetch_all(&pool)
+    };
 
     let files_future = async {
         let mut qb = QueryBuilder::<Sqlite>::new("SELECT * FROM files WHERE kb_id = ");
         qb.push_bind(id);
-        qb.push(" AND (user_id = ").push_bind(auth_user.user_id.clone()).push(" OR is_public = 1)");
+        if !is_admin {
+            qb.push(" AND (user_id = ").push_bind(user_id.clone()).push(" OR is_public = 1)");
+        }
         if let Some(filename) = query.filename.as_deref() {
             qb.push(" AND filename LIKE ").push_bind(format!("%{}%", filename));
         }
@@ -509,8 +556,8 @@ pub async fn get(
     count_ids.push(id);
     count_ids.extend(children_kbs.iter().map(|kb| kb.id));
     let (file_counts_res, children_counts_res) = tokio::join!(
-        get_file_counts(&pool, &count_ids, &auth_user.user_id),
-        get_children_kb_counts(&pool, &count_ids, &auth_user.user_id)
+        get_file_counts(&pool, &count_ids, &auth_user.user_id, is_admin),
+        get_children_kb_counts(&pool, &count_ids, &auth_user.user_id, is_admin)
     );
     let file_counts = file_counts_res?;
     let children_counts = children_counts_res?;
@@ -544,13 +591,22 @@ pub async fn get(
     while let Some(parent_id) = current_parent_id {
         // In a high-depth scenario, this could be slow. A recursive CTE would be faster.
         // But for typical UI breadcrumbs, this iterative approach is simpler and often sufficient.
-        let parent_kb: Knowledge = sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
-        )
-        .bind(parent_id)
-        .bind(auth_user.user_id.clone())
-        .fetch_one(&pool)
-        .await?;
+        let parent_kb: Knowledge = if is_admin {
+            sqlx::query_as(
+                "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ?",
+            )
+            .bind(parent_id)
+            .fetch_one(&pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
+            )
+            .bind(parent_id)
+            .bind(user_id.clone())
+            .fetch_one(&pool)
+            .await?
+        };
         current_parent_id = parent_kb.parent_id;
         path.push(parent_kb);
     }
@@ -797,21 +853,30 @@ pub async fn reparse(
 }
 
 async fn build_tree_recursive(
-    pool: &SqlitePool, parent_id: Option<i64>, user_id: &str,
+    pool: &SqlitePool, parent_id: Option<i64>, user_id: &str, is_admin: bool,
 ) -> anyhow::Result<Vec<KnowledgeTreeNode>> {
-    let children: Vec<Knowledge> = sqlx::query_as(
-        "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE parent_id IS NOT DISTINCT FROM ? AND (user_id = ? OR is_public = 1) ORDER BY name",
-    )
-    .bind(parent_id)
-    .bind(user_id)
-    .fetch_all(pool)
-    .await?;
+    let children: Vec<Knowledge> = if is_admin {
+        sqlx::query_as(
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE parent_id IS NOT DISTINCT FROM ? ORDER BY name",
+        )
+        .bind(parent_id)
+        .fetch_all(pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE parent_id IS NOT DISTINCT FROM ? AND (user_id = ? OR is_public = 1) ORDER BY name",
+        )
+        .bind(parent_id)
+        .bind(user_id)
+        .fetch_all(pool)
+        .await?
+    };
 
     let mut tree_nodes = Vec::new();
     for kb in children {
         let (sub_children, files) = tokio::join!(
-            async { Box::pin(build_tree_recursive(pool, Some(kb.id), user_id)).await },
-            get_files_for_kb(pool, kb.id, user_id),
+            async { Box::pin(build_tree_recursive(pool, Some(kb.id), user_id, is_admin)).await },
+            get_files_for_kb(pool, kb.id, user_id, is_admin),
         );
         let sub_children = sub_children?;
         let files = files?;
@@ -832,21 +897,30 @@ async fn build_tree_recursive(
 }
 
 async fn build_subtree_recursive(
-    pool: &SqlitePool, kb_id: i64, user_id: &str,
+    pool: &SqlitePool, kb_id: i64, user_id: &str, is_admin: bool,
 ) -> anyhow::Result<Option<KnowledgeTreeNode>> {
-    let kb: Option<Knowledge> = sqlx::query_as(
-        "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
-    )
-    .bind(kb_id)
-    .bind(user_id)
-    .fetch_optional(pool)
-    .await?;
+    let kb: Option<Knowledge> = if is_admin {
+        sqlx::query_as(
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ?",
+        )
+        .bind(kb_id)
+        .fetch_optional(pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
+        )
+        .bind(kb_id)
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await?
+    };
 
     match kb {
         Some(kb_info) => {
             let (children, files) = tokio::join!(
-                async { Box::pin(build_tree_recursive(pool, Some(kb_info.id), user_id)).await },
-                get_files_for_kb(pool, kb_info.id, user_id),
+                async { Box::pin(build_tree_recursive(pool, Some(kb_info.id), user_id, is_admin)).await },
+                get_files_for_kb(pool, kb_info.id, user_id, is_admin),
             );
             let children = children?;
             let files = files?;
@@ -867,13 +941,18 @@ async fn build_subtree_recursive(
     }
 }
 
-async fn get_files_for_kb(pool: &SqlitePool, kb_id: i64, user_id: &str) -> anyhow::Result<Vec<super::file::File>> {
-    let files: Vec<super::file::File> =
+async fn get_files_for_kb(
+    pool: &SqlitePool, kb_id: i64, user_id: &str, is_admin: bool,
+) -> anyhow::Result<Vec<super::file::File>> {
+    let files: Vec<super::file::File> = if is_admin {
+        sqlx::query_as("SELECT * FROM files WHERE kb_id = ? ORDER BY filename").bind(kb_id).fetch_all(pool).await?
+    } else {
         sqlx::query_as("SELECT * FROM files WHERE kb_id = ? AND (user_id = ? OR is_public = 1) ORDER BY filename")
             .bind(kb_id)
             .bind(user_id)
             .fetch_all(pool)
-            .await?;
+            .await?
+    };
     Ok(files)
 }
 
@@ -896,15 +975,16 @@ async fn get_files_for_kb(pool: &SqlitePool, kb_id: i64, user_id: &str) -> anyho
 pub async fn tree(
     State(pool): State<SqlitePool>, Query(params): Query<TreeQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<Vec<KnowledgeTreeNode>>> {
+    let is_admin = auth_user.is_admin();
     let tree = match params.kb_id {
         Some(kb_id) => {
-            let subtree = build_subtree_recursive(&pool, kb_id, &auth_user.user_id).await?;
+            let subtree = build_subtree_recursive(&pool, kb_id, &auth_user.user_id, is_admin).await?;
             match subtree {
                 Some(node) => vec![node],
                 None => vec![],
             }
         }
-        None => build_tree_recursive(&pool, None, &auth_user.user_id).await?,
+        None => build_tree_recursive(&pool, None, &auth_user.user_id, is_admin).await?,
     };
     Ok(Json(tree))
 }

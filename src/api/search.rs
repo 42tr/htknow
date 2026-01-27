@@ -129,25 +129,43 @@ pub async fn search(
     Query(params): Query<SearchQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<SearchResult>> {
     // If a kb_id is specified, find all its descendants to search within.
+    let is_admin = auth_user.is_admin();
     let user_id = auth_user.user_id.clone();
     let kb_ids_to_search = if let Some(root_kb_id) = params.kb_id {
-        let descendant_ids: Vec<i64> = sqlx::query_scalar(
-            r#"
-            WITH RECURSIVE kb_hierarchy AS (
-                SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
-                UNION ALL
-                SELECT kb.id FROM knowledge_bases kb
-                INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
-                WHERE kb.user_id = ? OR kb.is_public = 1
+        let descendant_ids: Vec<i64> = if is_admin {
+            sqlx::query_scalar(
+                r#"
+                WITH RECURSIVE kb_hierarchy AS (
+                    SELECT id FROM knowledge_bases WHERE id = ?
+                    UNION ALL
+                    SELECT kb.id FROM knowledge_bases kb
+                    INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
+                )
+                SELECT id FROM kb_hierarchy;
+                "#,
             )
-            SELECT id FROM kb_hierarchy;
-            "#,
-        )
-        .bind(root_kb_id)
-        .bind(&user_id)
-        .bind(&user_id)
-        .fetch_all(&pool)
-        .await?;
+            .bind(root_kb_id)
+            .fetch_all(&pool)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                r#"
+                WITH RECURSIVE kb_hierarchy AS (
+                    SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
+                    UNION ALL
+                    SELECT kb.id FROM knowledge_bases kb
+                    INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
+                    WHERE kb.user_id = ? OR kb.is_public = 1
+                )
+                SELECT id FROM kb_hierarchy;
+                "#,
+            )
+            .bind(root_kb_id)
+            .bind(&user_id)
+            .bind(&user_id)
+            .fetch_all(&pool)
+            .await?
+        };
 
         if descendant_ids.is_empty() {
             return Ok(Json(SearchResult { results: vec![] }));
@@ -195,7 +213,9 @@ pub async fn search(
         let kb = kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
 
         // 权限检查
-        let has_permission = if let Some(ref file_info) = file {
+        let has_permission = if is_admin {
+            true
+        } else if let Some(ref file_info) = file {
             // 如果文件存在，检查文件权限
             // 规则：私有文件（is_public=0）只有所有者可以查看
             if !file_info.is_public && file_info.user_id != user_id { false } else { true }
@@ -247,25 +267,43 @@ pub async fn search_full(
     Query(params): Query<SearchQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<FullSearchResult>> {
     // If a kb_id is specified, find all its descendants to search within.
+    let is_admin = auth_user.is_admin();
     let user_id = auth_user.user_id.clone();
     let kb_ids_to_search = if let Some(root_kb_id) = params.kb_id {
-        let descendant_ids: Vec<i64> = sqlx::query_scalar(
-            r#"
-            WITH RECURSIVE kb_hierarchy AS (
-                SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
-                UNION ALL
-                SELECT kb.id FROM knowledge_bases kb
-                INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
-                WHERE kb.user_id = ? OR kb.is_public = 1
+        let descendant_ids: Vec<i64> = if is_admin {
+            sqlx::query_scalar(
+                r#"
+                WITH RECURSIVE kb_hierarchy AS (
+                    SELECT id FROM knowledge_bases WHERE id = ?
+                    UNION ALL
+                    SELECT kb.id FROM knowledge_bases kb
+                    INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
+                )
+                SELECT id FROM kb_hierarchy;
+                "#,
             )
-            SELECT id FROM kb_hierarchy;
-            "#,
-        )
-        .bind(root_kb_id)
-        .bind(&user_id)
-        .bind(&user_id)
-        .fetch_all(&pool)
-        .await?;
+            .bind(root_kb_id)
+            .fetch_all(&pool)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                r#"
+                WITH RECURSIVE kb_hierarchy AS (
+                    SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
+                    UNION ALL
+                    SELECT kb.id FROM knowledge_bases kb
+                    INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
+                    WHERE kb.user_id = ? OR kb.is_public = 1
+                )
+                SELECT id FROM kb_hierarchy;
+                "#,
+            )
+            .bind(root_kb_id)
+            .bind(&user_id)
+            .bind(&user_id)
+            .fetch_all(&pool)
+            .await?
+        };
 
         if descendant_ids.is_empty() {
             return Ok(Json(FullSearchResult { results: vec![] }));
@@ -305,7 +343,9 @@ pub async fn search_full(
             let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
 
             // 权限检查
-            let has_permission = if let Some(ref file_info) = file {
+            let has_permission = if is_admin {
+                true
+            } else if let Some(ref file_info) = file {
                 // 如果文件存在，检查文件权限
                 // 规则：私有文件（is_public=0）只有所有者可以查看
                 if !file_info.is_public && file_info.user_id != user_id { false } else { true }
@@ -350,25 +390,43 @@ pub async fn search_with_graph(
     Query(params): Query<SearchQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<SearchResult>> {
     // If a kb_id is specified, find all its descendants to search within.
+    let is_admin = auth_user.is_admin();
     let user_id = auth_user.user_id.clone();
     let kb_ids_to_search = if let Some(root_kb_id) = params.kb_id {
-        let descendant_ids: Vec<i64> = sqlx::query_scalar(
-            r#"
-            WITH RECURSIVE kb_hierarchy AS (
-                SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
-                UNION ALL
-                SELECT kb.id FROM knowledge_bases kb
-                INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
-                WHERE kb.user_id = ? OR kb.is_public = 1
+        let descendant_ids: Vec<i64> = if is_admin {
+            sqlx::query_scalar(
+                r#"
+                WITH RECURSIVE kb_hierarchy AS (
+                    SELECT id FROM knowledge_bases WHERE id = ?
+                    UNION ALL
+                    SELECT kb.id FROM knowledge_bases kb
+                    INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
+                )
+                SELECT id FROM kb_hierarchy;
+                "#,
             )
-            SELECT id FROM kb_hierarchy;
-            "#,
-        )
-        .bind(root_kb_id)
-        .bind(&user_id)
-        .bind(&user_id)
-        .fetch_all(&pool)
-        .await?;
+            .bind(root_kb_id)
+            .fetch_all(&pool)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                r#"
+                WITH RECURSIVE kb_hierarchy AS (
+                    SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
+                    UNION ALL
+                    SELECT kb.id FROM knowledge_bases kb
+                    INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
+                    WHERE kb.user_id = ? OR kb.is_public = 1
+                )
+                SELECT id FROM kb_hierarchy;
+                "#,
+            )
+            .bind(root_kb_id)
+            .bind(&user_id)
+            .bind(&user_id)
+            .fetch_all(&pool)
+            .await?
+        };
 
         if descendant_ids.is_empty() {
             return Ok(Json(SearchResult { results: vec![] }));
@@ -411,7 +469,9 @@ pub async fn search_with_graph(
             let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
 
             // 权限检查
-            let has_permission = if let Some(ref file_info) = file {
+            let has_permission = if is_admin {
+                true
+            } else if let Some(ref file_info) = file {
                 // 如果文件存在，检查文件权限
                 // 规则：私有文件（is_public=0）只有所有者可以查看
                 if !file_info.is_public && file_info.user_id != user_id { false } else { true }
@@ -500,25 +560,43 @@ pub async fn search_image(
     };
 
     // If a kb_id is specified, find all its descendants to search within.
+    let is_admin = auth_user.is_admin();
     let user_id = auth_user.user_id.clone();
     let kb_ids_to_search = if let Some(root_kb_id) = params.kb_id {
-        let descendant_ids: Vec<i64> = sqlx::query_scalar(
-            r#"
-            WITH RECURSIVE kb_hierarchy AS (
-                SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
-                UNION ALL
-                SELECT kb.id FROM knowledge_bases kb
-                INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
-                WHERE kb.user_id = ? OR kb.is_public = 1
+        let descendant_ids: Vec<i64> = if is_admin {
+            sqlx::query_scalar(
+                r#"
+                WITH RECURSIVE kb_hierarchy AS (
+                    SELECT id FROM knowledge_bases WHERE id = ?
+                    UNION ALL
+                    SELECT kb.id FROM knowledge_bases kb
+                    INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
+                )
+                SELECT id FROM kb_hierarchy;
+                "#,
             )
-            SELECT id FROM kb_hierarchy;
-            "#,
-        )
-        .bind(root_kb_id)
-        .bind(&user_id)
-        .bind(&user_id)
-        .fetch_all(&pool)
-        .await?;
+            .bind(root_kb_id)
+            .fetch_all(&pool)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                r#"
+                WITH RECURSIVE kb_hierarchy AS (
+                    SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
+                    UNION ALL
+                    SELECT kb.id FROM knowledge_bases kb
+                    INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
+                    WHERE kb.user_id = ? OR kb.is_public = 1
+                )
+                SELECT id FROM kb_hierarchy;
+                "#,
+            )
+            .bind(root_kb_id)
+            .bind(&user_id)
+            .bind(&user_id)
+            .fetch_all(&pool)
+            .await?
+        };
 
         if descendant_ids.is_empty() {
             return Ok(Json(SearchResult { results: vec![] }));
@@ -561,7 +639,9 @@ pub async fn search_image(
             let file = file_map.get(&r.file_id).cloned();
             let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
 
-            let has_permission = if let Some(ref file_info) = file {
+            let has_permission = if is_admin {
+                true
+            } else if let Some(ref file_info) = file {
                 if !file_info.is_public && file_info.user_id != user_id { false } else { true }
             } else if let Some(ref kb_info) = kb {
                 if !kb_info.is_public && kb_info.user_id != user_id { false } else { true }
