@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use axum::{
     Extension, extract::{Multipart, Query, State}, response::Json
 };
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize, de};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use utoipa::{IntoParams, ToSchema};
 
@@ -18,8 +18,35 @@ pub struct SearchQuery {
     pub query: String,
     /// 文件 ID（可选）
     pub file_id: Option<i64>,
-    /// 知识库 ID（可选）
-    pub kb_id: Option<i64>,
+    /// 知识库 ID（可选，逗号分隔多个，如 1,2）
+    #[param(value_type = String, example = "1,2")]
+    #[serde(default, deserialize_with = "deserialize_kb_ids")]
+    pub kb_id: Option<Vec<i64>>,
+}
+
+fn deserialize_kb_ids<'de, D>(deserializer: D) -> Result<Option<Vec<i64>>, D::Error>
+where
+    D: serde::Deserializer<'de>, {
+    let raw = Option::<String>::deserialize(deserializer)?;
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+
+    let mut ids = Vec::new();
+    for part in raw.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let id = part.parse::<i64>().map_err(de::Error::custom)?;
+        ids.push(id);
+    }
+
+    if ids.is_empty() { Ok(None) } else { Ok(Some(ids)) }
 }
 
 /// 文件信息
@@ -104,8 +131,10 @@ pub struct FullSearchResult {
 pub struct ImageSearchQuery {
     /// 文件 ID（可选）
     pub file_id: Option<i64>,
-    /// 知识库 ID（可选）
-    pub kb_id: Option<i64>,
+    /// 知识库 ID（可选，逗号分隔多个，如 1,2）
+    #[param(value_type = String, example = "1,2")]
+    #[serde(default, deserialize_with = "deserialize_kb_ids")]
+    pub kb_id: Option<Vec<i64>>,
 }
 
 /// 搜索内容
@@ -128,52 +157,12 @@ pub async fn search(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Query(params): Query<SearchQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<SearchResult>> {
-    // If a kb_id is specified, find all its descendants to search within.
     let is_admin = auth_user.is_admin();
     let user_id = auth_user.user_id.clone();
-    let kb_ids_to_search = if let Some(root_kb_id) = params.kb_id {
-        let descendant_ids: Vec<i64> = if is_admin {
-            sqlx::query_scalar(
-                r#"
-                WITH RECURSIVE kb_hierarchy AS (
-                    SELECT id FROM knowledge_bases WHERE id = ?
-                    UNION ALL
-                    SELECT kb.id FROM knowledge_bases kb
-                    INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
-                )
-                SELECT id FROM kb_hierarchy;
-                "#,
-            )
-            .bind(root_kb_id)
-            .fetch_all(&pool)
-            .await?
-        } else {
-            sqlx::query_scalar(
-                r#"
-                WITH RECURSIVE kb_hierarchy AS (
-                    SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
-                    UNION ALL
-                    SELECT kb.id FROM knowledge_bases kb
-                    INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
-                    WHERE kb.user_id = ? OR kb.is_public = 1
-                )
-                SELECT id FROM kb_hierarchy;
-                "#,
-            )
-            .bind(root_kb_id)
-            .bind(&user_id)
-            .bind(&user_id)
-            .fetch_all(&pool)
-            .await?
-        };
-
-        if descendant_ids.is_empty() {
-            return Ok(Json(SearchResult { results: vec![] }));
-        }
-        Some(descendant_ids)
-    } else {
-        None
-    };
+    let kb_ids_to_search = resolve_kb_ids_to_search(&pool, &user_id, is_admin, params.kb_id.as_ref()).await?;
+    if matches!(kb_ids_to_search.as_ref(), Some(ids) if ids.is_empty()) {
+        return Ok(Json(SearchResult { results: vec![] }));
+    }
 
     let raw_results = search_engine
         .search(&params.query, params.file_id, kb_ids_to_search.as_ref())
@@ -266,52 +255,12 @@ pub async fn search_full(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Query(params): Query<SearchQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<FullSearchResult>> {
-    // If a kb_id is specified, find all its descendants to search within.
     let is_admin = auth_user.is_admin();
     let user_id = auth_user.user_id.clone();
-    let kb_ids_to_search = if let Some(root_kb_id) = params.kb_id {
-        let descendant_ids: Vec<i64> = if is_admin {
-            sqlx::query_scalar(
-                r#"
-                WITH RECURSIVE kb_hierarchy AS (
-                    SELECT id FROM knowledge_bases WHERE id = ?
-                    UNION ALL
-                    SELECT kb.id FROM knowledge_bases kb
-                    INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
-                )
-                SELECT id FROM kb_hierarchy;
-                "#,
-            )
-            .bind(root_kb_id)
-            .fetch_all(&pool)
-            .await?
-        } else {
-            sqlx::query_scalar(
-                r#"
-                WITH RECURSIVE kb_hierarchy AS (
-                    SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
-                    UNION ALL
-                    SELECT kb.id FROM knowledge_bases kb
-                    INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
-                    WHERE kb.user_id = ? OR kb.is_public = 1
-                )
-                SELECT id FROM kb_hierarchy;
-                "#,
-            )
-            .bind(root_kb_id)
-            .bind(&user_id)
-            .bind(&user_id)
-            .fetch_all(&pool)
-            .await?
-        };
-
-        if descendant_ids.is_empty() {
-            return Ok(Json(FullSearchResult { results: vec![] }));
-        }
-        Some(descendant_ids)
-    } else {
-        None
-    };
+    let kb_ids_to_search = resolve_kb_ids_to_search(&pool, &user_id, is_admin, params.kb_id.as_ref()).await?;
+    if matches!(kb_ids_to_search.as_ref(), Some(ids) if ids.is_empty()) {
+        return Ok(Json(FullSearchResult { results: vec![] }));
+    }
 
     let raw_results = search_engine
         .search_full(&params.query, params.file_id, kb_ids_to_search.as_ref())
@@ -389,52 +338,12 @@ pub async fn search_with_graph(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Query(params): Query<SearchQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<SearchResult>> {
-    // If a kb_id is specified, find all its descendants to search within.
     let is_admin = auth_user.is_admin();
     let user_id = auth_user.user_id.clone();
-    let kb_ids_to_search = if let Some(root_kb_id) = params.kb_id {
-        let descendant_ids: Vec<i64> = if is_admin {
-            sqlx::query_scalar(
-                r#"
-                WITH RECURSIVE kb_hierarchy AS (
-                    SELECT id FROM knowledge_bases WHERE id = ?
-                    UNION ALL
-                    SELECT kb.id FROM knowledge_bases kb
-                    INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
-                )
-                SELECT id FROM kb_hierarchy;
-                "#,
-            )
-            .bind(root_kb_id)
-            .fetch_all(&pool)
-            .await?
-        } else {
-            sqlx::query_scalar(
-                r#"
-                WITH RECURSIVE kb_hierarchy AS (
-                    SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
-                    UNION ALL
-                    SELECT kb.id FROM knowledge_bases kb
-                    INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
-                    WHERE kb.user_id = ? OR kb.is_public = 1
-                )
-                SELECT id FROM kb_hierarchy;
-                "#,
-            )
-            .bind(root_kb_id)
-            .bind(&user_id)
-            .bind(&user_id)
-            .fetch_all(&pool)
-            .await?
-        };
-
-        if descendant_ids.is_empty() {
-            return Ok(Json(SearchResult { results: vec![] }));
-        }
-        Some(descendant_ids)
-    } else {
-        None
-    };
+    let kb_ids_to_search = resolve_kb_ids_to_search(&pool, &user_id, is_admin, params.kb_id.as_ref()).await?;
+    if matches!(kb_ids_to_search.as_ref(), Some(ids) if ids.is_empty()) {
+        return Ok(Json(SearchResult { results: vec![] }));
+    }
 
     let raw_results = search_engine
         .search_with_graph_expansion(&params.query, params.file_id, kb_ids_to_search.as_ref())
@@ -559,52 +468,12 @@ pub async fn search_image(
         return Err(ApiError::BadRequest("file is required".to_string()));
     };
 
-    // If a kb_id is specified, find all its descendants to search within.
     let is_admin = auth_user.is_admin();
     let user_id = auth_user.user_id.clone();
-    let kb_ids_to_search = if let Some(root_kb_id) = params.kb_id {
-        let descendant_ids: Vec<i64> = if is_admin {
-            sqlx::query_scalar(
-                r#"
-                WITH RECURSIVE kb_hierarchy AS (
-                    SELECT id FROM knowledge_bases WHERE id = ?
-                    UNION ALL
-                    SELECT kb.id FROM knowledge_bases kb
-                    INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
-                )
-                SELECT id FROM kb_hierarchy;
-                "#,
-            )
-            .bind(root_kb_id)
-            .fetch_all(&pool)
-            .await?
-        } else {
-            sqlx::query_scalar(
-                r#"
-                WITH RECURSIVE kb_hierarchy AS (
-                    SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
-                    UNION ALL
-                    SELECT kb.id FROM knowledge_bases kb
-                    INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
-                    WHERE kb.user_id = ? OR kb.is_public = 1
-                )
-                SELECT id FROM kb_hierarchy;
-                "#,
-            )
-            .bind(root_kb_id)
-            .bind(&user_id)
-            .bind(&user_id)
-            .fetch_all(&pool)
-            .await?
-        };
-
-        if descendant_ids.is_empty() {
-            return Ok(Json(SearchResult { results: vec![] }));
-        }
-        Some(descendant_ids)
-    } else {
-        None
-    };
+    let kb_ids_to_search = resolve_kb_ids_to_search(&pool, &user_id, is_admin, params.kb_id.as_ref()).await?;
+    if matches!(kb_ids_to_search.as_ref(), Some(ids) if ids.is_empty()) {
+        return Ok(Json(SearchResult { results: vec![] }));
+    }
 
     let image_embedding = crate::search::embedding::get_image_embedding_from_bytes(
         &file_name,
@@ -684,6 +553,46 @@ async fn get_files_by_ids(pool: &SqlitePool, file_ids: &[i64]) -> Result<HashMap
 
     let files: Vec<FileInfo> = q.fetch_all(pool).await?;
     Ok(files.into_iter().map(|f| (f.id, f)).collect())
+}
+
+async fn resolve_kb_ids_to_search(
+    pool: &SqlitePool, user_id: &str, is_admin: bool, root_kb_ids: Option<&Vec<i64>>,
+) -> ApiResult<Option<Vec<i64>>> {
+    let Some(root_kb_ids) = root_kb_ids else {
+        return Ok(None);
+    };
+    if root_kb_ids.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    let mut qb = QueryBuilder::<Sqlite>::new("WITH RECURSIVE kb_hierarchy AS (");
+    qb.push("SELECT id FROM knowledge_bases WHERE id IN (");
+    let mut separated = qb.separated(", ");
+    for kb_id in root_kb_ids {
+        separated.push_bind(kb_id);
+    }
+    qb.push(")");
+    if !is_admin {
+        qb.push(" AND (user_id = ");
+        qb.push_bind(user_id);
+        qb.push(" OR is_public = 1)");
+    }
+    qb.push(" UNION ALL ");
+    qb.push("SELECT kb.id FROM knowledge_bases kb ");
+    qb.push("INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id");
+    if !is_admin {
+        qb.push(" WHERE kb.user_id = ");
+        qb.push_bind(user_id);
+        qb.push(" OR kb.is_public = 1");
+    }
+    qb.push(") SELECT DISTINCT id FROM kb_hierarchy");
+
+    let descendant_ids: Vec<i64> = qb.build_query_scalar().fetch_all(pool).await?;
+    if descendant_ids.is_empty() {
+        return Ok(Some(Vec::new()));
+    }
+
+    Ok(Some(descendant_ids))
 }
 
 async fn get_full_files_by_ids(pool: &SqlitePool, file_ids: &[i64]) -> Result<HashMap<i64, File>, sqlx::Error> {
