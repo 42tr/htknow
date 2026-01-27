@@ -181,7 +181,7 @@ impl ServicesConfig {
     fn from_env() -> Self {
         Self {
             mineru_url: env_or("HTKNOW_MINERU_URL", "http://192.168.0.46:10001/file_parse"),
-            mineru_max_pages: env_or_parse("HTKNOW_MINERU_MAX_PAGES", 0),
+            mineru_max_pages: env_or_parse("HTKNOW_MINERU_MAX_PAGES", 50),
             audio_transcription_url: env_or(
                 "HTKNOW_AUDIO_TRANSCRIPTION_URL",
                 "http://192.168.0.46:59805/api/v1/audio/transcriptions",
