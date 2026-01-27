@@ -4,6 +4,7 @@ use std::{
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use log::{debug, error, info, warn};
+use lopdf::Document;
 use reqwest::multipart;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
@@ -553,25 +554,108 @@ impl FileProcessor {
     async fn call_mineru_api(&self, file: &File, is_image: bool) -> anyhow::Result<Result> {
         let file_bytes = tokio::fs::read(&file.path).await?;
         let cfg = config::get();
+
+        if !is_image && cfg.services.mineru_max_pages > 0 {
+            match Document::load_mem(&file_bytes) {
+                Ok(doc) => {
+                    let total_pages = doc.get_pages().len();
+                    if total_pages > cfg.services.mineru_max_pages {
+                        return self
+                            .call_mineru_api_in_ranges(file, file_bytes, total_pages, cfg.services.mineru_max_pages)
+                            .await;
+                    }
+                }
+                Err(e) => {
+                    warn!(
+                        "Failed to read PDF page count for {}: {}, falling back to single MinerU request",
+                        file.filename, e
+                    );
+                }
+            }
+        }
+
+        self.call_mineru_api_with_bytes(&file.filename, file_bytes, is_image, None, None).await
+    }
+
+    async fn call_mineru_api_in_ranges(
+        &self, file: &File, file_bytes: Vec<u8>, total_pages: usize, max_pages: usize,
+    ) -> anyhow::Result<Result> {
+        let total_parts = (total_pages + max_pages - 1) / max_pages;
+        info!(
+            "PDF {} has {} pages, calling MinerU in {} ranges (max {} pages per range)",
+            file.filename, total_pages, total_parts, max_pages
+        );
+
+        let mut merged_items: Vec<ContentItem> = Vec::new();
+        let mut merged_images: HashMap<String, String> = HashMap::new();
+
+        for (part_index, range_start) in (0..total_pages).step_by(max_pages).enumerate() {
+            let range_end = std::cmp::min(range_start + max_pages, total_pages) - 1;
+            let chunk_filename = format!("{}_part_{}.pdf", file.filename, part_index + 1);
+
+            let chunk_result = self
+                .call_mineru_api_with_bytes(
+                    &chunk_filename,
+                    file_bytes.clone(),
+                    false,
+                    Some(range_start),
+                    Some(range_end),
+                )
+                .await?;
+            let mut chunk_items: Vec<ContentItem> = serde_json::from_str(&chunk_result.content_list)?;
+
+            let image_prefix = format!("part{}_", part_index + 1);
+            let min_page_idx = chunk_items.iter().map(|item| item.page_idx).min();
+            let needs_offset = min_page_idx.map_or(false, |min| min < range_start as i32);
+            for item in &mut chunk_items {
+                if needs_offset {
+                    item.page_idx += range_start as i32;
+                }
+                if let Some(img_path) = item.img_path.as_deref() {
+                    item.img_path = Some(Self::prefix_image_path(img_path, &image_prefix));
+                }
+            }
+
+            for (img_name, img_base64) in chunk_result.images {
+                let prefixed = Self::prefix_image_path(&img_name, &image_prefix);
+                merged_images.insert(prefixed, img_base64);
+            }
+
+            merged_items.extend(chunk_items);
+        }
+
+        let content_list = serde_json::to_string(&merged_items)?;
+        Ok(Result { content_list, images: merged_images })
+    }
+
+    fn prefix_image_path(img_path: &str, prefix: &str) -> String {
+        match img_path.rsplit_once('/') {
+            Some((dir, name)) => format!("{}/{}{}", dir, prefix, name),
+            None => format!("{}{}", prefix, img_path),
+        }
+    }
+
+    async fn call_mineru_api_with_bytes(
+        &self, filename: &str, file_bytes: Vec<u8>, is_image: bool, start_page: Option<usize>, end_page: Option<usize>,
+    ) -> anyhow::Result<Result> {
+        let cfg = config::get();
         let mineru_url = cfg.services.mineru_url.trim_end_matches('/');
 
         let client = reqwest::Client::new();
         if mineru_url.ends_with("/file_parse") {
             // 构建 multipart form
             let mime_type = if is_image {
-                mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string()
+                mime_guess::from_path(filename).first_or_octet_stream().essence_str().to_string()
             } else {
                 "application/pdf".to_string()
             };
 
-            let form = multipart::Form::new()
+            let mut form = multipart::Form::new()
                 .text("return_middle_json", "false")
                 .text("return_model_output", "false")
                 .text("return_md", "false")
                 .text("return_images", "true")
-                .text("end_page_id", "99999")
                 .text("parse_method", "auto")
-                .text("start_page_id", "0")
                 .text("lang_list", "ch")
                 .text("output_dir", "./output")
                 .text("server_url", "string")
@@ -582,8 +666,11 @@ impl FileProcessor {
                 .text("formula_enable", "true")
                 .part(
                     "files",
-                    multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str(&mime_type)?,
+                    multipart::Part::bytes(file_bytes).file_name(filename.to_string()).mime_str(&mime_type)?,
                 );
+            let start_page_id = start_page.unwrap_or(0);
+            let end_page_id = end_page.map(|v| v.to_string()).unwrap_or_else(|| "99999".to_string());
+            form = form.text("start_page_id", start_page_id.to_string()).text("end_page_id", end_page_id);
 
             // 调用 MinerU API
             let response = client.post(mineru_url).multipart(form).send().await?;
@@ -629,14 +716,17 @@ impl FileProcessor {
             query.append_pair("backend", "pipeline");
             query.append_pair("method", "auto");
             query.append_pair("lang", "ch");
-            query.append_pair("start_page", "0");
+            query.append_pair("start_page", &start_page.unwrap_or(0).to_string());
+            if let Some(end_page) = end_page {
+                query.append_pair("end_page", &end_page.to_string());
+            }
             query.append_pair("formula_enable", "true");
             query.append_pair("table_enable", "true");
         }
 
-        let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string();
+        let mime_type = mime_guess::from_path(filename).first_or_octet_stream().essence_str().to_string();
         let form = multipart::Form::new()
-            .part("file", multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str(&mime_type)?);
+            .part("file", multipart::Part::bytes(file_bytes).file_name(filename.to_string()).mime_str(&mime_type)?);
 
         let response = client.post(url.clone()).multipart(form).send().await?;
         if !response.status().is_success() {

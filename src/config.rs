@@ -60,6 +60,8 @@ pub struct ServerConfig {
 pub struct ServicesConfig {
     /// MinerU PDF 解析服务地址
     pub mineru_url: String,
+    /// MinerU 单次解析 PDF 最大页数（0 表示不限制）
+    pub mineru_max_pages: usize,
     /// 音频转写服务地址
     pub audio_transcription_url: String,
     /// 音频转写服务 API Key（可选）
@@ -179,6 +181,7 @@ impl ServicesConfig {
     fn from_env() -> Self {
         Self {
             mineru_url: env_or("HTKNOW_MINERU_URL", "http://192.168.0.46:10001/file_parse"),
+            mineru_max_pages: env_or_parse("HTKNOW_MINERU_MAX_PAGES", 0),
             audio_transcription_url: env_or(
                 "HTKNOW_AUDIO_TRANSCRIPTION_URL",
                 "http://192.168.0.46:59805/api/v1/audio/transcriptions",

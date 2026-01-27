@@ -72,6 +72,7 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `HTKNOW_MINERU_URL` | `http://192.168.0.46:10001/file_parse` | MinerU PDF 解析 |
+| `HTKNOW_MINERU_MAX_PAGES` | `0` | MinerU 单次解析 PDF 最大页数（0 表示不限制） |
 | `HTKNOW_EMBEDDING_URL` | `http://222.190.139.186:59700/v1/embeddings` | 文本向量服务 |
 | `HTKNOW_IMAGE_EMBEDDING_URL` | `http://192.168.0.46:59802/v1/embeddings/file` | 图片向量服务 |
 | `HTKNOW_RERANK_URL` | `http://222.190.139.186:59600/v1/rerank` | Rerank 服务 |

@@ -1,4 +1,4 @@
-version: '3.8'
+version: "3.8"
 
 services:
   htknow:
@@ -20,6 +20,7 @@ services:
       - HTKNOW_SERVER_PROCESS_INTERVAL_SECS=10
       # 外部服务地址
       - HTKNOW_MINERU_URL=http://192.168.0.46:10001/file_parse
+      - HTKNOW_MINERU_MAX_PAGES=0
       - HTKNOW_EMBEDDING_URL=http://192.168.0.46:9700/v1/embeddings
       - HTKNOW_RERANK_URL=http://192.168.0.46:9600/v1/rerank
       # AI 模型配置
