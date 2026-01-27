@@ -88,8 +88,14 @@ async fn create_tables(pool: &SqlitePool) -> anyhow::Result<()> {
 }
 
 async fn ensure_default_knowledge_bases(pool: &SqlitePool) -> anyhow::Result<()> {
-    let existing_ids: Vec<i64> =
-        sqlx::query_scalar("SELECT id FROM knowledge_bases WHERE id IN (1, 2, 3, 4, 5)").fetch_all(pool).await?;
+    let default_ids: Vec<i64> = DEFAULT_KNOWLEDGE_BASES.iter().map(|(id, ..)| *id).collect();
+    let placeholders = vec!["?"; default_ids.len()].join(", ");
+    let sql = format!("SELECT id FROM knowledge_bases WHERE id IN ({})", placeholders);
+    let mut query = sqlx::query_scalar(&sql);
+    for id in &default_ids {
+        query = query.bind(id);
+    }
+    let existing_ids: Vec<i64> = query.fetch_all(pool).await?;
     let existing_set: HashSet<i64> = existing_ids.into_iter().collect();
     let mut inserted = 0;
 
