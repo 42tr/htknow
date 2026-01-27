@@ -218,16 +218,7 @@ impl FileProcessor {
     async fn reset_processing_file_data(&self, file_id: i64) -> anyhow::Result<()> {
         let mut tx = self.pool.begin().await?;
 
-        sqlx::query("DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
-            .bind(file_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM slice_positions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
-            .bind(file_id)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query("DELETE FROM slices WHERE file_id = ?").bind(file_id).execute(&mut *tx).await?;
-        sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(file_id).execute(&mut *tx).await?;
+        self.delete_processing_file_data(&mut tx, file_id).await?;
         sqlx::query("UPDATE files SET status = 0, log = '', updated_at = strftime('%s','now') WHERE id = ?")
             .bind(file_id)
             .execute(&mut *tx)
@@ -239,6 +230,34 @@ impl FileProcessor {
             warn!("Failed to delete search index for file {}: {}", file_id, e);
         }
 
+        Ok(())
+    }
+
+    async fn cleanup_processing_file_data(&self, file_id: i64) -> anyhow::Result<()> {
+        let mut tx = self.pool.begin().await?;
+        self.delete_processing_file_data(&mut tx, file_id).await?;
+        tx.commit().await?;
+
+        if let Err(e) = self.search_engine.delete(Some(file_id), None).await {
+            warn!("Failed to delete search index for file {}: {}", file_id, e);
+        }
+
+        Ok(())
+    }
+
+    async fn delete_processing_file_data(
+        &self, tx: &mut sqlx::Transaction<'_, Sqlite>, file_id: i64,
+    ) -> anyhow::Result<()> {
+        sqlx::query("DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
+            .bind(file_id)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("DELETE FROM slice_positions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
+            .bind(file_id)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("DELETE FROM slices WHERE file_id = ?").bind(file_id).execute(&mut **tx).await?;
+        sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(file_id).execute(&mut **tx).await?;
         Ok(())
     }
 
@@ -256,6 +275,9 @@ impl FileProcessor {
         for file in files {
             if let Err(e) = self.process_file(&file).await {
                 error!("Failed to process file {}: {}", file.id, e);
+                if let Err(cleanup_err) = self.cleanup_processing_file_data(file.id).await {
+                    error!("Failed to cleanup processing data for file {}: {}", file.id, cleanup_err);
+                }
                 self.mark_file_failed(file.id, &e.to_string()).await?;
             } else {
                 info!("Successfully processed file {}", file.id);
