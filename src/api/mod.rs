@@ -9,6 +9,7 @@ mod file;
 mod graph;
 mod knowledge_base;
 mod search;
+mod system;
 // 重新导出 File 类型供其他模块使用
 pub use file::File;
 pub(crate) use file::{collect_image_paths_for_files, remove_image_files};
@@ -46,6 +47,10 @@ use crate::search::SearchEngine;
         graph::search_entities,
         graph::get_entity,
         graph::get_graph_stats,
+        // System
+        system::memory_usage,
+        system::heap_profile,
+        system::heap_profile_status,
     ),
     components(
         schemas(
@@ -72,13 +77,16 @@ use crate::search::SearchEngine;
             graph::NeighborInfo,
             graph::MentionInfo,
             graph::GraphStats,
+            system::MemoryUsage,
+            system::HeapProfileStatus,
         )
     ),
     tags(
         (name = "knowledge_base", description = "知识库管理接口"),
         (name = "file", description = "文件管理接口"),
         (name = "search", description = "搜索接口"),
-        (name = "graph", description = "知识图谱接口")
+        (name = "graph", description = "知识图谱接口"),
+        (name = "system", description = "系统监控接口")
     ),
     info(
         title = "HTKnow API",
@@ -115,12 +123,17 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/entities", get(graph::search_entities))
         .route("/entities/{id}", get(graph::get_entity))
         .route("/stats", get(graph::get_graph_stats));
+    let system_router = Router::new()
+        .route("/memory", get(system::memory_usage))
+        .route("/heap", get(system::heap_profile))
+        .route("/heap/status", get(system::heap_profile_status));
 
     Router::new()
         .nest("/knowledge_base/", knowledge_router)
         .nest("/files/", file_router)
         .nest("/search/", search_router)
         .nest("/graph/", graph_router)
+        .nest("/system/", system_router)
         .with_state(pool)
         .layer(Extension(search_engine))
 }

@@ -3,3 +3,4 @@ app.sqlite*
 /data
 *.log
 .DS_Store
+*.pdf

@@ -1,3 +1,11 @@
+#[cfg(debug_assertions)]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(debug_assertions)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:19\0";
+
 use std::net::SocketAddr;
 
 use axum::{Router, extract::DefaultBodyLimit, middleware, response::Html, routing::get};
