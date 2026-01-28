@@ -523,6 +523,8 @@ impl FileProcessor {
 
         let slice_count = slices.len();
         let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
+        let mut search_docs = Vec::new();
+        let mut search_embeddings = Vec::new();
 
         for slice in slices {
             let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
@@ -532,9 +534,14 @@ impl FileProcessor {
                     position_rows.push((id, position));
                 }
             }
-            self.search_engine
-                .write(tantivy_engine::Document::new(id, file.id, file.kb_id, slice.content), image_embedding.clone())
-                .await?;
+            // 收集文档，稍后批量写入
+            search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, slice.content));
+            search_embeddings.push(image_embedding.clone());
+        }
+
+        // 批量写入搜索引擎
+        if !search_docs.is_empty() {
+            self.search_engine.write_batch(search_docs, search_embeddings).await?;
         }
 
         if !position_rows.is_empty() {
@@ -858,11 +865,18 @@ impl FileProcessor {
         let slices = self.slice_content(content, &file.slice_type)?;
         let slice_count = slices.len();
 
-        // 保存分片到数据库
+        // 保存分片到数据库并收集文档
+        let mut search_docs = Vec::new();
         for slice in slices {
             let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
             let id = sqlx::query(sql).bind(file.id).bind(&slice).execute(&self.pool).await?.last_insert_rowid();
-            self.search_engine.write(tantivy_engine::Document::new(id, file.id, file.kb_id, slice), None).await?;
+            search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, slice));
+        }
+
+        // 批量写入搜索引擎
+        if !search_docs.is_empty() {
+            let embeddings = vec![None; search_docs.len()];
+            self.search_engine.write_batch(search_docs, embeddings).await?;
         }
 
         let index_full_content = format!("{}\n\n{}", file.filename, content);

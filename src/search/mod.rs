@@ -85,6 +85,38 @@ impl SearchEngine {
         Ok(())
     }
 
+    /// 批量写入文档，减少 commit 次数
+    pub async fn write_batch(
+        &self, docs: Vec<tantivy_engine::Document>, image_embeddings: Vec<Option<Vec<f32>>>,
+    ) -> anyhow::Result<()> {
+        if docs.is_empty() {
+            return Ok(());
+        }
+
+        // 批量写入 tantivy
+        {
+            let _guard = self.index_write_lock.lock().await;
+            tantivy_engine::write_documents_batch(&self.index, &self.schema, docs.clone()).await?;
+        }
+
+        // 批量写入 lancedb：收集所有 lancedb 文档后一次性写入
+        let lancedb_docs: Vec<lancedb::Document> = docs
+            .iter()
+            .zip(image_embeddings.iter())
+            .map(|(doc, image_embedding)| {
+                let mut lancedb_doc = lancedb::Document::new(doc.id, doc.file_id, doc.kb_id, doc.content.clone());
+                if let Some(embedding) = image_embedding {
+                    lancedb_doc = lancedb_doc.with_image_embedding(embedding.clone());
+                }
+                lancedb_doc
+            })
+            .collect();
+
+        lancedb::write_documents_batch(lancedb_docs).await?;
+
+        Ok(())
+    }
+
     pub async fn write_full(&self, doc: tantivy_engine::Document) -> anyhow::Result<()> {
         {
             let _guard = self.full_index_write_lock.lock().await;

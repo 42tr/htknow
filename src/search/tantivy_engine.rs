@@ -4,7 +4,7 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use log::info;
 use serde::Serialize;
 use tantivy::{
-    Index, Result, TantivyDocument, Term, collector::TopDocs, doc, query::{BooleanQuery, Occur, Query, TermQuery}, schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _}
+    Index, Result, TantivyDocument, Term, collector::TopDocs, doc, merge_policy::LogMergePolicy, query::{BooleanQuery, Occur, Query, TermQuery}, schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _}
 };
 
 use super::chinese_tokenizer;
@@ -71,11 +71,33 @@ fn init_with_path(path: &str) -> Result<(Schema, Index)> {
     Ok((schema, index))
 }
 
-pub async fn write_documents(index: &Index, schema: &Schema, doc: Document) -> tantivy::Result<()> {
+fn create_writer(index: &Index) -> tantivy::Result<tantivy::IndexWriter> {
     let writer_memory = config::get().search.tantivy_memory_mb * 1_000_000;
-    let mut index_writer = index.writer(writer_memory)?;
+    let writer = index.writer(writer_memory)?;
+
+    // 设置 merge policy，减少小 segment 数量
+    writer.set_merge_policy(Box::new(LogMergePolicy::default()));
+
+    Ok(writer)
+}
+
+pub async fn write_documents(index: &Index, schema: &Schema, doc: Document) -> tantivy::Result<()> {
+    let mut index_writer = create_writer(index)?;
     index_writer.add_document(create_document(doc, schema))?;
     index_writer.commit()?;
+    Ok(())
+}
+
+/// 批量写入文档，减少 commit 次数，避免产生大量小 segment
+pub async fn write_documents_batch(index: &Index, schema: &Schema, docs: Vec<Document>) -> tantivy::Result<()> {
+    if docs.is_empty() {
+        return Ok(());
+    }
+    let mut index_writer = create_writer(index)?;
+    for doc in docs {
+        index_writer.add_document(create_document(doc, schema))?;
+    }
+    index_writer.commit()?;  // 一次 commit
     Ok(())
 }
 
@@ -129,8 +151,7 @@ pub async fn search_with_snippet(
 }
 
 pub async fn delete_by_file(index: &Index, schema: &Schema, file_id: i64) -> anyhow::Result<()> {
-    let writer_memory = config::get().search.tantivy_memory_mb * 1_000_000;
-    let mut writer = index.writer::<TantivyDocument>(writer_memory)?;
+    let mut writer = create_writer(index)?;
     let file_id_field = get_field(schema, "file_id");
     let term = Term::from_field_i64(file_id_field, file_id);
     writer.delete_term(term);
@@ -139,8 +160,7 @@ pub async fn delete_by_file(index: &Index, schema: &Schema, file_id: i64) -> any
 }
 
 pub async fn delete_by_kb(index: &Index, schema: &Schema, kb_id: i64) -> anyhow::Result<()> {
-    let writer_memory = config::get().search.tantivy_memory_mb * 1_000_000;
-    let mut writer = index.writer::<TantivyDocument>(writer_memory)?;
+    let mut writer = create_writer(index)?;
     let kb_id_field = get_field(schema, "kb_id");
     let term = Term::from_field_i64(kb_id_field, kb_id);
     writer.delete_term(term);

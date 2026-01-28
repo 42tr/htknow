@@ -83,6 +83,19 @@ pub async fn write_documents(doc: Document) -> Result<()> {
     Ok(())
 }
 
+/// 批量写入文档，一次性获取 embeddings 并写入
+pub async fn write_documents_batch(docs: Vec<Document>) -> Result<()> {
+    if docs.is_empty() {
+        return Ok(());
+    }
+    let conn = get_connection()?;
+    let table = conn.open_table(TABLE_NAME).execute().await?;
+    let schema = create_schema();
+    let batch = create_record_batch(docs, &schema).await?;
+    table.add(Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema))).execute().await?;
+    Ok(())
+}
+
 pub async fn search(query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>) -> Result<Vec<SearchResultItem>> {
     let cfg = config::get();
     let conn = get_connection()?;
