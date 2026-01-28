@@ -11,7 +11,7 @@ use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tokio::{fs, time};
 
 use crate::{
-    api::File, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, SearchEngine, tantivy_engine}
+    api::{File, collect_image_paths_for_files, remove_image_files}, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, SearchEngine, tantivy_engine}
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -216,6 +216,7 @@ impl FileProcessor {
     }
 
     async fn reset_processing_file_data(&self, file_id: i64) -> anyhow::Result<()> {
+        let image_paths = collect_image_paths_for_files(&self.pool, std::slice::from_ref(&file_id)).await?;
         let mut tx = self.pool.begin().await?;
 
         self.delete_processing_file_data(&mut tx, file_id).await?;
@@ -226,6 +227,8 @@ impl FileProcessor {
 
         tx.commit().await?;
 
+        remove_image_files(image_paths).await;
+
         if let Err(e) = self.search_engine.delete(Some(file_id), None).await {
             warn!("Failed to delete search index for file {}: {}", file_id, e);
         }
@@ -234,9 +237,12 @@ impl FileProcessor {
     }
 
     async fn cleanup_processing_file_data(&self, file_id: i64) -> anyhow::Result<()> {
+        let image_paths = collect_image_paths_for_files(&self.pool, std::slice::from_ref(&file_id)).await?;
         let mut tx = self.pool.begin().await?;
         self.delete_processing_file_data(&mut tx, file_id).await?;
         tx.commit().await?;
+
+        remove_image_files(image_paths).await;
 
         if let Err(e) = self.search_engine.delete(Some(file_id), None).await {
             warn!("Failed to delete search index for file {}: {}", file_id, e);
@@ -486,6 +492,8 @@ impl FileProcessor {
             // 保存图片到本地
             let cfg = config::get();
             fs::create_dir_all(&cfg.storage.images_path).await?;
+            info!("image count: {}", mineru_result.images.len());
+            info!("images: {:?}", mineru_result.images.keys());
             for (img_name, img_base64) in &mineru_result.images {
                 // 保存图片，如果以 data:image/jpeg;base64, 开头就去掉，没有也不报错
                 let b64 = if let Some(stripped) = img_base64.strip_prefix("data:image/jpeg;base64,") {
@@ -681,7 +689,7 @@ impl FileProcessor {
                 .text("return_images", "true")
                 .text("parse_method", "auto")
                 .text("lang_list", "ch")
-                .text("output_dir", "./output")
+                .text("output_dir", "")
                 .text("server_url", "string")
                 .text("return_content_list", "true")
                 .text("backend", "pipeline")

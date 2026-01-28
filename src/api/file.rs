@@ -1,9 +1,11 @@
-use std::{collections::HashMap, path::Component, time::Instant};
+use std::{
+    collections::{HashMap, HashSet}, path::Component, time::Instant
+};
 
 use axum::{
     Extension, body::Body, extract::{Multipart, Path, Query, State}, http::{StatusCode, header}, response::Json
 };
-use log::debug;
+use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
@@ -418,6 +420,8 @@ pub async fn delete(
     let file: File = sqlx::query_as(query).bind(id).fetch_one(&pool).await?;
     debug!("file_delete id={} fetch_file {}ms", id, step_start.elapsed().as_millis());
 
+    let image_paths = collect_image_paths_for_files(&pool, std::slice::from_ref(&id)).await?;
+
     let step_start = Instant::now();
     fs::remove_file(file.path).await?;
     debug!("file_delete id={} remove_file {}ms", id, step_start.elapsed().as_millis());
@@ -430,13 +434,33 @@ pub async fn delete(
     }
     debug!("file_delete id={} remove_pdf {}ms", id, step_start.elapsed().as_millis());
 
+    remove_image_files(image_paths).await;
+
     let step_start = Instant::now();
     search_engine.delete(Some(id), None).await?;
     debug!("file_delete id={} search_delete {}ms", id, step_start.elapsed().as_millis());
 
     let step_start = Instant::now();
+    sqlx::query("DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    debug!("file_delete id={} delete_mentions {}ms", id, step_start.elapsed().as_millis());
+
+    let step_start = Instant::now();
+    sqlx::query("DELETE FROM slice_positions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    debug!("file_delete id={} delete_slice_positions {}ms", id, step_start.elapsed().as_millis());
+
+    let step_start = Instant::now();
     sqlx::query("DELETE FROM slices WHERE file_id = ?").bind(id).execute(&pool).await?;
     debug!("file_delete id={} delete_slices {}ms", id, step_start.elapsed().as_millis());
+
+    let step_start = Instant::now();
+    sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(id).execute(&pool).await?;
+    debug!("file_delete id={} delete_pdf_contents {}ms", id, step_start.elapsed().as_millis());
 
     let step_start = Instant::now();
     sqlx::query("DELETE FROM files WHERE id = ?").bind(id).execute(&pool).await?;
@@ -444,6 +468,119 @@ pub async fn delete(
 
     debug!("file_delete id={} total {}ms", id, overall_start.elapsed().as_millis());
     Ok(())
+}
+
+pub(crate) async fn collect_image_paths_for_files(
+    pool: &SqlitePool, file_ids: &[i64],
+) -> Result<Vec<String>, sqlx::Error> {
+    if file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut qb = QueryBuilder::<Sqlite>::new("SELECT img_path FROM pdf_contents WHERE file_id IN (");
+    let mut separated = qb.separated(", ");
+    for file_id in file_ids {
+        separated.push_bind(file_id);
+    }
+    qb.push(") AND img_path IS NOT NULL AND img_path != ''");
+    let rows: Vec<Option<String>> = qb.build_query_scalar().fetch_all(pool).await?;
+    let mut resolved = Vec::new();
+    for raw in rows.into_iter().flatten() {
+        if let Some(path) = resolve_image_storage_path(&raw) {
+            resolved.push(path);
+        }
+    }
+    Ok(resolved)
+}
+
+fn is_safe_relative_path(path: &str) -> bool {
+    let path = std::path::Path::new(path);
+    if path.is_absolute() {
+        return false;
+    }
+    for component in path.components() {
+        match component {
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+fn resolve_image_storage_path(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    if !is_safe_relative_path(trimmed) {
+        log::warn!("Skipping unsafe image path: {}", trimmed);
+        return None;
+    }
+
+    let cfg = config::get();
+    let images_root = std::path::Path::new(&cfg.storage.images_path);
+    let data_root = images_root.parent();
+    let use_data_root = trimmed.contains('/') || trimmed.contains('\\');
+
+    let resolved = if use_data_root {
+        if let Some(root) = data_root { root.join(trimmed) } else { images_root.join(trimmed) }
+    } else {
+        images_root.join(trimmed)
+    };
+
+    Some(resolved.to_string_lossy().to_string())
+}
+
+pub(crate) async fn remove_image_files(image_paths: Vec<String>) {
+    info!("Removing image files: {:?}", image_paths);
+    if image_paths.is_empty() {
+        return;
+    }
+
+    let cfg = config::get();
+    let images_root = std::path::Path::new(&cfg.storage.images_path);
+    let data_root = images_root.parent();
+    let mut seen = HashSet::new();
+    for img_path in image_paths {
+        let trimmed = img_path.trim();
+        if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+            continue;
+        }
+
+        let candidate = std::path::Path::new(trimmed);
+        let full_path = if candidate.is_absolute()
+            || candidate.starts_with(images_root)
+            || data_root.map_or(false, |root| candidate.starts_with(root))
+        {
+            candidate.to_path_buf()
+        } else {
+            match resolve_image_storage_path(trimmed) {
+                Some(path) => std::path::PathBuf::from(path),
+                None => continue,
+            }
+        };
+        let allowed = full_path.starts_with(images_root) || data_root.map_or(false, |root| full_path.starts_with(root));
+        if !allowed {
+            log::warn!("Skipping unsafe image path: {}", full_path.display());
+            continue;
+        }
+        if let Err(e) = fs::remove_file(&full_path).await {
+            if matches!(e.kind(), std::io::ErrorKind::NotFound) {
+                if !candidate.is_absolute() && (trimmed.contains('/') || trimmed.contains('\\')) {
+                    if let Some(file_name) = candidate.file_name() {
+                        let fallback_path = images_root.join(file_name);
+                        if let Err(e) = fs::remove_file(&fallback_path).await {
+                            if !matches!(e.kind(), std::io::ErrorKind::NotFound) {
+                                log::warn!("Failed to delete image {}: {}", fallback_path.display(), e);
+                            }
+                        }
+                    }
+                }
+            } else {
+                log::warn!("Failed to delete image {}: {}", full_path.display(), e);
+            }
+        }
+    }
 }
 
 #[derive(Deserialize, IntoParams)]

@@ -9,7 +9,7 @@ use tokio::fs;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    AuthUser, api::error::{ApiError, ApiResult}, search::SearchEngine
+    AuthUser, api::error::{ApiError, ApiResult}, config, search::SearchEngine
 };
 
 const KB_TYPE_ANALYSIS: &str = "analysis";
@@ -693,6 +693,35 @@ pub async fn delete(
 
     if !files.is_empty() {
         let file_ids: Vec<i64> = files.iter().map(|f| f.id).collect();
+        let image_paths = super::file::collect_image_paths_for_files(&pool, &file_ids).await?;
+
+        let mut mentions_qb = QueryBuilder::<Sqlite>::new(
+            "DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id IN (",
+        );
+        let mut mentions_sep = mentions_qb.separated(", ");
+        for file_id in &file_ids {
+            mentions_sep.push_bind(file_id);
+        }
+        mentions_qb.push("))");
+        mentions_qb.build().execute(&pool).await?;
+
+        let mut positions_qb = QueryBuilder::<Sqlite>::new(
+            "DELETE FROM slice_positions WHERE slice_id IN (SELECT id FROM slices WHERE file_id IN (",
+        );
+        let mut positions_sep = positions_qb.separated(", ");
+        for file_id in &file_ids {
+            positions_sep.push_bind(file_id);
+        }
+        positions_qb.push("))");
+        positions_qb.build().execute(&pool).await?;
+
+        let mut pdf_contents_qb = QueryBuilder::<Sqlite>::new("DELETE FROM pdf_contents WHERE file_id IN (");
+        let mut pdf_contents_sep = pdf_contents_qb.separated(", ");
+        for file_id in &file_ids {
+            pdf_contents_sep.push_bind(file_id);
+        }
+        pdf_contents_qb.push(")");
+        pdf_contents_qb.build().execute(&pool).await?;
 
         // Delete slices for all found files
         let mut slices_qb = QueryBuilder::new("DELETE FROM slices WHERE file_id IN (");
@@ -704,11 +733,17 @@ pub async fn delete(
         slices_qb.build().execute(&pool).await?;
 
         // Delete physical files on disk
+        let cfg = config::get();
         for file in &files {
             if let Err(e) = fs::remove_file(&file.path).await {
                 log::warn!("Failed to delete file {}: {}", &file.path, e);
             }
+            let pdf_path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", file.id));
+            if let Err(e) = fs::remove_file(&pdf_path).await {
+                log::warn!("Failed to delete converted pdf {}: {}", pdf_path.display(), e);
+            }
         }
+        super::file::remove_image_files(image_paths).await;
 
         // Delete the file records themselves
         let mut del_files_qb = QueryBuilder::new("DELETE FROM files WHERE id IN (");

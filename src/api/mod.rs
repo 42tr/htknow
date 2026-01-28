@@ -11,6 +11,7 @@ mod knowledge_base;
 mod search;
 // 重新导出 File 类型供其他模块使用
 pub use file::File;
+pub(crate) use file::{collect_image_paths_for_files, remove_image_files};
 
 use crate::search::SearchEngine;
 
