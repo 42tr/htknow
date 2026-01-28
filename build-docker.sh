@@ -2,6 +2,12 @@
 
 set -e
 
+# Build frontend
+cd frontend
+npm install
+npm run build
+cd ..
+
 # Parse command line arguments
 BUILD_MODE="release"
 if [ "$1" = "debug" ] || [ "$1" = "--debug" ]; then
@@ -12,19 +18,18 @@ if [ "$BUILD_MODE" = "debug" ]; then
     echo "Building htknow for debug..."
     cargo build
     IMAGE_TAG="$(date +%Y%m%d%H%M)-debug"
-    BINARY_PATH="target/debug/htknow"
+    DOCKERFILE="Dockerfile.debug"
+    echo "Using Dockerfile.debug with jemalloc profiling tools"
 else
     echo "Building htknow for release..."
     cargo build --release
     IMAGE_TAG="$(date +%Y%m%d%H%M)"
-    BINARY_PATH="target/release/htknow"
+    DOCKERFILE="Dockerfile"
 fi
 
-# Create a temporary Dockerfile with the correct binary path
-echo "Building Docker image..."
-sed "s|target/release/htknow|${BINARY_PATH}|g" Dockerfile > Dockerfile.tmp
-docker build -f Dockerfile.tmp -t htknow:${IMAGE_TAG} .
-rm -f Dockerfile.tmp
+# Build Docker image
+echo "Building Docker image with ${DOCKERFILE}..."
+docker build -f ${DOCKERFILE} -t htknow:${IMAGE_TAG} .
 
 echo "Build complete!"
 echo ""

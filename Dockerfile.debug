@@ -1,0 +1,57 @@
+# Debug image for htknow with jemalloc profiling tools
+# Binary should be compiled outside the container using: cargo build --profile dev
+
+FROM docker.1ms.run/debian:bookworm-slim
+
+# Install runtime dependencies + debug tools
+RUN apt-get update && apt-get install -y \
+    # LibreOffice for Word to PDF conversion
+    libreoffice-writer \
+    libreoffice-core \
+    # SSL certificates for HTTPS requests
+    ca-certificates \
+    # Timezone data
+    tzdata \
+    # sqlite3
+    sqlite3 \
+    # Jemalloc profiling tools
+    libjemalloc-dev \
+    google-perftools \
+    perl \
+    graphviz \
+    binutils \
+    # Optional: useful debug utilities
+    curl \
+    htop \
+    # Clean up
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure timezone
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && echo ${TZ} > /etc/timezone
+
+# Create application directory
+WORKDIR /app
+
+# Create data directories
+RUN mkdir -p /app/data/images /app/data/temp /app/data/db
+
+# Copy the compiled binary from host (debug build)
+# Make sure to build with: cargo build --profile dev
+COPY target/debug/htknow /app/htknow
+
+# Copy frontend files if needed
+COPY frontend /app/frontend
+
+# Set permissions
+RUN chmod +x /app/htknow
+
+# Expose the application port (adjust based on your app's configuration)
+EXPOSE 8080
+
+# Set environment variables for debug
+ENV RUST_LOG=debug
+ENV RUST_BACKTRACE=1
+
+# Run the application
+CMD ["/app/htknow"]
