@@ -1,5 +1,4 @@
 # Rust build artifacts (except the release binary we need)
-target/debug
 target/*/incremental
 target/*/build
 target/*/deps
