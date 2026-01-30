@@ -1,10 +1,10 @@
-use std::{collections::HashSet, path::Path};
+use std::{collections::HashSet, path::Path, time::Instant};
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
-use log::info;
+use log::{debug, info};
 use serde::Serialize;
 use tantivy::{
-    Index, Result, TantivyDocument, Term, collector::TopDocs, doc, merge_policy::LogMergePolicy, query::{BooleanQuery, Occur, Query, TermQuery}, schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _}
+    Index, IndexReader, Result, TantivyDocument, Term, collector::TopDocs, doc, merge_policy::LogMergePolicy, query::{BooleanQuery, Occur, Query, TermQuery}, schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _}
 };
 
 use super::chinese_tokenizer;
@@ -97,21 +97,33 @@ pub async fn write_documents_batch(index: &Index, schema: &Schema, docs: Vec<Doc
     for doc in docs {
         index_writer.add_document(create_document(doc, schema))?;
     }
-    index_writer.commit()?;  // 一次 commit
+    index_writer.commit()?; // 一次 commit
     Ok(())
 }
 
 pub async fn search(
-    index: &Index, schema: &Schema, query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>,
+    reader: &IndexReader, schema: &Schema, query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>,
 ) -> anyhow::Result<Vec<SearchResultItem>> {
     let cfg = config::get();
-    let searcher = index.reader()?.searcher();
+    let searcher = reader.searcher();
     let tantivy_query = build_query(query, file_id, kb_ids, schema)?;
+    let search_start = Instant::now();
     let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(cfg.search.limit))?;
+    debug!("Tantivy searcher.search {}ms", search_start.elapsed().as_millis());
 
     let mut results = vec![];
+    let mut doc_total_ms: u128 = 0;
+    let mut doc_max_ms: u128 = 0;
+    let mut doc_count: usize = 0;
     for (score, doc_address) in top_docs {
+        let doc_start = Instant::now();
         let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
+        let doc_elapsed = doc_start.elapsed().as_millis();
+        doc_total_ms += doc_elapsed;
+        if doc_elapsed > doc_max_ms {
+            doc_max_ms = doc_elapsed;
+        }
+        doc_count += 1;
         let id = retrieved_doc.get_first(get_field(schema, "id")).and_then(|v| v.as_i64()).unwrap_or(0);
         let file_id = retrieved_doc.get_first(get_field(schema, "file_id")).and_then(|v| v.as_i64()).unwrap_or(0);
         let kb_id = retrieved_doc.get_first(get_field(schema, "kb_id")).and_then(|v| v.as_i64());
@@ -122,30 +134,45 @@ pub async fn search(
             .unwrap_or_default();
         results.push(SearchResultItem { id, file_id, kb_id, content, score });
     }
+    debug!("Tantivy searcher.doc total={}ms max={}ms count={}", doc_total_ms, doc_max_ms, doc_count);
 
     Ok(results)
 }
 
 pub async fn search_with_snippet(
-    index: &Index, schema: &Schema, query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>, max_chars: usize,
+    reader: &IndexReader, schema: &Schema, query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>,
+    max_chars: usize,
 ) -> anyhow::Result<Vec<FullSearchResultItem>> {
     let cfg = config::get();
-    let searcher = index.reader()?.searcher();
+    let searcher = reader.searcher();
     let tantivy_query = build_query(query, file_id, kb_ids, schema)?;
+    let search_start = Instant::now();
     let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(cfg.search.limit))?;
+    debug!("Tantivy full searcher.search {}ms", search_start.elapsed().as_millis());
 
     let terms = build_snippet_terms(query);
     let matcher = build_matcher(&terms);
 
     let mut results = vec![];
+    let mut doc_total_ms: u128 = 0;
+    let mut doc_max_ms: u128 = 0;
+    let mut doc_count: usize = 0;
     for (score, doc_address) in top_docs {
+        let doc_start = Instant::now();
         let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
+        let doc_elapsed = doc_start.elapsed().as_millis();
+        doc_total_ms += doc_elapsed;
+        if doc_elapsed > doc_max_ms {
+            doc_max_ms = doc_elapsed;
+        }
+        doc_count += 1;
         let file_id = retrieved_doc.get_first(get_field(schema, "file_id")).and_then(|v| v.as_i64()).unwrap_or(0);
         let kb_id = retrieved_doc.get_first(get_field(schema, "kb_id")).and_then(|v| v.as_i64());
         let content = retrieved_doc.get_first(get_field(schema, "content")).and_then(|v| v.as_str()).unwrap_or("");
         let snippet = build_best_snippet(content, matcher.as_ref(), terms.len(), max_chars);
         results.push(FullSearchResultItem { file_id, kb_id, snippet, score });
     }
+    debug!("Tantivy full searcher.doc total={}ms max={}ms count={}", doc_total_ms, doc_max_ms, doc_count);
 
     Ok(results)
 }

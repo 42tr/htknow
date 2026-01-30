@@ -1,10 +1,9 @@
 use std::{collections::HashMap, sync::Arc, time::Instant};
 
-use anyhow::Ok;
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, SqlitePool};
-use tantivy::{Index, schema::Schema};
+use tantivy::{Index, IndexReader, ReloadPolicy, schema::Schema};
 use tokio::sync::Mutex;
 
 use crate::config;
@@ -36,13 +35,15 @@ struct RerankResult {
     relevance_score: f32,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct SearchEngine {
     index: Index,
     schema: Schema,
+    index_reader: IndexReader,
     index_write_lock: Arc<Mutex<()>>,
     full_index: Index,
     full_schema: Schema,
+    full_index_reader: IndexReader,
     full_index_write_lock: Arc<Mutex<()>>,
     pool: Option<SqlitePool>,
 }
@@ -52,12 +53,16 @@ impl SearchEngine {
         lancedb::init().await.expect("init lancedb failed");
         let (schema, index) = tantivy_engine::init().unwrap();
         let (full_schema, full_index) = tantivy_engine::init_full().unwrap();
+        let index_reader = build_reader(&index, "index");
+        let full_index_reader = build_reader(&full_index, "full_index");
         Self {
             index,
             schema,
+            index_reader,
             index_write_lock: Arc::new(Mutex::new(())),
             full_index,
             full_schema,
+            full_index_reader,
             full_index_write_lock: Arc::new(Mutex::new(())),
             pool: None,
         }
@@ -74,6 +79,7 @@ impl SearchEngine {
             let _guard = self.index_write_lock.lock().await;
             tantivy_engine::write_documents(&self.index, &self.schema, doc.clone()).await?;
         }
+        reload_reader(&self.index_reader, "index")?;
 
         // 写入 lancedb
         let mut lancedb_doc = lancedb::Document::new(doc.id, doc.file_id, doc.kb_id, doc.content);
@@ -98,6 +104,7 @@ impl SearchEngine {
             let _guard = self.index_write_lock.lock().await;
             tantivy_engine::write_documents_batch(&self.index, &self.schema, docs.clone()).await?;
         }
+        reload_reader(&self.index_reader, "index")?;
 
         // 批量写入 lancedb：收集所有 lancedb 文档后一次性写入
         let lancedb_docs: Vec<lancedb::Document> = docs
@@ -122,6 +129,7 @@ impl SearchEngine {
             let _guard = self.full_index_write_lock.lock().await;
             tantivy_engine::write_documents(&self.full_index, &self.full_schema, doc).await?;
         }
+        reload_reader(&self.full_index_reader, "full_index")?;
         Ok(())
     }
 
@@ -133,6 +141,7 @@ impl SearchEngine {
                 let _guard = self.index_write_lock.lock().await;
                 tantivy_engine::delete_by_file(&self.index, &self.schema, file_id).await?;
             }
+            reload_reader(&self.index_reader, "index")?;
             debug!("search_delete file_id={} tantivy {}ms", file_id, step_start.elapsed().as_millis());
 
             let step_start = Instant::now();
@@ -144,6 +153,7 @@ impl SearchEngine {
                 let _guard = self.full_index_write_lock.lock().await;
                 tantivy_engine::delete_by_file(&self.full_index, &self.full_schema, file_id).await?;
             }
+            reload_reader(&self.full_index_reader, "full_index")?;
             debug!("search_delete file_id={} tantivy_full {}ms", file_id, step_start.elapsed().as_millis());
         }
         if let Some(kb_id) = kb_id {
@@ -152,6 +162,7 @@ impl SearchEngine {
                 let _guard = self.index_write_lock.lock().await;
                 tantivy_engine::delete_by_kb(&self.index, &self.schema, kb_id).await?;
             }
+            reload_reader(&self.index_reader, "index")?;
             debug!("search_delete kb_id={} tantivy {}ms", kb_id, step_start.elapsed().as_millis());
 
             let step_start = Instant::now();
@@ -163,6 +174,7 @@ impl SearchEngine {
                 let _guard = self.full_index_write_lock.lock().await;
                 tantivy_engine::delete_by_kb(&self.full_index, &self.full_schema, kb_id).await?;
             }
+            reload_reader(&self.full_index_reader, "full_index")?;
             debug!("search_delete kb_id={} tantivy_full {}ms", kb_id, step_start.elapsed().as_millis());
         }
         debug!("search_delete total {}ms file_id={:?} kb_id={:?}", overall_start.elapsed().as_millis(), file_id, kb_id);
@@ -175,7 +187,7 @@ impl SearchEngine {
         debug!("Searching for query: {}", query);
 
         // 使用 tantivy 搜索
-        let tantivy_results = tantivy_engine::search(&self.index, &self.schema, query, file_id, kb_ids).await?;
+        let tantivy_results = tantivy_engine::search(&self.index_reader, &self.schema, query, file_id, kb_ids).await?;
         debug!("Tantivy results count: {}", tantivy_results.len());
         debug!("Tantivy results: {:?}", tantivy_results);
 
@@ -234,7 +246,7 @@ impl SearchEngine {
         &self, query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>,
     ) -> anyhow::Result<Vec<FullSearchResultItem>> {
         tantivy_engine::search_with_snippet(
-            &self.full_index,
+            &self.full_index_reader,
             &self.full_schema,
             query,
             file_id,
@@ -436,4 +448,22 @@ impl SearchEngine {
         info!("Graph-expanded search returned {} results", merged_results.len());
         Ok(merged_results)
     }
+}
+
+fn build_reader(index: &Index, label: &str) -> IndexReader {
+    let start = Instant::now();
+    let reader = index
+        .reader_builder()
+        .reload_policy(ReloadPolicy::Manual)
+        .try_into()
+        .unwrap_or_else(|e| panic!("failed to create tantivy {} reader: {}", label, e));
+    debug!("Tantivy {} index.reader init {}ms", label, start.elapsed().as_millis());
+    reader
+}
+
+fn reload_reader(reader: &IndexReader, label: &str) -> tantivy::Result<()> {
+    let start = Instant::now();
+    reader.reload()?;
+    debug!("Tantivy {} reader reload {}ms", label, start.elapsed().as_millis());
+    Ok(())
 }
