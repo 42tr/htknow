@@ -1,6 +1,5 @@
-use axum::response::{Json, Response};
+use axum::response::Response;
 use serde::Serialize;
-use sysinfo::{PidExt, ProcessExt, System, SystemExt};
 use utoipa::ToSchema;
 
 use crate::api::error::{ApiError, ApiResult};
@@ -33,46 +32,6 @@ pub struct HeapProfileStatus {
     pub warnings: Vec<String>,
 }
 
-/// 查询当前进程内存占用
-#[utoipa::path(
-    get,
-    path = "/api/v1/knowledge/system/memory",
-    operation_id = "system_memory_usage",
-    tag = "system",
-    responses(
-        (status = 200, description = "成功返回内存占用", body = MemoryUsage),
-        (status = 500, description = "获取内存占用失败")
-    )
-)]
-pub async fn memory_usage() -> ApiResult<Json<MemoryUsage>> {
-    let pid =
-        sysinfo::get_current_pid().map_err(|e| ApiError::internal(format!("Failed to get current pid: {}", e)))?;
-    let mut system = System::new();
-    system.refresh_processes();
-
-    let process = system.process(pid).ok_or_else(|| ApiError::internal("Process not found"))?;
-    let rss_bytes = process.memory().saturating_mul(1024);
-    let virtual_bytes = process.virtual_memory().saturating_mul(1024);
-
-    Ok(Json(MemoryUsage { pid: pid.as_u32(), rss_bytes, virtual_bytes }))
-}
-
-/// 查询堆分析状态（开发环境）
-#[utoipa::path(
-    get,
-    path = "/api/v1/knowledge/system/heap/status",
-    operation_id = "system_heap_profile_status",
-    tag = "system",
-    responses(
-        (status = 200, description = "成功返回堆分析状态", body = HeapProfileStatus),
-        (status = 400, description = "仅开发环境可用"),
-        (status = 500, description = "读取堆分析状态失败")
-    )
-)]
-pub async fn heap_profile_status() -> ApiResult<Json<HeapProfileStatus>> {
-    heap_profile_status_impl().await
-}
-
 /// 生成当前进程堆内存快照（jemalloc heap profile）
 #[utoipa::path(
     get,
@@ -103,55 +62,6 @@ pub async fn heap_profile() -> ApiResult<Response> {
 )]
 pub async fn heap_profile_pdf() -> ApiResult<Response> {
     heap_profile_pdf_impl().await
-}
-
-#[cfg(debug_assertions)]
-async fn heap_profile_status_impl() -> ApiResult<Json<HeapProfileStatus>> {
-    use tikv_jemalloc_ctl::{Access, AsName, config, profiling, version};
-
-    let mut warnings = Vec::new();
-
-    let jemalloc_version = match version::read() {
-        Ok(v) => Some(v.to_string()),
-        Err(e) => {
-            warnings.push(format!("Failed to read jemalloc version: {}", e));
-            None
-        }
-    };
-
-    let prof_enabled = match profiling::prof::read() {
-        Ok(v) => Some(v),
-        Err(e) => {
-            warnings.push(format!("Failed to read opt.prof: {}", e));
-            None
-        }
-    };
-
-    let prof_active = match "prof.active\0".name().read() {
-        Ok(v) => Some(v),
-        Err(e) => {
-            warnings.push(format!("Failed to read prof.active: {}", e));
-            None
-        }
-    };
-
-    let malloc_conf = match config::malloc_conf::read() {
-        Ok(v) if v.is_empty() => None,
-        Ok(v) => Some(v.to_string()),
-        Err(e) => {
-            warnings.push(format!("Failed to read config.malloc_conf: {}", e));
-            None
-        }
-    };
-
-    let env_malloc_conf = std::env::var("MALLOC_CONF").ok();
-
-    Ok(Json(HeapProfileStatus { jemalloc_version, prof_enabled, prof_active, malloc_conf, env_malloc_conf, warnings }))
-}
-
-#[cfg(not(debug_assertions))]
-async fn heap_profile_status_impl() -> ApiResult<Json<HeapProfileStatus>> {
-    Err(ApiError::BadRequest("Heap profiling is only available in debug builds.".to_string()))
 }
 
 #[cfg(debug_assertions)]

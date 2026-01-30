@@ -124,11 +124,8 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/entities", get(graph::search_entities))
         .route("/entities/{id}", get(graph::get_entity))
         .route("/stats", get(graph::get_graph_stats));
-    let system_router = Router::new()
-        .route("/memory", get(system::memory_usage))
-        .route("/heap", get(system::heap_profile))
-        .route("/heap/status", get(system::heap_profile_status))
-        .route("/heap/pdf", get(system::heap_profile_pdf));
+    let system_router =
+        Router::new().route("/heap", get(system::heap_profile)).route("/heap/pdf", get(system::heap_profile_pdf));
 
     Router::new()
         .nest("/knowledge_base/", knowledge_router)
