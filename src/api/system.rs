@@ -1,8 +1,10 @@
-use axum::response::Response;
+use axum::{Extension, Json, response::Response};
 use serde::Serialize;
 use utoipa::ToSchema;
 
-use crate::api::error::{ApiError, ApiResult};
+use crate::{
+    api::error::{ApiError, ApiResult}, search::SearchEngine
+};
 
 /// 进程内存占用
 #[derive(Debug, Serialize, ToSchema)]
@@ -30,6 +32,25 @@ pub struct HeapProfileStatus {
     pub env_malloc_conf: Option<String>,
     /// 状态读取失败的提示
     pub warnings: Vec<String>,
+}
+
+/// LanceDB compact 统计信息
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LanceDbCompactStats {
+    /// 删除行数（本次 compact 清理）
+    pub deleted_rows: u64,
+    /// compact 前被标记删除的行数
+    pub deleted_rows_before: u64,
+    /// compact 后被标记删除的行数
+    pub deleted_rows_after: u64,
+    /// compact 前总行数
+    pub total_rows_before: u64,
+    /// compact 后总行数
+    pub total_rows_after: u64,
+    /// compact 前磁盘大小（字节）
+    pub size_before_bytes: u64,
+    /// compact 后磁盘大小（字节）
+    pub size_after_bytes: u64,
 }
 
 /// 生成当前进程堆内存快照（jemalloc heap profile）
@@ -62,6 +83,40 @@ pub async fn heap_profile() -> ApiResult<Response> {
 )]
 pub async fn heap_profile_pdf() -> ApiResult<Response> {
     heap_profile_pdf_impl().await
+}
+
+/// 主动触发 LanceDB compact
+#[utoipa::path(
+    post,
+    path = "/api/v1/knowledge/system/lancedb/compact",
+    operation_id = "system_lancedb_compact",
+    tag = "system",
+    responses(
+        (status = 200, description = "LanceDB compact 成功", body = LanceDbCompactStats),
+        (status = 500, description = "LanceDB compact 失败")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn lancedb_compact(
+    Extension(search_engine): Extension<SearchEngine>,
+) -> ApiResult<Json<LanceDbCompactStats>> {
+    let stats = search_engine
+        .compact_lancedb()
+        .await
+        .map_err(|e| ApiError::internal(format!("LanceDB compact failed: {}", e)))?;
+
+    Ok(Json(LanceDbCompactStats {
+        deleted_rows: stats.deleted_rows,
+        deleted_rows_before: stats.deleted_rows_before,
+        deleted_rows_after: stats.deleted_rows_after,
+        total_rows_before: stats.total_rows_before,
+        total_rows_after: stats.total_rows_after,
+        size_before_bytes: stats.size_before_bytes,
+        size_after_bytes: stats.size_after_bytes,
+    }))
 }
 
 #[cfg(debug_assertions)]

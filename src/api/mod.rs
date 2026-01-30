@@ -50,6 +50,7 @@ use crate::search::SearchEngine;
         // System
         system::heap_profile,
         system::heap_profile_pdf,
+        system::lancedb_compact,
     ),
     components(
         schemas(
@@ -78,6 +79,7 @@ use crate::search::SearchEngine;
             graph::GraphStats,
             system::MemoryUsage,
             system::HeapProfileStatus,
+            system::LanceDbCompactStats,
         )
     ),
     tags(
@@ -122,8 +124,10 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/entities", get(graph::search_entities))
         .route("/entities/{id}", get(graph::get_entity))
         .route("/stats", get(graph::get_graph_stats));
-    let system_router =
-        Router::new().route("/heap", get(system::heap_profile)).route("/heap/pdf", get(system::heap_profile_pdf));
+    let system_router = Router::new()
+        .route("/heap", get(system::heap_profile))
+        .route("/heap/pdf", get(system::heap_profile_pdf))
+        .route("/lancedb/compact", post(system::lancedb_compact));
 
     Router::new()
         .nest("/knowledge_base/", knowledge_router)
