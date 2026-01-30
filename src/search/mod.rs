@@ -192,7 +192,9 @@ impl SearchEngine {
         debug!("Tantivy results: {:?}", tantivy_results);
 
         // 使用 lancedb 搜索
+        let lancedb_start = Instant::now();
         let lancedb_results = lancedb::search(query, file_id, kb_ids).await?;
+        debug!("LanceDB search {}ms", lancedb_start.elapsed().as_millis());
         debug!("LanceDB results count: {}", lancedb_results.len());
         debug!("LanceDB results: {:?}", lancedb_results);
 
@@ -264,6 +266,7 @@ impl SearchEngine {
 
     async fn rerank(&self, query: &str, results: Vec<SearchResultItem>) -> anyhow::Result<Vec<SearchResultItem>> {
         let cfg = config::get();
+        let rerank_total_start = Instant::now();
 
         // 提取所有文档内容用于重排序，并做去重
         let mut documents: Vec<String> = Vec::new();
@@ -285,7 +288,9 @@ impl SearchEngine {
 
         // 调用 BGE-Rerank API
         let client = reqwest::Client::new();
+        let rerank_http_start = Instant::now();
         let response = client.post(&cfg.services.rerank_url).json(&rerank_request).send().await?;
+        debug!("Rerank HTTP request {}ms", rerank_http_start.elapsed().as_millis());
 
         if !response.status().is_success() {
             let status = response.status();
@@ -299,11 +304,15 @@ impl SearchEngine {
         }
 
         // 先获取响应文本用于调试
+        let rerank_read_start = Instant::now();
         let response_text = response.text().await?;
+        debug!("Rerank response read {}ms", rerank_read_start.elapsed().as_millis());
         debug!("Rerank API response: {}", response_text);
 
         // 解析 JSON 响应
+        let rerank_parse_start = Instant::now();
         let rerank_response: RerankResponse = serde_json::from_str(&response_text)?;
+        debug!("Rerank response parse {}ms", rerank_parse_start.elapsed().as_millis());
 
         // 检查返回的结果数量是否匹配
         if rerank_response.results.len() != rerank_request.documents.len() {
@@ -340,6 +349,7 @@ impl SearchEngine {
         reranked_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         let threshold = cfg.ai.rerank_threshold;
         let filter_results = reranked_results.into_iter().filter(|f| f.score >= threshold).collect();
+        debug!("Rerank total {}ms", rerank_total_start.elapsed().as_millis());
         Ok(filter_results)
     }
 
