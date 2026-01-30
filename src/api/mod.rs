@@ -48,9 +48,7 @@ use crate::search::SearchEngine;
         graph::get_entity,
         graph::get_graph_stats,
         // System
-        system::memory_usage,
         system::heap_profile,
-        system::heap_profile_status,
         system::heap_profile_pdf,
     ),
     components(
