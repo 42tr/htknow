@@ -7,7 +7,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::stream::StreamExt;
 use lancedb::{
-    Connection, connect, query::{ExecutableQuery, QueryBase}, table::{CompactionOptions, Duration, NewColumnTransform, OptimizeAction, OptimizeOptions}
+    Connection, connect, query::{ExecutableQuery, QueryBase, Select}, table::{CompactionOptions, Duration, NewColumnTransform, OptimizeAction, OptimizeOptions}
 };
 use once_cell::sync::OnceCell;
 
@@ -116,7 +116,13 @@ pub async fn search(query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>
     let query_vector = embedding::get_embedding(query).await?;
 
     // 使用向量搜索
-    let mut query_builder = table.query().nearest_to(query_vector)?;
+    let mut query_builder = table.query().nearest_to(query_vector)?.column("vector").select(Select::columns(&[
+        "id",
+        "file_id",
+        "kb_id",
+        "content",
+        "_distance",
+    ]));
 
     // 应用过滤条件
     let mut filter_conditions = Vec::new();
@@ -203,7 +209,13 @@ pub async fn search_image(
         anyhow::bail!("Image embedding dimension mismatch: expected {}, got {}", image_vector_dim, query_vector.len());
     }
 
-    let mut query_builder = table.query().nearest_to(query_vector)?.column("image_vector");
+    let mut query_builder = table.query().nearest_to(query_vector)?.column("image_vector").select(Select::columns(&[
+        "id",
+        "file_id",
+        "kb_id",
+        "content",
+        "_distance",
+    ]));
 
     let mut filter_conditions = vec![
         format!("({} = false OR {} IS NULL)", IS_DELETED_COLUMN, IS_DELETED_COLUMN),
