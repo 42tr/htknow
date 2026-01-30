@@ -1,6 +1,6 @@
 //! 中文分词器模块 - 提供高性能的中英文混合分词功能
 
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use jieba_rs::{Jieba, TokenizeMode};
 use lazy_static::lazy_static;
@@ -15,6 +15,19 @@ lazy_static! {
         // 注意：jieba-rs 的 load_dict 需要可变引用和 BufRead
         // 如果需要加载自定义词典，应该在初始化时处理
         Arc::new(jieba)
+    };
+    // 基础停用词集合，可按需扩展
+    static ref STOP_WORDS: HashSet<&'static str> = {
+        let mut set = HashSet::new();
+        let content = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/stopwords.txt"));
+        for line in content.lines() {
+            let word = line.trim();
+            if word.is_empty() || word.starts_with('#') {
+                continue;
+            }
+            set.insert(word);
+        }
+        set
     };
 }
 
@@ -54,9 +67,25 @@ impl FastChineseTokenizer {
         let words = match self.mode {
             SegmentationMode::Search => {
                 // 搜索模式：使用 cut_for_search，召回率高
-                JIEBA.cut_for_search(text, false).into_iter().map(|s| s.to_string()).collect()
+                JIEBA
+                    .cut_for_search(text, false)
+                    .into_iter()
+                    .filter(|s| {
+                        let word = s.trim();
+                        !word.is_empty() && !STOP_WORDS.contains(word)
+                    })
+                    .map(|s| s.to_string())
+                    .collect()
             }
-            SegmentationMode::All => JIEBA.cut_all(text).into_iter().map(|s| s.to_string()).collect(),
+            SegmentationMode::All => JIEBA
+                .cut_all(text)
+                .into_iter()
+                .filter(|s| {
+                    let word = s.trim();
+                    !word.is_empty() && !STOP_WORDS.contains(word)
+                })
+                .map(|s| s.to_string())
+                .collect(),
         };
         info!("Segmented words: {:?}", words);
         words
@@ -70,6 +99,10 @@ impl FastChineseTokenizer {
         JIEBA
             .tokenize(text, mode, false)
             .into_iter()
+            .filter(|t| {
+                let word = t.word.trim();
+                !word.is_empty() && !STOP_WORDS.contains(word)
+            })
             .map(|t| TokenInfo { text: t.word.to_string(), start: t.start, end: t.end })
             .collect()
     }
