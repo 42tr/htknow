@@ -9,11 +9,13 @@ static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 // lg_prof_sample:19 表示每 512KB 采样一次(默认值)
 pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:10\0";
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, sync::Arc};
 
 use axum::{Router, extract::DefaultBodyLimit, middleware, response::Html, routing::get};
+use chrono::Local;
 use htknow::{api, auth, config, db, frontend, log4rs, processor, search};
 use tokio::net::TcpListener;
+use tokio_cron_scheduler::{Job, JobScheduler};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -29,6 +31,48 @@ async fn main() -> anyhow::Result<()> {
     let processor =
         processor::FileProcessor::new(pool.clone(), search_engine.clone(), cfg.server.process_interval_secs);
     processor.start();
+    let cron = cfg.server.lancedb_compact_cron.trim();
+    let _lancedb_compact_scheduler = if !cron.is_empty()
+        && !cron.eq_ignore_ascii_case("off")
+        && !cron.eq_ignore_ascii_case("disabled")
+        && cron != "0"
+    {
+        let compact_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let search_engine = search_engine.clone();
+        let sched = JobScheduler::new().await?;
+        let job_lock = compact_lock.clone();
+
+        let job = Job::new_async_tz(cron, Local, move |_uuid, _lock| {
+            let search_engine = search_engine.clone();
+            let job_lock = job_lock.clone();
+            Box::pin(async move {
+                let _guard = job_lock.lock().await;
+                match search_engine.compact_lancedb().await {
+                    Ok(stats) => {
+                        log::info!(
+                            "LanceDB auto-compact done: deleted_rows={}, total_rows_before={}, total_rows_after={}, size_before_bytes={}, size_after_bytes={}",
+                            stats.deleted_rows,
+                            stats.total_rows_before,
+                            stats.total_rows_after,
+                            stats.size_before_bytes,
+                            stats.size_after_bytes,
+                        );
+                    }
+                    Err(e) => {
+                        log::error!("LanceDB auto-compact failed: {}", e);
+                    }
+                }
+            })
+        })?;
+
+        sched.add(job).await?;
+        sched.start().await?;
+        log::warn!("LanceDB auto-compact enabled; avoid concurrent writes during compaction");
+        log::info!("LanceDB auto-compact cron: {}", cron);
+        Some(sched)
+    } else {
+        None
+    };
 
     // API 路由需要认证
     let upload_limit = cfg.server.upload_limit_mb * 1024 * 1024;

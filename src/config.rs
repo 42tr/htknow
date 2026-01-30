@@ -53,6 +53,8 @@ pub struct ServerConfig {
     pub upload_limit_mb: usize,
     /// 文件处理间隔（秒）
     pub process_interval_secs: u64,
+    /// LanceDB 自动压缩 cron 表达式（off/disabled/0 表示禁用）
+    pub lancedb_compact_cron: String,
 }
 
 /// 外部服务配置
@@ -173,6 +175,7 @@ impl ServerConfig {
             port: env_or_parse("HTKNOW_SERVER_PORT", 3000),
             upload_limit_mb: env_or_parse("HTKNOW_SERVER_UPLOAD_LIMIT_MB", 500),
             process_interval_secs: env_or_parse("HTKNOW_SERVER_PROCESS_INTERVAL_SECS", 10),
+            lancedb_compact_cron: env_or("HTKNOW_LANCEDB_COMPACT_CRON", "0 0 3 * * *"),
         }
     }
 }

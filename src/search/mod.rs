@@ -387,6 +387,11 @@ impl SearchEngine {
         Ok(expanded_queries)
     }
 
+    /// 清理 LanceDB 已删除的记录，释放空间
+    pub async fn compact_lancedb(&self) -> anyhow::Result<lancedb::CompactStats> {
+        lancedb::compact().await
+    }
+
     /// 使用图谱增强的搜索
     /// 先扩展查询，然后对每个扩展查询进行搜索，最后合并去重结果
     pub async fn search_with_graph_expansion(

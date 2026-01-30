@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{path::Path, sync::Arc};
 
 use anyhow::Result;
 use arrow_array::{
@@ -7,7 +7,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::stream::StreamExt;
 use lancedb::{
-    Connection, connect, query::{ExecutableQuery, QueryBase}, table::NewColumnTransform
+    Connection, connect, query::{ExecutableQuery, QueryBase}, table::{CompactionOptions, Duration, NewColumnTransform, OptimizeAction, OptimizeOptions}
 };
 use once_cell::sync::OnceCell;
 
@@ -17,6 +17,17 @@ use crate::config;
 static LANCEDB: OnceCell<Arc<Connection>> = OnceCell::new();
 static TABLE_NAME: &str = "documents";
 static IS_DELETED_COLUMN: &str = "is_deleted";
+
+#[derive(Debug, Clone)]
+pub struct CompactStats {
+    pub deleted_rows: u64,
+    pub deleted_rows_before: u64,
+    pub deleted_rows_after: u64,
+    pub total_rows_before: u64,
+    pub total_rows_after: u64,
+    pub size_before_bytes: u64,
+    pub size_after_bytes: u64,
+}
 
 #[derive(Clone)]
 pub struct Document {
@@ -277,8 +288,65 @@ pub async fn delete_by_kb(kb_id: i64) -> Result<()> {
     Ok(())
 }
 
+/// 清理已删除的记录，释放磁盘和内存空间
+pub async fn compact() -> Result<CompactStats> {
+    let conn = get_connection()?;
+    let table = conn.open_table(TABLE_NAME).execute().await?;
+    let storage_path = &config::get().storage.lancedb_path;
+
+    let size_before_bytes = dir_size_bytes(Path::new(storage_path))?;
+    let total_rows_before = table.count_rows(None).await? as u64;
+    let deleted_rows_before = table.count_rows(Some(format!("{} = true", IS_DELETED_COLUMN))).await? as u64;
+
+    // 删除标记为已删除的记录
+    let delete_predicate = format!("{} = true", IS_DELETED_COLUMN);
+    table.delete(&delete_predicate).await?;
+
+    // 执行 compact / index / prune，回收空间并强制清理旧版本
+    table.optimize(OptimizeAction::Compact { options: CompactionOptions::default(), remap_options: None }).await?;
+    table.optimize(OptimizeAction::Index(OptimizeOptions::default())).await?;
+    table
+        .optimize(OptimizeAction::Prune {
+            older_than: Some(Duration::minutes(10)),
+            delete_unverified: Some(false),
+            error_if_tagged_old_versions: Some(true),
+        })
+        .await?;
+
+    let total_rows_after = table.count_rows(None).await? as u64;
+    let deleted_rows_after = table.count_rows(Some(format!("{} = true", IS_DELETED_COLUMN))).await? as u64;
+    let size_after_bytes = dir_size_bytes(Path::new(storage_path))?;
+
+    Ok(CompactStats {
+        deleted_rows: deleted_rows_before.saturating_sub(deleted_rows_after),
+        deleted_rows_before,
+        deleted_rows_after,
+        total_rows_before,
+        total_rows_after,
+        size_before_bytes,
+        size_after_bytes,
+    })
+}
+
 fn get_connection() -> Result<Arc<Connection>> {
     LANCEDB.get().cloned().ok_or_else(|| anyhow::anyhow!("LanceDB not initialized"))
+}
+
+fn dir_size_bytes(path: &Path) -> Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut total = 0u64;
+    for entry in std::fs::read_dir(path)? {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if metadata.is_dir() {
+            total = total.saturating_add(dir_size_bytes(&entry.path())?);
+        } else {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
 }
 
 fn create_schema() -> Arc<ArrowSchema> {
