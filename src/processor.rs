@@ -1,8 +1,9 @@
 use std::{
-    collections::{HashMap, HashSet}, time::Duration
+    collections::{HashMap, HashSet}, sync::Arc, time::Duration
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
+use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
 use lopdf::Document;
 use reqwest::multipart;
@@ -162,17 +163,18 @@ impl FileProcessor {
 
     /// 启动后台处理任务
     pub fn start(self) {
+        let processor = Arc::new(self);
         tokio::spawn(async move {
-            info!("File processor started with interval: {:?}", self.interval);
+            info!("File processor started with interval: {:?}", processor.interval);
 
-            if let Err(e) = self.reset_processing_files().await {
+            if let Err(e) = processor.reset_processing_files().await {
                 error!("Failed to reset in-progress files: {}", e);
             }
 
             loop {
                 // 持续处理直到没有待处理的文件
                 loop {
-                    match self.process_pending_files().await {
+                    match processor.process_pending_files().await {
                         Ok(has_more) => {
                             if !has_more {
                                 // 没有更多文件需要处理，退出内循环
@@ -190,7 +192,7 @@ impl FileProcessor {
                 }
 
                 // 等待指定时间后再次检查
-                time::sleep(self.interval).await;
+                time::sleep(processor.interval).await;
             }
         });
     }
@@ -269,17 +271,31 @@ impl FileProcessor {
 
     /// 处理所有待处理的文件
     /// 返回是否还有更多文件需要处理
-    async fn process_pending_files(&self) -> anyhow::Result<bool> {
+    async fn process_pending_files(self: &Arc<Self>) -> anyhow::Result<bool> {
         let files = self.fetch_pending_files().await?;
 
         if files.is_empty() {
             return Ok(false);
         }
 
-        info!("Found {} pending files to process", files.len());
+        let cfg = config::get();
+        let concurrency = cfg.server.process_concurrency.max(1);
+        info!("Found {} pending files to process (concurrency: {})", files.len(), concurrency);
 
-        for file in files {
-            if let Err(e) = self.process_file(&file).await {
+        let results: Vec<_> = stream::iter(files)
+            .map(|file| {
+                let processor = Arc::clone(self);
+                async move {
+                    let result = processor.process_file(&file).await;
+                    (file, result)
+                }
+            })
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+        for (file, result) in results {
+            if let Err(e) = result {
                 error!("Failed to process file {}: {}", file.id, e);
                 if let Err(cleanup_err) = self.cleanup_processing_file_data(file.id).await {
                     error!("Failed to cleanup processing data for file {}: {}", file.id, cleanup_err);
@@ -591,17 +607,14 @@ impl FileProcessor {
     }
 
     async fn call_mineru_api(&self, file: &File, is_image: bool) -> anyhow::Result<Result> {
-        let file_bytes = tokio::fs::read(&file.path).await?;
         let cfg = config::get();
 
         if !is_image && cfg.services.mineru_max_pages > 0 {
-            match Document::load_mem(&file_bytes) {
+            match Document::load(&file.path) {
                 Ok(doc) => {
                     let total_pages = doc.get_pages().len();
                     if total_pages > cfg.services.mineru_max_pages {
-                        return self
-                            .call_mineru_api_in_ranges(file, file_bytes, total_pages, cfg.services.mineru_max_pages)
-                            .await;
+                        return self.call_mineru_api_in_ranges(file, total_pages, cfg.services.mineru_max_pages).await;
                     }
                 }
                 Err(e) => {
@@ -613,11 +626,11 @@ impl FileProcessor {
             }
         }
 
-        self.call_mineru_api_with_bytes(&file.filename, file_bytes, is_image, None, None).await
+        self.call_mineru_api_with_path(&file.path, &file.filename, is_image, None, None).await
     }
 
     async fn call_mineru_api_in_ranges(
-        &self, file: &File, file_bytes: Vec<u8>, total_pages: usize, max_pages: usize,
+        &self, file: &File, total_pages: usize, max_pages: usize,
     ) -> anyhow::Result<Result> {
         let total_parts = (total_pages + max_pages - 1) / max_pages;
         info!(
@@ -633,13 +646,7 @@ impl FileProcessor {
             let chunk_filename = format!("{}_part_{}.pdf", file.filename, part_index + 1);
 
             let chunk_result = self
-                .call_mineru_api_with_bytes(
-                    &chunk_filename,
-                    file_bytes.clone(),
-                    false,
-                    Some(range_start),
-                    Some(range_end),
-                )
+                .call_mineru_api_with_path(&file.path, &chunk_filename, false, Some(range_start), Some(range_end))
                 .await?;
             let mut chunk_items: Vec<ContentItem> = serde_json::from_str(&chunk_result.content_list)?;
 
@@ -674,9 +681,10 @@ impl FileProcessor {
         }
     }
 
-    async fn call_mineru_api_with_bytes(
-        &self, filename: &str, file_bytes: Vec<u8>, is_image: bool, start_page: Option<usize>, end_page: Option<usize>,
+    async fn call_mineru_api_with_path(
+        &self, file_path: &str, filename: &str, is_image: bool, start_page: Option<usize>, end_page: Option<usize>,
     ) -> anyhow::Result<Result> {
+        let file_bytes = tokio::fs::read(file_path).await?;
         let cfg = config::get();
         let mineru_url = cfg.services.mineru_url.trim_end_matches('/');
 
