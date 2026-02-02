@@ -379,16 +379,7 @@ impl FileProcessor {
         let mut last_error: Option<String> = None;
         for attempt in 0..2 {
             let output = tokio::process::Command::new("soffice")
-                .args(&[
-                    "--headless",
-                    "--nologo",
-                    "--norestore",
-                    "--convert-to",
-                    "pdf",
-                    "--outdir",
-                    temp_dir.to_str().unwrap(),
-                    &file.path,
-                ])
+                .args(&["--headless", "--convert-to", "pdf", "--outdir", temp_dir.to_str().unwrap(), &file.path])
                 .output()
                 .await?;
 
