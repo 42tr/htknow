@@ -456,7 +456,7 @@ impl FileProcessor {
             "SELECT COUNT(*) as count FROM pdf_contents WHERE file_id = ? AND bbox IS NOT NULL AND bbox != ''";
         let bbox_count: (i64,) = sqlx::query_as(bbox_sql).bind(file.id).fetch_one(&self.pool).await?;
 
-        let content_list: Vec<ContentItem>;
+        let mut content_list: Vec<ContentItem>;
 
         if count.0 > 0 && bbox_count.0 > 0 {
             // 已有数据，直接从数据库读取
@@ -499,8 +499,9 @@ impl FileProcessor {
                 .collect();
         } else {
             // 没有数据，调用 MinerU API
-            let mineru_result = self.call_mineru_api(file, is_image).await?;
+            let mut mineru_result = self.call_mineru_api(file, is_image).await?;
             content_list = serde_json::from_str(&mineru_result.content_list)?;
+            Self::prefix_images_for_file(file.id, &mut content_list, &mut mineru_result.images);
 
             // 提取文本内容并过滤掉 discarded 项
             let valid_content_items: Vec<ContentItem> =
@@ -710,6 +711,28 @@ impl FileProcessor {
             Some((dir, name)) => format!("{}/{}{}", dir, prefix, name),
             None => format!("{}{}", prefix, img_path),
         }
+    }
+
+    fn prefix_images_for_file(file_id: i64, content_list: &mut [ContentItem], images: &mut HashMap<String, String>) {
+        if images.is_empty() {
+            return;
+        }
+        let prefix = format!("f{}_", file_id);
+        let mut renamed: HashMap<String, String> = HashMap::new();
+        for item in content_list.iter_mut() {
+            let Some(img_path) = item.img_path.as_deref() else { continue };
+            let new_name =
+                renamed.entry(img_path.to_string()).or_insert_with(|| Self::prefix_image_path(img_path, &prefix));
+            item.img_path = Some(new_name.clone());
+        }
+
+        let mut new_images = HashMap::new();
+        for (img_name, img_base64) in images.drain() {
+            let new_name =
+                renamed.get(&img_name).cloned().unwrap_or_else(|| Self::prefix_image_path(&img_name, &prefix));
+            new_images.insert(new_name, img_base64);
+        }
+        *images = new_images;
     }
 
     async fn call_mineru_api_with_path(
