@@ -68,6 +68,26 @@ pub struct KnowledgeDetailResponse {
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
+pub struct FileWithoutContent {
+    pub id: i64,
+    pub user_id: String,
+    pub user_name: String,
+    pub hash: String,
+    pub filename: String,
+    pub path: String,
+    pub size: i64,
+    pub tags: String,
+    pub status: i32,
+    pub log: String,
+    pub slice_type: String,
+    pub kb_id: Option<i64>,
+    pub is_public: bool,
+    pub meta: Option<String>,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
 pub struct KnowledgeTreeNode {
     pub id: i64,
     pub user_id: String,
@@ -77,7 +97,7 @@ pub struct KnowledgeTreeNode {
     pub kb_type: String,
     pub parent_id: Option<i64>,
     pub is_public: bool,
-    pub files: Vec<super::file::File>,
+    pub files: Vec<FileWithoutContent>,
     #[schema(no_recursion)]
     pub children: Vec<KnowledgeTreeNode>,
 }
@@ -978,7 +998,7 @@ async fn build_subtree_recursive(
 
 async fn get_files_for_kb(
     pool: &SqlitePool, kb_id: i64, user_id: &str, is_admin: bool,
-) -> anyhow::Result<Vec<super::file::File>> {
+) -> anyhow::Result<Vec<FileWithoutContent>> {
     let files: Vec<super::file::File> = if is_admin {
         sqlx::query_as("SELECT * FROM files WHERE kb_id = ? ORDER BY filename").bind(kb_id).fetch_all(pool).await?
     } else {
@@ -988,7 +1008,29 @@ async fn get_files_for_kb(
             .fetch_all(pool)
             .await?
     };
-    Ok(files)
+    // Convert to FileWithoutContent by excluding the content field
+    let files_without_content = files
+        .into_iter()
+        .map(|f| FileWithoutContent {
+            id: f.id,
+            user_id: f.user_id,
+            user_name: f.user_name,
+            hash: f.hash,
+            filename: f.filename,
+            path: f.path,
+            size: f.size,
+            tags: f.tags,
+            status: f.status,
+            log: f.log,
+            slice_type: f.slice_type,
+            kb_id: f.kb_id,
+            is_public: f.is_public,
+            meta: f.meta,
+            created_at: f.created_at,
+            updated_at: f.updated_at,
+        })
+        .collect();
+    Ok(files_without_content)
 }
 
 /// 获取知识库树结构
