@@ -16,15 +16,17 @@ use crate::{
 pub struct SearchQuery {
     /// 搜索关键词
     pub query: String,
-    /// 文件 ID（可选）
-    pub file_id: Option<i64>,
+    /// 文件 ID（可选，逗号分隔多个，如 1,2）
+    #[param(value_type = String, example = "1,2")]
+    #[serde(default, deserialize_with = "deserialize_id_list")]
+    pub file_id: Option<Vec<i64>>,
     /// 知识库 ID（可选，逗号分隔多个，如 1,2）
     #[param(value_type = String, example = "1,2")]
-    #[serde(default, deserialize_with = "deserialize_kb_ids")]
+    #[serde(default, deserialize_with = "deserialize_id_list")]
     pub kb_id: Option<Vec<i64>>,
 }
 
-fn deserialize_kb_ids<'de, D>(deserializer: D) -> Result<Option<Vec<i64>>, D::Error>
+fn deserialize_id_list<'de, D>(deserializer: D) -> Result<Option<Vec<i64>>, D::Error>
 where
     D: serde::Deserializer<'de>, {
     let raw = Option::<String>::deserialize(deserializer)?;
@@ -129,11 +131,13 @@ pub struct FullSearchResult {
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ImageSearchQuery {
-    /// 文件 ID（可选）
-    pub file_id: Option<i64>,
+    /// 文件 ID（可选，逗号分隔多个，如 1,2）
+    #[param(value_type = String, example = "1,2")]
+    #[serde(default, deserialize_with = "deserialize_id_list")]
+    pub file_id: Option<Vec<i64>>,
     /// 知识库 ID（可选，逗号分隔多个，如 1,2）
     #[param(value_type = String, example = "1,2")]
-    #[serde(default, deserialize_with = "deserialize_kb_ids")]
+    #[serde(default, deserialize_with = "deserialize_id_list")]
     pub kb_id: Option<Vec<i64>>,
 }
 
@@ -165,7 +169,7 @@ pub async fn search(
     }
 
     let raw_results = search_engine
-        .search(&params.query, params.file_id, kb_ids_to_search.as_ref())
+        .search(&params.query, params.file_id.as_ref(), kb_ids_to_search.as_ref())
         .await
         .map_err(|e| crate::api::error::ApiError::internal(format!("Search failed: {}", e)))?;
 
@@ -263,7 +267,7 @@ pub async fn search_full(
     }
 
     let raw_results = search_engine
-        .search_full(&params.query, params.file_id, kb_ids_to_search.as_ref())
+        .search_full(&params.query, params.file_id.as_ref(), kb_ids_to_search.as_ref())
         .await
         .map_err(|e| crate::api::error::ApiError::internal(format!("Full search failed: {}", e)))?;
 
@@ -346,7 +350,7 @@ pub async fn search_with_graph(
     }
 
     let raw_results = search_engine
-        .search_with_graph_expansion(&params.query, params.file_id, kb_ids_to_search.as_ref())
+        .search_with_graph_expansion(&params.query, params.file_id.as_ref(), kb_ids_to_search.as_ref())
         .await
         .map_err(|e| crate::api::error::ApiError::internal(format!("Graph search failed: {}", e)))?;
 
@@ -485,7 +489,7 @@ pub async fn search_image(
     .map_err(|e| ApiError::Internal(format!("Image embedding failed: {}", e)))?;
 
     let raw_results = search_engine
-        .search_image(image_embedding, params.file_id, kb_ids_to_search.as_ref())
+        .search_image(image_embedding, params.file_id.as_ref(), kb_ids_to_search.as_ref())
         .await
         .map_err(|e| ApiError::internal(format!("Image search failed: {}", e)))?;
 

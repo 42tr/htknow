@@ -107,7 +107,9 @@ pub async fn write_documents_batch(docs: Vec<Document>) -> Result<()> {
     Ok(())
 }
 
-pub async fn search(query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>) -> Result<Vec<SearchResultItem>> {
+pub async fn search(
+    query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
+) -> Result<Vec<SearchResultItem>> {
     let cfg = config::get();
     let conn = get_connection()?;
     let table = conn.open_table(TABLE_NAME).execute().await?;
@@ -128,8 +130,11 @@ pub async fn search(query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>
     let mut filter_conditions = Vec::new();
     filter_conditions.push(format!("({} = false OR {} IS NULL)", IS_DELETED_COLUMN, IS_DELETED_COLUMN));
     filter_conditions.push("is_image = false".to_string());
-    if let Some(fid) = file_id {
-        filter_conditions.push(format!("file_id = {}", fid));
+    if let Some(fids) = file_ids {
+        if !fids.is_empty() {
+            let ids_str = fids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+            filter_conditions.push(format!("file_id IN ({})", ids_str));
+        }
     }
     if let Some(kids) = kb_ids {
         if !kids.is_empty() {
@@ -198,7 +203,7 @@ pub async fn search(query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>
 }
 
 pub async fn search_image(
-    query_vector: Vec<f32>, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>,
+    query_vector: Vec<f32>, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
 ) -> Result<Vec<SearchResultItem>> {
     let cfg = config::get();
     let conn = get_connection()?;
@@ -221,8 +226,11 @@ pub async fn search_image(
         format!("({} = false OR {} IS NULL)", IS_DELETED_COLUMN, IS_DELETED_COLUMN),
         "is_image = true".to_string(),
     ];
-    if let Some(fid) = file_id {
-        filter_conditions.push(format!("file_id = {}", fid));
+    if let Some(fids) = file_ids {
+        if !fids.is_empty() {
+            let ids_str = fids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+            filter_conditions.push(format!("file_id IN ({})", ids_str));
+        }
     }
     if let Some(kids) = kb_ids {
         if !kids.is_empty() {

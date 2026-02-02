@@ -104,11 +104,11 @@ pub async fn write_documents_batch(index: &Index, schema: &Schema, docs: Vec<Doc
 }
 
 pub async fn search(
-    reader: &IndexReader, schema: &Schema, query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>,
+    reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
 ) -> anyhow::Result<Vec<SearchResultItem>> {
     let cfg = config::get();
     let searcher = reader.searcher();
-    let tantivy_query = build_query(query, file_id, kb_ids, schema)?;
+    let tantivy_query = build_query(query, file_ids, kb_ids, schema)?;
     let search_start = Instant::now();
     let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(cfg.search.limit))?;
     debug!("Tantivy searcher.search {}ms", search_start.elapsed().as_millis());
@@ -142,12 +142,12 @@ pub async fn search(
 }
 
 pub async fn search_with_snippet(
-    reader: &IndexReader, schema: &Schema, query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>,
+    reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     max_chars: usize,
 ) -> anyhow::Result<Vec<FullSearchResultItem>> {
     let cfg = config::get();
     let searcher = reader.searcher();
-    let tantivy_query = build_query(query, file_id, kb_ids, schema)?;
+    let tantivy_query = build_query(query, file_ids, kb_ids, schema)?;
     let search_start = Instant::now();
     let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(cfg.search.limit))?;
     debug!("Tantivy full searcher.search {}ms", search_start.elapsed().as_millis());
@@ -198,7 +198,7 @@ pub async fn delete_by_kb(index: &Index, schema: &Schema, kb_id: i64) -> anyhow:
 }
 
 fn build_query(
-    input: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>, schema: &Schema,
+    input: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>, schema: &Schema,
 ) -> tantivy::Result<Box<dyn Query>> {
     let mut subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::new();
     let segmented_words = perform_segmentation(input, chinese_tokenizer::SegmentationMode::Search);
@@ -212,10 +212,20 @@ fn build_query(
     let content_bool = BooleanQuery::new(content_queries);
     subqueries.push((Occur::Must, Box::new(content_bool)));
 
-    if let Some(file_id) = file_id {
-        let file_id_query =
-            TermQuery::new(Term::from_field_i64(get_field(schema, "file_id"), file_id), IndexRecordOption::Basic);
-        subqueries.push((Occur::Must, Box::new(file_id_query)));
+    if let Some(ids) = file_ids {
+        if !ids.is_empty() {
+            let mut file_id_queries = Vec::new();
+            let file_id_field = get_field(schema, "file_id");
+            for file_id in ids {
+                let file_id_query =
+                    TermQuery::new(Term::from_field_i64(file_id_field, *file_id), IndexRecordOption::Basic);
+                file_id_queries.push((Occur::Should, Box::new(file_id_query) as Box<dyn Query>));
+            }
+            if !file_id_queries.is_empty() {
+                let file_ids_bool_query = BooleanQuery::new(file_id_queries);
+                subqueries.push((Occur::Must, Box::new(file_ids_bool_query)));
+            }
+        }
     }
 
     if let Some(ids) = kb_ids {

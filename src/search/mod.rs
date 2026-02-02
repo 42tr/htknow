@@ -182,18 +182,18 @@ impl SearchEngine {
     }
 
     pub async fn search(
-        &self, query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>,
+        &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     ) -> anyhow::Result<Vec<SearchResultItem>> {
         debug!("Searching for query: {}", query);
 
         // 使用 tantivy 搜索
-        let tantivy_results = tantivy_engine::search(&self.index_reader, &self.schema, query, file_id, kb_ids).await?;
+        let tantivy_results = tantivy_engine::search(&self.index_reader, &self.schema, query, file_ids, kb_ids).await?;
         debug!("Tantivy results count: {}", tantivy_results.len());
         debug!("Tantivy results: {:?}", tantivy_results);
 
         // 使用 lancedb 搜索
         let lancedb_start = Instant::now();
-        let lancedb_results = lancedb::search(query, file_id, kb_ids).await?;
+        let lancedb_results = lancedb::search(query, file_ids, kb_ids).await?;
         debug!("LanceDB search {}ms", lancedb_start.elapsed().as_millis());
         debug!("LanceDB results count: {}", lancedb_results.len());
         debug!("LanceDB results: {:?}", lancedb_results);
@@ -245,13 +245,13 @@ impl SearchEngine {
     }
 
     pub async fn search_full(
-        &self, query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>,
+        &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     ) -> anyhow::Result<Vec<FullSearchResultItem>> {
         tantivy_engine::search_with_snippet(
             &self.full_index_reader,
             &self.full_schema,
             query,
-            file_id,
+            file_ids,
             kb_ids,
             FULL_SNIPPET_MAX_CHARS,
         )
@@ -259,9 +259,9 @@ impl SearchEngine {
     }
 
     pub async fn search_image(
-        &self, image_embedding: Vec<f32>, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>,
+        &self, image_embedding: Vec<f32>, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     ) -> anyhow::Result<Vec<SearchResultItem>> {
-        lancedb::search_image(image_embedding, file_id, kb_ids).await
+        lancedb::search_image(image_embedding, file_ids, kb_ids).await
     }
 
     async fn rerank(&self, query: &str, results: Vec<SearchResultItem>) -> anyhow::Result<Vec<SearchResultItem>> {
@@ -417,21 +417,21 @@ impl SearchEngine {
     /// 使用图谱增强的搜索
     /// 先扩展查询，然后对每个扩展查询进行搜索，最后合并去重结果
     pub async fn search_with_graph_expansion(
-        &self, query: &str, file_id: Option<i64>, kb_ids: Option<&Vec<i64>>,
+        &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     ) -> anyhow::Result<Vec<SearchResultItem>> {
         // 1. 扩展查询
         let expanded_queries = self.expand_query_with_graph(query, kb_ids).await?;
 
         if expanded_queries.len() == 1 {
             // 没有扩展，直接使用原查询
-            return self.search(query, file_id, kb_ids).await;
+            return self.search(query, file_ids, kb_ids).await;
         }
 
         // 2. 对每个扩展查询进行搜索
         let mut all_results: HashMap<i64, SearchResultItem> = HashMap::new();
 
         for (idx, expanded_query) in expanded_queries.iter().enumerate() {
-            let results = self.search(expanded_query, file_id, kb_ids).await?;
+            let results = self.search(expanded_query, file_ids, kb_ids).await?;
 
             // 原始查询的结果权重更高
             let weight = if idx == 0 { 1.0 } else { 0.7 };
