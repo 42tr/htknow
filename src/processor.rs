@@ -376,7 +376,16 @@ impl FileProcessor {
         // 使用 LibreOffice 将 Word/Excel 转换为 PDF
         // 注意：这需要系统中安装了 LibreOffice
         let output = tokio::process::Command::new("soffice")
-            .args(&["--headless", "--convert-to", "pdf", "--outdir", temp_dir.to_str().unwrap(), &file.path])
+            .args(&[
+                "--headless",
+                "--nologo",
+                "--norestore",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                temp_dir.to_str().unwrap(),
+                &file.path,
+            ])
             .output()
             .await?;
 
