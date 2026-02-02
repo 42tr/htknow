@@ -375,22 +375,44 @@ impl FileProcessor {
 
         // 使用 LibreOffice 将 Word/Excel 转换为 PDF
         // 注意：这需要系统中安装了 LibreOffice
-        let output = tokio::process::Command::new("soffice")
-            .args(&[
-                "--headless",
-                "--nologo",
-                "--norestore",
-                "--convert-to",
-                "pdf",
-                "--outdir",
-                temp_dir.to_str().unwrap(),
-                &file.path,
-            ])
-            .output()
-            .await?;
+        let mut converted_ok = false;
+        let mut last_error: Option<String> = None;
+        for attempt in 0..2 {
+            let output = tokio::process::Command::new("soffice")
+                .args(&[
+                    "--headless",
+                    "--nologo",
+                    "--norestore",
+                    "--convert-to",
+                    "pdf",
+                    "--outdir",
+                    temp_dir.to_str().unwrap(),
+                    &file.path,
+                ])
+                .output()
+                .await?;
 
-        if !output.status.success() {
-            let error_msg = String::from_utf8_lossy(&output.stderr);
+            if output.status.success() {
+                converted_ok = true;
+                break;
+            }
+
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let error_msg =
+                if stderr.is_empty() { format!("LibreOffice exited with {}", output.status) } else { stderr };
+            last_error = Some(error_msg);
+
+            if attempt == 0 {
+                warn!(
+                    "LibreOffice convert failed, retrying in 3s: {}",
+                    last_error.as_deref().unwrap_or("unknown error")
+                );
+                time::sleep(Duration::from_secs(3)).await;
+            }
+        }
+
+        if !converted_ok {
+            let error_msg = last_error.unwrap_or_else(|| "unknown error".to_string());
             return Err(anyhow::anyhow!("Failed to convert Word to PDF: {}", error_msg));
         }
 
