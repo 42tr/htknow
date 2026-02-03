@@ -320,6 +320,9 @@ impl FileProcessor {
     /// 处理单个文件
     async fn process_file(&self, file: &File) -> anyhow::Result<()> {
         info!("Processing file: {} ({})", file.filename, file.id);
+        if !self.ensure_file_exists(file.id, "process start").await? {
+            return Ok(());
+        }
         if self.is_storage_kb(file.kb_id).await? {
             info!("Skipping parsing for storage knowledge base file {}", file.id);
             self.mark_file_storage_skipped(file.id).await?;
@@ -340,20 +343,35 @@ impl FileProcessor {
         let is_excel = filename_lower.ends_with(".xls") || filename_lower.ends_with(".xlsx");
 
         if is_word || is_excel {
+            if !self.ensure_file_exists(file.id, "before office conversion").await? {
+                return Ok(());
+            }
             // Word/Excel 文档：先转换为 PDF，再使用 process_pdf_file 处理
             let doc_kind = if is_word { "Word" } else { "Excel" };
             info!("Detected {} document, converting to PDF: {}", doc_kind, file.filename);
             self.convert_office_to_pdf_and_process(file).await?;
         } else if is_pdf {
+            if !self.ensure_file_exists(file.id, "before pdf processing").await? {
+                return Ok(());
+            }
             // 处理 PDF 或图片文件
             self.process_pdf_file(file, None, false, None).await?;
         } else if is_image {
+            if !self.ensure_file_exists(file.id, "before image embedding").await? {
+                return Ok(());
+            }
             let image_embedding =
                 search::embedding::get_image_embedding_from_path(&file.path, Some(&file.filename)).await?;
             self.process_pdf_file(file, Some(image_embedding), true, None).await?;
         } else if is_audio {
+            if !self.ensure_file_exists(file.id, "before audio processing").await? {
+                return Ok(());
+            }
             self.process_audio_file(file).await?;
         } else {
+            if !self.ensure_file_exists(file.id, "before text processing").await? {
+                return Ok(());
+            }
             // 处理普通文本文件
             self.process_text_file(file).await?;
         }
@@ -454,6 +472,9 @@ impl FileProcessor {
     async fn process_pdf_file(
         &self, file: &File, image_embedding: Option<Vec<f32>>, is_image: bool, index_filename: Option<&str>,
     ) -> anyhow::Result<()> {
+        if !self.ensure_file_exists(file.id, "pdf processing start").await? {
+            return Ok(());
+        }
         info!("Processing PDF file: {}", file.filename);
 
         // 先检查 pdf_contents 表中是否已有该文件的数据
@@ -509,6 +530,10 @@ impl FileProcessor {
             let mut mineru_result = self.call_mineru_api(file, is_image).await?;
             content_list = serde_json::from_str(&mineru_result.content_list)?;
             Self::prefix_images_for_file(file.id, &mut content_list, &mut mineru_result.images);
+
+            if !self.ensure_file_exists(file.id, "before writing pdf contents").await? {
+                return Ok(());
+            }
 
             // 提取文本内容并过滤掉 discarded 项
             let valid_content_items: Vec<ContentItem> =
@@ -576,6 +601,10 @@ impl FileProcessor {
                 .collect()
         };
 
+        if !self.ensure_file_exists(file.id, "before writing slices").await? {
+            return Ok(());
+        }
+
         let slice_count = slices.len();
         let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
         let mut search_docs = Vec::new();
@@ -624,6 +653,10 @@ impl FileProcessor {
             // 不影响主流程，仅记录错误
         }
 
+        if !self.ensure_file_exists(file.id, "before writing full index").await? {
+            return Ok(());
+        }
+
         let index_filename = index_filename.unwrap_or(file.filename.as_str());
         let index_full_content = format!("{}\n\n{}", index_filename, full_content);
         debug!("write full content: {}", index_full_content);
@@ -632,6 +665,9 @@ impl FileProcessor {
             .await?;
 
         // 更新文件状态
+        if !self.ensure_file_exists(file.id, "before updating status").await? {
+            return Ok(());
+        }
         let sql = "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
         sqlx::query(sql)
             .bind(&full_content)
@@ -890,6 +926,9 @@ impl FileProcessor {
 
     /// 处理普通文本文件
     async fn process_text_file(&self, file: &File) -> anyhow::Result<()> {
+        if !self.ensure_file_exists(file.id, "before reading text").await? {
+            return Ok(());
+        }
         // 示例：读取文件内容
         let content = tokio::fs::read_to_string(file.path.as_str()).await?;
         self.process_plain_text_content(file, &content, "Processing completed successfully").await
@@ -898,6 +937,9 @@ impl FileProcessor {
     async fn process_audio_file(&self, file: &File) -> anyhow::Result<()> {
         info!("Processing audio file: {}", file.filename);
 
+        if !self.ensure_file_exists(file.id, "before reading audio").await? {
+            return Ok(());
+        }
         let file_bytes = tokio::fs::read(&file.path).await?;
         let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string();
 
@@ -930,6 +972,9 @@ impl FileProcessor {
     }
 
     async fn process_plain_text_content(&self, file: &File, content: &str, log_message: &str) -> anyhow::Result<()> {
+        if !self.ensure_file_exists(file.id, "before writing slices").await? {
+            return Ok(());
+        }
         // 示例：根据 slice_type 进行分片处理
         let slices = self.slice_content(content, &file.slice_type)?;
         let slice_count = slices.len();
@@ -948,12 +993,18 @@ impl FileProcessor {
             self.search_engine.write_batch(search_docs, embeddings).await?;
         }
 
+        if !self.ensure_file_exists(file.id, "before writing full index").await? {
+            return Ok(());
+        }
         let index_full_content = format!("{}\n\n{}", file.filename, content);
         self.search_engine
             .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
             .await?;
 
         // 更新文件状态为已处理，并保存内容
+        if !self.ensure_file_exists(file.id, "before updating status").await? {
+            return Ok(());
+        }
         let sql = "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
         sqlx::query(sql).bind(content).bind(log_message).bind(file.id).execute(&self.pool).await?;
 
@@ -979,6 +1030,18 @@ impl FileProcessor {
         let sql = "UPDATE files SET status = 3, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
         sqlx::query(sql).bind("Storage mode: not parsed").bind(file_id).execute(&self.pool).await?;
         Ok(())
+    }
+
+    async fn ensure_file_exists(&self, file_id: i64, stage: &str) -> anyhow::Result<bool> {
+        let exists = sqlx::query_scalar::<_, i64>("SELECT 1 FROM files WHERE id = ? LIMIT 1")
+            .bind(file_id)
+            .fetch_optional(&self.pool)
+            .await?
+            .is_some();
+        if !exists {
+            info!("File {} no longer exists during {}, skipping further processing", file_id, stage);
+        }
+        Ok(exists)
     }
 
     async fn is_storage_kb(&self, kb_id: Option<i64>) -> anyhow::Result<bool> {
