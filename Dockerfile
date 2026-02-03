@@ -5,17 +5,52 @@ FROM docker.1ms.run/debian:bookworm-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
-    # LibreOffice for Word to PDF conversion
-    libreoffice-writer \
-    libreoffice-core \
     # SSL certificates for HTTPS requests
     ca-certificates \
     # Timezone data
     tzdata \
     # sqlite3
     sqlite3 \
-    # Clean up
+    # LibreOffice runtime libraries
+    libxinerama1 \
+    libx11-6 \
+    libxext6 \
+    libxrender1 \
+    libxrandr2 \
+    libxcb1 \
+    libxau6 \
+    libxdmcp6 \
+    libxfixes3 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxshmfence1 \
+    libfontconfig1 \
+    libfreetype6 \
+    libcairo2 \
+    libglib2.0-0 \
+    libcups2 \
+    libnss3 \
+    libsm6 \
+    libice6 \
+    libgl1 \
+    fonts-dejavu \
+    fonts-noto \
+    fontconfig \
+    # Tools for installing LibreOffice from tarball
+    tar \
     && rm -rf /var/lib/apt/lists/*
+
+# Install LibreOffice from official tarball
+ARG LO_VERSION=25.8.4
+ARG LO_TARBALL=LibreOffice_25.8.4_Linux_x86-64_deb.tar.gz
+COPY ${LO_TARBALL} /tmp/
+RUN LO_DIR="$(tar -tzf /tmp/${LO_TARBALL} | head -1 | cut -d/ -f1)" \
+    && tar -xzf /tmp/${LO_TARBALL} -C /tmp \
+    && dpkg -i /tmp/${LO_DIR}/DEBS/*.deb \
+    && rm -rf /tmp/${LO_TARBALL} /tmp/${LO_DIR}
+
+# Ensure `soffice` is available on PATH
+RUN ln -sf /opt/libreoffice25.8/program/soffice /usr/bin/soffice
 
 # Configure timezone
 ENV TZ=Asia/Shanghai
