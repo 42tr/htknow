@@ -377,11 +377,27 @@ impl FileProcessor {
         // 注意：这需要系统中安装了 LibreOffice
         let mut converted_ok = false;
         let mut last_error: Option<String> = None;
+        let convert_timeout = Duration::from_secs(120);
         for attempt in 0..2 {
-            let output = tokio::process::Command::new("soffice")
+            let mut command = tokio::process::Command::new("soffice");
+            command
                 .args(&["--headless", "--convert-to", "pdf", "--outdir", temp_dir.to_str().unwrap(), &file.path])
-                .output()
-                .await?;
+                .kill_on_drop(true);
+
+            let output = match time::timeout(convert_timeout, command.output()).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    last_error = Some(format!("LibreOffice timed out after {}s", convert_timeout.as_secs()));
+                    if attempt == 0 {
+                        warn!(
+                            "LibreOffice convert timed out, retrying in 3s: {}",
+                            last_error.as_deref().unwrap_or("unknown error")
+                        );
+                        time::sleep(Duration::from_secs(3)).await;
+                    }
+                    continue;
+                }
+            };
 
             if output.status.success() {
                 converted_ok = true;
