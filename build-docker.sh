@@ -10,18 +10,20 @@ cd ..
 
 # Parse command line arguments
 BUILD_MODE="release"
+PROFILING_FLAG=""
 if [ "$1" = "debug" ] || [ "$1" = "--debug" ]; then
     BUILD_MODE="debug"
+    PROFILING_FLAG="--features profiling"
 fi
 
 if [ "$BUILD_MODE" = "debug" ]; then
-    echo "Building htknow for debug..."
-    cargo build
+    echo "Building htknow for debug with profiling..."
+    cargo build ${PROFILING_FLAG}
     IMAGE_TAG="$(date +%Y%m%d%H%M)-debug"
     DOCKERFILE="Dockerfile.debug"
     echo "Using Dockerfile.debug with jemalloc profiling tools"
 else
-    echo "Building htknow for release..."
+    echo "Building htknow for release (profiling disabled)..."
     cargo build --release
     IMAGE_TAG="$(date +%Y%m%d%H%M)"
     DOCKERFILE="Dockerfile"

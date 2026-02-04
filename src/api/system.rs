@@ -119,7 +119,7 @@ pub async fn lancedb_compact(
     }))
 }
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "profiling")]
 async fn heap_profile_impl() -> ApiResult<Response> {
     use std::{
         ffi::CString, time::{SystemTime, UNIX_EPOCH}
@@ -165,12 +165,12 @@ async fn heap_profile_impl() -> ApiResult<Response> {
     Ok(response)
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(feature = "profiling"))]
 async fn heap_profile_impl() -> ApiResult<Response> {
-    Err(ApiError::BadRequest("Heap profiling is only available in debug builds.".to_string()))
+    Err(ApiError::BadRequest("Heap profiling is only available with 'profiling' feature enabled.".to_string()))
 }
 
-#[cfg(debug_assertions)]
+#[cfg(feature = "profiling")]
 async fn heap_profile_pdf_impl() -> ApiResult<Response> {
     use std::{
         ffi::CString, time::{SystemTime, UNIX_EPOCH}
@@ -258,7 +258,7 @@ async fn heap_profile_pdf_impl() -> ApiResult<Response> {
     Ok(response)
 }
 
-#[cfg(not(debug_assertions))]
+#[cfg(not(feature = "profiling"))]
 async fn heap_profile_pdf_impl() -> ApiResult<Response> {
-    Err(ApiError::BadRequest("Heap profiling is only available in debug builds.".to_string()))
+    Err(ApiError::BadRequest("Heap profiling is only available with 'profiling' feature enabled.".to_string()))
 }

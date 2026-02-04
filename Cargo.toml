@@ -53,12 +53,16 @@ lopdf = "0.36"
 etcd-client = { version = "0.14", optional = true }
 serde_with = "3.16.1"
 sysinfo = "0.29"
-tikv-jemallocator = { version = "0.6", features = ["profiling"] }
-tikv-jemalloc-ctl = { version = "0.6", features = ["profiling", "use_std"] }
+# jemalloc allocator
+# Note: profiling is only needed for debug/analysis, disabled in release for better performance
+tikv-jemallocator = { version = "0.6" }
+tikv-jemalloc-ctl = { version = "0.6", optional = true, features = ["use_std"] }
 
 [features]
 default = []
 etcd = ["etcd-client"]
+# Enable jemalloc profiling for debug/analysis builds only
+profiling = ["tikv-jemalloc-ctl"]
 
 [dev-dependencies]
 http-body-util = "0.1"
