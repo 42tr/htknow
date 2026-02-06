@@ -71,6 +71,32 @@ struct AudioTranscriptionResponse {
     #[serde(default)]
     language: String,
 }
+
+#[derive(Debug, Deserialize)]
+struct CustomParseResponse {
+    #[serde(default)]
+    code: i32,
+    #[serde(default)]
+    message: String,
+    data: Option<CustomParseData>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CustomParseData {
+    #[serde(default)]
+    slices: Vec<CustomSlice>,
+    #[serde(default)]
+    full_content: Option<String>,
+    #[serde(default)]
+    images: Option<HashMap<String, String>>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CustomSlice {
+    content: String,
+    #[serde(default)]
+    positions: Vec<SlicePosition>,
+}
 /*
 "type": "text",
 "text": "维修服务信息",
@@ -332,6 +358,13 @@ impl FileProcessor {
         let sql = "UPDATE files SET status = 2, updated_at = strftime('%s','now') WHERE id = ?";
         sqlx::query(sql).bind(file.id).execute(&self.pool).await?;
 
+        let cfg = config::get();
+        if let Some(custom_url) = cfg.services.custom_parse_url.as_deref() {
+            info!("Custom parse enabled, routing file {} to {}", file.id, custom_url);
+            self.process_file_with_custom_parser(file, custom_url).await?;
+            return Ok(());
+        }
+
         // 检查文件是否为 PDF 或图片
         let filename_lower = file.filename.to_lowercase();
         let is_pdf = filename_lower.ends_with(".pdf");
@@ -376,6 +409,158 @@ impl FileProcessor {
             self.process_text_file(file).await?;
         }
 
+        Ok(())
+    }
+
+    async fn process_file_with_custom_parser(&self, file: &File, custom_url: &str) -> anyhow::Result<()> {
+        if !self.ensure_file_exists(file.id, "custom parse start").await? {
+            return Ok(());
+        }
+
+        let parse_data = self.call_custom_parse_api(file, custom_url).await?;
+
+        if let Some(images) = parse_data.images.as_ref() {
+            if !images.is_empty() {
+                self.save_custom_images(images).await?;
+            }
+        }
+
+        self.save_custom_slices(file, &parse_data.slices, parse_data.full_content.as_deref()).await?;
+
+        Ok(())
+    }
+
+    async fn call_custom_parse_api(&self, file: &File, custom_url: &str) -> anyhow::Result<CustomParseData> {
+        let file_bytes = tokio::fs::read(&file.path).await?;
+        let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string();
+        let form = multipart::Form::new()
+            .part("file", multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str(&mime_type)?);
+
+        let client = reqwest::Client::new();
+        let response = client.post(custom_url).multipart(form).send().await?;
+        let status = response.status();
+        let body_bytes = response.bytes().await?;
+        if !status.is_success() {
+            let error_text = String::from_utf8_lossy(&body_bytes);
+            return Err(anyhow::anyhow!("Custom parse API failed: {}", error_text));
+        }
+
+        let parsed: CustomParseResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
+            let body_text = String::from_utf8_lossy(&body_bytes);
+            anyhow::anyhow!("Custom parse API response decode failed: {} - {}", e, body_text)
+        })?;
+
+        if parsed.code != 200 {
+            let msg =
+                if parsed.message.is_empty() { "Custom parse API returned error".to_string() } else { parsed.message };
+            return Err(anyhow::anyhow!("{}", msg));
+        }
+
+        let data = parsed.data.ok_or_else(|| anyhow::anyhow!("Custom parse API returned empty data"))?;
+        if data.slices.is_empty() {
+            return Err(anyhow::anyhow!("Custom parse API returned empty slices"));
+        }
+
+        Ok(data)
+    }
+
+    async fn save_custom_slices(
+        &self, file: &File, slices: &[CustomSlice], full_content: Option<&str>,
+    ) -> anyhow::Result<()> {
+        if !self.ensure_file_exists(file.id, "before writing custom slices").await? {
+            return Ok(());
+        }
+
+        let derived_full_content = match full_content {
+            Some(content) if !content.trim().is_empty() => content.to_string(),
+            _ => {
+                let mut combined = String::new();
+                for (idx, slice) in slices.iter().enumerate() {
+                    if idx > 0 {
+                        combined.push_str("\n\n");
+                    }
+                    combined.push_str(&slice.content);
+                }
+                combined
+            }
+        };
+
+        let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
+        let mut search_docs = Vec::new();
+
+        for slice in slices {
+            let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
+            let id = sqlx::query(sql).bind(file.id).bind(&slice.content).execute(&self.pool).await?.last_insert_rowid();
+            for position in &slice.positions {
+                position_rows.push((id, position.clone()));
+            }
+            search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, slice.content.clone()));
+        }
+
+        if !search_docs.is_empty() {
+            let embeddings = vec![None; search_docs.len()];
+            self.search_engine.write_batch(search_docs, embeddings).await?;
+        }
+
+        if !position_rows.is_empty() {
+            let binds_per_row = 6_usize;
+            let max_vars = 999_usize;
+            let batch_size = std::cmp::max(1, max_vars / binds_per_row);
+            for chunk in position_rows.chunks(batch_size) {
+                let mut pos_sql =
+                    QueryBuilder::<Sqlite>::new("insert into slice_positions(slice_id, page_idx, x1, y1, x2, y2) ");
+                pos_sql.push_values(chunk.iter(), |mut b, (slice_id, position)| {
+                    b.push_bind(slice_id)
+                        .push_bind(position.page_idx)
+                        .push_bind(position.bbox[0])
+                        .push_bind(position.bbox[1])
+                        .push_bind(position.bbox[2])
+                        .push_bind(position.bbox[3]);
+                });
+                pos_sql.build().execute(&self.pool).await?;
+            }
+        }
+
+        if !self.ensure_file_exists(file.id, "before writing custom full index").await? {
+            return Ok(());
+        }
+        let index_full_content = format!("{}\n\n{}", file.filename, derived_full_content);
+        self.search_engine
+            .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
+            .await?;
+
+        if !self.ensure_file_exists(file.id, "before updating custom status").await? {
+            return Ok(());
+        }
+        let sql = "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
+        sqlx::query(sql)
+            .bind(&derived_full_content)
+            .bind("Custom parse processed successfully")
+            .bind(file.id)
+            .execute(&self.pool)
+            .await?;
+
+        info!("File {} processed successfully with {} custom slices", file.id, slices.len());
+
+        if let Err(e) = self.build_knowledge_graph(file).await {
+            error!("Failed to build knowledge graph for file {}: {}", file.id, e);
+        }
+
+        Ok(())
+    }
+
+    async fn save_custom_images(&self, images: &HashMap<String, String>) -> anyhow::Result<()> {
+        let cfg = config::get();
+        fs::create_dir_all(&cfg.storage.images_path).await?;
+        info!("custom image count: {}", images.len());
+        for (img_name, img_base64) in images {
+            let payload = match img_base64.find("base64,") {
+                Some(idx) => &img_base64[idx + "base64,".len()..],
+                None => img_base64.as_str(),
+            };
+            let bytes = STANDARD.decode(payload)?;
+            fs::write(format!("{}/{}", cfg.storage.images_path, img_name), bytes).await?;
+        }
         Ok(())
     }
 

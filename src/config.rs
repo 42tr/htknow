@@ -66,6 +66,8 @@ pub struct ServicesConfig {
     pub mineru_url: String,
     /// MinerU 单次解析 PDF 最大页数（0 表示不限制）
     pub mineru_max_pages: usize,
+    /// 自定义解析服务地址（配置后所有文件解析走该服务）
+    pub custom_parse_url: Option<String>,
     /// 音频转写服务地址
     pub audio_transcription_url: String,
     /// 音频转写服务 API Key（可选）
@@ -188,6 +190,7 @@ impl ServicesConfig {
         Self {
             mineru_url: env_or("HTKNOW_MINERU_URL", "http://192.168.0.46:10001/file_parse"),
             mineru_max_pages: env_or_parse("HTKNOW_MINERU_MAX_PAGES", 50),
+            custom_parse_url: env_optional("HTKNOW_CUSTOM_PARSE_URL"),
             audio_transcription_url: env_or(
                 "HTKNOW_AUDIO_TRANSCRIPTION_URL",
                 "http://192.168.0.46:59805/api/v1/audio/transcriptions",
@@ -279,6 +282,14 @@ impl LLMConfig {
 /// 从环境变量读取字符串，如果不存在则返回默认值
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+/// 从环境变量读取字符串，空字符串视为未配置
+fn env_optional(key: &str) -> Option<String> {
+    std::env::var(key).ok().and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+    })
 }
 
 /// 从环境变量读取并解析值，如果不存在或解析失败则返回默认值
