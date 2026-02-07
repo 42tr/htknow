@@ -66,7 +66,7 @@ pub struct ServicesConfig {
     pub mineru_url: String,
     /// MinerU 单次解析 PDF 最大页数（0 表示不限制）
     pub mineru_max_pages: usize,
-    /// 自定义解析服务地址（配置后所有文件解析走该服务）
+    /// 自定义解析服务地址（配置后仅 Word/PDF 走该服务）
     pub custom_parse_url: Option<String>,
     /// 音频转写服务地址
     pub audio_transcription_url: String,

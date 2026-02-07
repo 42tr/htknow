@@ -358,13 +358,6 @@ impl FileProcessor {
         let sql = "UPDATE files SET status = 2, updated_at = strftime('%s','now') WHERE id = ?";
         sqlx::query(sql).bind(file.id).execute(&self.pool).await?;
 
-        let cfg = config::get();
-        if let Some(custom_url) = cfg.services.custom_parse_url.as_deref() {
-            info!("Custom parse enabled, routing file {} to {}", file.id, custom_url);
-            self.process_file_with_custom_parser(file, custom_url).await?;
-            return Ok(());
-        }
-
         // 检查文件是否为 PDF 或图片
         let filename_lower = file.filename.to_lowercase();
         let is_pdf = filename_lower.ends_with(".pdf");
@@ -374,6 +367,15 @@ impl FileProcessor {
         // 检查文件是否为 Word 或 Excel 文档
         let is_word = filename_lower.ends_with(".doc") || filename_lower.ends_with(".docx");
         let is_excel = filename_lower.ends_with(".xls") || filename_lower.ends_with(".xlsx");
+
+        let cfg = config::get();
+        if let Some(custom_url) = cfg.services.custom_parse_url.as_deref() {
+            if is_pdf || is_word {
+                info!("Custom parse enabled, routing file {} to {}", file.id, custom_url);
+                self.process_file_with_custom_parser(file, custom_url).await?;
+                return Ok(());
+            }
+        }
 
         if is_word || is_excel {
             if !self.ensure_file_exists(file.id, "before office conversion").await? {
