@@ -217,19 +217,21 @@ fn calc_bbox_transform(page_box: &PageBox, bounds: Option<PageCoordBounds>) -> B
         return BboxTransform { scale_x: 1.0, scale_y: 1.0, offset_x: 0.0, offset_y: 0.0 };
     };
 
-    let min_x = bounds.min_x.max(0.0);
-    let min_y = bounds.min_y.max(0.0);
-    let padded_range_x = bounds.max_x + min_x;
-    let padded_range_y = bounds.max_y + min_y;
+    // 计算实际坐标范围（max - min）
+    let coord_range_x = bounds.max_x - bounds.min_x;
+    let coord_range_y = bounds.max_y - bounds.min_y;
 
-    let ratio_x = if padded_range_x > 0.0 { page_box.width / padded_range_x } else { 1.0 };
-    let ratio_y = if padded_range_y > 0.0 { page_box.height / padded_range_y } else { 1.0 };
+    // 计算缩放比例
+    let ratio_x = if coord_range_x > 0.0 { page_box.width / coord_range_x } else { 1.0 };
+    let ratio_y = if coord_range_y > 0.0 { page_box.height / coord_range_y } else { 1.0 };
 
-    let scale_x = if padded_range_x > page_box.width * BBOX_SCALE_TOLERANCE { ratio_x.min(1.0) } else { 1.0 };
-    let scale_y = if padded_range_y > page_box.height * BBOX_SCALE_TOLERANCE { ratio_y.min(1.0) } else { 1.0 };
+    // 只在坐标范围明显超出页面时才缩放
+    let scale_x = if coord_range_x > page_box.width * BBOX_SCALE_TOLERANCE { ratio_x.min(1.0) } else { 1.0 };
+    let scale_y = if coord_range_y > page_box.height * BBOX_SCALE_TOLERANCE { ratio_y.min(1.0) } else { 1.0 };
 
-    let offset_x = if bounds.min_x < 0.0 { bounds.min_x } else { 0.0 };
-    let offset_y = if bounds.min_y < 0.0 { bounds.min_y } else { 0.0 };
+    // 偏移量：将 min 坐标映射到 0
+    let offset_x = bounds.min_x;
+    let offset_y = bounds.min_y;
 
     BboxTransform { scale_x, scale_y, offset_x, offset_y }
 }
