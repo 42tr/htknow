@@ -1,5 +1,5 @@
 <script setup>
-import { computed } from 'vue'
+import { computed, ref } from 'vue'
 
 const props = defineProps({
   stats: {
@@ -45,12 +45,12 @@ const normalizedStats = computed(() => ({
 }))
 
 const cardConfigs = [
-  { key: 'pending', label: '待处理', icon: '⏳', bar: 'bg-amber-300', chip: 'bg-amber-50 text-amber-700' },
-  { key: 'processing', label: '处理中', icon: '⚙️', bar: 'bg-blue-300', chip: 'bg-blue-50 text-blue-700' },
-  { key: 'completed', label: '已完成', icon: '✓', bar: 'bg-emerald-400', chip: 'bg-emerald-50 text-emerald-700' },
-  { key: 'failed', label: '处理失败', icon: '✗', bar: 'bg-red-400', chip: 'bg-red-50 text-red-700' },
-  { key: 'skipped', label: '不解析', icon: '🗄️', bar: 'bg-slate-300', chip: 'bg-slate-50 text-slate-600' },
-  { key: 'unknown', label: '未知状态', icon: '?', bar: 'bg-slate-200', chip: 'bg-slate-50 text-slate-600' },
+  { key: 'pending', label: '待处理', bar: 'bg-amber-300', chip: 'bg-amber-50 text-amber-700' },
+  { key: 'processing', label: '处理中', bar: 'bg-blue-300', chip: 'bg-blue-50 text-blue-700' },
+  { key: 'completed', label: '已完成', bar: 'bg-emerald-400', chip: 'bg-emerald-50 text-emerald-700' },
+  { key: 'failed', label: '处理失败', bar: 'bg-red-400', chip: 'bg-red-50 text-red-700' },
+  { key: 'skipped', label: '不解析', bar: 'bg-slate-300', chip: 'bg-slate-50 text-slate-600' },
+  { key: 'unknown', label: '未知状态', bar: 'bg-slate-200', chip: 'bg-slate-50 text-slate-600' },
 ]
 
 const cards = computed(() => {
@@ -61,10 +61,17 @@ const cards = computed(() => {
 })
 
 const hasData = computed(() => normalizedStats.value.total > 0)
+const processingFiles = computed(() => props.stats?.processing_files ?? [])
+const hoveredCard = ref(null)
 
 const getPercent = (value) => {
   if (!normalizedStats.value.total) return 0
   return Math.round((value / normalizedStats.value.total) * 100)
+}
+
+const formatTimestamp = (timestamp) => {
+  if (!timestamp) return '-'
+  return new Date(timestamp * 1000).toLocaleString('zh-CN')
 }
 </script>
 
@@ -93,11 +100,19 @@ const getPercent = (value) => {
             <div v-for="i in 4" :key="`stats-skeleton-${i}`" class="h-10 flex-1 rounded-full bg-slate-100 animate-pulse" />
           </div>
 
-          <div v-else-if="hasData" class="flex items-center gap-2 overflow-x-auto scrollbar-thin scrollbar-thumb-slate-300">
+          <div
+            v-else-if="hasData"
+            class="flex items-center gap-2 overflow-x-auto scrollbar-thin scrollbar-thumb-slate-300"
+          >
             <div
               v-for="card in cards"
               :key="card.key"
-              class="shrink-0 px-3 py-2 rounded-2xl border border-slate-100 bg-slate-50 text-xs flex flex-col gap-0.5"
+              :class="[
+                'shrink-0 px-3 py-2 rounded-2xl border border-slate-100 bg-slate-50 text-xs flex flex-col gap-0.5',
+                card.key === 'processing' && processingFiles.length ? 'cursor-pointer' : ''
+              ]"
+              @mouseenter="hoveredCard = card.key"
+              @mouseleave="hoveredCard = null"
             >
               <span class="text-[11px] text-slate-500 font-medium">{{ card.label }}</span>
               <span class="text-base font-semibold text-slate-900 leading-none">
@@ -112,6 +127,29 @@ const getPercent = (value) => {
           </div>
         </div>
       </div>
+    </div>
+    <div
+      v-if="hoveredCard === 'processing' && processingFiles.length"
+      class="mt-3 bg-white border border-slate-200 rounded-2xl shadow-sm p-3 text-xs text-slate-600 w-full"
+      @mouseenter="hoveredCard = 'processing'"
+      @mouseleave="hoveredCard = null"
+    >
+      <div class="flex items-center justify-between text-[11px] uppercase tracking-wide text-slate-400 mb-2">
+        <span>正在处理的文件</span>
+        <span>{{ processingFiles.length }} 项</span>
+      </div>
+      <ul class="space-y-1 max-h-60 overflow-auto pr-1">
+        <li
+          v-for="file in processingFiles"
+          :key="file.id"
+          class="flex flex-col gap-0.5 border-b border-slate-100 last:border-0 pb-1 last:pb-0"
+        >
+          <span class="font-medium text-slate-800 truncate">{{ file.filename }}</span>
+          <span class="text-[11px] text-slate-400">
+            {{ file.kb_name || '未分配知识库' }} · 更新时间 {{ formatTimestamp(file.updated_at) }}
+          </span>
+        </li>
+      </ul>
     </div>
   </div>
 </template>

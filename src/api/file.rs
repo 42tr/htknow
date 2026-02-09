@@ -54,6 +54,17 @@ pub struct FileStatusBreakdown {
     pub failed: i64,
     /// 其他未知状态
     pub unknown: i64,
+    /// 当前正在处理的文件（按更新时间倒序，最多10条）
+    pub processing_files: Vec<FileStatusPreview>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
+pub struct FileStatusPreview {
+    pub id: i64,
+    pub filename: String,
+    pub kb_id: Option<i64>,
+    pub kb_name: Option<String>,
+    pub updated_at: i64,
 }
 
 impl FileStatusBreakdown {
@@ -122,13 +133,58 @@ async fn query_file_status_breakdown(
     qb.push(" GROUP BY f.status");
 
     let rows = qb.build().fetch_all(pool).await?;
-    let mut breakdown = FileStatusBreakdown::default();
+    let mut breakdown = FileStatusBreakdown { processing_files: Vec::new(), ..Default::default() };
     for row in rows {
         let status: i32 = row.get("status");
         let cnt: i64 = row.get("cnt");
         breakdown.add(status, cnt);
     }
+    breakdown.processing_files = fetch_processing_files_for_scope(pool, scope, user_id, is_admin).await?;
     Ok(breakdown)
+}
+
+async fn fetch_processing_files_for_scope(
+    pool: &SqlitePool, scope: FileStatsScope, user_id: &str, is_admin: bool,
+) -> AnyResult<Vec<FileStatusPreview>> {
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "SELECT f.id, f.filename, f.kb_id, kb.name AS kb_name, f.updated_at FROM files f \
+         LEFT JOIN knowledge_bases kb ON kb.id = f.kb_id WHERE f.status = 2",
+    );
+
+    match scope {
+        FileStatsScope::Global { include_unassigned } => {
+            if !include_unassigned {
+                qb.push(" AND f.kb_id IS NOT NULL");
+            }
+        }
+        FileStatsScope::KnowledgeBase { kb_id, include_descendants } => {
+            if include_descendants {
+                qb.push(" AND f.kb_id IN (WITH RECURSIVE descendants AS (SELECT id FROM knowledge_bases WHERE id = ");
+                qb.push_bind(kb_id);
+                if !is_admin {
+                    qb.push(" AND (user_id = ").push_bind(user_id).push(" OR is_public = 1)");
+                }
+                qb.push(
+                    " UNION ALL SELECT kb.id FROM knowledge_bases kb JOIN descendants d ON kb.parent_id = d.id \
+                     ) SELECT id FROM descendants)",
+                );
+            } else {
+                qb.push(" AND f.kb_id = ").push_bind(kb_id);
+            }
+        }
+        FileStatsScope::UnassignedOnly => {
+            qb.push(" AND f.kb_id IS NULL");
+        }
+    }
+
+    if !is_admin {
+        qb.push(" AND (f.user_id = ").push_bind(user_id).push(" OR f.is_public = 1)");
+    }
+
+    qb.push(" ORDER BY f.updated_at DESC LIMIT 10");
+
+    let rows = qb.build_query_as::<FileStatusPreview>().fetch_all(pool).await?;
+    Ok(rows)
 }
 
 pub async fn get_file_status_breakdown_for_kb(
