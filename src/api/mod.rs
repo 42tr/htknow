@@ -12,7 +12,9 @@ mod search;
 mod system;
 // 重新导出 File 类型供其他模块使用
 pub use file::File;
-pub(crate) use file::{collect_image_paths_for_files, remove_image_files};
+pub(crate) use file::{
+    collect_image_paths_for_files, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path
+};
 
 use crate::search::SearchEngine;
 

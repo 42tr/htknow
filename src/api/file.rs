@@ -5,7 +5,7 @@ use std::{
 use axum::{
     Extension, body::Body, extract::{Multipart, Path, Query, State}, http::{StatusCode, header}, response::Json
 };
-use log::{debug, info};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
@@ -75,6 +75,7 @@ pub async fn upload(
     let cfg = config::get();
     let dir = &cfg.storage.files_path;
     tokio::fs::create_dir_all(dir).await?;
+    let reuse_duplicates = cfg.server.reuse_duplicate_files;
 
     let mut files_data: Vec<(String, String, String, i64)> = Vec::new();
     let mut slice_type = String::new();
@@ -212,13 +213,47 @@ pub async fn upload(
             .await?
             .last_insert_rowid();
 
-        let file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
-        uploaded_files.push(file);
-        uploaded_file_ids.push(id);
+        let mut file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+        if file.status == 3 {
+            uploaded_files.push(file);
+            uploaded_file_ids.push(id);
+            continue;
+        }
+        let mut reused_now = false;
 
-        if immediate_parse || sync {
+        if reuse_duplicates {
+            if sync {
+                match processor::try_reuse_file_with_file(pool.clone(), search_engine.clone(), file.clone()).await {
+                    Ok(true) => {
+                        reused_now = true;
+                        file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+                    }
+                    Ok(false) => {}
+                    Err(e) => {
+                        warn!("Immediate reuse failed for file {}: {}", id, e);
+                    }
+                }
+            } else if !immediate_parse {
+                let pool_clone = pool.clone();
+                let search_engine_clone = search_engine.clone();
+                let file_clone = file.clone();
+                let file_id = id;
+                spawn(async move {
+                    if let Err(e) =
+                        processor::try_reuse_file_with_file(pool_clone, search_engine_clone, file_clone).await
+                    {
+                        log::error!("Background reuse failed for file {}: {}", file_id, e);
+                    }
+                });
+            }
+        }
+
+        if (immediate_parse || sync) && !reused_now {
             parse_file_ids.push(id);
         }
+
+        uploaded_files.push(file);
+        uploaded_file_ids.push(id);
     }
 
     if immediate_parse || sync {
@@ -507,7 +542,7 @@ fn is_safe_relative_path(path: &str) -> bool {
     true
 }
 
-fn resolve_image_storage_path(raw: &str) -> Option<String> {
+pub(crate) fn resolve_image_storage_path(raw: &str) -> Option<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return None;
@@ -529,6 +564,24 @@ fn resolve_image_storage_path(raw: &str) -> Option<String> {
     };
 
     Some(resolved.to_string_lossy().to_string())
+}
+
+pub(crate) async fn find_reusable_parsed_file(
+    pool: &SqlitePool, hash: &str, slice_type: &str, exclude_file_id: Option<i64>,
+) -> Result<Option<File>, sqlx::Error> {
+    let base_sql = "SELECT * FROM files WHERE hash = ? AND slice_type = ? AND status = 1";
+    let sql = if exclude_file_id.is_some() {
+        format!("{} AND id != ? ORDER BY updated_at DESC LIMIT 1", base_sql)
+    } else {
+        format!("{} ORDER BY updated_at DESC LIMIT 1", base_sql)
+    };
+
+    let mut query = sqlx::query_as::<_, File>(&sql).bind(hash).bind(slice_type);
+    if let Some(file_id) = exclude_file_id {
+        query = query.bind(file_id);
+    }
+
+    query.fetch_optional(pool).await
 }
 
 pub(crate) async fn remove_image_files(image_paths: Vec<String>) {

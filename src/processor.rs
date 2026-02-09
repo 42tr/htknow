@@ -12,7 +12,9 @@ use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tokio::{fs, time};
 
 use crate::{
-    api::{File, collect_image_paths_for_files, remove_image_files}, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, SearchEngine, tantivy_engine}
+    api::{
+        File, collect_image_paths_for_files, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path
+    }, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, SearchEngine, tantivy_engine}
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -167,6 +169,39 @@ struct Segment {
     start: usize,
     end: usize,
     positions: Vec<SlicePosition>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct PdfContentRow {
+    page_idx: i32,
+    bbox: Option<String>,
+    text: Option<String>,
+    text_level: Option<i32>,
+    img_path: Option<String>,
+    table_body: Option<String>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct SliceRow {
+    id: i64,
+    content: String,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow)]
+struct SlicePositionRecord {
+    slice_id: i64,
+    page_idx: i32,
+    x1: i32,
+    y1: i32,
+    x2: i32,
+    y2: i32,
+}
+
+#[derive(Debug, Clone)]
+struct ClonedSlice {
+    old_id: i64,
+    new_id: i64,
+    content: String,
 }
 
 /// 文件处理器：定时从数据库读取未处理的文件并处理
@@ -343,15 +378,61 @@ impl FileProcessor {
         Ok(files)
     }
 
+    async fn try_reuse_existing_data(&self, file: &File) -> anyhow::Result<bool> {
+        if !config::get().server.reuse_duplicate_files {
+            return Ok(false);
+        }
+        let Some(source_file) =
+            find_reusable_parsed_file(&self.pool, &file.hash, &file.slice_type, Some(file.id)).await?
+        else {
+            return Ok(false);
+        };
+
+        info!("Found reusable parsed file {} for new file {} (hash={})", source_file.id, file.id, file.hash);
+
+        match self.clone_file_data(&source_file, file).await {
+            Ok(_) => Ok(true),
+            Err(err) => {
+                error!("Failed to reuse parsed data from file {} for file {}: {}", source_file.id, file.id, err);
+                if let Err(clean_err) = self.cleanup_processing_file_data(file.id).await {
+                    warn!("Failed to cleanup file {} after reuse error: {}", file.id, clean_err);
+                }
+                sqlx::query("UPDATE files SET status = 0, log = ?, updated_at = strftime('%s','now') WHERE id = ?")
+                    .bind(format!("Reuse failed: {}", err))
+                    .bind(file.id)
+                    .execute(&self.pool)
+                    .await?;
+                Ok(false)
+            }
+        }
+    }
+
     /// 处理单个文件
     async fn process_file(&self, file: &File) -> anyhow::Result<()> {
         info!("Processing file: {} ({})", file.filename, file.id);
         if !self.ensure_file_exists(file.id, "process start").await? {
             return Ok(());
         }
+
+        let current_status: Option<i32> = sqlx::query_scalar("SELECT status FROM files WHERE id = ?")
+            .bind(file.id)
+            .fetch_optional(&self.pool)
+            .await?;
+        if let Some(status) = current_status {
+            if status != 0 {
+                info!("File {} status changed to {}, skipping processing", file.id, status);
+                return Ok(());
+            }
+        }
+
         if self.is_storage_kb(file.kb_id).await? {
             info!("Skipping parsing for storage knowledge base file {}", file.id);
             self.mark_file_storage_skipped(file.id).await?;
+            return Ok(());
+        }
+
+        if self.try_reuse_existing_data(file).await? {
+            info!("File {} reused existing parsed data, skipping processing pipeline", file.id);
             return Ok(());
         }
 
@@ -1737,6 +1818,292 @@ impl FileProcessor {
         set.into_iter().collect()
     }
 
+    async fn clone_file_data(&self, source: &File, target: &File) -> anyhow::Result<()> {
+        if source.id == target.id {
+            anyhow::bail!("Source and target file ids are identical");
+        }
+        if source.status != 1 {
+            anyhow::bail!("Source file {} is not processed", source.id);
+        }
+
+        let reuse_log = format!("Reusing parsed data from file {}", source.id);
+        sqlx::query("UPDATE files SET status = 2, log = ?, updated_at = strftime('%s','now') WHERE id = ?")
+            .bind(&reuse_log)
+            .bind(target.id)
+            .execute(&self.pool)
+            .await?;
+
+        self.cleanup_processing_file_data(target.id).await?;
+
+        let pdf_rows = self.fetch_pdf_content_rows(source.id).await?;
+        let slice_rows = self.fetch_slice_rows(source.id).await?;
+        let slice_ids: Vec<i64> = slice_rows.iter().map(|row| row.id).collect();
+        let slice_positions = self.fetch_slice_position_rows(&slice_ids).await?;
+        let (image_jobs, image_mapping) = self.prepare_image_jobs(&pdf_rows, source.id, target.id);
+
+        let mut tx = self.pool.begin().await?;
+        self.insert_pdf_rows(&mut tx, target.id, &pdf_rows, &image_mapping).await?;
+        let cloned_slices = self.insert_slice_rows(&mut tx, target.id, &slice_rows).await?;
+        self.insert_slice_positions(&mut tx, &cloned_slices, &slice_positions).await?;
+        tx.commit().await?;
+
+        self.copy_image_files(&image_jobs).await?;
+        self.copy_converted_pdf(source.id, target.id).await?;
+
+        let full_content = self.reindex_cloned_slices(target, &cloned_slices, source).await?;
+
+        let final_log = format!("Reused parsed data from file {}", source.id);
+        sqlx::query(
+            "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?",
+        )
+        .bind(&full_content)
+        .bind(&final_log)
+        .bind(target.id)
+        .execute(&self.pool)
+        .await?;
+
+        let mut updated_file = target.clone();
+        updated_file.content = Some(full_content.clone());
+        if let Err(e) = self.build_knowledge_graph(&updated_file).await {
+            error!("Failed to build knowledge graph for reused file {}: {}", target.id, e);
+        }
+
+        Ok(())
+    }
+
+    async fn fetch_pdf_content_rows(&self, file_id: i64) -> anyhow::Result<Vec<PdfContentRow>> {
+        let sql = "SELECT page_idx, bbox, text, text_level, img_path, table_body FROM pdf_contents WHERE file_id = ? ORDER BY id";
+        let rows = sqlx::query_as::<_, PdfContentRow>(sql).bind(file_id).fetch_all(&self.pool).await?;
+        Ok(rows)
+    }
+
+    async fn fetch_slice_rows(&self, file_id: i64) -> anyhow::Result<Vec<SliceRow>> {
+        let sql = "SELECT id, content FROM slices WHERE file_id = ? ORDER BY id";
+        let rows = sqlx::query_as::<_, SliceRow>(sql).bind(file_id).fetch_all(&self.pool).await?;
+        Ok(rows)
+    }
+
+    async fn fetch_slice_position_rows(&self, slice_ids: &[i64]) -> anyhow::Result<Vec<SlicePositionRecord>> {
+        if slice_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut all_rows = Vec::new();
+        let chunk_size = 400;
+        for chunk in slice_ids.chunks(chunk_size) {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "SELECT slice_id, page_idx, x1, y1, x2, y2 FROM slice_positions WHERE slice_id IN (",
+            );
+            let mut separated = qb.separated(", ");
+            for slice_id in chunk {
+                separated.push_bind(slice_id);
+            }
+            qb.push(") ORDER BY slice_id, id");
+            let rows = qb.build_query_as::<SlicePositionRecord>().fetch_all(&self.pool).await?;
+            all_rows.extend(rows);
+        }
+        Ok(all_rows)
+    }
+
+    fn prepare_image_jobs(
+        &self, rows: &[PdfContentRow], source_id: i64, target_id: i64,
+    ) -> (Vec<(String, String)>, HashMap<String, String>) {
+        let mut jobs = Vec::new();
+        let mut mapping = HashMap::new();
+        for row in rows {
+            if let Some(path) = &row.img_path {
+                if mapping.contains_key(path) {
+                    continue;
+                }
+                let new_path = Self::remap_image_name(path, source_id, target_id);
+                jobs.push((path.clone(), new_path.clone()));
+                mapping.insert(path.clone(), new_path);
+            }
+        }
+        (jobs, mapping)
+    }
+
+    async fn insert_pdf_rows(
+        &self, tx: &mut sqlx::Transaction<'_, Sqlite>, target_file_id: i64, rows: &[PdfContentRow],
+        image_mapping: &HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let binds_per_row = 7;
+        let batch_size = std::cmp::max(1, 999 / binds_per_row);
+        for chunk in rows.chunks(batch_size) {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "INSERT INTO pdf_contents(file_id, page_idx, bbox, text, text_level, img_path, table_body) ",
+            );
+            qb.push_values(chunk.iter(), |mut b, row| {
+                let new_img_path = row
+                    .img_path
+                    .as_ref()
+                    .and_then(|path| image_mapping.get(path))
+                    .cloned()
+                    .or_else(|| row.img_path.clone());
+                b.push_bind(target_file_id)
+                    .push_bind(row.page_idx)
+                    .push_bind(row.bbox.clone())
+                    .push_bind(row.text.clone())
+                    .push_bind(row.text_level)
+                    .push_bind(new_img_path)
+                    .push_bind(row.table_body.clone());
+            });
+            qb.build().execute(&mut **tx).await?;
+        }
+        Ok(())
+    }
+
+    async fn insert_slice_rows(
+        &self, tx: &mut sqlx::Transaction<'_, Sqlite>, target_file_id: i64, rows: &[SliceRow],
+    ) -> anyhow::Result<Vec<ClonedSlice>> {
+        let mut cloned = Vec::new();
+        for row in rows {
+            let new_id = sqlx::query("INSERT INTO slices (file_id, content) VALUES (?, ?)")
+                .bind(target_file_id)
+                .bind(&row.content)
+                .execute(&mut **tx)
+                .await?
+                .last_insert_rowid();
+            cloned.push(ClonedSlice { old_id: row.id, new_id, content: row.content.clone() });
+        }
+        Ok(cloned)
+    }
+
+    async fn insert_slice_positions(
+        &self, tx: &mut sqlx::Transaction<'_, Sqlite>, cloned_slices: &[ClonedSlice], positions: &[SlicePositionRecord],
+    ) -> anyhow::Result<()> {
+        if positions.is_empty() || cloned_slices.is_empty() {
+            return Ok(());
+        }
+        let id_map: HashMap<i64, i64> = cloned_slices.iter().map(|slice| (slice.old_id, slice.new_id)).collect();
+        let filtered: Vec<&SlicePositionRecord> =
+            positions.iter().filter(|row| id_map.contains_key(&row.slice_id)).collect();
+        if filtered.is_empty() {
+            return Ok(());
+        }
+        let binds_per_row = 6;
+        let batch_size = std::cmp::max(1, 999 / binds_per_row);
+        for chunk in filtered.chunks(batch_size) {
+            let mut qb =
+                QueryBuilder::<Sqlite>::new("INSERT INTO slice_positions(slice_id, page_idx, x1, y1, x2, y2) ");
+            qb.push_values(chunk.iter(), |mut b, row| {
+                let new_id = id_map[&row.slice_id];
+                b.push_bind(new_id)
+                    .push_bind(row.page_idx)
+                    .push_bind(row.x1)
+                    .push_bind(row.y1)
+                    .push_bind(row.x2)
+                    .push_bind(row.y2);
+            });
+            qb.build().execute(&mut **tx).await?;
+        }
+        Ok(())
+    }
+
+    async fn copy_image_files(&self, jobs: &[(String, String)]) -> anyhow::Result<()> {
+        for (old_path, new_path) in jobs {
+            let Some(src_abs) = resolve_image_storage_path(old_path) else {
+                warn!("Unable to resolve source image path {}, skipping reuse copy", old_path);
+                continue;
+            };
+            let Some(dst_abs) = resolve_image_storage_path(new_path) else {
+                warn!("Unable to resolve destination image path {}, skipping reuse copy", new_path);
+                continue;
+            };
+            if let Some(parent) = std::path::Path::new(&dst_abs).parent() {
+                fs::create_dir_all(parent).await?;
+            }
+            fs::copy(&src_abs, &dst_abs).await?;
+        }
+        Ok(())
+    }
+
+    async fn copy_converted_pdf(&self, source_id: i64, target_id: i64) -> anyhow::Result<()> {
+        let cfg = config::get();
+        let pdf_dir = std::path::Path::new(&cfg.storage.pdf_path);
+        let src_pdf = pdf_dir.join(format!("{}.pdf", source_id));
+        match fs::try_exists(&src_pdf).await {
+            Ok(true) => {}
+            Ok(false) => return Ok(()),
+            Err(err) => {
+                warn!("Failed to check converted PDF existence for file {}: {}, skipping copy", source_id, err);
+                return Ok(());
+            }
+        }
+        fs::create_dir_all(pdf_dir).await?;
+        let dst_pdf = pdf_dir.join(format!("{}.pdf", target_id));
+        fs::copy(&src_pdf, &dst_pdf).await?;
+        Ok(())
+    }
+
+    async fn reindex_cloned_slices(
+        &self, target: &File, cloned_slices: &[ClonedSlice], source: &File,
+    ) -> anyhow::Result<String> {
+        let mut search_docs = Vec::new();
+        for slice in cloned_slices {
+            search_docs.push(tantivy_engine::Document::new(
+                slice.new_id,
+                target.id,
+                target.kb_id,
+                slice.content.clone(),
+            ));
+        }
+
+        if !search_docs.is_empty() {
+            let filename_lower = target.filename.to_lowercase();
+            let is_image = Self::is_image_file(&filename_lower);
+            let embeddings = if is_image {
+                let embedding =
+                    search::embedding::get_image_embedding_from_path(&target.path, Some(&target.filename)).await?;
+                (0..search_docs.len()).map(|_| Some(embedding.clone())).collect()
+            } else {
+                vec![None; search_docs.len()]
+            };
+            self.search_engine.write_batch(search_docs, embeddings).await?;
+        }
+
+        let full_content = if let Some(content) = source.content.clone() {
+            content
+        } else if cloned_slices.is_empty() {
+            String::new()
+        } else {
+            cloned_slices
+                .iter()
+                .map(|slice| slice.content.as_str())
+                .filter(|content| !content.trim().is_empty())
+                .map(|content| content.to_string())
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        };
+
+        let index_full_content = if full_content.is_empty() {
+            target.filename.clone()
+        } else {
+            format!("{}\n\n{}", target.filename, full_content)
+        };
+        self.search_engine
+            .write_full(tantivy_engine::Document::new(target.id, target.id, target.kb_id, index_full_content))
+            .await?;
+
+        Ok(full_content)
+    }
+
+    fn remap_image_name(original: &str, source_id: i64, target_id: i64) -> String {
+        let path = std::path::Path::new(original);
+        let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or(original);
+        let prefix = format!("f{}_", source_id);
+        let replacement = format!("f{}_", target_id);
+        let stripped = if filename.starts_with(&prefix) {
+            filename.trim_start_matches(&prefix).to_string()
+        } else {
+            filename.to_string()
+        };
+        let new_name = format!("{}{}", replacement, stripped);
+        if let Some(parent) = path.parent() { parent.join(new_name).to_string_lossy().to_string() } else { new_name }
+    }
+
     /// 构建知识图谱（完全由LLM生成）
     async fn build_knowledge_graph(&self, file: &File) -> anyhow::Result<()> {
         info!("Building knowledge graph for file {}", file.id);
@@ -1822,4 +2189,11 @@ pub async fn process_file_immediate(pool: SqlitePool, search_engine: SearchEngin
 
     let processor = FileProcessor::new(pool, search_engine, 0);
     processor.process_file(&file).await
+}
+
+pub async fn try_reuse_file_with_file(
+    pool: SqlitePool, search_engine: SearchEngine, file: File,
+) -> anyhow::Result<bool> {
+    let processor = FileProcessor::new(pool, search_engine, 0);
+    processor.try_reuse_existing_data(&file).await
 }

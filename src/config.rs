@@ -59,6 +59,8 @@ pub struct ServerConfig {
     pub lancedb_compact_cron: String,
     /// 是否启用后台文件解析
     pub parse_enabled: bool,
+    /// 是否启用重复文件复用
+    pub reuse_duplicate_files: bool,
 }
 
 /// 外部服务配置
@@ -184,6 +186,7 @@ impl ServerConfig {
             process_concurrency: env_or_parse("HTKNOW_SERVER_PROCESS_CONCURRENCY", 2),
             lancedb_compact_cron: env_or("HTKNOW_LANCEDB_COMPACT_CRON", "0 0 3 * * *"),
             parse_enabled: env_or_parse("HTKNOW_PARSE_ENABLED", true),
+            reuse_duplicate_files: env_or_parse("HTKNOW_REUSE_DUPLICATE_FILES", true),
         }
     }
 }
