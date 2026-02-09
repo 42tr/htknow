@@ -30,7 +30,11 @@ async fn main() -> anyhow::Result<()> {
 
     let processor =
         processor::FileProcessor::new(pool.clone(), search_engine.clone(), cfg.server.process_interval_secs);
-    processor.start();
+    if cfg.server.parse_enabled {
+        processor.start();
+    } else {
+        log::warn!("HTKNOW_PARSE_ENABLED=false，后台文件解析已禁用，仅支持即时解析");
+    }
     let cron = cfg.server.lancedb_compact_cron.trim();
     let _lancedb_compact_scheduler = if !cron.is_empty()
         && !cron.eq_ignore_ascii_case("off")

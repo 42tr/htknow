@@ -66,6 +66,7 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | `HTKNOW_SERVER_PORT` | `3000` | 监听端口 |
 | `HTKNOW_SERVER_UPLOAD_LIMIT_MB` | `500` | 上传大小限制（MB） |
 | `HTKNOW_SERVER_PROCESS_INTERVAL_SECS` | `10` | 文件处理间隔（秒） |
+| `HTKNOW_PARSE_ENABLED` | `true` | 是否启动后台文件解析（false 时仅即时解析生效） |
 | `HTKNOW_LANCEDB_COMPACT_CRON` | `0 0 3 * * *` | LanceDB 自动压缩 cron 表达式（本地时区，off/disabled/0 禁用） |
 
 ### 外部服务

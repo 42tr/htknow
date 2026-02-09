@@ -57,6 +57,8 @@ pub struct ServerConfig {
     pub process_concurrency: usize,
     /// LanceDB 自动压缩 cron 表达式（off/disabled/0 表示禁用）
     pub lancedb_compact_cron: String,
+    /// 是否启用后台文件解析
+    pub parse_enabled: bool,
 }
 
 /// 外部服务配置
@@ -181,6 +183,7 @@ impl ServerConfig {
             process_interval_secs: env_or_parse("HTKNOW_SERVER_PROCESS_INTERVAL_SECS", 10),
             process_concurrency: env_or_parse("HTKNOW_SERVER_PROCESS_CONCURRENCY", 2),
             lancedb_compact_cron: env_or("HTKNOW_LANCEDB_COMPACT_CRON", "0 0 3 * * *"),
+            parse_enabled: env_or_parse("HTKNOW_PARSE_ENABLED", true),
         }
     }
 }
@@ -359,10 +362,20 @@ impl ConfigLoader for EtcdConfigLoader {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
+    use once_cell::sync::Lazy;
+
     use super::*;
+
+    static ENV_LOCK: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
 
     #[test]
     fn test_default_config() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::remove_var("HTKNOW_PARSE_ENABLED");
+        }
         let config = AppConfig::from_env();
 
         // 验证默认值
@@ -372,11 +385,25 @@ mod tests {
         assert_eq!(config.ai.embedding_model, "bge-m3");
         assert_eq!(config.ai.embedding_dim, 1024);
         assert_eq!(config.ai.image_embedding_dim, 2048);
+        assert!(config.server.parse_enabled);
     }
 
     #[test]
     fn test_get_config() {
         let config = get();
         assert!(!config.server.host.is_empty());
+    }
+
+    #[test]
+    fn test_parse_enabled_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("HTKNOW_PARSE_ENABLED", "false");
+        }
+        let config = AppConfig::from_env();
+        assert!(!config.server.parse_enabled);
+        unsafe {
+            std::env::remove_var("HTKNOW_PARSE_ENABLED");
+        }
     }
 }
