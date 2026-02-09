@@ -741,6 +741,11 @@ pub async fn list(
         });
     }
 
+    // List view hides the potentially large/敏感 file body; single-file fetch still exposes it.
+    for file in files.iter_mut() {
+        file.content = None;
+    }
+
     Ok(Json(files))
 }
 
