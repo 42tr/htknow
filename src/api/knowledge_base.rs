@@ -63,7 +63,7 @@ pub struct KnowledgeDetailResponse {
     pub file_count: i64,
     pub children_kb_count: i64,
     pub children_kbs: Vec<KnowledgeResponse>,
-    pub files: Vec<super::file::File>,
+    pub files: Vec<FileWithoutContent>,
     pub path: Vec<Knowledge>, // For breadcrumbs
 }
 
@@ -85,6 +85,27 @@ pub struct FileWithoutContent {
     pub meta: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+fn file_without_content(file: super::file::File) -> FileWithoutContent {
+    FileWithoutContent {
+        id: file.id,
+        user_id: file.user_id,
+        user_name: file.user_name,
+        hash: file.hash,
+        filename: file.filename,
+        path: file.path,
+        size: file.size,
+        tags: file.tags,
+        status: file.status,
+        log: file.log,
+        slice_type: file.slice_type,
+        kb_id: file.kb_id,
+        is_public: file.is_public,
+        meta: file.meta,
+        created_at: file.created_at,
+        updated_at: file.updated_at,
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
@@ -604,6 +625,7 @@ pub async fn get(
             if let Ok(tags) = serde_json::from_str::<Vec<String>>(&file.tags) { tags.contains(tag) } else { false }
         });
     }
+    let files: Vec<FileWithoutContent> = files.into_iter().map(file_without_content).collect();
 
     // 3. Fetch the breadcrumb path
     let mut path = Vec::new();
@@ -1009,27 +1031,7 @@ async fn get_files_for_kb(
             .await?
     };
     // Convert to FileWithoutContent by excluding the content field
-    let files_without_content = files
-        .into_iter()
-        .map(|f| FileWithoutContent {
-            id: f.id,
-            user_id: f.user_id,
-            user_name: f.user_name,
-            hash: f.hash,
-            filename: f.filename,
-            path: f.path,
-            size: f.size,
-            tags: f.tags,
-            status: f.status,
-            log: f.log,
-            slice_type: f.slice_type,
-            kb_id: f.kb_id,
-            is_public: f.is_public,
-            meta: f.meta,
-            created_at: f.created_at,
-            updated_at: f.updated_at,
-        })
-        .collect();
+    let files_without_content = files.into_iter().map(file_without_content).collect();
     Ok(files_without_content)
 }
 
