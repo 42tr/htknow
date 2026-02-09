@@ -8,7 +8,7 @@ CREATE TABLE IF NOT EXISTS files (
     size INTEGER NOT NULL DEFAULT 0, -- 文件大小(字节)
     content TEXT, -- 内容
     tags TEXT NOT NULL DEFAULT '', -- 标签
-    status INTEGER NOT NULL DEFAULT 0, -- 状态: 0-未处理, 1-已处理, 2-处理中, -1-处理失败
+    status INTEGER NOT NULL DEFAULT 0, -- 状态: 0-未处理, 1-已处理, 2-处理中, 3-不解析, -1-处理失败
     log TEXT DEFAULT '', -- 日志
     slice_type TEXT DEFAULT '', -- 切片类型
     kb_id INTEGER DEFAULT NULL, -- 知识库ID
