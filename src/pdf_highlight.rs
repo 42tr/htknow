@@ -219,15 +219,34 @@ fn calc_bbox_transform_from_bounds(page_box: &PageBox, bounds: Option<PageCoordB
         return BboxTransform { scale_x: 1.0, scale_y: 1.0, offset_x: 0.0, offset_y: 0.0 };
     }
 
+    // MinerU docs show two possible normalized coordinate ranges:
+    // - [0, 1] (percent)
+    // - [0, 1000] (normalized to 1000)
+    let max_x = bounds.max_x.max(bounds.min_x);
+    let max_y = bounds.max_y.max(bounds.min_y);
+
+    if max_x <= 1.5 && max_y <= 1.5 {
+        return BboxTransform { scale_x: page_box.width, scale_y: page_box.height, offset_x: 0.0, offset_y: 0.0 };
+    }
+
+    if max_x <= 1000.0 && max_y <= 1000.0 {
+        return BboxTransform {
+            scale_x: page_box.width / 1000.0,
+            scale_y: page_box.height / 1000.0,
+            offset_x: 0.0,
+            offset_y: 0.0,
+        };
+    }
+
+    // Fallback: treat as absolute coords or pixels; shrink only if larger than page.
     let mut scale_x = 1.0;
     let mut scale_y = 1.0;
 
-    if bounds.max_x.is_finite() && bounds.max_x > page_box.width * 1.02 {
-        scale_x = page_box.width / bounds.max_x;
+    if max_x > page_box.width * 1.02 {
+        scale_x = page_box.width / max_x;
     }
-
-    if bounds.max_y.is_finite() && bounds.max_y > page_box.height * 1.02 {
-        scale_y = page_box.height / bounds.max_y;
+    if max_y > page_box.height * 1.02 {
+        scale_y = page_box.height / max_y;
     }
 
     BboxTransform { scale_x, scale_y, offset_x: 0.0, offset_y: 0.0 }
