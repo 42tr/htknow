@@ -369,23 +369,44 @@ impl FileProcessor {
         let is_excel = filename_lower.ends_with(".xls") || filename_lower.ends_with(".xlsx");
 
         let cfg = config::get();
-        if let Some(custom_url) = cfg.services.custom_parse_url.as_deref() {
-            if is_pdf || is_word {
+        let custom_url = cfg.services.custom_parse_url.as_deref();
+
+        if is_word || is_excel {
+            if !self.ensure_file_exists(file.id, "before office conversion").await? {
+                return Ok(());
+            }
+            // Word/Excel 文档：先转换为 PDF，再按需要处理
+            let doc_kind = if is_word { "Word" } else { "Excel" };
+            info!("Detected {} document, converting to PDF: {}", doc_kind, file.filename);
+
+            if let Some(custom_url) = custom_url {
+                let stored_pdf_path = self.convert_office_to_pdf(file).await?;
+                if is_word {
+                    info!("Custom parse enabled, routing file {} to {}", file.id, custom_url);
+                    self.process_file_with_custom_parser(file, custom_url).await?;
+                    return Ok(());
+                }
+
+                let mut temp_file = file.clone();
+                temp_file.path = stored_pdf_path.to_string_lossy().to_string();
+                temp_file.filename = format!("{}.pdf", file.id);
+                self.process_pdf_file(&temp_file, None, false, Some(file.filename.as_str())).await?;
+                return Ok(());
+            }
+
+            self.convert_office_to_pdf_and_process(file).await?;
+            return Ok(());
+        }
+
+        if let Some(custom_url) = custom_url {
+            if is_pdf {
                 info!("Custom parse enabled, routing file {} to {}", file.id, custom_url);
                 self.process_file_with_custom_parser(file, custom_url).await?;
                 return Ok(());
             }
         }
 
-        if is_word || is_excel {
-            if !self.ensure_file_exists(file.id, "before office conversion").await? {
-                return Ok(());
-            }
-            // Word/Excel 文档：先转换为 PDF，再使用 process_pdf_file 处理
-            let doc_kind = if is_word { "Word" } else { "Excel" };
-            info!("Detected {} document, converting to PDF: {}", doc_kind, file.filename);
-            self.convert_office_to_pdf_and_process(file).await?;
-        } else if is_pdf {
+        if is_pdf {
             if !self.ensure_file_exists(file.id, "before pdf processing").await? {
                 return Ok(());
             }
@@ -566,8 +587,8 @@ impl FileProcessor {
         Ok(())
     }
 
-    /// 将 Word/Excel 文档转换为 PDF 并处理
-    async fn convert_office_to_pdf_and_process(&self, file: &File) -> anyhow::Result<()> {
+    /// 将 Word/Excel 文档转换为 PDF
+    async fn convert_office_to_pdf(&self, file: &File) -> anyhow::Result<std::path::PathBuf> {
         // 创建临时目录用于存放转换后的 PDF
         let cfg = config::get();
         let temp_dir = std::path::Path::new(&cfg.storage.temp_path);
@@ -625,12 +646,18 @@ impl FileProcessor {
 
         if !converted_ok {
             let error_msg = last_error.unwrap_or_else(|| "unknown error".to_string());
-            return Err(anyhow::anyhow!("Failed to convert Word to PDF: {}", error_msg));
+            return Err(anyhow::anyhow!("Failed to convert office document to PDF: {}", error_msg));
         }
 
         // 查找生成的 PDF 文件
         // LibreOffice 会使用原文件名（不含扩展名）+ .pdf
-        let converted_pdf_path = temp_dir.join(format!("{}.pdf", file.path.split("/").last().unwrap()));
+        let converted_pdf_path = temp_dir.join(format!(
+            "{}.pdf",
+            std::path::Path::new(&file.path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .ok_or_else(|| anyhow::anyhow!("Invalid file path: {}", file.path))?
+        ));
         let stored_pdf_path = pdf_dir.join(&pdf_filename);
 
         // 检查转换后的 PDF 是否存在
@@ -641,18 +668,23 @@ impl FileProcessor {
         // 保存转换后的 PDF 以便溯源高亮
         fs::copy(&converted_pdf_path, &stored_pdf_path).await?;
 
-        // 创建临时 File 结构用于处理 PDF
-        let mut temp_file = file.clone();
-        temp_file.path = stored_pdf_path.to_string_lossy().to_string();
-        temp_file.filename = pdf_filename;
-
-        // 使用 process_pdf_file 处理转换后的 PDF
-        let result = self.process_pdf_file(&temp_file, None, false, Some(file.filename.as_str())).await;
-
         // 清理临时 PDF 文件
         let _ = fs::remove_file(&converted_pdf_path).await;
 
-        result
+        Ok(stored_pdf_path)
+    }
+
+    /// 将 Word/Excel 文档转换为 PDF 并处理
+    async fn convert_office_to_pdf_and_process(&self, file: &File) -> anyhow::Result<()> {
+        let stored_pdf_path = self.convert_office_to_pdf(file).await?;
+
+        // 创建临时 File 结构用于处理 PDF
+        let mut temp_file = file.clone();
+        temp_file.path = stored_pdf_path.to_string_lossy().to_string();
+        temp_file.filename = format!("{}.pdf", file.id);
+
+        // 使用 process_pdf_file 处理转换后的 PDF
+        self.process_pdf_file(&temp_file, None, false, Some(file.filename.as_str())).await
     }
 
     /// 处理 PDF 文件，调用 MinerU API
