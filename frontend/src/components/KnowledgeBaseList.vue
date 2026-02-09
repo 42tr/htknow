@@ -1,8 +1,9 @@
 <script setup>
-import { ref, onMounted } from 'vue'
+import { ref, onMounted, computed } from 'vue'
 import { api } from '../api'
 import FileCard from './FileCard.vue'
 import CreateKnowledgeBase from './CreateKnowledgeBase.vue'
+import FileStatusSummary from './FileStatusSummary.vue'
 import { setCurrentKb } from '../store'
 
 // Reactive state for the current view
@@ -13,13 +14,56 @@ const breadcrumbs = ref([])
 const loading = ref(true)
 const error = ref('')
 const reparseLoading = ref(false)
+const createEmptyStats = () => ({
+  total: 0,
+  pending: 0,
+  processing: 0,
+  completed: 0,
+  skipped: 0,
+  failed: 0,
+  unknown: 0,
+})
+const stats = ref(createEmptyStats())
+const statsLoading = ref(true)
+const statsError = ref('')
+
+const statsSubtitle = computed(() => {
+  if (currentKb.value && currentKb.value.id !== null) {
+    return `覆盖 ${currentKb.value.name} 及其子知识库`
+  }
+  return '覆盖所有知识库（含未分配文件）'
+})
+
+const getCurrentKbId = () => {
+  return currentKb.value?.id ?? null
+}
+
+const fetchStats = async (kbId) => {
+  statsLoading.value = true
+  statsError.value = ''
+  try {
+    const params = {}
+    if (kbId === null || kbId === undefined) {
+      // 全局统计，后台默认包含未分配文件
+    } else {
+      params.kbId = kbId
+      params.includeDescendants = true
+    }
+    stats.value = await api.getFileStats(params)
+  } catch (e) {
+    statsError.value = e?.message || '加载统计失败'
+  } finally {
+    statsLoading.value = false
+  }
+}
 
 const loadKbContent = async (kbId) => {
+  const targetId = kbId ?? null
   loading.value = true
   error.value = ''
   try {
     let newCurrentKb;
-    if (kbId === null) {
+    if (targetId === null) {
       // Root view: fetch top-level KBs and unassigned files
       const [topLevelKbs, unassignedFiles] = await Promise.all([
         api.getKnowledgeBases(null),
@@ -31,7 +75,7 @@ const loadKbContent = async (kbId) => {
       breadcrumbs.value = []
     } else {
       // Inside a specific KB
-      const data = await api.getKnowledgeBase(kbId)
+      const data = await api.getKnowledgeBase(targetId)
       childrenKbs.value = data.children_kbs || []
       files.value = data.files || []
       newCurrentKb = { id: data.id, name: data.name, description: data.description, kb_type: data.kb_type }
@@ -39,6 +83,7 @@ const loadKbContent = async (kbId) => {
     }
     currentKb.value = newCurrentKb;
     setCurrentKb(newCurrentKb); // Update global store
+    await fetchStats(targetId)
   } catch (e) {
     error.value = e.message
   } finally {
@@ -53,7 +98,7 @@ const navigateToKb = (kbId) => {
 
 // --- Event Handlers ---
 const handleKbCreated = () => {
-  loadKbContent(currentKb.value?.id)
+  loadKbContent(getCurrentKbId())
 }
 
 const handleDeleteKb = async (e, kbId) => {
@@ -62,14 +107,14 @@ const handleDeleteKb = async (e, kbId) => {
 
   try {
     await api.deleteKnowledgeBase(kbId)
-    await loadKbContent(currentKb.value?.id) // Refresh current view
+    await loadKbContent(getCurrentKbId()) // Refresh current view
   } catch (e) {
     alert('删除失败：' + e.message)
   }
 }
 
 const handleFileAction = () => {
-  loadKbContent(currentKb.value?.id)
+  loadKbContent(getCurrentKbId())
 }
 
 const handleTogglePublic = async (e, kbId, currentPublic) => {
@@ -79,7 +124,7 @@ const handleTogglePublic = async (e, kbId, currentPublic) => {
 
   try {
     await api.updateKnowledgeBase(kbId, { is_public: newPublic })
-    await loadKbContent(currentKb.value?.id)
+    await loadKbContent(getCurrentKbId())
   } catch (e) {
     alert('更新失败：' + e.message)
   }
@@ -93,7 +138,7 @@ const handleReparse = async () => {
     const result = await api.reparseKnowledgeBases()
     const count = result?.file_count ?? 0
     alert(`已提交重新解析任务，共 ${count} 个文件`)
-    await loadKbContent(currentKb.value?.id)
+    await loadKbContent(getCurrentKbId())
   } catch (e) {
     alert('重新解析失败：' + e.message)
   } finally {
@@ -103,7 +148,7 @@ const handleReparse = async () => {
 
 // Expose refresh method to parent component
 defineExpose({
-  refresh: () => loadKbContent(currentKb.value?.id),
+  refresh: () => loadKbContent(getCurrentKbId()),
 })
 
 // Initial load
@@ -149,6 +194,16 @@ onMounted(() => {
       </div>
     </div>
 
+    <FileStatusSummary
+      class="mb-4"
+      :stats="stats"
+      :loading="statsLoading"
+      :error="statsError"
+      :title="currentKb && currentKb.id !== null ? '知识库文件状态' : '全局文件状态'"
+      :subtitle="statsSubtitle"
+      @retry="fetchStats(getCurrentKbId())"
+    />
+
     <!-- Loading -->
     <div v-if="loading" class="text-center py-12">
         <p>加载中...</p>
@@ -157,7 +212,7 @@ onMounted(() => {
     <!-- Error -->
     <div v-else-if="error" class="text-center py-12 text-red-500">
         <p>错误: {{ error }}</p>
-        <button @click="loadKbContent(currentKb?.id)">重试</button>
+        <button @click="loadKbContent(getCurrentKbId())">重试</button>
     </div>
 
     <!-- Empty State -->

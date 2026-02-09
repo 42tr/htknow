@@ -8,6 +8,7 @@ use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use tokio::fs;
 use utoipa::{IntoParams, ToSchema};
 
+use super::file::{self, FileStatusBreakdown};
 use crate::{
     AuthUser, api::error::{ApiError, ApiResult}, config, search::SearchEngine
 };
@@ -65,6 +66,7 @@ pub struct KnowledgeDetailResponse {
     pub children_kbs: Vec<KnowledgeResponse>,
     pub files: Vec<FileWithoutContent>,
     pub path: Vec<Knowledge>, // For breadcrumbs
+    pub status_breakdown: FileStatusBreakdown,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
@@ -604,6 +606,8 @@ pub async fn get(
     let children_counts = children_counts_res?;
     let file_count = *file_counts.get(&id).unwrap_or(&0);
     let children_kb_count = *children_counts.get(&id).unwrap_or(&0);
+    let status_breakdown =
+        file::get_file_status_breakdown_for_kb(&pool, id, true, &auth_user.user_id, is_admin).await?;
     let children_kbs: Vec<KnowledgeResponse> = children_kbs
         .into_iter()
         .map(|kb| KnowledgeResponse {
@@ -669,6 +673,7 @@ pub async fn get(
         children_kbs,
         files,
         path,
+        status_breakdown,
     };
 
     Ok(Json(response))

@@ -195,6 +195,33 @@ export const api = {
     return response.json()
   },
 
+  async getFileStats(options = {}) {
+    const {
+      kbId = undefined,
+      includeDescendants = true,
+      includeUnassigned = true,
+    } = options
+    const params = new URLSearchParams()
+    if (kbId === null) {
+      params.append('kb_id', 'null')
+    } else if (kbId !== undefined) {
+      params.append('kb_id', kbId)
+    }
+    if (!includeDescendants) {
+      params.append('include_descendants', 'false')
+    }
+    if (!includeUnassigned) {
+      params.append('include_unassigned', 'false')
+    }
+    const query = params.toString()
+    const response = await fetch(
+      `${API_BASE}/files/stats${query ? `?${query}` : ''}`,
+      { headers: getHeaders() }
+    )
+    if (!response.ok) throw new Error('获取文件状态统计失败')
+    return response.json()
+  },
+
   async getFile(id) {
     const response = await fetch(`${API_BASE}/files/${id}`, {
       headers: getHeaders(),

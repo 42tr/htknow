@@ -2,13 +2,14 @@ use std::{
     collections::{HashMap, HashSet}, path::Component, time::Instant
 };
 
+use anyhow::Result as AnyResult;
 use axum::{
     Extension, body::Body, extract::{Multipart, Path, Query, State}, http::{StatusCode, header}, response::Json
 };
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{QueryBuilder, Sqlite, SqlitePool};
+use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use tokio::{fs, io::AsyncWriteExt as _, spawn};
 use utoipa::{IntoParams, ToSchema};
 
@@ -35,6 +36,118 @@ pub struct File {
     pub meta: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, Default, ToSchema)]
+pub struct FileStatusBreakdown {
+    /// 所有满足条件的文件总数
+    pub total: i64,
+    /// status = 0，待处理
+    pub pending: i64,
+    /// status = 2，处理中
+    pub processing: i64,
+    /// status = 1，已完成
+    pub completed: i64,
+    /// status = 3，不解析/跳过
+    pub skipped: i64,
+    /// status = -1，处理失败
+    pub failed: i64,
+    /// 其他未知状态
+    pub unknown: i64,
+}
+
+impl FileStatusBreakdown {
+    fn add(&mut self, status: i32, count: i64) {
+        self.total += count;
+        match status {
+            0 => self.pending += count,
+            1 => self.completed += count,
+            2 => self.processing += count,
+            3 => self.skipped += count,
+            -1 => self.failed += count,
+            _ => self.unknown += count,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum FileStatsScope {
+    Global { include_unassigned: bool },
+    KnowledgeBase { kb_id: i64, include_descendants: bool },
+    UnassignedOnly,
+}
+
+async fn query_file_status_breakdown(
+    pool: &SqlitePool, scope: FileStatsScope, user_id: &str, is_admin: bool,
+) -> AnyResult<FileStatusBreakdown> {
+    let mut qb = QueryBuilder::<Sqlite>::new("");
+
+    if let FileStatsScope::KnowledgeBase { kb_id, include_descendants: true } = scope {
+        qb.push("WITH RECURSIVE descendants AS (SELECT id FROM knowledge_bases WHERE id = ");
+        qb.push_bind(kb_id);
+        if !is_admin {
+            qb.push(" AND (user_id = ").push_bind(user_id).push(" OR is_public = 1)");
+        }
+        qb.push(" UNION ALL SELECT kb.id FROM knowledge_bases kb JOIN descendants d ON kb.parent_id = d.id");
+        if !is_admin {
+            qb.push(" WHERE kb.user_id = ").push_bind(user_id).push(" OR kb.is_public = 1");
+        }
+        qb.push(") ");
+    }
+
+    qb.push("SELECT COALESCE(f.status, -99) AS status, COUNT(*) AS cnt FROM files f WHERE 1=1");
+
+    match scope {
+        FileStatsScope::Global { include_unassigned } => {
+            if !include_unassigned {
+                qb.push(" AND f.kb_id IS NOT NULL");
+            }
+        }
+        FileStatsScope::KnowledgeBase { kb_id, include_descendants } => {
+            if include_descendants {
+                qb.push(" AND f.kb_id IN (SELECT id FROM descendants)");
+            } else {
+                qb.push(" AND f.kb_id = ").push_bind(kb_id);
+            }
+        }
+        FileStatsScope::UnassignedOnly => {
+            qb.push(" AND f.kb_id IS NULL");
+        }
+    }
+
+    if !is_admin {
+        qb.push(" AND (f.user_id = ").push_bind(user_id).push(" OR f.is_public = 1)");
+    }
+
+    qb.push(" GROUP BY f.status");
+
+    let rows = qb.build().fetch_all(pool).await?;
+    let mut breakdown = FileStatusBreakdown::default();
+    for row in rows {
+        let status: i32 = row.get("status");
+        let cnt: i64 = row.get("cnt");
+        breakdown.add(status, cnt);
+    }
+    Ok(breakdown)
+}
+
+pub async fn get_file_status_breakdown_for_kb(
+    pool: &SqlitePool, kb_id: i64, include_descendants: bool, user_id: &str, is_admin: bool,
+) -> AnyResult<FileStatusBreakdown> {
+    query_file_status_breakdown(pool, FileStatsScope::KnowledgeBase { kb_id, include_descendants }, user_id, is_admin)
+        .await
+}
+
+pub async fn get_file_status_breakdown_for_all(
+    pool: &SqlitePool, include_unassigned: bool, user_id: &str, is_admin: bool,
+) -> AnyResult<FileStatusBreakdown> {
+    query_file_status_breakdown(pool, FileStatsScope::Global { include_unassigned }, user_id, is_admin).await
+}
+
+pub async fn get_file_status_breakdown_for_unassigned(
+    pool: &SqlitePool, user_id: &str, is_admin: bool,
+) -> AnyResult<FileStatusBreakdown> {
+    query_file_status_breakdown(pool, FileStatsScope::UnassignedOnly, user_id, is_admin).await
 }
 
 /// 上传文件（支持单个或多个文件）
@@ -642,6 +755,16 @@ pub struct ListQuery {
     pub tag: Option<String>,
 }
 
+#[derive(Deserialize, IntoParams)]
+pub struct FileStatsQuery {
+    /// 指定知识库 ID，统计该知识库以及（可选）子知识库
+    pub kb_id: Option<String>,
+    /// 是否包含子知识库文件，默认 true
+    pub include_descendants: Option<bool>,
+    /// 全局统计时是否包含未分配知识库的文件，默认 true
+    pub include_unassigned: Option<bool>,
+}
+
 /// 获取文件列表
 #[utoipa::path(
     get,
@@ -747,6 +870,64 @@ pub async fn list(
     }
 
     Ok(Json(files))
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/files/stats",
+    operation_id = "file_stats",
+    tag = "file",
+    params(FileStatsQuery),
+    responses(
+        (status = 200, description = "成功返回文件状态统计", body = FileStatusBreakdown),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn stats(
+    State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Query(query): Query<FileStatsQuery>,
+) -> ApiResult<Json<FileStatusBreakdown>> {
+    let is_admin = auth_user.is_admin();
+    let include_descendants = query.include_descendants.unwrap_or(true);
+    let include_unassigned = query.include_unassigned.unwrap_or(true);
+
+    let breakdown = match query.kb_id.as_deref() {
+        Some("null") | Some("unassigned") => {
+            get_file_status_breakdown_for_unassigned(&pool, &auth_user.user_id, is_admin).await?
+        }
+        Some(kb_id_str) => {
+            let kb_id =
+                kb_id_str.parse::<i64>().map_err(|_| ApiError::BadRequest("Invalid kb_id format".to_string()))?;
+            ensure_kb_accessible(&pool, kb_id, &auth_user.user_id, is_admin).await?;
+            get_file_status_breakdown_for_kb(&pool, kb_id, include_descendants, &auth_user.user_id, is_admin).await?
+        }
+        None => get_file_status_breakdown_for_all(&pool, include_unassigned, &auth_user.user_id, is_admin).await?,
+    };
+
+    Ok(Json(breakdown))
+}
+
+async fn ensure_kb_accessible(pool: &SqlitePool, kb_id: i64, user_id: &str, is_admin: bool) -> ApiResult<()> {
+    let exists = if is_admin {
+        sqlx::query_scalar::<_, i64>("SELECT id FROM knowledge_bases WHERE id = ?")
+            .bind(kb_id)
+            .fetch_optional(pool)
+            .await?
+    } else {
+        sqlx::query_scalar::<_, i64>("SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)")
+            .bind(kb_id)
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await?
+    };
+
+    if exists.is_none() {
+        return Err(ApiError::NotFound("Knowledge base not found or permission denied".to_string()));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow, ToSchema)]
