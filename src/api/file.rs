@@ -720,6 +720,7 @@ struct SlicePositionRow {
 
 #[derive(Debug, sqlx::FromRow)]
 struct PageBBoxRow {
+    page_idx: i32,
     bbox: String,
 }
 
@@ -918,44 +919,42 @@ pub async fn get_highlighted_pdf(
         .fetch_all(&pool)
         .await?;
 
-        let mut global_min_x = f32::MAX;
-        let mut global_min_y = f32::MAX;
-        let mut global_max_x = f32::MIN;
-        let mut global_max_y = f32::MIN;
+        let mut bounds: HashMap<i32, pdf_highlight::PageCoordBounds> = HashMap::new();
         for row in rows {
-            if let Ok(bbox) = serde_json::from_str::<Vec<i32>>(&row.bbox) {
+            if let Ok(bbox) = serde_json::from_str::<Vec<f32>>(&row.bbox) {
                 if bbox.len() == 4 {
-                    let x1 = bbox[0] as f32;
-                    let y1 = bbox[1] as f32;
-                    let x2 = bbox[2] as f32;
-                    let y2 = bbox[3] as f32;
-                    global_min_x = global_min_x.min(x1.min(x2));
-                    global_min_y = global_min_y.min(y1.min(y2));
-                    global_max_x = global_max_x.max(x1.max(x2));
-                    global_max_y = global_max_y.max(y1.max(y2));
+                    let x1 = bbox[0];
+                    let y1 = bbox[1];
+                    let x2 = bbox[2];
+                    let y2 = bbox[3];
+                    let min_x = x1.min(x2);
+                    let min_y = y1.min(y2);
+                    let max_x = x1.max(x2);
+                    let max_y = y1.max(y2);
+
+                    bounds
+                        .entry(row.page_idx)
+                        .and_modify(|b| {
+                            b.min_x = b.min_x.min(min_x);
+                            b.min_y = b.min_y.min(min_y);
+                            b.max_x = b.max_x.max(max_x);
+                            b.max_y = b.max_y.max(max_y);
+                        })
+                        .or_insert(pdf_highlight::PageCoordBounds { min_x, min_y, max_x, max_y });
                 }
             }
         }
 
-        if !global_min_x.is_finite()
-            || !global_min_y.is_finite()
-            || !global_max_x.is_finite()
-            || !global_max_y.is_finite()
-        {
-            None
-        } else {
-            let global_bounds = pdf_highlight::PageCoordBounds {
-                min_x: global_min_x,
-                min_y: global_min_y,
-                max_x: global_max_x,
-                max_y: global_max_y,
-            };
-            let mut bounds: HashMap<i32, pdf_highlight::PageCoordBounds> = HashMap::new();
-            for page_idx in positions.iter().map(|pos| pos.page_idx) {
-                bounds.entry(page_idx).or_insert(global_bounds);
-            }
-            Some(bounds)
-        }
+        bounds.retain(|_, b| {
+            b.min_x.is_finite()
+                && b.min_y.is_finite()
+                && b.max_x.is_finite()
+                && b.max_y.is_finite()
+                && b.max_x > b.min_x
+                && b.max_y > b.min_y
+        });
+
+        if bounds.is_empty() { None } else { Some(bounds) }
     };
 
     // 确定 PDF 文件路径

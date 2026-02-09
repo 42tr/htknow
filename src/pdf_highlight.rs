@@ -31,7 +31,6 @@ pub struct PageCoordBounds {
 const HIGHLIGHT_COLOR: [f32; 3] = [1.0, 0.8, 0.0]; // 橙黄色
 /// 高亮透明度
 const HIGHLIGHT_OPACITY: f32 = 0.3;
-const BBOX_SCALE_TOLERANCE: f32 = 1.02;
 
 /// 为 PDF 添加高亮标注
 ///
@@ -93,25 +92,22 @@ pub fn add_highlights_to_pdf_with_bounds(
                 .and_then(|m| m.get(&page_idx))
                 .copied()
                 .or_else(|| estimate_bounds_from_positions(&page_positions));
-            let bbox_transform = calc_bbox_transform(&page_box, coord_bounds);
-            if (bbox_transform.scale_x - 1.0).abs() > f32::EPSILON
-                || (bbox_transform.scale_y - 1.0).abs() > f32::EPSILON
-                || bbox_transform.offset_x.abs() > f32::EPSILON
-                || bbox_transform.offset_y.abs() > f32::EPSILON
-            {
+            if let Some(bounds) = coord_bounds {
                 info!(
-                    "Page {} (idx {}): applying bbox transform scale x={} y={}, offset x={} y={}",
-                    page_num,
-                    page_idx,
-                    bbox_transform.scale_x,
-                    bbox_transform.scale_y,
-                    bbox_transform.offset_x,
-                    bbox_transform.offset_y
+                    "Page {} (idx {}): coord bounds = ({:.2}, {:.2}) -> ({:.2}, {:.2})",
+                    page_num, page_idx, bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y
                 );
+            } else {
+                info!("Page {} (idx {}): coord bounds missing, no scaling/offset", page_num, page_idx);
             }
+            let bbox_transform = calc_bbox_transform_from_bounds(&page_box, coord_bounds);
+            info!(
+                "Page {} (idx {}): bbox transform scale x={:.4} y={:.4}",
+                page_num, page_idx, bbox_transform.scale_x, bbox_transform.scale_y
+            );
 
-            // 方法：直接在页面内容流中绘制半透明矩形
-            add_highlight_to_page_content(&mut doc, page_id, &page_positions, &page_box, bbox_transform)?;
+            // 方法：添加 Highlight 注释（类似 PyMuPDF 的 add_highlight_annot）
+            add_highlight_annotations_to_page(&mut doc, page_id, &page_positions, &page_box, bbox_transform)?;
         } else {
             info!("Page {} not found in PDF", page_num);
         }
@@ -180,12 +176,17 @@ fn get_box_from_dict(dict: &lopdf::Dictionary, name: &[u8]) -> Option<PageBox> {
 }
 
 fn estimate_bounds_from_positions(positions: &[&HighlightPosition]) -> Option<PageCoordBounds> {
-    let mut min_x = f32::MAX;
-    let mut min_y = f32::MAX;
-    let mut max_x = f32::MIN;
-    let mut max_y = f32::MIN;
+    if positions.is_empty() {
+        return None;
+    }
 
-    for pos in positions {
+    let first = positions[0];
+    let mut min_x = first.bbox[0].min(first.bbox[2]) as f32;
+    let mut min_y = first.bbox[1].min(first.bbox[3]) as f32;
+    let mut max_x = first.bbox[0].max(first.bbox[2]) as f32;
+    let mut max_y = first.bbox[1].max(first.bbox[3]) as f32;
+
+    for pos in positions.iter().skip(1) {
         let x1 = pos.bbox[0] as f32;
         let y1 = pos.bbox[1] as f32;
         let x2 = pos.bbox[2] as f32;
@@ -197,11 +198,7 @@ fn estimate_bounds_from_positions(positions: &[&HighlightPosition]) -> Option<Pa
         max_y = max_y.max(y1.max(y2));
     }
 
-    if min_x.is_finite() && min_y.is_finite() && max_x.is_finite() && max_y.is_finite() {
-        Some(PageCoordBounds { min_x, min_y, max_x, max_y })
-    } else {
-        None
-    }
+    Some(PageCoordBounds { min_x, min_y, max_x, max_y })
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -212,28 +209,28 @@ struct BboxTransform {
     offset_y: f32,
 }
 
-fn calc_bbox_transform(page_box: &PageBox, bounds: Option<PageCoordBounds>) -> BboxTransform {
+fn calc_bbox_transform_from_bounds(page_box: &PageBox, bounds: Option<PageCoordBounds>) -> BboxTransform {
     let Some(bounds) = bounds else {
         return BboxTransform { scale_x: 1.0, scale_y: 1.0, offset_x: 0.0, offset_y: 0.0 };
     };
 
-    // 计算实际坐标范围（max - min）
-    let coord_range_x = bounds.max_x - bounds.min_x;
-    let coord_range_y = bounds.max_y - bounds.min_y;
+    if !bounds.min_x.is_finite() || !bounds.min_y.is_finite() || !bounds.max_x.is_finite() || !bounds.max_y.is_finite()
+    {
+        return BboxTransform { scale_x: 1.0, scale_y: 1.0, offset_x: 0.0, offset_y: 0.0 };
+    }
 
-    // 计算缩放比例
-    let ratio_x = if coord_range_x > 0.0 { page_box.width / coord_range_x } else { 1.0 };
-    let ratio_y = if coord_range_y > 0.0 { page_box.height / coord_range_y } else { 1.0 };
+    let mut scale_x = 1.0;
+    let mut scale_y = 1.0;
 
-    // 只在坐标范围明显超出页面时才缩放
-    let scale_x = if coord_range_x > page_box.width * BBOX_SCALE_TOLERANCE { ratio_x.min(1.0) } else { 1.0 };
-    let scale_y = if coord_range_y > page_box.height * BBOX_SCALE_TOLERANCE { ratio_y.min(1.0) } else { 1.0 };
+    if bounds.max_x.is_finite() && bounds.max_x > page_box.width * 1.02 {
+        scale_x = page_box.width / bounds.max_x;
+    }
 
-    // 偏移量：将 min 坐标映射到 0
-    let offset_x = bounds.min_x;
-    let offset_y = bounds.min_y;
+    if bounds.max_y.is_finite() && bounds.max_y > page_box.height * 1.02 {
+        scale_y = page_box.height / bounds.max_y;
+    }
 
-    BboxTransform { scale_x, scale_y, offset_x, offset_y }
+    BboxTransform { scale_x, scale_y, offset_x: 0.0, offset_y: 0.0 }
 }
 
 /// 从 Object 获取数字值
@@ -245,35 +242,14 @@ fn get_number(obj: &Object) -> Option<f32> {
     }
 }
 
-/// 在页面内容流中添加高亮矩形
-fn add_highlight_to_page_content(
+/// 在页面上添加 Highlight 注释
+fn add_highlight_annotations_to_page(
     doc: &mut Document, page_id: ObjectId, positions: &[&HighlightPosition], page_box: &PageBox,
     bbox_transform: BboxTransform,
 ) -> Result<()> {
-    // 构建绘制高亮的 PDF 操作序列
-    let mut operations = vec![
-        // 保存图形状态
-        Operation::new("q", vec![]),
-        // 设置填充颜色（RGB）
-        Operation::new("rg", vec![HIGHLIGHT_COLOR[0].into(), HIGHLIGHT_COLOR[1].into(), HIGHLIGHT_COLOR[2].into()]),
-    ];
-
-    // 创建 ExtGState 用于透明度
-    let gs_dict = dictionary! {
-        "Type" => Object::Name(b"ExtGState".to_vec()),
-        "ca" => Object::Real(HIGHLIGHT_OPACITY),
-        "CA" => Object::Real(HIGHLIGHT_OPACITY),
-    };
-    let gs_id = doc.add_object(gs_dict);
-
-    // 添加 ExtGState 到页面资源
-    let gs_name = add_extgstate_to_page(doc, page_id, gs_id)?;
-
-    // 使用透明度状态
-    operations.push(Operation::new("gs", vec![Object::Name(gs_name.into_bytes())]));
-
-    // 为每个位置绘制矩形
+    // 为每个位置添加 Highlight 注释
     for pos in positions {
+        // 先减去偏移量，将坐标归一化到从 0 开始，然后缩放，最后加上页面原点
         let x1 = (pos.bbox[0] as f32 - bbox_transform.offset_x) * bbox_transform.scale_x + page_box.x0;
         let y1_mineru = (pos.bbox[1] as f32 - bbox_transform.offset_y) * bbox_transform.scale_y;
         let x2 = (pos.bbox[2] as f32 - bbox_transform.offset_x) * bbox_transform.scale_x + page_box.x0;
@@ -289,119 +265,120 @@ fn add_highlight_to_page_content(
         let width = x2 - x1;
         let height = y2 - y1;
 
-        info!("Drawing highlight at ({}, {}) size {}x{}", x1, y1, width, height);
+        info!(
+            "Bbox raw: [{}, {}, {}, {}] -> PDF coords: ({:.2}, {:.2}) size {:.2}x{:.2}",
+            pos.bbox[0], pos.bbox[1], pos.bbox[2], pos.bbox[3], x1, y1, width, height
+        );
 
-        // 绘制填充矩形: x y width height re f
-        operations.push(Operation::new("re", vec![x1.into(), y1.into(), width.into(), height.into()]));
-        operations.push(Operation::new("f", vec![]));
-    }
+        // 检查坐标是否在合理范围内
+        if width <= 0.0 || height <= 0.0 {
+            info!("Skipping invalid highlight: width={}, height={}", width, height);
+            continue;
+        }
+        if x1 < page_box.x0 - 100.0
+            || x2 > page_box.x0 + page_box.width + 100.0
+            || y1 < page_box.y0 - 100.0
+            || y2 > page_box.y0 + page_box.height + 100.0
+        {
+            info!("Warning: highlight outside page bounds: ({:.2}, {:.2}) -> ({:.2}, {:.2})", x1, y1, x2, y2);
+        }
 
-    // 恢复图形状态
-    operations.push(Operation::new("Q", vec![]));
+        // Highlight 注释需要 Rect + QuadPoints（PDF 坐标系，原点在左下）
+        let rect = Object::Array(vec![x1.into(), y1.into(), x2.into(), y2.into()]);
+        let quad_points =
+            Object::Array(vec![x1.into(), y2.into(), x2.into(), y2.into(), x2.into(), y1.into(), x1.into(), y1.into()]);
 
-    // 创建新的内容流
-    let highlight_content = Content { operations };
-    let highlight_stream = Stream::new(dictionary! {}, highlight_content.encode()?);
-    let highlight_stream_id = doc.add_object(highlight_stream);
+        let appearance_id = create_highlight_appearance(doc, width, height)?;
 
-    // 将高亮内容流添加到页面（放在原内容之后，这样高亮会覆盖在图片上方）
-    let page_obj = doc.get_object(page_id)?.clone();
-    if let Object::Dictionary(page_dict) = &page_obj {
-        let existing_contents = page_dict.get(b"Contents").ok();
-
-        let new_contents = match existing_contents {
-            Some(Object::Reference(content_ref)) => {
-                // 单个内容流引用
-                Object::Array(vec![Object::Reference(*content_ref), Object::Reference(highlight_stream_id)])
-            }
-            Some(Object::Array(arr)) => {
-                // 已经是数组
-                let mut new_arr = arr.clone();
-                new_arr.push(Object::Reference(highlight_stream_id));
-                Object::Array(new_arr)
-            }
-            _ => {
-                // 没有内容或其他情况
-                Object::Reference(highlight_stream_id)
-            }
+        let annot = dictionary! {
+            "Type" => Object::Name(b"Annot".to_vec()),
+            "Subtype" => Object::Name(b"Highlight".to_vec()),
+            "Rect" => rect,
+            "QuadPoints" => quad_points,
+            "C" => Object::Array(vec![HIGHLIGHT_COLOR[0].into(), HIGHLIGHT_COLOR[1].into(), HIGHLIGHT_COLOR[2].into()]),
+            "CA" => Object::Real(HIGHLIGHT_OPACITY),
+            "F" => Object::Integer(4), // Print
+            "P" => Object::Reference(page_id),
+            "AP" => dictionary! { "N" => Object::Reference(appearance_id) },
         };
 
-        // 更新页面
-        let page_obj_mut = doc.get_object_mut(page_id)?;
-        if let Object::Dictionary(page_dict_mut) = page_obj_mut {
-            page_dict_mut.set("Contents", new_contents);
+        let annot_id = doc.add_object(annot);
+        add_annot_to_page(doc, page_id, annot_id)?;
+    }
+
+    Ok(())
+}
+
+/// 将注释添加到页面的 Annots 列表
+fn add_annot_to_page(doc: &mut Document, page_id: ObjectId, annot_id: ObjectId) -> Result<()> {
+    let page_obj = doc.get_object(page_id)?.clone();
+    if let Object::Dictionary(page_dict) = &page_obj {
+        match page_dict.get(b"Annots") {
+            Ok(Object::Reference(annots_ref)) => {
+                let annots_obj = doc.get_object(*annots_ref)?.clone();
+                let mut new_arr = match annots_obj {
+                    Object::Array(arr) => arr,
+                    _ => Vec::new(),
+                };
+                new_arr.push(Object::Reference(annot_id));
+                let annots_obj_mut = doc.get_object_mut(*annots_ref)?;
+                *annots_obj_mut = Object::Array(new_arr);
+            }
+            Ok(Object::Array(arr)) => {
+                let mut new_arr = arr.clone();
+                new_arr.push(Object::Reference(annot_id));
+                let page_obj_mut = doc.get_object_mut(page_id)?;
+                if let Object::Dictionary(page_dict_mut) = page_obj_mut {
+                    page_dict_mut.set("Annots", Object::Array(new_arr));
+                }
+            }
+            _ => {
+                let page_obj_mut = doc.get_object_mut(page_id)?;
+                if let Object::Dictionary(page_dict_mut) = page_obj_mut {
+                    page_dict_mut.set("Annots", Object::Array(vec![Object::Reference(annot_id)]));
+                }
+            }
         }
     }
 
     Ok(())
 }
 
-/// 将 ExtGState 添加到页面资源并返回名称
-fn add_extgstate_to_page(doc: &mut Document, page_id: ObjectId, gs_id: ObjectId) -> Result<String> {
-    let gs_name = format!("GS{}", gs_id.0);
+fn create_highlight_appearance(doc: &mut Document, width: f32, height: f32) -> Result<ObjectId> {
+    let gs_dict = dictionary! {
+        "Type" => Object::Name(b"ExtGState".to_vec()),
+        "ca" => Object::Real(HIGHLIGHT_OPACITY),
+        "CA" => Object::Real(HIGHLIGHT_OPACITY),
+    };
+    let gs_id = doc.add_object(gs_dict);
 
-    // 获取或创建页面的 Resources
-    let page_obj = doc.get_object(page_id)?.clone();
-    if let Object::Dictionary(page_dict) = &page_obj {
-        let resources = if let Ok(res) = page_dict.get(b"Resources") {
-            match res {
-                Object::Reference(res_ref) => {
-                    // Resources 是引用，获取实际对象
-                    let res_obj = doc.get_object(*res_ref)?.clone();
-                    Some((*res_ref, res_obj))
-                }
-                Object::Dictionary(res_dict) => {
-                    // Resources 是内联字典，需要转换为引用
-                    let res_id = doc.add_object(Object::Dictionary(res_dict.clone()));
-                    // 更新页面指向新的 Resources 引用
-                    let page_obj_mut = doc.get_object_mut(page_id)?;
-                    if let Object::Dictionary(page_dict_mut) = page_obj_mut {
-                        page_dict_mut.set("Resources", Object::Reference(res_id));
-                    }
-                    Some((res_id, Object::Dictionary(res_dict.clone())))
-                }
-                _ => None,
-            }
-        } else {
-            None
-        };
+    let resources = dictionary! {
+        "ExtGState" => dictionary! {
+            "GS1" => Object::Reference(gs_id),
+        },
+    };
 
-        if let Some((res_id, Object::Dictionary(mut res_dict))) = resources {
-            // 获取或创建 ExtGState 字典
-            let extgstate = if let Ok(egs) = res_dict.get(b"ExtGState") {
-                match egs {
-                    Object::Dictionary(d) => d.clone(),
-                    _ => lopdf::Dictionary::new(),
-                }
-            } else {
-                lopdf::Dictionary::new()
-            };
+    let operations = vec![
+        Operation::new("q", vec![]),
+        Operation::new("gs", vec![Object::Name(b"GS1".to_vec())]),
+        Operation::new("rg", vec![HIGHLIGHT_COLOR[0].into(), HIGHLIGHT_COLOR[1].into(), HIGHLIGHT_COLOR[2].into()]),
+        Operation::new("re", vec![0.into(), 0.into(), width.into(), height.into()]),
+        Operation::new("f", vec![]),
+        Operation::new("Q", vec![]),
+    ];
 
-            let mut new_extgstate = extgstate;
-            new_extgstate.set(gs_name.as_bytes(), Object::Reference(gs_id));
-            res_dict.set("ExtGState", Object::Dictionary(new_extgstate));
+    let content = Content { operations };
+    let stream = Stream::new(
+        dictionary! {
+            "Type" => Object::Name(b"XObject".to_vec()),
+            "Subtype" => Object::Name(b"Form".to_vec()),
+            "BBox" => Object::Array(vec![0.into(), 0.into(), width.into(), height.into()]),
+            "Resources" => Object::Dictionary(resources),
+        },
+        content.encode()?,
+    );
 
-            // 更新 Resources
-            let res_obj_mut = doc.get_object_mut(res_id)?;
-            *res_obj_mut = Object::Dictionary(res_dict);
-        } else {
-            // 创建新的 Resources
-            let mut extgstate = lopdf::Dictionary::new();
-            extgstate.set(gs_name.as_bytes(), Object::Reference(gs_id));
-
-            let mut resources = lopdf::Dictionary::new();
-            resources.set("ExtGState", Object::Dictionary(extgstate));
-
-            let res_id = doc.add_object(Object::Dictionary(resources));
-
-            let page_obj_mut = doc.get_object_mut(page_id)?;
-            if let Object::Dictionary(page_dict_mut) = page_obj_mut {
-                page_dict_mut.set("Resources", Object::Reference(res_id));
-            }
-        }
-    }
-
-    Ok(gs_name)
+    Ok(doc.add_object(stream))
 }
 
 #[cfg(test)]
