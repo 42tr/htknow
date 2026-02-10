@@ -462,15 +462,16 @@ impl FileProcessor {
 
             if let Some(custom_url) = custom_url {
                 let stored_pdf_path = self.convert_office_to_pdf(file).await?;
-                if is_word {
-                    info!("Custom parse enabled, routing file {} to {}", file.id, custom_url);
-                    self.process_file_with_custom_parser(file, custom_url).await?;
-                    return Ok(());
-                }
-
                 let mut temp_file = file.clone();
                 temp_file.path = stored_pdf_path.to_string_lossy().to_string();
                 temp_file.filename = format!("{}.pdf", file.id);
+
+                if is_word {
+                    info!("Custom parse enabled, routing converted PDF for file {} to {}", file.id, custom_url);
+                    self.process_file_with_custom_parser(&temp_file, custom_url).await?;
+                    return Ok(());
+                }
+
                 self.process_pdf_file(&temp_file, None, false, Some(file.filename.as_str())).await?;
                 return Ok(());
             }
