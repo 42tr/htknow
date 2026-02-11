@@ -7,7 +7,7 @@ use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
 use lopdf::Document;
 use reqwest::multipart;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tokio::{fs, time};
 
@@ -96,7 +96,7 @@ struct CustomParseData {
 #[derive(Debug, Deserialize)]
 struct CustomSlice {
     content: String,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_slice_positions")]
     positions: Vec<SlicePosition>,
 }
 /*
@@ -156,6 +156,33 @@ struct ContentItem {
 struct SlicePosition {
     page_idx: i32,
     bbox: [i32; 4],
+}
+
+#[derive(Debug, Deserialize)]
+struct RawSlicePosition {
+    page_idx: i32,
+    #[serde(default)]
+    bbox: Vec<i32>,
+}
+
+fn deserialize_slice_positions<'de, D>(deserializer: D) -> std::result::Result<Vec<SlicePosition>, D::Error>
+where
+    D: Deserializer<'de>, {
+    let raw_positions: Option<Vec<RawSlicePosition>> = Option::deserialize(deserializer)?;
+    let mut positions = Vec::new();
+    if let Some(raw_positions) = raw_positions {
+        for raw in raw_positions {
+            if raw.bbox.len() == 4 {
+                positions.push(SlicePosition {
+                    page_idx: raw.page_idx,
+                    bbox: [raw.bbox[0], raw.bbox[1], raw.bbox[2], raw.bbox[3]],
+                });
+            } else {
+                debug!("Dropping custom slice position on page {} due to invalid bbox {:?}", raw.page_idx, raw.bbox);
+            }
+        }
+    }
+    Ok(positions)
 }
 
 #[derive(Debug, Clone)]
