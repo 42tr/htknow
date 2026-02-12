@@ -72,6 +72,8 @@ pub struct ServicesConfig {
     pub mineru_max_pages: usize,
     /// 自定义解析服务地址（配置后仅 Word/PDF 走该服务）
     pub custom_parse_url: Option<String>,
+    /// 自定义解析复用服务地址（仅输入 pdf_contents）
+    pub custom_parse_reuse_url: Option<String>,
     /// 音频转写服务地址
     pub audio_transcription_url: String,
     /// 音频转写服务 API Key（可选）
@@ -197,6 +199,7 @@ impl ServicesConfig {
             mineru_url: env_or("HTKNOW_MINERU_URL", "http://192.168.0.46:10001/file_parse"),
             mineru_max_pages: env_or_parse("HTKNOW_MINERU_MAX_PAGES", 50),
             custom_parse_url: env_optional("HTKNOW_CUSTOM_PARSE_URL"),
+            custom_parse_reuse_url: env_optional("HTKNOW_CUSTOM_PARSE_REUSE_URL"),
             audio_transcription_url: env_or(
                 "HTKNOW_AUDIO_TRANSCRIPTION_URL",
                 "http://192.168.0.46:59805/api/v1/audio/transcriptions",

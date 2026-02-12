@@ -93,6 +93,11 @@ struct CustomParseData {
     images: Option<HashMap<String, String>>,
 }
 
+#[derive(Debug, Serialize)]
+struct CustomParseReuseRequest<'a> {
+    pdf_contents: &'a [PdfContentRow],
+}
+
 #[derive(Debug, Deserialize)]
 struct CustomSlice {
     content: String,
@@ -198,7 +203,7 @@ struct Segment {
     positions: Vec<SlicePosition>,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
 struct PdfContentRow {
     page_idx: i32,
     bbox: Option<String>,
@@ -478,6 +483,24 @@ impl FileProcessor {
 
         let cfg = config::get();
         let custom_url = cfg.services.custom_parse_url.as_deref();
+        let custom_reuse_url = cfg.services.custom_parse_reuse_url.as_deref();
+
+        if let Some(reuse_url) = custom_reuse_url {
+            info!("Custom parse reuse enabled");
+            match self.process_file_with_custom_reuse_parser(file, reuse_url).await {
+                Ok(true) => {
+                    info!(
+                        "Custom parse reuse enabled, reused existing pdf_contents for file {} via {}",
+                        file.id, reuse_url
+                    );
+                    return Ok(());
+                }
+                Ok(false) => {}
+                Err(err) => {
+                    error!("Custom parse reuse failed for file {}: {}", file.id, err);
+                }
+            }
+        }
 
         if is_word || is_excel {
             if !self.ensure_file_exists(file.id, "before office conversion").await? {
@@ -560,6 +583,47 @@ impl FileProcessor {
         self.save_custom_slices(file, &parse_data.slices, parse_data.full_content.as_deref()).await?;
 
         Ok(())
+    }
+
+    async fn process_file_with_custom_reuse_parser(&self, file: &File, custom_reuse_url: &str) -> anyhow::Result<bool> {
+        let pdf_rows = self.fetch_pdf_content_rows(file.id).await?;
+        if pdf_rows.is_empty() {
+            debug!("Custom parse reuse skipped for file {} because pdf_contents are empty", file.id);
+            return Ok(false);
+        }
+
+        let payload = CustomParseReuseRequest { pdf_contents: &pdf_rows };
+        let client = reqwest::Client::new();
+        let response = client.post(custom_reuse_url).json(&payload).send().await?;
+        let status = response.status();
+        let body_bytes = response.bytes().await?;
+        if !status.is_success() {
+            let error_text = String::from_utf8_lossy(&body_bytes);
+            return Err(anyhow::anyhow!("Custom parse reuse API failed: {}", error_text));
+        }
+
+        let parsed: CustomParseResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
+            let body_text = String::from_utf8_lossy(&body_bytes);
+            anyhow::anyhow!("Custom parse reuse API response decode failed: {} - {}", e, body_text)
+        })?;
+
+        if parsed.code != 200 {
+            let msg = if parsed.message.is_empty() {
+                "Custom parse reuse API returned error".to_string()
+            } else {
+                parsed.message
+            };
+            return Err(anyhow::anyhow!("{}", msg));
+        }
+
+        let data = parsed.data.ok_or_else(|| anyhow::anyhow!("Custom parse reuse API returned empty data"))?;
+        if data.slices.is_empty() {
+            return Err(anyhow::anyhow!("Custom parse reuse API returned empty slices"));
+        }
+
+        self.save_custom_slices(file, &data.slices, data.full_content.as_deref()).await?;
+
+        Ok(true)
     }
 
     async fn call_custom_parse_api(&self, file: &File, custom_url: &str) -> anyhow::Result<CustomParseData> {
@@ -690,7 +754,18 @@ impl FileProcessor {
                 Some(idx) => &img_base64[idx + "base64,".len()..],
                 None => img_base64.as_str(),
             };
-            let bytes = STANDARD.decode(payload)?;
+            let preview: String = payload.chars().take(32).collect();
+            debug!("Decoding custom image {} (len={}, preview=\"{}\")", img_name, payload.len(), preview);
+            let bytes = STANDARD.decode(payload).map_err(|err| {
+                error!(
+                    "Failed to decode custom image {} (len={}, preview=\"{}\"): {}",
+                    img_name,
+                    payload.len(),
+                    preview,
+                    err
+                );
+                anyhow::anyhow!(err)
+            })?;
             fs::write(format!("{}/{}", cfg.storage.images_path, img_name), bytes).await?;
         }
         Ok(())
@@ -904,12 +979,32 @@ impl FileProcessor {
             info!("images: {:?}", mineru_result.images.keys());
             for (img_name, img_base64) in &mineru_result.images {
                 // 保存图片，如果以 data:image/jpeg;base64, 开头就去掉，没有也不报错
-                let b64 = if let Some(stripped) = img_base64.strip_prefix("data:image/jpeg;base64,") {
-                    stripped
-                } else {
-                    img_base64.as_str()
+                let base64_marker = "base64,";
+                let (prefix, payload) = match img_base64.find(base64_marker) {
+                    Some(idx) => (&img_base64[..idx + base64_marker.len()], &img_base64[idx + base64_marker.len()..]),
+                    None => ("(raw)", img_base64.as_str()),
                 };
-                let bytes = STANDARD.decode(b64)?;
+                let preview: String = payload.chars().take(32).collect();
+                debug!(
+                    "Decoding mineru image {} for file {} (prefix={}, len={}, preview=\"{}\")",
+                    img_name,
+                    file.id,
+                    prefix,
+                    payload.len(),
+                    preview
+                );
+                let bytes = STANDARD.decode(payload).map_err(|err| {
+                    error!(
+                        "Failed to decode mineru image {} for file {} (prefix={}, len={}, preview=\"{}\"): {}",
+                        img_name,
+                        file.id,
+                        prefix,
+                        payload.len(),
+                        preview,
+                        err
+                    );
+                    anyhow::anyhow!(err)
+                })?;
                 fs::write(format!("{}/{}", cfg.storage.images_path, img_name), bytes).await?;
             }
         }
