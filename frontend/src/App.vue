@@ -1,14 +1,42 @@
 <script setup>
-import { ref } from 'vue'
+import { reactive, ref } from 'vue'
 import SearchBar from './components/SearchBar.vue'
 import SearchResults from './components/SearchResults.vue'
 import KnowledgeBaseList from './components/KnowledgeBaseList.vue'
 import FileUpload from './components/FileUpload.vue'
 import KnowledgeGraph from './components/KnowledgeGraph.vue'
+import AdvancedSearchPanel from './components/AdvancedSearchPanel.vue'
+import { api } from './api'
 
 const activeTab = ref('search')
 const searchResults = ref([])
 const isSearching = ref(false)
+const advancedState = reactive({
+  active: false,
+  running: false,
+  status: '待开始',
+  planSteps: [],
+  results: [],
+  timeline: [],
+  debugEvents: [],
+  error: '',
+  lastQuery: '',
+})
+let advancedController = null
+const newId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+const sliceKey = (item) => {
+  const ids = item.slice_ids || item.sliceIds
+  if (Array.isArray(ids) && ids.length > 0) {
+    return ids.join('-')
+  }
+  if (item.file?.id) {
+    return `${item.file.id}-${item.step_action || ''}`
+  }
+  if (item.content) {
+    return item.content.slice(0, 40)
+  }
+  return item.id || ''
+}
 
 const tabs = [
   { id: 'search', name: '搜索', icon: '🔍' },
@@ -27,6 +55,151 @@ const handleSearchStart = () => {
 
 const handleSearchEnd = () => {
   isSearching.value = false
+}
+
+const resetAdvancedState = () => {
+  advancedState.active = true
+  advancedState.running = true
+  advancedState.status = '连接中...'
+  advancedState.planSteps = []
+  advancedState.results = []
+  advancedState.timeline = []
+  advancedState.debugEvents = []
+  advancedState.error = ''
+}
+
+const pushTimeline = (entry) => {
+  advancedState.timeline.unshift({ id: newId(), time: Date.now(), ...entry })
+  if (advancedState.timeline.length > 50) {
+    advancedState.timeline.pop()
+  }
+}
+
+const pushDebug = (entry) => {
+  advancedState.debugEvents.unshift({ id: newId(), time: Date.now(), ...entry })
+  if (advancedState.debugEvents.length > 50) {
+    advancedState.debugEvents.pop()
+  }
+}
+
+const handleAdvancedSearch = ({ query, kbId, options }) => {
+  if (!query) return
+  if (advancedController) {
+    advancedController.cancel()
+  }
+  resetAdvancedState()
+  advancedState.lastQuery = query
+  pushTimeline({ type: 'start', title: '开始搜索', message: query })
+
+  const handlers = {
+    onStatus: (payload) => {
+      advancedState.status = payload?.message || payload?.phase || '处理中'
+      pushTimeline({ type: 'status', title: payload?.phase || '状态', message: payload?.message || '' })
+    },
+    onPlan: (payload) => {
+      const steps = (payload?.steps || []).map((step, index) => ({
+        ...step,
+        status: 'pending',
+        details: null,
+        index: index + 1,
+      }))
+      advancedState.planSteps = steps
+      const message = steps.map((step) => step.comment || step.action || '').filter(Boolean).join(' → ')
+      pushTimeline({ type: 'plan', title: '执行计划', message: message || '已生成计划' })
+    },
+    onStep: (payload) => {
+      if (payload?.action) {
+        const target = advancedState.planSteps.find((step) => step.action === payload.action)
+        if (target) {
+          target.status = payload.status || 'updated'
+          target.details = payload.details || null
+          if (payload.comment) {
+            target.comment = payload.comment
+          }
+        }
+      }
+      pushTimeline({
+        type: 'step',
+        title: payload?.action ? `步骤 ${payload.action}` : '步骤更新',
+        message: `${payload?.status || ''} ${payload?.comment || ''}`.trim(),
+      })
+    },
+    onCandidate: (payload) => {
+      pushDebug({ type: 'candidate', payload })
+    },
+    onFiltered: (payload) => {
+      pushDebug({ type: 'filtered', payload })
+    },
+    onResult: (payload) => {
+      const entry = {
+        id: newId(),
+        receivedAt: Date.now(),
+        ...payload,
+      }
+      const key = sliceKey(entry)
+      const existingIdx = advancedState.results.findIndex((item) => sliceKey(item) === key)
+      if (existingIdx !== -1) {
+        advancedState.results.splice(existingIdx, 1)
+      }
+      advancedState.results.unshift(entry)
+      if (advancedState.results.length > 30) {
+        advancedState.results.pop()
+      }
+    },
+    onErrorEvent: (payload) => {
+      advancedState.error = payload?.message || '服务返回错误'
+      pushTimeline({ type: 'error', title: '错误', message: advancedState.error })
+    },
+    onDone: () => {
+      advancedState.running = false
+      advancedState.status = '已完成'
+      pushTimeline({ type: 'done', title: '完成', message: '高级搜索完成' })
+    },
+    onError: (err) => {
+      advancedState.error = err?.message || '高级搜索失败'
+      advancedState.running = false
+      pushTimeline({ type: 'error', title: '连接失败', message: advancedState.error })
+    },
+    onFinally: () => {
+      advancedController = null
+    },
+  }
+
+  advancedController = api.advancedSearchStream(
+    {
+      query,
+      kbId,
+      maxSubQueries: options?.maxSteps,
+      perQueryLimit: options?.docLimit,
+      contextChars: options?.contextChars,
+      debug: options?.debug,
+    },
+    handlers,
+  )
+}
+
+const stopAdvancedSearch = () => {
+  if (advancedController) {
+    advancedController.cancel()
+    advancedController = null
+  }
+  if (advancedState.active) {
+    advancedState.running = false
+    advancedState.status = '已停止'
+    pushTimeline({ type: 'stop', title: '已停止', message: '用户中断搜索' })
+  }
+}
+
+const clearAdvanced = () => {
+  advancedState.active = false
+  advancedState.running = false
+  advancedState.status = '待开始'
+  advancedState.planSteps = []
+  advancedState.results = []
+  advancedState.timeline = []
+  advancedState.debugEvents = []
+  advancedState.error = ''
+  advancedState.lastQuery = ''
 }
 </script>
 
@@ -77,6 +250,14 @@ const handleSearchEnd = () => {
           @search="handleSearchResults"
           @search-start="handleSearchStart"
           @search-end="handleSearchEnd"
+          @advanced-search="handleAdvancedSearch"
+        />
+
+        <AdvancedSearchPanel
+          v-if="advancedState.active"
+          :state="advancedState"
+          @cancel="stopAdvancedSearch"
+          @clear="clearAdvanced"
         />
 
         <SearchResults

@@ -2649,6 +2649,7 @@ dependencies = [
  "tikv-jemallocator",
  "tokio",
  "tokio-cron-scheduler",
+ "tokio-stream",
  "tower 0.5.2",
  "utoipa",
  "uuid",

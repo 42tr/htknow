@@ -34,6 +34,124 @@ export const api = {
     const data = await response.json()
     return data.results || []
   },
+
+  advancedSearchStream(params, handlers = {}) {
+    const {
+      query,
+      kbId = null,
+      fileId = null,
+      maxSubQueries = 3,
+      perQueryLimit = 5,
+      contextChars = 2000,
+      debug = false,
+    } = params
+
+    const searchParams = new URLSearchParams()
+    searchParams.set('query', query)
+    searchParams.set('max_sub_queries', maxSubQueries)
+    searchParams.set('per_query_limit', perQueryLimit)
+    searchParams.set('context_chars', contextChars)
+    if (debug) searchParams.set('debug', 'true')
+    if (kbId) searchParams.set('kb_id', kbId)
+    if (fileId) searchParams.set('file_id', fileId)
+
+    const controller = new AbortController()
+    const url = `${API_BASE}/search/advanced/stream?${searchParams.toString()}`
+    const headers = getHeaders(false)
+    const decoder = new TextDecoder('utf-8')
+
+    const parseEvent = (chunk) => {
+      const lines = chunk.split('\n')
+      let eventType = 'message'
+      let dataLines = []
+      for (const line of lines) {
+        const trimmed = line.trim()
+        if (trimmed.startsWith('event:')) {
+          eventType = trimmed.slice(6).trim()
+        } else if (trimmed.startsWith('data:')) {
+          dataLines.push(trimmed.slice(5).trim())
+        }
+      }
+      const dataStr = dataLines.join('\n')
+      let parsedData = null
+      if (dataStr) {
+        try {
+          parsedData = JSON.parse(dataStr)
+        } catch (err) {
+          parsedData = dataStr
+        }
+      }
+      return { eventType, data: parsedData }
+    }
+
+    const streamPromise = (async () => {
+      try {
+        const response = await fetch(url, {
+          headers,
+          signal: controller.signal,
+        })
+        if (!response.ok) {
+          throw new Error('高级搜索连接失败')
+        }
+        const reader = response.body.getReader()
+        let buffer = ''
+        while (true) {
+          const { value, done } = await reader.read()
+          if (done) break
+          buffer += decoder.decode(value, { stream: true })
+          let boundary
+          while ((boundary = buffer.indexOf('\n\n')) !== -1) {
+            const rawEvent = buffer.slice(0, boundary).trim()
+            buffer = buffer.slice(boundary + 2)
+            if (!rawEvent) continue
+            const { eventType, data } = parseEvent(rawEvent)
+            switch (eventType) {
+              case 'status':
+                handlers.onStatus?.(data)
+                break
+              case 'plan':
+                handlers.onPlan?.(data)
+                break
+              case 'step':
+                handlers.onStep?.(data)
+                break
+              case 'candidate':
+                handlers.onCandidate?.(data)
+                break
+              case 'filtered':
+                handlers.onFiltered?.(data)
+                break
+              case 'result':
+                handlers.onResult?.(data)
+                break
+              case 'error':
+                handlers.onErrorEvent?.(data)
+                break
+              case 'done':
+                handlers.onDone?.()
+                break
+              default:
+                handlers.onMessage?.({ eventType, data })
+            }
+          }
+        }
+        handlers.onComplete?.()
+      } catch (err) {
+        if (controller.signal.aborted) {
+          handlers.onAbort?.()
+        } else {
+          handlers.onError?.(err)
+        }
+      } finally {
+        handlers.onFinally?.()
+      }
+    })()
+
+    return {
+      cancel: () => controller.abort(),
+      finished: streamPromise,
+    }
+  },
   async searchFull(query, kbId = null, fileId = null) {
     let url = `${API_BASE}/search/full?query=${encodeURIComponent(query)}`
     if (kbId) {

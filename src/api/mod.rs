@@ -46,6 +46,7 @@ use crate::search::SearchEngine;
         search::search_full,
         search::search_with_graph,
         search::search_image,
+        search::advanced_search_stream,
         // Graph
         graph::search_entities,
         graph::get_entity,
@@ -124,7 +125,8 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/", get(search::search))
         .route("/full", get(search::search_full))
         .route("/graph", get(search::search_with_graph))
-        .route("/image", post(search::search_image));
+        .route("/image", post(search::search_image))
+        .route("/advanced/stream", get(search::advanced_search_stream));
     let graph_router = Router::new()
         .route("/entities", get(graph::search_entities))
         .route("/entities/{id}", get(graph::get_entity))

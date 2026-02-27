@@ -1,16 +1,29 @@
 <script setup>
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { api } from '../api'
 import { currentKb } from '../store' // Import global store
 import KnowledgeBaseSelector from './KnowledgeBaseSelector.vue' // Import selector
 
-const emit = defineEmits(['search', 'search-start', 'search-end'])
+const emit = defineEmits(['search', 'search-start', 'search-end', 'advanced-search'])
 
 const query = ref('')
 const error = ref('')
 const searchMode = ref('full')
 const imageFile = ref(null)
 const fileInput = ref(null)
+const advancedOptions = ref({
+  maxSteps: 3,
+  docLimit: 5,
+  contextChars: 2000,
+  debug: false,
+})
+
+const canSubmit = computed(() => {
+  if (searchMode.value === 'image') {
+    return Boolean(imageFile.value)
+  }
+  return Boolean(query.value.trim())
+})
 
 // Local state for search scope
 const localSelectedKb = ref({ id: null, name: '所有知识库' })
@@ -32,6 +45,19 @@ const handleKbSelect = (kb) => {
 }
 
 const handleSearch = async () => {
+  if (searchMode.value === 'advanced') {
+    if (!query.value.trim()) {
+      error.value = '请输入搜索内容'
+      return
+    }
+    emit('advanced-search', {
+      query: query.value.trim(),
+      kbId: localSelectedKb.value?.id,
+      options: { ...advancedOptions.value },
+    })
+    return
+  }
+
   if (searchMode.value === 'image') {
     if (!imageFile.value) {
       error.value = '请先选择图片'
@@ -130,9 +156,17 @@ const handleKeydown = (e) => {
         >
           图片搜索
         </button>
+        <button
+          type="button"
+          class="px-4 py-2 text-sm rounded-lg transition-colors"
+          :class="searchMode === 'advanced' ? 'bg-slate-900 text-white' : 'text-slate-600 hover:text-slate-900'"
+          @click="searchMode = 'advanced'"
+        >
+          高级搜索
+        </button>
       </div>
       <p class="mt-2 text-xs text-slate-500">
-        文件搜索返回高亮片段；切片搜索返回命中的切片内容；图片搜索支持以图搜图。
+        文件搜索返回高亮片段；切片搜索返回命中的切片内容；图片搜索支持以图搜图；高级搜索以 SSE 流返回更长上下文。
       </p>
     </div>
 
@@ -196,7 +230,55 @@ const handleKeydown = (e) => {
     </div>
 
     <!-- 文本搜索输入框 -->
-    <div v-else class="relative">
+    <div v-else class="relative space-y-4">
+      <div v-if="searchMode === 'advanced'" class="grid grid-cols-2 gap-4 bg-white border border-slate-200 rounded-2xl p-4 mb-2">
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-2">计划步骤数</label>
+          <input
+            type="number"
+            min="1"
+            max="8"
+            v-model.number="advancedOptions.maxSteps"
+            class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-2">每步处理文档</label>
+          <input
+            type="number"
+            min="1"
+            max="20"
+            v-model.number="advancedOptions.docLimit"
+            class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-2">上下文单侧字数</label>
+          <input
+            type="number"
+            min="200"
+            max="6000"
+            step="100"
+            v-model.number="advancedOptions.contextChars"
+            class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
+          />
+        </div>
+        <div class="flex items-center gap-3 mt-6">
+          <label class="text-xs font-medium text-slate-600">输出调试信息</label>
+          <button
+            type="button"
+            class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors"
+            :class="advancedOptions.debug ? 'bg-blue-600' : 'bg-slate-300'"
+            @click="advancedOptions.debug = !advancedOptions.debug"
+          >
+            <span
+              class="inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform"
+              :class="advancedOptions.debug ? 'translate-x-5' : 'translate-x-1'"
+            />
+          </button>
+        </div>
+      </div>
+
       <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
         <svg class="h-5 w-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
@@ -211,7 +293,8 @@ const handleKeydown = (e) => {
       />
       <button
         @click="handleSearch"
-        class="absolute right-2 top-1/2 -translate-y-1/2 px-6 py-2.5 bg-linear-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-medium hover:from-blue-600 hover:to-indigo-700 transition-all duration-200 shadow-sm"
+        :disabled="!canSubmit"
+        class="absolute right-2 top-1/2 -translate-y-1/2 px-6 py-2.5 bg-linear-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-medium hover:from-blue-600 hover:to-indigo-700 transition-all duration-200 shadow-sm disabled:opacity-60 disabled:cursor-not-allowed"
       >
         搜索
       </button>

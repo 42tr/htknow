@@ -1,0 +1,361 @@
+use std::time::Duration;
+
+use anyhow::{Context, Result, anyhow};
+use log::warn;
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
+
+use super::SearchResultItem;
+use crate::config;
+
+const MAX_NEIGHBOR_SLICES: i64 = 30;
+
+#[derive(Clone)]
+pub struct LlmClient {
+    client: Client,
+    api_url: Option<String>,
+    api_key: Option<String>,
+    model: String,
+}
+
+impl LlmClient {
+    pub fn new() -> Self {
+        let cfg = config::get();
+        let llm = cfg.llm.clone();
+        let client = Client::builder().timeout(Duration::from_secs(60)).build().expect("build reqwest client");
+        Self { client, api_url: llm.api_url, api_key: llm.api_key, model: llm.model }
+    }
+
+    pub fn is_enabled(&self) -> bool {
+        self.api_url.is_some()
+    }
+
+    pub async fn chat_json<T: serde::de::DeserializeOwned>(
+        &self, prompt: &str, max_tokens: usize, temperature: f32,
+    ) -> Result<T> {
+        let content = self.chat(prompt, max_tokens, temperature).await?;
+        let clean = clean_json_like(&content);
+        let parsed = serde_json::from_str::<T>(&clean)
+            .map_err(|e| anyhow!("Failed to parse LLM JSON response: {}. content={}", e, clean))?;
+        Ok(parsed)
+    }
+
+    pub async fn chat(&self, prompt: &str, max_tokens: usize, temperature: f32) -> Result<String> {
+        let url = self.api_url.as_ref().ok_or_else(|| anyhow!("LLM not configured"))?;
+        let request = ChatRequest {
+            model: self.model.clone(),
+            messages: vec![Message { role: "user".to_string(), content: prompt.to_string() }],
+            max_tokens: Some(max_tokens),
+            temperature: Some(temperature),
+        };
+
+        let mut builder = self.client.post(url).json(&request);
+        if let Some(api_key) = &self.api_key {
+            builder = builder.header("Authorization", format!("Bearer {}", api_key));
+        }
+
+        let response = builder.send().await.context("LLM HTTP request failed")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            return Err(anyhow!("LLM HTTP error {}: {}", status, body));
+        }
+        let body = response.text().await.context("Failed to read LLM body")?;
+        let parsed: ChatResponse =
+            serde_json::from_str(&body).map_err(|e| anyhow!("Failed to decode LLM response: {} body={}", e, body))?;
+        let choice =
+            parsed.choices.first().ok_or_else(|| anyhow!("LLM response missing choices"))?.message.content.clone();
+        Ok(choice)
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanAction {
+    RecentDocuments,
+    DocumentStructure,
+    PageContent,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct PlanStep {
+    pub action: PlanAction,
+    #[serde(default)]
+    pub comment: String,
+}
+
+pub struct QueryPlanner {
+    llm: LlmClient,
+}
+
+impl QueryPlanner {
+    pub fn new(llm: LlmClient) -> Self {
+        Self { llm }
+    }
+
+    pub async fn plan(&self, query: &str, max_steps: usize) -> Vec<PlanStep> {
+        let capped_steps = max_steps.max(1).min(5);
+        if query.trim().is_empty() {
+            return default_plan(capped_steps);
+        }
+        if !self.llm.is_enabled() {
+            return default_plan(capped_steps);
+        }
+
+        let prompt = format!(
+            r#"
+你需要为一个检索助手制定逐步计划。可用的动作有：
+1. recent_documents - 查找最新/最相关的文档
+2. document_structure - 根据候选文档提炼结构或章节
+3. page_content - 精确定位页面内容并提取文本
+
+请根据问题在不超过 {} 个步骤内给出动作序列和理由，输出 JSON：
+{{
+  "steps": [
+    {{"action": "recent_documents", "comment": "..." }}
+  ]
+}}
+
+问题：{}
+"#,
+            capped_steps, query
+        );
+
+        let result = self.llm.chat_json::<PlanResponse>(&prompt, 600, 0.2).await;
+        match result {
+            Ok(resp) => {
+                let mut steps: Vec<PlanStep> = resp
+                    .steps
+                    .into_iter()
+                    .filter(|s| {
+                        matches!(
+                            s.action,
+                            PlanAction::RecentDocuments | PlanAction::DocumentStructure | PlanAction::PageContent
+                        )
+                    })
+                    .collect();
+                if steps.is_empty() {
+                    steps = default_plan(capped_steps);
+                }
+                steps.truncate(capped_steps);
+                steps
+            }
+            Err(err) => {
+                warn!("LLM plan failed: {}", err);
+                default_plan(capped_steps)
+            }
+        }
+    }
+}
+
+fn default_plan(max_steps: usize) -> Vec<PlanStep> {
+    let mut steps = vec![
+        PlanStep { action: PlanAction::RecentDocuments, comment: "先确认有哪些相关文档".to_string() },
+        PlanStep { action: PlanAction::DocumentStructure, comment: "查看文档结构定位章节".to_string() },
+        PlanStep { action: PlanAction::PageContent, comment: "提取具体内容".to_string() },
+    ];
+    steps.truncate(max_steps.min(steps.len()));
+    steps
+}
+
+pub struct RelevanceJudge {
+    llm: LlmClient,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct JudgeOutcome {
+    pub is_relevant: bool,
+    pub score: f32,
+    pub reason: String,
+}
+
+impl RelevanceJudge {
+    pub fn new(llm: LlmClient) -> Self {
+        Self { llm }
+    }
+
+    pub async fn judge(&self, question: &str, context: &str) -> JudgeOutcome {
+        if question.trim().is_empty() || context.trim().is_empty() {
+            return JudgeOutcome { is_relevant: false, score: 0.0, reason: "输入为空".to_string() };
+        }
+        if !self.llm.is_enabled() {
+            return JudgeOutcome { is_relevant: true, score: 1.0, reason: "LLM 未启用，默认通过".to_string() };
+        }
+
+        let prompt = format!(
+            r#"
+你是一名检索质量评估助手。判断候选内容是否可以帮助回答问题，只输出 JSON：
+{{"relevant":true/false, "score":0-1之间的小数, "reason":"简要说明"}}
+
+问题：
+{}
+
+候选内容：
+{}
+"#,
+            question, context
+        );
+
+        match self.llm.chat_json::<JudgeResponse>(&prompt, 400, 0.0).await {
+            Ok(resp) => {
+                let mut score = resp.score.unwrap_or(0.5);
+                if !(0.0..=1.0).contains(&score) {
+                    score = score.clamp(0.0, 1.0);
+                }
+                JudgeOutcome {
+                    is_relevant: resp.relevant,
+                    score,
+                    reason: resp.reason.unwrap_or_else(|| "LLM 无理由".to_string()),
+                }
+            }
+            Err(err) => {
+                warn!("LLM judge failed: {}", err);
+                JudgeOutcome { is_relevant: true, score: 0.6, reason: "LLM 判定失败，默认通过".to_string() }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ContextChunk {
+    pub slice_ids: Vec<i64>,
+    pub content: String,
+}
+
+pub async fn assemble_context_chunk(
+    pool: &SqlitePool, center: &SearchResultItem, per_side_chars: usize,
+) -> Result<ContextChunk> {
+    let before_rows = fetch_before_slices(pool, center.file_id, center.id).await?;
+    let after_rows = fetch_after_slices(pool, center.file_id, center.id).await?;
+
+    let before = take_with_limit(before_rows, per_side_chars, true);
+    let after = take_with_limit(after_rows, per_side_chars, false);
+
+    let mut slice_ids = Vec::new();
+    let mut content_parts = Vec::new();
+    for row in &before {
+        slice_ids.push(row.id);
+        content_parts.push(row.content.as_str());
+    }
+    slice_ids.push(center.id);
+    content_parts.push(center.content.as_str());
+    for row in &after {
+        slice_ids.push(row.id);
+        content_parts.push(row.content.as_str());
+    }
+
+    let combined = content_parts.join("\n");
+    Ok(ContextChunk { slice_ids, content: combined })
+}
+
+#[derive(sqlx::FromRow, Clone)]
+struct SliceRow {
+    id: i64,
+    content: String,
+}
+
+fn take_with_limit(items: Vec<SliceRow>, char_limit: usize, reverse_after: bool) -> Vec<SliceRow> {
+    if reverse_after {
+        // 当前 items 为倒序
+        let mut selected = Vec::new();
+        let mut total = 0;
+        for row in items.into_iter() {
+            total += row.content.chars().count();
+            selected.push(row);
+            if total >= char_limit {
+                break;
+            }
+        }
+        selected.reverse();
+        selected
+    } else {
+        let mut selected = Vec::new();
+        let mut total = 0;
+        for row in items.into_iter() {
+            total += row.content.chars().count();
+            selected.push(row);
+            if total >= char_limit {
+                break;
+            }
+        }
+        selected
+    }
+}
+
+async fn fetch_before_slices(pool: &SqlitePool, file_id: i64, center_id: i64) -> Result<Vec<SliceRow>> {
+    let sql = format!(
+        "SELECT id, content FROM slices WHERE file_id = ? AND id < ? ORDER BY id DESC LIMIT {}",
+        MAX_NEIGHBOR_SLICES
+    );
+    let rows = sqlx::query_as::<_, SliceRow>(&sql).bind(file_id).bind(center_id).fetch_all(pool).await?;
+    Ok(rows)
+}
+
+async fn fetch_after_slices(pool: &SqlitePool, file_id: i64, center_id: i64) -> Result<Vec<SliceRow>> {
+    let sql = format!(
+        "SELECT id, content FROM slices WHERE file_id = ? AND id > ? ORDER BY id ASC LIMIT {}",
+        MAX_NEIGHBOR_SLICES
+    );
+    let rows = sqlx::query_as::<_, SliceRow>(&sql).bind(file_id).bind(center_id).fetch_all(pool).await?;
+    Ok(rows)
+}
+
+#[derive(Debug, Deserialize)]
+struct PlanResponse {
+    #[serde(default)]
+    steps: Vec<PlanStep>,
+}
+
+#[derive(Debug, Deserialize)]
+struct JudgeResponse {
+    relevant: bool,
+    #[serde(default)]
+    score: Option<f32>,
+    #[serde(default)]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ChatRequest {
+    model: String,
+    messages: Vec<Message>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+}
+
+#[derive(Debug, Serialize)]
+struct Message {
+    role: String,
+    content: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatResponse {
+    choices: Vec<ChatChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatChoice {
+    message: ChatMessage,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatMessage {
+    content: String,
+}
+
+fn clean_json_like(input: &str) -> String {
+    let mut text = input.trim();
+    if let Some(stripped) = text.strip_prefix("```json") {
+        text = stripped.trim_start();
+    } else if let Some(stripped) = text.strip_prefix("```") {
+        text = stripped.trim_start();
+    }
+    if let Some(stripped) = text.strip_suffix("```") {
+        text = stripped.trim_end();
+    }
+    text.trim().to_string()
+}
