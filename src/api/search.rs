@@ -19,7 +19,9 @@ use utoipa::{IntoParams, ToSchema};
 use super::File;
 use crate::{
     AuthUser, api::error::{ApiError, ApiResult}, search::{
-        SearchEngine, SearchResultItem as EngineSearchResultItem, advanced::{LlmClient, PlanAction, PlanStep, QueryPlanner, RelevanceJudge, assemble_context_chunk}
+        SearchEngine, SearchResultItem as EngineSearchResultItem, advanced::{
+            ChunkRefiner, LlmClient, PlanAction, PlanStep, QueryPlanner, RefineOutcome, RelevanceJudge, assemble_context_chunk
+        }
     }
 };
 
@@ -340,9 +342,12 @@ async fn run_advanced_search_flow(
 ) -> anyhow::Result<()> {
     let llm_client = LlmClient::new();
     let planner = QueryPlanner::new(llm_client.clone());
-    let judge = RelevanceJudge::new(llm_client);
+    let judge = RelevanceJudge::new(llm_client.clone());
+    let chunk_refiner = ChunkRefiner::new(llm_client);
 
-    let outcome = run_advanced_search_logic(pool, search_engine, auth_user, params, kb_ids, planner, judge, &tx).await;
+    let outcome =
+        run_advanced_search_logic(pool, search_engine, auth_user, params, kb_ids, planner, judge, chunk_refiner, &tx)
+            .await;
 
     match outcome {
         Ok(_) => {
@@ -361,7 +366,7 @@ async fn run_advanced_search_flow(
 #[allow(clippy::too_many_arguments)]
 async fn run_advanced_search_logic(
     pool: SqlitePool, search_engine: SearchEngine, auth_user: AuthUser, params: AdvancedSearchQuery,
-    kb_ids: Option<Vec<i64>>, planner: QueryPlanner, judge: RelevanceJudge,
+    kb_ids: Option<Vec<i64>>, planner: QueryPlanner, judge: RelevanceJudge, chunk_refiner: ChunkRefiner,
     tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) -> anyhow::Result<()> {
     if matches!(kb_ids.as_ref(), Some(ids) if ids.is_empty()) {
@@ -440,9 +445,17 @@ async fn run_advanced_search_logic(
                     send_step_event(tx, &step, "skipped", Some(json!({ "reason": "未找到可提取内容" }))).await?;
                     continue;
                 }
-                let emitted =
-                    execute_page_content_step(&pool, &doc_candidates, doc_limit, context_chars, &judge, &params, tx)
-                        .await?;
+                let emitted = execute_page_content_step(
+                    &pool,
+                    &doc_candidates,
+                    doc_limit,
+                    context_chars,
+                    &judge,
+                    &chunk_refiner,
+                    &params,
+                    tx,
+                )
+                .await?;
                 send_step_event(tx, &step, "completed", Some(json!({ "emitted": emitted }))).await?;
             }
         }
@@ -462,6 +475,8 @@ struct AdvancedResultPayload {
     score: f32,
     judge_score: f32,
     judge_reason: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refine_reason: Option<String>,
     content: String,
 }
 
@@ -622,10 +637,11 @@ async fn fetch_document_sections(pool: &SqlitePool, file_id: i64, limit: usize) 
 
 async fn execute_page_content_step(
     pool: &SqlitePool, docs: &[DocumentCandidate], doc_limit: usize, context_chars: usize, judge: &RelevanceJudge,
-    params: &AdvancedSearchQuery, tx: &mpsc::Sender<Result<Event, Infallible>>,
+    chunk_refiner: &ChunkRefiner, params: &AdvancedSearchQuery, tx: &mpsc::Sender<Result<Event, Infallible>>,
 ) -> anyhow::Result<usize> {
     let mut emitted = 0;
     let mut seen_slice_ids: HashSet<i64> = HashSet::new();
+    let mut seen_big_chunks: HashSet<Vec<i64>> = HashSet::new();
     let max_docs = doc_limit.max(1);
 
     for doc in docs.iter().take(max_docs) {
@@ -653,8 +669,60 @@ async fn execute_page_content_step(
                 }
             };
 
+            let refine_outcome = match chunk_refiner.refine(&params.query, &context_chunk.segments).await {
+                Ok(outcome) => outcome,
+                Err(err) => {
+                    if params.debug {
+                        let _ = send_event_json(
+                            tx,
+                            "candidate",
+                            &json!({
+                                "step_action": PlanAction::PageContent,
+                                "file": doc.file.clone(),
+                                "kb": doc.kb.clone(),
+                                "error": format!("切片筛选失败: {}", err),
+                            }),
+                        )
+                        .await;
+                    }
+                    RefineOutcome {
+                        segments: context_chunk.segments.clone(),
+                        reason: Some("切片筛选失败，保留全部上下文".to_string()),
+                    }
+                }
+            };
+
+            let refined_slice_ids: Vec<i64> = refine_outcome.segments.iter().map(|seg| seg.slice_id).collect();
+            if refined_slice_ids.is_empty() {
+                continue;
+            }
+            let refined_content =
+                refine_outcome.segments.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>().join("\n");
+            if refined_content.trim().is_empty() {
+                continue;
+            }
+
+            let canonical_ids = canonical_slice_set(&refined_slice_ids);
+            if !seen_big_chunks.insert(canonical_ids) {
+                if params.debug {
+                    let _ = send_event_json(
+                        tx,
+                        "filtered",
+                        &json!({
+                            "step_action": PlanAction::PageContent,
+                            "file": doc.file.clone(),
+                            "kb": doc.kb.clone(),
+                            "reason": "重复切片组合",
+                            "slice_ids": refined_slice_ids,
+                        }),
+                    )
+                    .await;
+                }
+                continue;
+            }
+
             if params.debug {
-                let preview = preview_text(&context_chunk.content, 160);
+                let preview = preview_text(&refined_content, 160);
                 let _ = send_event_json(
                     tx,
                     "candidate",
@@ -663,24 +731,26 @@ async fn execute_page_content_step(
                         "file": doc.file.clone(),
                         "kb": doc.kb.clone(),
                         "score": slice.score,
-                        "slice_ids": context_chunk.slice_ids,
+                        "slice_ids": refined_slice_ids.clone(),
                         "preview": preview,
+                        "refine_reason": refine_outcome.reason.clone(),
                     }),
                 )
                 .await;
             }
 
-            let judge_outcome = judge.judge(&params.query, &context_chunk.content).await;
+            let judge_outcome = judge.judge(&params.query, &refined_content).await;
             if judge_outcome.is_relevant {
                 let payload = AdvancedResultPayload {
                     step_action: PlanAction::PageContent,
                     file: Some(doc.file.clone()),
                     kb: doc.kb.clone(),
-                    slice_ids: context_chunk.slice_ids.clone(),
+                    slice_ids: refined_slice_ids,
                     score: slice.score,
                     judge_score: judge_outcome.score,
                     judge_reason: judge_outcome.reason.clone(),
-                    content: context_chunk.content.clone(),
+                    refine_reason: refine_outcome.reason.clone(),
+                    content: refined_content.clone(),
                 };
                 send_event_json(tx, "result", &payload).await?;
                 emitted += 1;
@@ -718,6 +788,13 @@ fn preview_text(text: &str, max_chars: usize) -> String {
         buf.push(ch);
     }
     buf
+}
+
+fn canonical_slice_set(ids: &[i64]) -> Vec<i64> {
+    let mut normalized: Vec<i64> = ids.iter().copied().collect();
+    normalized.sort_unstable();
+    normalized.dedup();
+    normalized
 }
 
 /// 全文搜索（仅 Tantivy 全文索引）

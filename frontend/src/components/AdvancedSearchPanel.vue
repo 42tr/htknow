@@ -170,6 +170,9 @@ const copyContent = async (text) => {
             <p class="text-xs text-slate-500 mt-2">
               相关度：{{ item.judge_score?.toFixed(2) ?? '-' }} · {{ item.judge_reason }}
             </p>
+            <p v-if="item.refine_reason" class="text-xs text-slate-500 mt-1">
+              筛选说明：{{ item.refine_reason }}
+            </p>
             <pre class="mt-3 text-sm text-slate-700 bg-slate-50 rounded-lg p-3 max-h-40 overflow-auto whitespace-pre-wrap">{{ item.content }}</pre>
           </article>
         </div>

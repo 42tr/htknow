@@ -27,7 +27,8 @@ const newId = () => `${Date.now().toString(36)}-${Math.random().toString(36).sli
 const sliceKey = (item) => {
   const ids = item.slice_ids || item.sliceIds
   if (Array.isArray(ids) && ids.length > 0) {
-    return ids.join('-')
+    const normalized = [...new Set(ids)].sort((a, b) => a - b)
+    return normalized.join('-')
   }
   if (item.file?.id) {
     return `${item.file.id}-${item.step_action || ''}`

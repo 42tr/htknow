@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{collections::HashSet, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use log::warn;
@@ -217,10 +217,80 @@ impl RelevanceJudge {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ChunkSegment {
+    pub slice_id: i64,
+    pub text: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct ContextChunk {
     pub slice_ids: Vec<i64>,
     pub content: String,
+    pub segments: Vec<ChunkSegment>,
+}
+
+#[derive(Clone)]
+pub struct ChunkRefiner {
+    llm: LlmClient,
+}
+
+impl ChunkRefiner {
+    pub fn new(llm: LlmClient) -> Self {
+        Self { llm }
+    }
+
+    pub async fn refine(&self, question: &str, segments: &[ChunkSegment]) -> Result<RefineOutcome> {
+        if segments.is_empty() {
+            return Ok(RefineOutcome { segments: Vec::new(), reason: None });
+        }
+        if !self.llm.is_enabled() {
+            return Ok(RefineOutcome { segments: segments.to_vec(), reason: None });
+        }
+
+        let limited_segments: Vec<RefineSegmentInput> = segments
+            .iter()
+            .map(|seg| RefineSegmentInput { slice_id: seg.slice_id, text: truncate_text(&seg.text, 400) })
+            .collect();
+
+        let prompt = format!(
+            r#"
+你会得到一个问题和若干切片。请保留对问题最有帮助的切片，其余丢弃。
+输出 JSON：{{"keep_slice_ids":[1,2], "reason":"简短说明"}}。至少保留一个切片。
+
+问题：
+{}
+
+切片：
+{}
+"#,
+            question,
+            serde_json::to_string(&limited_segments)?
+        );
+
+        match self.llm.chat_json::<RefineResponse>(&prompt, 600, 0.0).await {
+            Ok(resp) => {
+                let keep_ids: HashSet<i64> = if resp.keep_slice_ids.is_empty() {
+                    segments.iter().map(|seg| seg.slice_id).collect()
+                } else {
+                    resp.keep_slice_ids.into_iter().collect()
+                };
+                let filtered: Vec<ChunkSegment> =
+                    segments.iter().filter(|seg| keep_ids.contains(&seg.slice_id)).cloned().collect();
+                let final_segments = if filtered.is_empty() { segments.to_vec() } else { filtered };
+                Ok(RefineOutcome { segments: final_segments, reason: resp.reason })
+            }
+            Err(err) => {
+                warn!("LLM chunk refine failed: {}", err);
+                Ok(RefineOutcome { segments: segments.to_vec(), reason: None })
+            }
+        }
+    }
+}
+
+pub struct RefineOutcome {
+    pub segments: Vec<ChunkSegment>,
+    pub reason: Option<String>,
 }
 
 pub async fn assemble_context_chunk(
@@ -232,27 +302,45 @@ pub async fn assemble_context_chunk(
     let before = take_with_limit(before_rows, per_side_chars, true);
     let after = take_with_limit(after_rows, per_side_chars, false);
 
-    let mut slice_ids = Vec::new();
-    let mut content_parts = Vec::new();
+    let mut segments: Vec<ChunkSegment> = Vec::new();
     for row in &before {
-        slice_ids.push(row.id);
-        content_parts.push(row.content.as_str());
+        segments.push(ChunkSegment { slice_id: row.id, text: row.content.clone() });
     }
-    slice_ids.push(center.id);
-    content_parts.push(center.content.as_str());
+    segments.push(ChunkSegment { slice_id: center.id, text: center.content.clone() });
     for row in &after {
-        slice_ids.push(row.id);
-        content_parts.push(row.content.as_str());
+        segments.push(ChunkSegment { slice_id: row.id, text: row.content.clone() });
     }
 
-    let combined = content_parts.join("\n");
-    Ok(ContextChunk { slice_ids, content: combined })
+    let slice_ids = segments.iter().map(|seg| seg.slice_id).collect();
+    let combined = segments.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>().join("\n");
+    Ok(ContextChunk { slice_ids, content: combined, segments })
 }
 
 #[derive(sqlx::FromRow, Clone)]
 struct SliceRow {
     id: i64,
     content: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RefineSegmentInput {
+    slice_id: i64,
+    text: String,
+}
+
+fn truncate_text(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let mut result = String::new();
+    for (idx, ch) in text.chars().enumerate() {
+        if idx >= max_chars {
+            result.push_str("...");
+            break;
+        }
+        result.push(ch);
+    }
+    result
 }
 
 fn take_with_limit(items: Vec<SliceRow>, char_limit: usize, reverse_after: bool) -> Vec<SliceRow> {
@@ -305,6 +393,14 @@ async fn fetch_after_slices(pool: &SqlitePool, file_id: i64, center_id: i64) -> 
 struct PlanResponse {
     #[serde(default)]
     steps: Vec<PlanStep>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RefineResponse {
+    #[serde(default)]
+    keep_slice_ids: Vec<i64>,
+    #[serde(default)]
+    reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
