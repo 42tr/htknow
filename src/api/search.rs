@@ -21,7 +21,7 @@ use super::File;
 use crate::{
     AuthUser, api::error::{ApiError, ApiResult}, processor, search::{
         RebuildProgress, SearchEngine, SearchResultItem as EngineSearchResultItem, advanced::{
-            ChunkRefiner, LlmClient, PlanAction, PlanStep, QueryPlanner, RefineOutcome, RelevanceJudge, assemble_context_chunk
+            ChunkRefiner, ChunkSegment, LlmClient, PlanAction, PlanStep, QueryPlanner, RefineOutcome, RelevanceJudge, assemble_context_chunk
         }
     }
 };
@@ -52,7 +52,7 @@ fn default_context_chars() -> usize {
     2000
 }
 
-const ADVANCED_JUDGE_EARLY_STOP_SCORE: f32 = 0.9;
+const ADVANCED_JUDGE_EARLY_STOP_SCORE: f32 = 0.8;
 
 /// 高级搜索参数
 #[derive(Debug, Deserialize, IntoParams, Clone)]
@@ -800,6 +800,17 @@ struct SliceCandidate {
     slice: EngineSearchResultItem,
 }
 
+struct SelectedAnswerCandidate {
+    file: FileInfo,
+    kb: Option<KbInfo>,
+    base_slice_id: i64,
+    base_score: f32,
+    judge_score: f32,
+    judge_reason: String,
+    context_segments: Vec<ChunkSegment>,
+    context_content: String,
+}
+
 async fn send_event_json<T: Serialize>(
     tx: &mpsc::Sender<Result<Event, Infallible>>, event: &str, payload: &T,
 ) -> anyhow::Result<()> {
@@ -969,7 +980,8 @@ async fn execute_page_content_step(
     let mut empty_slice_group_count = 0usize;
     let mut empty_content_count = 0usize;
     let mut judge_rejected_count = 0usize;
-    let mut best_payload: Option<AdvancedResultPayload> = None;
+    let mut selected_candidate: Option<SelectedAnswerCandidate> = None;
+    let mut best_candidate: Option<SelectedAnswerCandidate> = None;
 
     info!(
         "execute_page_content_step started: request_id={}, candidates={}, max_slices={}, context_chars={}, early_stop_score>{:.2}, debug={}",
@@ -1018,50 +1030,9 @@ async fn execute_page_content_step(
                 continue;
             }
         };
-        info!("context_chunk: {:?}", context_chunk);
-
-        let refine_outcome = match chunk_refiner.refine(&params.query, &context_chunk.segments).await {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                refine_error_count += 1;
-                info!(
-                    "execute_page_content_step refine failed: request_id={}, file_id={}, base_slice_id={}, error={}",
-                    request_id, candidate.file.id, base_slice.id, err
-                );
-                if params.debug {
-                    let _ = send_event_json(
-                        tx,
-                        "candidate",
-                        &json!({
-                            "step_action": PlanAction::PageContent,
-                            "file": candidate.file.clone(),
-                            "kb": candidate.kb.clone(),
-                            "error": format!("切片筛选失败: {}", err),
-                        }),
-                    )
-                    .await;
-                }
-                RefineOutcome {
-                    segments: context_chunk.segments.clone(),
-                    reason: Some("切片筛选失败，保留全部上下文".to_string()),
-                }
-            }
-        };
-
-        let refined_slice_ids: Vec<i64> = refine_outcome.segments.iter().map(|seg| seg.slice_id).collect();
-        if refined_slice_ids.is_empty() {
-            empty_slice_group_count += 1;
-            continue;
-        }
-        let refined_content =
-            refine_outcome.segments.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>().join("\n");
-        if refined_content.trim().is_empty() {
-            empty_content_count += 1;
-            continue;
-        }
 
         if params.debug {
-            let preview = preview_text(&refined_content, 160);
+            let preview = preview_text(&context_chunk.content, 160);
             let _ = send_event_json(
                 tx,
                 "candidate",
@@ -1070,102 +1041,158 @@ async fn execute_page_content_step(
                     "file": candidate.file.clone(),
                     "kb": candidate.kb.clone(),
                     "score": base_slice.score,
-                    "slice_ids": refined_slice_ids.clone(),
+                    "slice_ids": context_chunk.slice_ids.clone(),
                     "preview": preview,
-                    "refine_reason": refine_outcome.reason.clone(),
+                    "stage": "before_refine",
                 }),
             )
             .await;
         }
 
-        let judge_outcome = judge.judge(&params.query, &refined_content).await;
-        if judge_outcome.is_relevant {
-            let payload = AdvancedResultPayload {
-                step_action: PlanAction::PageContent,
-                file: Some(candidate.file.clone()),
-                kb: candidate.kb.clone(),
-                slice_ids: refined_slice_ids,
-                score: base_slice.score,
-                judge_score: judge_outcome.score,
-                judge_reason: judge_outcome.reason.clone(),
-                refine_reason: refine_outcome.reason.clone(),
-                content: refined_content.clone(),
-            };
-            if judge_outcome.score > ADVANCED_JUDGE_EARLY_STOP_SCORE {
-                send_event_json(tx, "result", &payload).await?;
-                emitted += 1;
-                info!(
-                    "execute_page_content_step emitted result with early stop: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, slice_count={}, score={:.4}, judge_score={:.4}, refine_reason=\"{}\"",
-                    request_id,
-                    candidate.file.id,
-                    candidate.kb.as_ref().map(|kb| kb.id),
-                    base_slice.id,
-                    payload.slice_ids.len(),
-                    base_slice.score,
-                    judge_outcome.score,
-                    preview_for_log(refine_outcome.reason.as_deref().unwrap_or("none"), 120)
-                );
-                break;
-            }
+        let judge_outcome = judge.judge(&params.query, &context_chunk.content).await;
+        if !judge_outcome.is_relevant {
+            judge_rejected_count += 1;
+            info!(
+                "execute_page_content_step candidate rejected: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, judge_score={:.4}, reason=\"{}\"",
+                request_id,
+                candidate.file.id,
+                candidate.kb.as_ref().map(|kb| kb.id),
+                base_slice.id,
+                judge_outcome.score,
+                preview_for_log(&judge_outcome.reason, 120)
+            );
 
-            let should_replace_best = best_payload.as_ref().map_or(true, |best| {
-                judge_outcome.score > best.judge_score
-                    || ((judge_outcome.score - best.judge_score).abs() < f32::EPSILON && base_slice.score > best.score)
-            });
-            if should_replace_best {
-                info!(
-                    "execute_page_content_step updated best candidate: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, score={:.4}, judge_score={:.4}",
-                    request_id,
-                    candidate.file.id,
-                    candidate.kb.as_ref().map(|kb| kb.id),
-                    base_slice.id,
-                    base_slice.score,
-                    judge_outcome.score
-                );
-                best_payload = Some(payload);
+            if params.debug {
+                let _ = send_event_json(
+                    tx,
+                    "filtered",
+                    &json!({
+                        "step_action": PlanAction::PageContent,
+                        "file": candidate.file.clone(),
+                        "kb": candidate.kb.clone(),
+                        "reason": judge_outcome.reason,
+                        "score": judge_outcome.score,
+                    }),
+                )
+                .await;
             }
             continue;
         }
 
-        judge_rejected_count += 1;
-        info!(
-            "execute_page_content_step candidate rejected: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, judge_score={:.4}, reason=\"{}\"",
-            request_id,
-            candidate.file.id,
-            candidate.kb.as_ref().map(|kb| kb.id),
-            base_slice.id,
-            judge_outcome.score,
-            preview_for_log(&judge_outcome.reason, 120)
-        );
+        let current_candidate = SelectedAnswerCandidate {
+            file: candidate.file.clone(),
+            kb: candidate.kb.clone(),
+            base_slice_id: base_slice.id,
+            base_score: base_slice.score,
+            judge_score: judge_outcome.score,
+            judge_reason: judge_outcome.reason.clone(),
+            context_segments: context_chunk.segments,
+            context_content: context_chunk.content,
+        };
 
-        if params.debug {
-            let _ = send_event_json(
-                tx,
-                "filtered",
-                &json!({
-                    "step_action": PlanAction::PageContent,
-                    "file": candidate.file.clone(),
-                    "kb": candidate.kb.clone(),
-                    "reason": judge_outcome.reason,
-                    "score": judge_outcome.score,
-                }),
-            )
-            .await;
+        if judge_outcome.score > ADVANCED_JUDGE_EARLY_STOP_SCORE {
+            info!(
+                "execute_page_content_step selected candidate for early stop: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, score={:.4}, judge_score={:.4}",
+                request_id,
+                candidate.file.id,
+                candidate.kb.as_ref().map(|kb| kb.id),
+                base_slice.id,
+                base_slice.score,
+                judge_outcome.score
+            );
+            selected_candidate = Some(current_candidate);
+            break;
+        }
+
+        let should_replace_best = best_candidate.as_ref().map_or(true, |best| {
+            judge_outcome.score > best.judge_score
+                || ((judge_outcome.score - best.judge_score).abs() < f32::EPSILON && base_slice.score > best.base_score)
+        });
+        if should_replace_best {
+            info!(
+                "execute_page_content_step updated best candidate: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, score={:.4}, judge_score={:.4}",
+                request_id,
+                candidate.file.id,
+                candidate.kb.as_ref().map(|kb| kb.id),
+                base_slice.id,
+                base_slice.score,
+                judge_outcome.score
+            );
+            best_candidate = Some(current_candidate);
         }
     }
 
-    if emitted == 0 {
-        if let Some(payload) = best_payload {
+    if selected_candidate.is_none() {
+        selected_candidate = best_candidate;
+    }
+
+    if let Some(selected) = selected_candidate {
+        info!(
+            "execute_page_content_step refining selected candidate: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, judge_score={:.4}",
+            request_id,
+            selected.file.id,
+            selected.kb.as_ref().map(|kb| kb.id),
+            selected.base_slice_id,
+            selected.judge_score
+        );
+
+        let refine_outcome = match chunk_refiner.refine(&params.query, &selected.context_segments).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                refine_error_count += 1;
+                info!(
+                    "execute_page_content_step refine failed: request_id={}, file_id={}, base_slice_id={}, error={}",
+                    request_id, selected.file.id, selected.base_slice_id, err
+                );
+                RefineOutcome {
+                    segments: selected.context_segments.clone(),
+                    reason: Some("切片筛选失败，保留全部上下文".to_string()),
+                }
+            }
+        };
+
+        let refine_reason = refine_outcome.reason.clone();
+        let mut final_segments = refine_outcome.segments;
+        if final_segments.is_empty() {
+            empty_slice_group_count += 1;
+            final_segments = selected.context_segments.clone();
+        }
+
+        let mut final_content = final_segments.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>().join("\n");
+        if final_content.trim().is_empty() {
+            empty_content_count += 1;
+            final_content = selected.context_content.clone();
+        }
+
+        if final_content.trim().is_empty() {
+            info!(
+                "execute_page_content_step selected candidate has empty content after refine: request_id={}, file_id={}, base_slice_id={}",
+                request_id, selected.file.id, selected.base_slice_id
+            );
+        } else {
+            let payload = AdvancedResultPayload {
+                step_action: PlanAction::PageContent,
+                file: Some(selected.file.clone()),
+                kb: selected.kb.clone(),
+                slice_ids: final_segments.iter().map(|seg| seg.slice_id).collect(),
+                score: selected.base_score,
+                judge_score: selected.judge_score,
+                judge_reason: selected.judge_reason.clone(),
+                refine_reason: refine_reason.clone(),
+                content: final_content.clone(),
+            };
             send_event_json(tx, "result", &payload).await?;
             emitted += 1;
             info!(
-                "execute_page_content_step emitted best result after full scan: request_id={}, file_id={:?}, kb_id={:?}, slice_count={}, score={:.4}, judge_score={:.4}",
+                "execute_page_content_step emitted result after refine: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, slice_count={}, score={:.4}, judge_score={:.4}, refine_reason=\"{}\"",
                 request_id,
-                payload.file.as_ref().map(|f| f.id),
-                payload.kb.as_ref().map(|kb| kb.id),
+                selected.file.id,
+                selected.kb.as_ref().map(|kb| kb.id),
+                selected.base_slice_id,
                 payload.slice_ids.len(),
-                payload.score,
-                payload.judge_score
+                selected.base_score,
+                selected.judge_score,
+                preview_for_log(refine_reason.as_deref().unwrap_or("none"), 120)
             );
         }
     }
