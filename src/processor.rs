@@ -1,5 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet}, sync::Arc, time::Duration
+    collections::{HashMap, HashSet}, sync::{
+        Arc, atomic::{AtomicBool, Ordering}
+    }, time::Duration
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -243,6 +245,21 @@ pub struct FileProcessor {
     interval: Duration,
 }
 
+static PARSE_PAUSED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_parse_paused(paused: bool) {
+    PARSE_PAUSED.store(paused, Ordering::SeqCst);
+    if paused {
+        warn!("File parsing has been paused for index maintenance");
+    } else {
+        info!("File parsing resumed");
+    }
+}
+
+pub fn is_parse_paused() -> bool {
+    PARSE_PAUSED.load(Ordering::SeqCst)
+}
+
 impl FileProcessor {
     /// 创建新的文件处理器
     ///
@@ -265,8 +282,17 @@ impl FileProcessor {
             }
 
             loop {
+                if is_parse_paused() {
+                    debug!("File processor paused, sleeping for {:?}", processor.interval);
+                    time::sleep(processor.interval).await;
+                    continue;
+                }
                 // 持续处理直到没有待处理的文件
                 loop {
+                    if is_parse_paused() {
+                        debug!("File processor paused while processing queue");
+                        break;
+                    }
                     match processor.process_pending_files().await {
                         Ok(has_more) => {
                             if !has_more {
@@ -365,6 +391,9 @@ impl FileProcessor {
     /// 处理所有待处理的文件
     /// 返回是否还有更多文件需要处理
     async fn process_pending_files(self: &Arc<Self>) -> anyhow::Result<bool> {
+        if is_parse_paused() {
+            return Ok(false);
+        }
         let files = self.fetch_pending_files().await?;
 
         if files.is_empty() {
@@ -441,6 +470,9 @@ impl FileProcessor {
 
     /// 处理单个文件
     async fn process_file(&self, file: &File) -> anyhow::Result<()> {
+        if is_parse_paused() {
+            anyhow::bail!("parse is paused for index maintenance");
+        }
         info!("Processing file: {} ({})", file.filename, file.id);
         if !self.ensure_file_exists(file.id, "process start").await? {
             return Ok(());
@@ -2307,6 +2339,9 @@ impl FileProcessor {
 }
 
 pub async fn process_file_immediate(pool: SqlitePool, search_engine: SearchEngine, file_id: i64) -> anyhow::Result<()> {
+    if is_parse_paused() {
+        anyhow::bail!("parse is paused for index maintenance");
+    }
     let sql = "SELECT * FROM files WHERE id = ?";
     let file: File = sqlx::query_as(sql).bind(file_id).fetch_one(&pool).await?;
 
@@ -2317,6 +2352,9 @@ pub async fn process_file_immediate(pool: SqlitePool, search_engine: SearchEngin
 pub async fn try_reuse_file_with_file(
     pool: SqlitePool, search_engine: SearchEngine, file: File,
 ) -> anyhow::Result<bool> {
+    if is_parse_paused() {
+        return Ok(false);
+    }
     let processor = FileProcessor::new(pool, search_engine, 0);
     processor.try_reuse_existing_data(&file).await
 }

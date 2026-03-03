@@ -1,21 +1,23 @@
 //! 中文分词器模块 - 提供高性能的中英文混合分词功能
 
-use std::{collections::HashSet, sync::Arc};
+use std::{collections::HashSet, sync::RwLock};
 
+use anyhow::anyhow;
 use jieba_rs::{Jieba, TokenizeMode};
 use lazy_static::lazy_static;
 use log::info;
 use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
 
+#[derive(Debug, Clone)]
+pub struct LexiconEntry {
+    pub term: String,
+    pub freq: Option<usize>,
+    pub tag: Option<String>,
+}
+
 // 使用全局静态 Jieba 实例，避免重复初始化
 lazy_static! {
-    static ref JIEBA: Arc<Jieba> = {
-        let jieba = Jieba::new();
-        // 可以在这里加载自定义词典
-        // 注意：jieba-rs 的 load_dict 需要可变引用和 BufRead
-        // 如果需要加载自定义词典，应该在初始化时处理
-        Arc::new(jieba)
-    };
+    static ref JIEBA: RwLock<Jieba> = RwLock::new(Jieba::new());
     // 基础停用词集合，可按需扩展
     static ref STOP_WORDS: HashSet<&'static str> = {
         let mut set = HashSet::new();
@@ -29,6 +31,26 @@ lazy_static! {
         }
         set
     };
+}
+
+pub fn reload_custom_words(entries: &[LexiconEntry]) -> anyhow::Result<usize> {
+    let mut jieba = Jieba::new();
+    let mut loaded = 0usize;
+    for entry in entries {
+        let term = entry.term.trim();
+        if term.is_empty() {
+            continue;
+        }
+        let tag = entry.tag.as_deref().map(str::trim).filter(|s| !s.is_empty());
+        let freq = entry.freq.filter(|f| *f > 0);
+        jieba.add_word(term, freq, tag);
+        loaded += 1;
+    }
+
+    let mut guard = JIEBA.write().map_err(|_| anyhow!("failed to lock jieba for writing"))?;
+    *guard = jieba;
+    info!("Reloaded Jieba custom lexicon with {} words", loaded);
+    Ok(loaded)
 }
 
 /// 分词模式
@@ -64,10 +86,11 @@ impl FastChineseTokenizer {
 
     /// 执行分词
     pub fn segment(&self, text: &str) -> Vec<String> {
+        let jieba = JIEBA.read().unwrap_or_else(|e| e.into_inner());
         let words = match self.mode {
             SegmentationMode::Search => {
                 // 搜索模式：使用 cut_for_search，召回率高
-                JIEBA
+                jieba
                     .cut_for_search(text, false)
                     .into_iter()
                     .filter(|s| {
@@ -77,7 +100,7 @@ impl FastChineseTokenizer {
                     .map(|s| s.to_string())
                     .collect()
             }
-            SegmentationMode::All => JIEBA
+            SegmentationMode::All => jieba
                 .cut_all(text)
                 .into_iter()
                 .filter(|s| {
@@ -96,7 +119,8 @@ impl FastChineseTokenizer {
             SegmentationMode::Search => TokenizeMode::Search,
             SegmentationMode::All => TokenizeMode::Search,
         };
-        JIEBA
+        let jieba = JIEBA.read().unwrap_or_else(|e| e.into_inner());
+        jieba
             .tokenize(text, mode, false)
             .into_iter()
             .filter(|t| {

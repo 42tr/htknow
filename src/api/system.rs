@@ -1,9 +1,11 @@
-use axum::{Extension, Json, response::Response};
+use axum::{Extension, Json, extract::State, response::Response};
+use chrono::Utc;
 use serde::Serialize;
+use sqlx::SqlitePool;
 use utoipa::ToSchema;
 
 use crate::{
-    api::error::{ApiError, ApiResult}, search::SearchEngine
+    AuthUser, api::error::{ApiError, ApiResult}, search::SearchEngine
 };
 
 /// 进程内存占用
@@ -51,6 +53,47 @@ pub struct LanceDbCompactStats {
     pub size_before_bytes: u64,
     /// compact 后磁盘大小（字节）
     pub size_after_bytes: u64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct IndexRebuildStatus {
+    /// 任务 ID（无任务时为 null）
+    pub job_id: Option<i64>,
+    /// 任务状态：idle/running/completed/failed
+    pub status: String,
+    /// 当前阶段描述
+    pub phase: String,
+    /// 总文档数
+    pub total_docs: i64,
+    /// 已处理文档数
+    pub processed_docs: i64,
+    /// 进度百分比（0-100）
+    pub progress_pct: f32,
+    /// 已运行秒数
+    pub elapsed_secs: Option<i64>,
+    /// 预计剩余秒数（ETA）
+    pub eta_secs: Option<i64>,
+    /// 任务开始时间（秒级时间戳）
+    pub started_at: Option<i64>,
+    /// 最近更新时间（秒级时间戳）
+    pub updated_at: Option<i64>,
+    /// 任务结束时间（秒级时间戳）
+    pub finished_at: Option<i64>,
+    /// 失败时错误信息
+    pub error: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct IndexRebuildStatusRow {
+    id: i64,
+    status: String,
+    phase: String,
+    total_docs: i64,
+    processed_docs: i64,
+    started_at: Option<i64>,
+    updated_at: Option<i64>,
+    finished_at: Option<i64>,
+    error: Option<String>,
 }
 
 /// 生成当前进程堆内存快照（jemalloc heap profile）
@@ -117,6 +160,102 @@ pub async fn lancedb_compact(
         size_before_bytes: stats.size_before_bytes,
         size_after_bytes: stats.size_after_bytes,
     }))
+}
+
+/// 查询索引重建进度与 ETA
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/system/index/rebuild/status",
+    operation_id = "system_index_rebuild_status",
+    tag = "system",
+    responses(
+        (status = 200, description = "成功返回索引重建状态", body = IndexRebuildStatus)
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn index_rebuild_status(
+    State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<IndexRebuildStatus>> {
+    ensure_admin(&auth_user)?;
+
+    let row: Option<IndexRebuildStatusRow> = sqlx::query_as(
+        "SELECT id, status, phase, total_docs, processed_docs, started_at, updated_at, finished_at, error
+         FROM index_rebuild_jobs
+         ORDER BY CASE WHEN status = 'running' THEN 0 ELSE 1 END, id DESC
+         LIMIT 1",
+    )
+    .fetch_optional(&pool)
+    .await?;
+
+    let Some(row) = row else {
+        return Ok(Json(IndexRebuildStatus {
+            job_id: None,
+            status: "idle".to_string(),
+            phase: String::new(),
+            total_docs: 0,
+            processed_docs: 0,
+            progress_pct: 0.0,
+            elapsed_secs: None,
+            eta_secs: None,
+            started_at: None,
+            updated_at: None,
+            finished_at: None,
+            error: None,
+        }));
+    };
+
+    let total_docs = row.total_docs.max(0);
+    let processed_docs = row.processed_docs.clamp(0, total_docs.max(0));
+    let progress_pct = if total_docs > 0 {
+        ((processed_docs as f64 / total_docs as f64) * 100.0).clamp(0.0, 100.0) as f32
+    } else if row.status == "completed" {
+        100.0
+    } else {
+        0.0
+    };
+
+    let now = Utc::now().timestamp();
+    let elapsed_secs = row.started_at.map(|start| (now - start).max(0));
+    let eta_secs = if row.status == "running" && total_docs > processed_docs {
+        match elapsed_secs {
+            Some(elapsed) if elapsed > 0 && processed_docs > 0 => {
+                let speed = processed_docs as f64 / elapsed as f64;
+                if speed > 0.0 {
+                    let remaining = (total_docs - processed_docs) as f64;
+                    Some((remaining / speed).ceil() as i64)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    } else if row.status == "completed" {
+        Some(0)
+    } else {
+        None
+    };
+
+    Ok(Json(IndexRebuildStatus {
+        job_id: Some(row.id),
+        status: row.status,
+        phase: row.phase,
+        total_docs,
+        processed_docs,
+        progress_pct,
+        elapsed_secs,
+        eta_secs,
+        started_at: row.started_at,
+        updated_at: row.updated_at,
+        finished_at: row.finished_at,
+        error: row.error,
+    }))
+}
+
+fn ensure_admin(auth_user: &AuthUser) -> ApiResult<()> {
+    if auth_user.is_admin() { Ok(()) } else { Err(ApiError::BadRequest("admin role required".to_string())) }
 }
 
 #[cfg(feature = "profiling")]

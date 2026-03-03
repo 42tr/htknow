@@ -27,6 +27,10 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = db::init().await?;
     let search_engine = search::SearchEngine::init().await.with_pool(pool.clone());
+    match search_engine.reload_lexicon().await {
+        Ok(loaded) => log::info!("Search lexicon loaded: {} words", loaded),
+        Err(e) => log::warn!("Failed to load search lexicon at startup: {}", e),
+    }
 
     let processor =
         processor::FileProcessor::new(pool.clone(), search_engine.clone(), cfg.server.process_interval_secs);

@@ -1,4 +1,6 @@
-use std::{collections::HashSet, path::Path, time::Instant};
+use std::{
+    collections::{HashMap, HashSet}, path::Path, time::Instant
+};
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use log::{debug, info};
@@ -13,6 +15,14 @@ use crate::config;
 const ALL_TOKENIZER: &str = "all";
 const SENTENCE_SHOULD_BOOST: f32 = 2.0;
 const SENTENCE_SLOP: u32 = 12;
+
+#[derive(Debug, Clone)]
+pub struct SynonymTerm {
+    pub term: String,
+    pub boost: f32,
+}
+
+pub type SynonymMap = HashMap<String, Vec<SynonymTerm>>;
 
 #[derive(Clone)]
 pub struct Document {
@@ -60,7 +70,7 @@ pub fn init_full() -> Result<(Schema, Index)> {
     init_with_path(&cfg.search.tantivy_full_index_path)
 }
 
-fn init_with_path(path: &str) -> Result<(Schema, Index)> {
+pub fn init_with_path(path: &str) -> Result<(Schema, Index)> {
     let schema = build_schema();
     let path = Path::new(path);
     let index = if path.exists() {
@@ -105,10 +115,11 @@ pub async fn write_documents_batch(index: &Index, schema: &Schema, docs: Vec<Doc
 
 pub async fn search(
     reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
+    synonym_map: Option<&SynonymMap>,
 ) -> anyhow::Result<Vec<SearchResultItem>> {
     let cfg = config::get();
     let searcher = reader.searcher();
-    let tantivy_query = build_query(query, file_ids, kb_ids, schema)?;
+    let tantivy_query = build_query(query, file_ids, kb_ids, schema, synonym_map)?;
     let search_start = Instant::now();
     let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(cfg.search.limit))?;
     debug!("Tantivy searcher.search {}ms", search_start.elapsed().as_millis());
@@ -143,16 +154,16 @@ pub async fn search(
 
 pub async fn search_with_snippet(
     reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
-    max_chars: usize,
+    max_chars: usize, synonym_map: Option<&SynonymMap>,
 ) -> anyhow::Result<Vec<FullSearchResultItem>> {
     let cfg = config::get();
     let searcher = reader.searcher();
-    let tantivy_query = build_query(query, file_ids, kb_ids, schema)?;
+    let tantivy_query = build_query(query, file_ids, kb_ids, schema, synonym_map)?;
     let search_start = Instant::now();
     let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(cfg.search.limit))?;
     debug!("Tantivy full searcher.search {}ms", search_start.elapsed().as_millis());
 
-    let terms = build_snippet_terms(query);
+    let terms = build_snippet_terms(query, synonym_map);
     let matcher = build_matcher(&terms);
 
     let mut results = vec![];
@@ -199,15 +210,24 @@ pub async fn delete_by_kb(index: &Index, schema: &Schema, kb_id: i64) -> anyhow:
 
 fn build_query(
     input: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>, schema: &Schema,
+    synonym_map: Option<&SynonymMap>,
 ) -> tantivy::Result<Box<dyn Query>> {
     let mut subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::new();
-    let segmented_words = perform_segmentation(input, chinese_tokenizer::SegmentationMode::Search);
+    let query_terms = build_query_terms(input, synonym_map);
 
     // content 至少命中一个
     let mut content_queries = Vec::new();
-    for word in segmented_words {
-        let tq = TermQuery::new(Term::from_field_text(get_field(schema, "content"), &word), IndexRecordOption::Basic);
-        content_queries.push((Occur::Should, Box::new(tq) as Box<dyn Query>));
+    for query_term in query_terms {
+        let tq = TermQuery::new(
+            Term::from_field_text(get_field(schema, "content"), query_term.term.as_str()),
+            IndexRecordOption::Basic,
+        );
+        if (query_term.boost - 1.0).abs() > f32::EPSILON {
+            content_queries
+                .push((Occur::Should, Box::new(BoostQuery::new(Box::new(tq), query_term.boost)) as Box<dyn Query>));
+        } else {
+            content_queries.push((Occur::Should, Box::new(tq) as Box<dyn Query>));
+        }
     }
     let content_bool = BooleanQuery::new(content_queries);
     subqueries.push((Occur::Must, Box::new(content_bool)));
@@ -298,7 +318,7 @@ struct MatchInfo {
     term_idx: usize,
 }
 
-fn build_snippet_terms(query: &str) -> Vec<String> {
+fn build_snippet_terms(query: &str, synonym_map: Option<&SynonymMap>) -> Vec<String> {
     let mut terms = Vec::new();
     let mut seen = HashSet::new();
     let segmented = perform_segmentation(query, chinese_tokenizer::SegmentationMode::Search);
@@ -310,8 +330,77 @@ fn build_snippet_terms(query: &str) -> Vec<String> {
         if seen.insert(trimmed.to_string()) {
             terms.push(trimmed.to_string());
         }
+        if let Some(map) = synonym_map {
+            if let Some(synonyms) = map.get(trimmed) {
+                for synonym in synonyms {
+                    let syn = synonym.term.trim();
+                    if syn.is_empty() {
+                        continue;
+                    }
+                    if seen.insert(syn.to_string()) {
+                        terms.push(syn.to_string());
+                    }
+                }
+            }
+        }
     }
     terms.sort_by(|a, b| b.len().cmp(&a.len()));
+    terms
+}
+
+#[derive(Debug, Clone)]
+struct QueryTerm {
+    term: String,
+    boost: f32,
+}
+
+fn build_query_terms(input: &str, synonym_map: Option<&SynonymMap>) -> Vec<QueryTerm> {
+    let mut terms = Vec::new();
+    let mut seen = HashSet::new();
+    let segmented = perform_segmentation(input, chinese_tokenizer::SegmentationMode::Search);
+    for term in segmented {
+        let trimmed = term.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            terms.push(QueryTerm { term: trimmed.to_string(), boost: 1.0 });
+        }
+        if let Some(map) = synonym_map {
+            if let Some(synonyms) = map.get(trimmed) {
+                for synonym in synonyms {
+                    let syn = synonym.term.trim();
+                    if syn.is_empty() || syn == trimmed {
+                        continue;
+                    }
+                    if seen.insert(syn.to_string()) {
+                        terms.push(QueryTerm { term: syn.to_string(), boost: synonym.boost.max(0.01) });
+                    }
+                }
+            }
+        }
+    }
+
+    if terms.is_empty() {
+        let raw = input.trim();
+        if !raw.is_empty() {
+            terms.push(QueryTerm { term: raw.to_string(), boost: 1.0 });
+            if let Some(map) = synonym_map {
+                if let Some(synonyms) = map.get(raw) {
+                    for synonym in synonyms {
+                        let syn = synonym.term.trim();
+                        if syn.is_empty() || syn == raw {
+                            continue;
+                        }
+                        if seen.insert(syn.to_string()) {
+                            terms.push(QueryTerm { term: syn.to_string(), boost: synonym.boost.max(0.01) });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     terms
 }
 

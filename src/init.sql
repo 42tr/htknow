@@ -133,3 +133,49 @@ CREATE INDEX IF NOT EXISTS idx_mentions_node ON entity_mentions(node_id);
 CREATE INDEX IF NOT EXISTS idx_mentions_slice ON entity_mentions(slice_id);
 CREATE INDEX IF NOT EXISTS idx_slice_positions_slice ON slice_positions(slice_id);
 CREATE INDEX IF NOT EXISTS idx_files_meta ON files(meta);
+
+-- 搜索词表（分词增强）
+CREATE TABLE IF NOT EXISTS search_lexicon (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    term TEXT NOT NULL UNIQUE,                -- 词条
+    freq INTEGER DEFAULT NULL,                -- 词频
+    tag TEXT DEFAULT NULL,                    -- 词性
+    enabled INTEGER NOT NULL DEFAULT 1,       -- 是否启用
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    updated_at INTEGER DEFAULT (strftime('%s','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_lexicon_enabled ON search_lexicon(enabled);
+
+-- 搜索同义词词典（查询扩展）
+CREATE TABLE IF NOT EXISTS search_synonyms (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    term TEXT NOT NULL,                        -- 原词
+    synonym TEXT NOT NULL,                     -- 同义词
+    weight REAL NOT NULL DEFAULT 1.0,          -- 行级权重
+    bidirectional INTEGER NOT NULL DEFAULT 1,  -- 是否双向
+    enabled INTEGER NOT NULL DEFAULT 1,        -- 是否启用
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    updated_at INTEGER DEFAULT (strftime('%s','now')),
+    UNIQUE(term, synonym)
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_synonyms_term ON search_synonyms(term);
+CREATE INDEX IF NOT EXISTS idx_search_synonyms_synonym ON search_synonyms(synonym);
+
+-- 索引重建任务状态
+CREATE TABLE IF NOT EXISTS index_rebuild_jobs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    status TEXT NOT NULL DEFAULT 'idle',      -- idle/running/completed/failed
+    phase TEXT NOT NULL DEFAULT '',           -- 当前阶段
+    total_docs INTEGER NOT NULL DEFAULT 0,    -- 总文档数（切片 + 全文等）
+    processed_docs INTEGER NOT NULL DEFAULT 0,-- 已处理文档数
+    started_at INTEGER DEFAULT NULL,          -- 开始时间（秒级时间戳）
+    updated_at INTEGER DEFAULT (strftime('%s','now')),
+    finished_at INTEGER DEFAULT NULL,         -- 完成时间
+    error TEXT DEFAULT NULL,                  -- 错误信息
+    meta TEXT DEFAULT NULL                    -- 扩展信息（JSON）
+);
+
+CREATE INDEX IF NOT EXISTS idx_index_rebuild_jobs_status ON index_rebuild_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_index_rebuild_jobs_updated_at ON index_rebuild_jobs(updated_at);

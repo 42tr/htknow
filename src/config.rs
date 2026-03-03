@@ -140,6 +140,14 @@ pub struct SearchConfig {
     pub tantivy_full_index_path: String,
     /// Tantivy 索引内存（MB）
     pub tantivy_memory_mb: usize,
+    /// 是否启用同义词扩展
+    pub synonym_enabled: bool,
+    /// 同义词默认权重因子
+    pub synonym_boost: f32,
+    /// 每个词最多扩展的同义词数
+    pub max_synonyms_per_term: usize,
+    /// 单次查询最多扩展的同义词总数
+    pub max_total_synonyms: usize,
 }
 
 /// 切片配置
@@ -260,6 +268,10 @@ impl SearchConfig {
                 &format!("{}/tantivy_full_index", data_dir),
             ),
             tantivy_memory_mb: env_or_parse("HTKNOW_TANTIVY_MEMORY_MB", 50),
+            synonym_enabled: env_or_parse("HTKNOW_SEARCH_SYNONYM_ENABLED", true),
+            synonym_boost: env_or_parse("HTKNOW_SEARCH_SYNONYM_BOOST", 0.7),
+            max_synonyms_per_term: env_or_parse("HTKNOW_SEARCH_MAX_SYNONYMS_PER_TERM", 5),
+            max_total_synonyms: env_or_parse("HTKNOW_SEARCH_MAX_TOTAL_SYNONYMS", 30),
         }
     }
 }

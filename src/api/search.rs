@@ -4,11 +4,12 @@ use std::{
 
 use anyhow::anyhow;
 use axum::{
-    Extension, extract::{Multipart, Query, State}, response::{
+    Extension, extract::{Multipart, Path, Query, State}, response::{
         Json, sse::{Event, KeepAlive, KeepAliveStream, Sse}
     }
 };
-use log::error;
+use chrono::Utc;
+use log::{error, info, warn};
 use serde::{Deserialize, Serialize, de};
 use serde_json::{Value, json};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
@@ -18,8 +19,8 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::File;
 use crate::{
-    AuthUser, api::error::{ApiError, ApiResult}, search::{
-        SearchEngine, SearchResultItem as EngineSearchResultItem, advanced::{
+    AuthUser, api::error::{ApiError, ApiResult}, processor, search::{
+        RebuildProgress, SearchEngine, SearchResultItem as EngineSearchResultItem, advanced::{
             ChunkRefiner, LlmClient, PlanAction, PlanStep, QueryPlanner, RefineOutcome, RelevanceJudge, assemble_context_chunk
         }
     }
@@ -194,6 +195,179 @@ pub struct ImageSearchQuery {
     #[param(value_type = String, example = "1,2")]
     #[serde(default, deserialize_with = "deserialize_id_list")]
     pub kb_id: Option<Vec<i64>>,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct LexiconListQuery {
+    /// 关键字（匹配 term）
+    pub q: Option<String>,
+    /// 启用状态过滤
+    pub enabled: Option<bool>,
+    /// 返回数量上限
+    #[serde(default = "default_synonym_limit")]
+    pub limit: i64,
+    /// 偏移量
+    #[serde(default)]
+    pub offset: i64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct LexiconItem {
+    pub id: i64,
+    pub term: String,
+    pub freq: Option<i64>,
+    pub tag: Option<String>,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct LexiconListResponse {
+    pub total: i64,
+    pub items: Vec<LexiconItem>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeleteLexiconResponse {
+    pub id: i64,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReloadLexiconResponse {
+    pub loaded: usize,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct PublishLexiconResponse {
+    pub job_id: i64,
+    pub status: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateLexiconReq {
+    pub term: String,
+    pub freq: Option<i64>,
+    pub tag: Option<String>,
+    #[serde(default = "default_synonym_enabled")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateLexiconReq {
+    pub term: Option<String>,
+    pub freq: Option<i64>,
+    pub tag: Option<String>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ToggleLexiconReq {
+    pub enabled: bool,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct LexiconItemRow {
+    id: i64,
+    term: String,
+    freq: Option<i64>,
+    tag: Option<String>,
+    enabled: i64,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct SynonymListQuery {
+    /// 关键字（匹配 term 或 synonym）
+    pub q: Option<String>,
+    /// 启用状态过滤
+    pub enabled: Option<bool>,
+    /// 返回数量上限
+    #[serde(default = "default_synonym_limit")]
+    pub limit: i64,
+    /// 偏移量
+    #[serde(default)]
+    pub offset: i64,
+}
+
+fn default_synonym_limit() -> i64 {
+    50
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct SynonymItem {
+    pub id: i64,
+    pub term: String,
+    pub synonym: String,
+    pub weight: f32,
+    pub bidirectional: bool,
+    pub enabled: bool,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SynonymListResponse {
+    pub total: i64,
+    pub items: Vec<SynonymItem>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct DeleteSynonymResponse {
+    pub id: i64,
+    pub deleted: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct CreateSynonymReq {
+    pub term: String,
+    pub synonym: String,
+    #[serde(default = "default_synonym_weight")]
+    pub weight: f32,
+    #[serde(default = "default_synonym_bidirectional")]
+    pub bidirectional: bool,
+    #[serde(default = "default_synonym_enabled")]
+    pub enabled: bool,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateSynonymReq {
+    pub term: Option<String>,
+    pub synonym: Option<String>,
+    pub weight: Option<f32>,
+    pub bidirectional: Option<bool>,
+    pub enabled: Option<bool>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ToggleSynonymReq {
+    pub enabled: bool,
+}
+
+fn default_synonym_weight() -> f32 {
+    1.0
+}
+
+fn default_synonym_bidirectional() -> bool {
+    true
+}
+
+fn default_synonym_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct SynonymItemRow {
+    id: i64,
+    term: String,
+    synonym: String,
+    weight: f32,
+    bidirectional: i64,
+    enabled: i64,
+    created_at: i64,
+    updated_at: i64,
 }
 
 /// 搜索内容
@@ -1097,6 +1271,769 @@ pub async fn search_image(
         .collect();
 
     Ok(Json(SearchResult { results }))
+}
+
+/// 词表列表（管理员）
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/search/lexicons",
+    operation_id = "search_lexicon_list",
+    tag = "search",
+    params(LexiconListQuery),
+    responses(
+        (status = 200, description = "词表列表查询成功", body = LexiconListResponse),
+        (status = 400, description = "请求参数错误")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn list_lexicons(
+    State(pool): State<SqlitePool>, Query(params): Query<LexiconListQuery>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<LexiconListResponse>> {
+    ensure_admin(&auth_user)?;
+
+    let q = params.q.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let limit = params.limit.clamp(1, 200);
+    let offset = params.offset.max(0);
+
+    let mut count_qb = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM search_lexicon WHERE 1 = 1");
+    if let Some(enabled) = params.enabled {
+        count_qb.push(" AND enabled = ");
+        count_qb.push_bind(if enabled { 1_i64 } else { 0_i64 });
+    }
+    if let Some(keyword) = &q {
+        let pattern = format!("%{}%", keyword);
+        count_qb.push(" AND term LIKE ");
+        count_qb.push_bind(pattern);
+    }
+    let total: i64 = count_qb.build_query_scalar().fetch_one(&pool).await?;
+
+    let mut list_qb = QueryBuilder::<Sqlite>::new(
+        "SELECT id, term, freq, tag, enabled, created_at, updated_at FROM search_lexicon WHERE 1 = 1",
+    );
+    if let Some(enabled) = params.enabled {
+        list_qb.push(" AND enabled = ");
+        list_qb.push_bind(if enabled { 1_i64 } else { 0_i64 });
+    }
+    if let Some(keyword) = &q {
+        let pattern = format!("%{}%", keyword);
+        list_qb.push(" AND term LIKE ");
+        list_qb.push_bind(pattern);
+    }
+    list_qb.push(" ORDER BY updated_at DESC, id DESC LIMIT ");
+    list_qb.push_bind(limit);
+    list_qb.push(" OFFSET ");
+    list_qb.push_bind(offset);
+
+    let rows: Vec<LexiconItemRow> = list_qb.build_query_as().fetch_all(&pool).await?;
+    let items = rows.into_iter().map(lexicon_row_to_item).collect();
+    Ok(Json(LexiconListResponse { total, items }))
+}
+
+/// 新增词表词条（管理员）
+#[utoipa::path(
+    post,
+    path = "/api/v1/knowledge/search/lexicons",
+    operation_id = "search_lexicon_create",
+    tag = "search",
+    request_body = CreateLexiconReq,
+    responses(
+        (status = 200, description = "词条新增成功", body = LexiconItem),
+        (status = 400, description = "请求参数错误")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn create_lexicon(
+    State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Json(req): Json<CreateLexiconReq>,
+) -> ApiResult<Json<LexiconItem>> {
+    ensure_admin(&auth_user)?;
+
+    let term = normalize_lexicon_term(req.term.as_str())?;
+    let freq = normalize_lexicon_freq(req.freq)?;
+    let tag = normalize_lexicon_tag(req.tag.as_deref());
+
+    let insert_result = sqlx::query("INSERT INTO search_lexicon (term, freq, tag, enabled) VALUES (?, ?, ?, ?)")
+        .bind(term.as_str())
+        .bind(freq)
+        .bind(tag.as_deref())
+        .bind(if req.enabled { 1_i64 } else { 0_i64 })
+        .execute(&pool)
+        .await;
+
+    let result = match insert_result {
+        Ok(result) => result,
+        Err(sqlx::Error::Database(db_err)) if db_err.message().contains("UNIQUE") => {
+            return Err(ApiError::BadRequest("lexicon term already exists".to_string()));
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let id = result.last_insert_rowid();
+    let row = fetch_lexicon_row_by_id(&pool, id)
+        .await?
+        .ok_or_else(|| ApiError::internal("created lexicon term not found"))?;
+    Ok(Json(lexicon_row_to_item(row)))
+}
+
+/// 更新词表词条（管理员）
+#[utoipa::path(
+    put,
+    path = "/api/v1/knowledge/search/lexicons/{id}",
+    operation_id = "search_lexicon_update",
+    tag = "search",
+    params(
+        ("id" = i64, Path, description = "词条 ID")
+    ),
+    request_body = UpdateLexiconReq,
+    responses(
+        (status = 200, description = "词条更新成功", body = LexiconItem),
+        (status = 400, description = "请求参数错误"),
+        (status = 404, description = "词条不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn update_lexicon(
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
+    Json(req): Json<UpdateLexiconReq>,
+) -> ApiResult<Json<LexiconItem>> {
+    ensure_admin(&auth_user)?;
+
+    if req.term.is_none() && req.freq.is_none() && req.tag.is_none() && req.enabled.is_none() {
+        return Err(ApiError::BadRequest("no fields to update".to_string()));
+    }
+
+    let current = fetch_lexicon_row_by_id(&pool, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("lexicon term not found".to_string()))?;
+    let term = match req.term.as_deref() {
+        Some(value) => normalize_lexicon_term(value)?,
+        None => current.term.clone(),
+    };
+    let freq = match req.freq {
+        Some(value) => normalize_lexicon_freq(Some(value))?,
+        None => current.freq,
+    };
+    let tag = match req.tag.as_deref() {
+        Some(value) => normalize_lexicon_tag(Some(value)),
+        None => current.tag.clone(),
+    };
+    let enabled = req.enabled.unwrap_or(current.enabled != 0);
+
+    let update_result = sqlx::query(
+        "UPDATE search_lexicon SET term = ?, freq = ?, tag = ?, enabled = ?, updated_at = strftime('%s','now') WHERE id = ?",
+    )
+    .bind(term.as_str())
+    .bind(freq)
+    .bind(tag.as_deref())
+    .bind(if enabled { 1_i64 } else { 0_i64 })
+    .bind(id)
+    .execute(&pool)
+    .await;
+
+    match update_result {
+        Ok(result) if result.rows_affected() == 0 => {
+            return Err(ApiError::NotFound("lexicon term not found".to_string()));
+        }
+        Err(sqlx::Error::Database(db_err)) if db_err.message().contains("UNIQUE") => {
+            return Err(ApiError::BadRequest("lexicon term already exists".to_string()));
+        }
+        Err(e) => return Err(e.into()),
+        _ => {}
+    }
+
+    let row = fetch_lexicon_row_by_id(&pool, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("lexicon term not found".to_string()))?;
+    Ok(Json(lexicon_row_to_item(row)))
+}
+
+/// 删除词表词条（管理员）
+#[utoipa::path(
+    delete,
+    path = "/api/v1/knowledge/search/lexicons/{id}",
+    operation_id = "search_lexicon_delete",
+    tag = "search",
+    params(
+        ("id" = i64, Path, description = "词条 ID")
+    ),
+    responses(
+        (status = 200, description = "词条删除成功", body = DeleteLexiconResponse),
+        (status = 404, description = "词条不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn delete_lexicon(
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<DeleteLexiconResponse>> {
+    ensure_admin(&auth_user)?;
+
+    let result = sqlx::query("DELETE FROM search_lexicon WHERE id = ?").bind(id).execute(&pool).await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("lexicon term not found".to_string()));
+    }
+
+    Ok(Json(DeleteLexiconResponse { id, deleted: true }))
+}
+
+/// 启用/停用词表词条（管理员）
+#[utoipa::path(
+    put,
+    path = "/api/v1/knowledge/search/lexicons/{id}/enabled",
+    operation_id = "search_lexicon_toggle_enabled",
+    tag = "search",
+    params(
+        ("id" = i64, Path, description = "词条 ID")
+    ),
+    request_body = ToggleLexiconReq,
+    responses(
+        (status = 200, description = "词条状态更新成功", body = LexiconItem),
+        (status = 404, description = "词条不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn toggle_lexicon_enabled(
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
+    Json(req): Json<ToggleLexiconReq>,
+) -> ApiResult<Json<LexiconItem>> {
+    ensure_admin(&auth_user)?;
+
+    let result = sqlx::query("UPDATE search_lexicon SET enabled = ?, updated_at = strftime('%s','now') WHERE id = ?")
+        .bind(if req.enabled { 1_i64 } else { 0_i64 })
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("lexicon term not found".to_string()));
+    }
+
+    let row = fetch_lexicon_row_by_id(&pool, id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("lexicon term not found".to_string()))?;
+    Ok(Json(lexicon_row_to_item(row)))
+}
+
+/// 重新加载词表到分词器（管理员）
+#[utoipa::path(
+    post,
+    path = "/api/v1/knowledge/search/lexicons/reload",
+    operation_id = "search_lexicon_reload",
+    tag = "search",
+    responses(
+        (status = 200, description = "词表重载成功", body = ReloadLexiconResponse)
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn reload_lexicon(
+    Extension(search_engine): Extension<SearchEngine>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<ReloadLexiconResponse>> {
+    ensure_admin(&auth_user)?;
+
+    let loaded = search_engine
+        .reload_lexicon()
+        .await
+        .map_err(|e| ApiError::internal(format!("reload lexicon failed: {}", e)))?;
+    Ok(Json(ReloadLexiconResponse { loaded }))
+}
+
+/// 发布词表并触发索引重建（管理员）
+#[utoipa::path(
+    post,
+    path = "/api/v1/knowledge/search/lexicons/publish",
+    operation_id = "search_lexicon_publish",
+    tag = "search",
+    responses(
+        (status = 200, description = "发布成功，返回重建任务信息", body = PublishLexiconResponse),
+        (status = 400, description = "已有重建任务在运行或权限不足")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn publish_lexicon(
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<PublishLexiconResponse>> {
+    ensure_admin(&auth_user)?;
+
+    let running_job_id: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM index_rebuild_jobs WHERE status = 'running' ORDER BY id DESC LIMIT 1")
+            .fetch_optional(&pool)
+            .await?;
+    if let Some(job_id) = running_job_id {
+        return Err(ApiError::BadRequest(format!("index rebuild job {} is already running", job_id)));
+    }
+
+    let now = Utc::now().timestamp();
+    let result = sqlx::query(
+        "INSERT INTO index_rebuild_jobs (status, phase, total_docs, processed_docs, started_at, updated_at, finished_at, error) \
+         VALUES ('running', 'queued', 0, 0, ?, ?, NULL, NULL)",
+    )
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await?;
+    let job_id = result.last_insert_rowid();
+
+    processor::set_parse_paused(true);
+
+    let pool_clone = pool.clone();
+    let search_engine_clone = search_engine.clone();
+    tokio::spawn(async move {
+        if let Err(err) = run_lexicon_publish_job(pool_clone, search_engine_clone, job_id).await {
+            warn!("Lexicon publish job {} failed: {}", job_id, err);
+        }
+    });
+
+    Ok(Json(PublishLexiconResponse { job_id, status: "running".to_string() }))
+}
+
+/// 同义词列表（管理员）
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/search/synonyms",
+    operation_id = "search_synonym_list",
+    tag = "search",
+    params(SynonymListQuery),
+    responses(
+        (status = 200, description = "同义词列表查询成功", body = SynonymListResponse),
+        (status = 400, description = "请求参数错误")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn list_synonyms(
+    State(pool): State<SqlitePool>, Query(params): Query<SynonymListQuery>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<SynonymListResponse>> {
+    ensure_admin(&auth_user)?;
+
+    let q = params.q.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
+    let limit = params.limit.clamp(1, 200);
+    let offset = params.offset.max(0);
+
+    let mut count_qb = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM search_synonyms WHERE 1 = 1");
+    if let Some(enabled) = params.enabled {
+        count_qb.push(" AND enabled = ");
+        count_qb.push_bind(if enabled { 1_i64 } else { 0_i64 });
+    }
+    if let Some(keyword) = &q {
+        let pattern = format!("%{}%", keyword);
+        count_qb.push(" AND (term LIKE ");
+        count_qb.push_bind(pattern.clone());
+        count_qb.push(" OR synonym LIKE ");
+        count_qb.push_bind(pattern);
+        count_qb.push(")");
+    }
+    let total: i64 = count_qb.build_query_scalar().fetch_one(&pool).await?;
+
+    let mut list_qb = QueryBuilder::<Sqlite>::new(
+        "SELECT id, term, synonym, weight, bidirectional, enabled, created_at, updated_at \
+        FROM search_synonyms WHERE 1 = 1",
+    );
+    if let Some(enabled) = params.enabled {
+        list_qb.push(" AND enabled = ");
+        list_qb.push_bind(if enabled { 1_i64 } else { 0_i64 });
+    }
+    if let Some(keyword) = &q {
+        let pattern = format!("%{}%", keyword);
+        list_qb.push(" AND (term LIKE ");
+        list_qb.push_bind(pattern.clone());
+        list_qb.push(" OR synonym LIKE ");
+        list_qb.push_bind(pattern);
+        list_qb.push(")");
+    }
+    list_qb.push(" ORDER BY updated_at DESC, id DESC LIMIT ");
+    list_qb.push_bind(limit);
+    list_qb.push(" OFFSET ");
+    list_qb.push_bind(offset);
+
+    let rows: Vec<SynonymItemRow> = list_qb.build_query_as().fetch_all(&pool).await?;
+    let items = rows.into_iter().map(synonym_row_to_item).collect();
+    Ok(Json(SynonymListResponse { total, items }))
+}
+
+/// 新增同义词（管理员）
+#[utoipa::path(
+    post,
+    path = "/api/v1/knowledge/search/synonyms",
+    operation_id = "search_synonym_create",
+    tag = "search",
+    request_body = CreateSynonymReq,
+    responses(
+        (status = 200, description = "同义词新增成功", body = SynonymItem),
+        (status = 400, description = "请求参数错误")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn create_synonym(
+    State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Json(req): Json<CreateSynonymReq>,
+) -> ApiResult<Json<SynonymItem>> {
+    ensure_admin(&auth_user)?;
+
+    let term = req.term.trim();
+    let synonym = req.synonym.trim();
+    if term.is_empty() || synonym.is_empty() {
+        return Err(ApiError::BadRequest("term and synonym are required".to_string()));
+    }
+    if term == synonym {
+        return Err(ApiError::BadRequest("term and synonym must be different".to_string()));
+    }
+    if req.weight <= 0.0 {
+        return Err(ApiError::BadRequest("weight must be > 0".to_string()));
+    }
+
+    let insert_result = sqlx::query(
+        "INSERT INTO search_synonyms (term, synonym, weight, bidirectional, enabled) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(term)
+    .bind(synonym)
+    .bind(req.weight)
+    .bind(if req.bidirectional { 1_i64 } else { 0_i64 })
+    .bind(if req.enabled { 1_i64 } else { 0_i64 })
+    .execute(&pool)
+    .await;
+
+    let result = match insert_result {
+        Ok(result) => result,
+        Err(sqlx::Error::Database(db_err)) if db_err.message().contains("UNIQUE") => {
+            return Err(ApiError::BadRequest("synonym pair already exists".to_string()));
+        }
+        Err(e) => return Err(e.into()),
+    };
+
+    let id = result.last_insert_rowid();
+    let row =
+        fetch_synonym_row_by_id(&pool, id).await?.ok_or_else(|| ApiError::internal("created synonym not found"))?;
+    Ok(Json(synonym_row_to_item(row)))
+}
+
+/// 更新同义词（管理员）
+#[utoipa::path(
+    put,
+    path = "/api/v1/knowledge/search/synonyms/{id}",
+    operation_id = "search_synonym_update",
+    tag = "search",
+    params(
+        ("id" = i64, Path, description = "同义词 ID")
+    ),
+    request_body = UpdateSynonymReq,
+    responses(
+        (status = 200, description = "同义词更新成功", body = SynonymItem),
+        (status = 400, description = "请求参数错误"),
+        (status = 404, description = "同义词不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn update_synonym(
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
+    Json(req): Json<UpdateSynonymReq>,
+) -> ApiResult<Json<SynonymItem>> {
+    ensure_admin(&auth_user)?;
+
+    if req.term.is_none()
+        && req.synonym.is_none()
+        && req.weight.is_none()
+        && req.bidirectional.is_none()
+        && req.enabled.is_none()
+    {
+        return Err(ApiError::BadRequest("no fields to update".to_string()));
+    }
+
+    let current =
+        fetch_synonym_row_by_id(&pool, id).await?.ok_or_else(|| ApiError::NotFound("synonym not found".to_string()))?;
+    let term = req.term.as_deref().map(str::trim).unwrap_or(current.term.as_str());
+    let synonym = req.synonym.as_deref().map(str::trim).unwrap_or(current.synonym.as_str());
+    if term.is_empty() || synonym.is_empty() {
+        return Err(ApiError::BadRequest("term and synonym cannot be empty".to_string()));
+    }
+    if term == synonym {
+        return Err(ApiError::BadRequest("term and synonym must be different".to_string()));
+    }
+    let weight = req.weight.unwrap_or(current.weight);
+    if weight <= 0.0 {
+        return Err(ApiError::BadRequest("weight must be > 0".to_string()));
+    }
+    let bidirectional = req.bidirectional.unwrap_or(current.bidirectional != 0);
+    let enabled = req.enabled.unwrap_or(current.enabled != 0);
+
+    let update_result = sqlx::query(
+        "UPDATE search_synonyms SET term = ?, synonym = ?, weight = ?, bidirectional = ?, enabled = ?, updated_at = strftime('%s','now') WHERE id = ?",
+    )
+    .bind(term)
+    .bind(synonym)
+    .bind(weight)
+    .bind(if bidirectional { 1_i64 } else { 0_i64 })
+    .bind(if enabled { 1_i64 } else { 0_i64 })
+    .bind(id)
+    .execute(&pool)
+    .await;
+
+    match update_result {
+        Ok(result) if result.rows_affected() == 0 => {
+            return Err(ApiError::NotFound("synonym not found".to_string()));
+        }
+        Err(sqlx::Error::Database(db_err)) if db_err.message().contains("UNIQUE") => {
+            return Err(ApiError::BadRequest("synonym pair already exists".to_string()));
+        }
+        Err(e) => return Err(e.into()),
+        _ => {}
+    }
+
+    let row =
+        fetch_synonym_row_by_id(&pool, id).await?.ok_or_else(|| ApiError::NotFound("synonym not found".to_string()))?;
+    Ok(Json(synonym_row_to_item(row)))
+}
+
+/// 删除同义词（管理员）
+#[utoipa::path(
+    delete,
+    path = "/api/v1/knowledge/search/synonyms/{id}",
+    operation_id = "search_synonym_delete",
+    tag = "search",
+    params(
+        ("id" = i64, Path, description = "同义词 ID")
+    ),
+    responses(
+        (status = 200, description = "同义词删除成功", body = DeleteSynonymResponse),
+        (status = 404, description = "同义词不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn delete_synonym(
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<DeleteSynonymResponse>> {
+    ensure_admin(&auth_user)?;
+
+    let result = sqlx::query("DELETE FROM search_synonyms WHERE id = ?").bind(id).execute(&pool).await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("synonym not found".to_string()));
+    }
+
+    Ok(Json(DeleteSynonymResponse { id, deleted: true }))
+}
+
+/// 启用/停用同义词（管理员）
+#[utoipa::path(
+    put,
+    path = "/api/v1/knowledge/search/synonyms/{id}/enabled",
+    operation_id = "search_synonym_toggle_enabled",
+    tag = "search",
+    params(
+        ("id" = i64, Path, description = "同义词 ID")
+    ),
+    request_body = ToggleSynonymReq,
+    responses(
+        (status = 200, description = "同义词状态更新成功", body = SynonymItem),
+        (status = 404, description = "同义词不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn toggle_synonym_enabled(
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
+    Json(req): Json<ToggleSynonymReq>,
+) -> ApiResult<Json<SynonymItem>> {
+    ensure_admin(&auth_user)?;
+
+    let result = sqlx::query("UPDATE search_synonyms SET enabled = ?, updated_at = strftime('%s','now') WHERE id = ?")
+        .bind(if req.enabled { 1_i64 } else { 0_i64 })
+        .bind(id)
+        .execute(&pool)
+        .await?;
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("synonym not found".to_string()));
+    }
+
+    let row =
+        fetch_synonym_row_by_id(&pool, id).await?.ok_or_else(|| ApiError::NotFound("synonym not found".to_string()))?;
+    Ok(Json(synonym_row_to_item(row)))
+}
+
+async fn run_lexicon_publish_job(pool: SqlitePool, search_engine: SearchEngine, job_id: i64) -> anyhow::Result<()> {
+    let run_result: anyhow::Result<()> = async {
+        update_rebuild_job_progress(&pool, job_id, "reload_lexicon", 0, 0).await?;
+        let loaded = search_engine.reload_lexicon().await?;
+        info!("Search lexicon published for job {}: {} words", job_id, loaded);
+
+        search_engine
+            .rebuild_tantivy_indexes(&format!("job-{}", job_id), |progress: RebuildProgress| {
+                let pool = pool.clone();
+                async move {
+                    if let Err(e) = update_rebuild_job_progress(
+                        &pool,
+                        job_id,
+                        progress.phase.as_str(),
+                        progress.total_docs,
+                        progress.processed_docs,
+                    )
+                    .await
+                    {
+                        warn!("Failed to update index rebuild progress for job {}: {}", job_id, e);
+                    }
+                }
+            })
+            .await?;
+
+        mark_rebuild_job_completed(&pool, job_id).await?;
+        Ok(())
+    }
+    .await;
+
+    match run_result {
+        Ok(()) => {}
+        Err(err) => {
+            if let Err(update_err) = mark_rebuild_job_failed(&pool, job_id, &err.to_string()).await {
+                warn!("Failed to mark rebuild job {} as failed: {}", job_id, update_err);
+            }
+            processor::set_parse_paused(false);
+            return Err(err);
+        }
+    }
+
+    processor::set_parse_paused(false);
+    Ok(())
+}
+
+async fn update_rebuild_job_progress(
+    pool: &SqlitePool, job_id: i64, phase: &str, total_docs: i64, processed_docs: i64,
+) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE index_rebuild_jobs \
+         SET status = 'running', phase = ?, total_docs = ?, processed_docs = ?, updated_at = strftime('%s','now'), finished_at = NULL, error = NULL \
+         WHERE id = ?",
+    )
+    .bind(phase)
+    .bind(total_docs.max(0))
+    .bind(processed_docs.max(0))
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn mark_rebuild_job_completed(pool: &SqlitePool, job_id: i64) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE index_rebuild_jobs \
+         SET status = 'completed', phase = 'completed', processed_docs = total_docs, updated_at = strftime('%s','now'), finished_at = strftime('%s','now'), error = NULL \
+         WHERE id = ?",
+    )
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+async fn mark_rebuild_job_failed(pool: &SqlitePool, job_id: i64, error: &str) -> anyhow::Result<()> {
+    sqlx::query(
+        "UPDATE index_rebuild_jobs \
+         SET status = 'failed', phase = 'failed', updated_at = strftime('%s','now'), finished_at = strftime('%s','now'), error = ? \
+         WHERE id = ?",
+    )
+    .bind(error)
+    .bind(job_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+fn normalize_lexicon_term(input: &str) -> ApiResult<String> {
+    let term = input.trim();
+    if term.is_empty() {
+        return Err(ApiError::BadRequest("term cannot be empty".to_string()));
+    }
+    Ok(term.to_string())
+}
+
+fn normalize_lexicon_freq(freq: Option<i64>) -> ApiResult<Option<i64>> {
+    match freq {
+        Some(value) if value <= 0 => Err(ApiError::BadRequest("freq must be > 0".to_string())),
+        Some(value) => Ok(Some(value)),
+        None => Ok(None),
+    }
+}
+
+fn normalize_lexicon_tag(tag: Option<&str>) -> Option<String> {
+    tag.and_then(|value| {
+        let trimmed = value.trim();
+        if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+    })
+}
+
+async fn fetch_lexicon_row_by_id(pool: &SqlitePool, id: i64) -> Result<Option<LexiconItemRow>, sqlx::Error> {
+    sqlx::query_as::<_, LexiconItemRow>(
+        "SELECT id, term, freq, tag, enabled, created_at, updated_at FROM search_lexicon WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+fn lexicon_row_to_item(row: LexiconItemRow) -> LexiconItem {
+    LexiconItem {
+        id: row.id,
+        term: row.term,
+        freq: row.freq,
+        tag: row.tag,
+        enabled: row.enabled != 0,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }
+}
+
+fn ensure_admin(auth_user: &AuthUser) -> ApiResult<()> {
+    if auth_user.is_admin() { Ok(()) } else { Err(ApiError::BadRequest("admin role required".to_string())) }
+}
+
+async fn fetch_synonym_row_by_id(pool: &SqlitePool, id: i64) -> Result<Option<SynonymItemRow>, sqlx::Error> {
+    sqlx::query_as::<_, SynonymItemRow>(
+        "SELECT id, term, synonym, weight, bidirectional, enabled, created_at, updated_at FROM search_synonyms WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+}
+
+fn synonym_row_to_item(row: SynonymItemRow) -> SynonymItem {
+    SynonymItem {
+        id: row.id,
+        term: row.term,
+        synonym: row.synonym,
+        weight: row.weight,
+        bidirectional: row.bidirectional != 0,
+        enabled: row.enabled != 0,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    }
 }
 
 async fn get_files_by_ids(pool: &SqlitePool, file_ids: &[i64]) -> Result<HashMap<i64, FileInfo>, sqlx::Error> {

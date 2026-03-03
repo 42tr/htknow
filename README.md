@@ -115,6 +115,10 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | `HTKNOW_TANTIVY_INDEX_PATH` | `data/tantivy_index` | Tantivy 索引路径 |
 | `HTKNOW_TANTIVY_FULL_INDEX_PATH` | `data/tantivy_full_index` | Tantivy 全文索引 |
 | `HTKNOW_TANTIVY_MEMORY_MB` | `50` | Tantivy 内存（MB） |
+| `HTKNOW_SEARCH_SYNONYM_ENABLED` | `true` | 是否启用同义词查询扩展 |
+| `HTKNOW_SEARCH_SYNONYM_BOOST` | `0.7` | 同义词权重因子（与行权重相乘） |
+| `HTKNOW_SEARCH_MAX_SYNONYMS_PER_TERM` | `5` | 每个词最多扩展同义词数 |
+| `HTKNOW_SEARCH_MAX_TOTAL_SYNONYMS` | `30` | 单次查询最多扩展同义词总数 |
 
 ### 切片
 | 环境变量 | 默认值 | 说明 |

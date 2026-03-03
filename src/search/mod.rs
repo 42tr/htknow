@@ -1,6 +1,9 @@
-use std::{collections::HashMap, sync::Arc, time::Instant};
+use std::{
+    collections::{HashMap, HashSet}, fs, path::Path, sync::Arc, time::{Instant, SystemTime, UNIX_EPOCH}
+};
 
-use log::{debug, info};
+use anyhow::{Context, anyhow};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, SqlitePool};
 use tantivy::{Index, IndexReader, ReloadPolicy, schema::Schema};
@@ -17,6 +20,8 @@ pub mod tantivy_engine;
 pub use tantivy_engine::{FullSearchResultItem, SearchResultItem};
 
 const FULL_SNIPPET_MAX_CHARS: usize = 400;
+const MAX_QUERY_TERMS_FOR_SYNONYM_LOOKUP: usize = 100;
+const REBUILD_BATCH_SIZE: i64 = 500;
 
 #[derive(Debug, Serialize)]
 struct RerankRequest {
@@ -36,6 +41,44 @@ struct RerankResult {
     relevance_score: f32,
 }
 
+#[derive(Debug, sqlx::FromRow)]
+struct SynonymRow {
+    term: String,
+    synonym: String,
+    weight: f32,
+    bidirectional: i64,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct LexiconRow {
+    term: String,
+    freq: Option<i64>,
+    tag: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct RebuildSliceRow {
+    id: i64,
+    file_id: i64,
+    kb_id: Option<i64>,
+    content: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct RebuildFullRow {
+    id: i64,
+    kb_id: Option<i64>,
+    filename: String,
+    content: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct RebuildProgress {
+    pub phase: String,
+    pub total_docs: i64,
+    pub processed_docs: i64,
+}
+
 #[derive(Clone)]
 pub struct SearchEngine {
     index: Index,
@@ -46,6 +89,7 @@ pub struct SearchEngine {
     full_schema: Schema,
     full_index_reader: IndexReader,
     full_index_write_lock: Arc<Mutex<()>>,
+    rebuild_lock: Arc<Mutex<()>>,
     pool: Option<SqlitePool>,
 }
 
@@ -65,6 +109,7 @@ impl SearchEngine {
             full_schema,
             full_index_reader,
             full_index_write_lock: Arc::new(Mutex::new(())),
+            rebuild_lock: Arc::new(Mutex::new(())),
             pool: None,
         }
     }
@@ -72,6 +117,176 @@ impl SearchEngine {
     pub fn with_pool(mut self, pool: SqlitePool) -> Self {
         self.pool = Some(pool);
         self
+    }
+
+    pub async fn reload_lexicon(&self) -> anyhow::Result<usize> {
+        let Some(pool) = &self.pool else {
+            return Ok(0);
+        };
+
+        let rows: Vec<LexiconRow> =
+            sqlx::query_as("SELECT term, freq, tag FROM search_lexicon WHERE enabled = 1 ORDER BY id")
+                .fetch_all(pool)
+                .await?;
+
+        let entries: Vec<chinese_tokenizer::LexiconEntry> = rows
+            .into_iter()
+            .map(|row| chinese_tokenizer::LexiconEntry {
+                term: row.term,
+                freq: row.freq.and_then(|value| usize::try_from(value).ok()).filter(|value| *value > 0),
+                tag: row.tag,
+            })
+            .collect();
+
+        chinese_tokenizer::reload_custom_words(&entries)
+    }
+
+    pub async fn rebuild_tantivy_indexes<F, Fut>(&self, job_tag: &str, mut on_progress: F) -> anyhow::Result<()>
+    where
+        F: FnMut(RebuildProgress) -> Fut+Send,
+        Fut: std::future::Future<Output=()>+Send, {
+        let Some(pool) = &self.pool else {
+            return Err(anyhow!("search engine db pool not set"));
+        };
+        let _rebuild_guard = self.rebuild_lock.lock().await;
+
+        let total_slices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM slices").fetch_one(pool).await?;
+        let total_full_docs: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE status = 1").fetch_one(pool).await?;
+        let total_docs = total_slices + total_full_docs;
+        let mut processed_docs = 0_i64;
+        on_progress(RebuildProgress { phase: "prepare".to_string(), total_docs, processed_docs }).await;
+
+        let cfg = config::get();
+        let tag = sanitize_job_tag(job_tag);
+        let slice_live_path = cfg.search.tantivy_index_path.clone();
+        let full_live_path = cfg.search.tantivy_full_index_path.clone();
+        let slice_temp_path = format!("{}.rebuild.{}", slice_live_path, tag);
+        let full_temp_path = format!("{}.rebuild.{}", full_live_path, tag);
+        let slice_backup_path = format!("{}.backup.{}", slice_live_path, tag);
+        let full_backup_path = format!("{}.backup.{}", full_live_path, tag);
+
+        cleanup_dir_if_exists(&slice_temp_path)?;
+        cleanup_dir_if_exists(&full_temp_path)?;
+        cleanup_dir_if_exists(&slice_backup_path)?;
+        cleanup_dir_if_exists(&full_backup_path)?;
+
+        let rebuild_result: anyhow::Result<()> = async {
+            let (slice_schema, slice_temp_index) = tantivy_engine::init_with_path(&slice_temp_path)
+                .with_context(|| format!("init temp slice index failed: {}", slice_temp_path))?;
+            let (full_schema, full_temp_index) = tantivy_engine::init_with_path(&full_temp_path)
+                .with_context(|| format!("init temp full index failed: {}", full_temp_path))?;
+
+            on_progress(RebuildProgress { phase: "build_slice".to_string(), total_docs, processed_docs }).await;
+            let mut last_slice_id = 0_i64;
+            loop {
+                let rows: Vec<RebuildSliceRow> = sqlx::query_as(
+                    "SELECT s.id, s.file_id, f.kb_id, s.content \
+                     FROM slices s \
+                     JOIN files f ON f.id = s.file_id \
+                     WHERE s.id > ? \
+                     ORDER BY s.id ASC \
+                     LIMIT ?",
+                )
+                .bind(last_slice_id)
+                .bind(REBUILD_BATCH_SIZE)
+                .fetch_all(pool)
+                .await?;
+                if rows.is_empty() {
+                    break;
+                }
+                last_slice_id = rows.last().map(|row| row.id).unwrap_or(last_slice_id);
+                let batch_size = rows.len() as i64;
+                let docs: Vec<tantivy_engine::Document> = rows
+                    .into_iter()
+                    .map(|row| tantivy_engine::Document::new(row.id, row.file_id, row.kb_id, row.content))
+                    .collect();
+                tantivy_engine::write_documents_batch(&slice_temp_index, &slice_schema, docs).await?;
+                processed_docs += batch_size;
+                on_progress(RebuildProgress { phase: "build_slice".to_string(), total_docs, processed_docs }).await;
+            }
+
+            on_progress(RebuildProgress { phase: "build_full".to_string(), total_docs, processed_docs }).await;
+            let mut last_file_id = 0_i64;
+            loop {
+                let rows: Vec<RebuildFullRow> = sqlx::query_as(
+                    "SELECT id, kb_id, filename, content \
+                     FROM files \
+                     WHERE status = 1 AND id > ? \
+                     ORDER BY id ASC \
+                     LIMIT ?",
+                )
+                .bind(last_file_id)
+                .bind(REBUILD_BATCH_SIZE)
+                .fetch_all(pool)
+                .await?;
+                if rows.is_empty() {
+                    break;
+                }
+                last_file_id = rows.last().map(|row| row.id).unwrap_or(last_file_id);
+                let batch_size = rows.len() as i64;
+                let docs: Vec<tantivy_engine::Document> = rows
+                    .into_iter()
+                    .map(|row| {
+                        let full_content = row.content.unwrap_or_default();
+                        let index_content = if full_content.trim().is_empty() {
+                            row.filename
+                        } else {
+                            format!("{}\n\n{}", row.filename, full_content)
+                        };
+                        tantivy_engine::Document::new(row.id, row.id, row.kb_id, index_content)
+                    })
+                    .collect();
+                tantivy_engine::write_documents_batch(&full_temp_index, &full_schema, docs).await?;
+                processed_docs += batch_size;
+                on_progress(RebuildProgress { phase: "build_full".to_string(), total_docs, processed_docs }).await;
+            }
+
+            drop(slice_temp_index);
+            drop(full_temp_index);
+
+            let _slice_write_guard = self.index_write_lock.lock().await;
+            let _full_write_guard = self.full_index_write_lock.lock().await;
+            on_progress(RebuildProgress { phase: "swap".to_string(), total_docs, processed_docs }).await;
+
+            if let Err(err) = swap_index_dir(&slice_live_path, &slice_temp_path, &slice_backup_path) {
+                return Err(err.context("swap slice index failed"));
+            }
+
+            if let Err(err) = swap_index_dir(&full_live_path, &full_temp_path, &full_backup_path) {
+                if let Err(rb_err) = restore_backup_dir(&slice_live_path, &slice_backup_path) {
+                    warn!("rollback slice index failed after full swap failure: {}", rb_err);
+                }
+                return Err(err.context("swap full index failed"));
+            }
+
+            if let Err(err) = reload_reader(&self.index_reader, "index") {
+                let _ = restore_backup_dir(&full_live_path, &full_backup_path);
+                let _ = restore_backup_dir(&slice_live_path, &slice_backup_path);
+                return Err(err).context("reload slice reader after swap failed");
+            }
+            if let Err(err) = reload_reader(&self.full_index_reader, "full_index") {
+                let _ = restore_backup_dir(&full_live_path, &full_backup_path);
+                let _ = restore_backup_dir(&slice_live_path, &slice_backup_path);
+                return Err(err).context("reload full reader after swap failed");
+            }
+
+            cleanup_dir_if_exists(&slice_backup_path)?;
+            cleanup_dir_if_exists(&full_backup_path)?;
+            processed_docs = total_docs;
+            on_progress(RebuildProgress { phase: "completed".to_string(), total_docs, processed_docs }).await;
+            Ok(())
+        }
+        .await;
+
+        if rebuild_result.is_err() {
+            let _ = cleanup_dir_if_exists(&slice_temp_path);
+            let _ = cleanup_dir_if_exists(&full_temp_path);
+            let _ = cleanup_dir_if_exists(&slice_backup_path);
+            let _ = cleanup_dir_if_exists(&full_backup_path);
+        }
+
+        rebuild_result
     }
 
     pub async fn write(&self, doc: tantivy_engine::Document, image_embedding: Option<Vec<f32>>) -> anyhow::Result<()> {
@@ -186,9 +401,18 @@ impl SearchEngine {
         &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     ) -> anyhow::Result<Vec<SearchResultItem>> {
         debug!("Searching for query: {}", query);
+        let synonym_map = match self.load_query_synonyms(query).await {
+            Ok(map) => map,
+            Err(e) => {
+                warn!("Failed to load query synonyms for '{}': {}", query, e);
+                HashMap::new()
+            }
+        };
+        let synonym_ref = if synonym_map.is_empty() { None } else { Some(&synonym_map) };
 
         // 使用 tantivy 搜索
-        let tantivy_results = tantivy_engine::search(&self.index_reader, &self.schema, query, file_ids, kb_ids).await?;
+        let tantivy_results =
+            tantivy_engine::search(&self.index_reader, &self.schema, query, file_ids, kb_ids, synonym_ref).await?;
         debug!("Tantivy results count: {}", tantivy_results.len());
         debug!("Tantivy results: {:?}", tantivy_results);
 
@@ -248,6 +472,14 @@ impl SearchEngine {
     pub async fn search_full(
         &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     ) -> anyhow::Result<Vec<FullSearchResultItem>> {
+        let synonym_map = match self.load_query_synonyms(query).await {
+            Ok(map) => map,
+            Err(e) => {
+                warn!("Failed to load query synonyms for '{}': {}", query, e);
+                HashMap::new()
+            }
+        };
+        let synonym_ref = if synonym_map.is_empty() { None } else { Some(&synonym_map) };
         tantivy_engine::search_with_snippet(
             &self.full_index_reader,
             &self.full_schema,
@@ -255,6 +487,7 @@ impl SearchEngine {
             file_ids,
             kb_ids,
             FULL_SNIPPET_MAX_CHARS,
+            synonym_ref,
         )
         .await
     }
@@ -415,6 +648,80 @@ impl SearchEngine {
         lancedb::compact().await
     }
 
+    async fn load_query_synonyms(&self, query: &str) -> anyhow::Result<tantivy_engine::SynonymMap> {
+        let cfg = config::get();
+        if !cfg.search.synonym_enabled {
+            return Ok(HashMap::new());
+        }
+        let Some(pool) = &self.pool else {
+            return Ok(HashMap::new());
+        };
+
+        let terms = extract_query_terms(query);
+        if terms.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let mut qb = QueryBuilder::new(
+            "SELECT term, synonym, weight, bidirectional FROM search_synonyms \
+            WHERE enabled = 1 AND (term IN (",
+        );
+        {
+            let mut separated = qb.separated(", ");
+            for term in &terms {
+                separated.push_bind(term);
+            }
+        }
+        qb.push(") OR synonym IN (");
+        {
+            let mut separated = qb.separated(", ");
+            for term in &terms {
+                separated.push_bind(term);
+            }
+        }
+        qb.push("))");
+
+        let rows: Vec<SynonymRow> = qb.build_query_as().fetch_all(pool).await?;
+        if rows.is_empty() {
+            return Ok(HashMap::new());
+        }
+
+        let input_terms: HashSet<&str> = terms.iter().map(String::as_str).collect();
+        let mut synonym_map: tantivy_engine::SynonymMap = HashMap::new();
+        let max_per_term = cfg.search.max_synonyms_per_term.max(1);
+        let max_total = cfg.search.max_total_synonyms.max(1);
+        let boost_factor = cfg.search.synonym_boost.max(0.0);
+        let mut total_inserted = 0usize;
+
+        for row in rows {
+            let boost = row.weight.max(0.0) * boost_factor;
+            if boost <= 0.0 {
+                continue;
+            }
+
+            if input_terms.contains(row.term.as_str())
+                && insert_synonym(&mut synonym_map, row.term.as_str(), row.synonym.as_str(), boost, max_per_term)
+            {
+                total_inserted += 1;
+                if total_inserted >= max_total {
+                    break;
+                }
+            }
+
+            if row.bidirectional != 0
+                && input_terms.contains(row.synonym.as_str())
+                && insert_synonym(&mut synonym_map, row.synonym.as_str(), row.term.as_str(), boost, max_per_term)
+            {
+                total_inserted += 1;
+                if total_inserted >= max_total {
+                    break;
+                }
+            }
+        }
+
+        Ok(synonym_map)
+    }
+
     /// 使用图谱增强的搜索
     /// 先扩展查询，然后对每个扩展查询进行搜索，最后合并去重结果
     pub async fn search_with_graph_expansion(
@@ -461,6 +768,77 @@ impl SearchEngine {
     }
 }
 
+fn sanitize_job_tag(input: &str) -> String {
+    let trimmed = input.trim();
+    if !trimmed.is_empty() {
+        let sanitized: String = trimmed
+            .chars()
+            .map(|ch| if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' { ch } else { '_' })
+            .collect();
+        if !sanitized.is_empty() {
+            return sanitized;
+        }
+    }
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or_default();
+    now_ms.to_string()
+}
+
+fn cleanup_dir_if_exists(path: &str) -> anyhow::Result<()> {
+    let path_ref = Path::new(path);
+    if !path_ref.exists() {
+        return Ok(());
+    }
+    fs::remove_dir_all(path_ref).with_context(|| format!("remove dir failed: {}", path))?;
+    Ok(())
+}
+
+fn swap_index_dir(active_path: &str, staged_path: &str, backup_path: &str) -> anyhow::Result<()> {
+    let active = Path::new(active_path);
+    let staged = Path::new(staged_path);
+    let backup = Path::new(backup_path);
+    if !staged.exists() {
+        return Err(anyhow!("staged index path not found: {}", staged_path));
+    }
+
+    if let Some(parent) = active.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create parent dir failed: {}", parent.display()))?;
+    }
+
+    if backup.exists() {
+        fs::remove_dir_all(backup).with_context(|| format!("remove backup dir failed: {}", backup.display()))?;
+    }
+
+    let moved_old = if active.exists() {
+        fs::rename(active, backup)
+            .with_context(|| format!("rename active->backup failed: {} -> {}", active_path, backup_path))?;
+        true
+    } else {
+        false
+    };
+
+    if let Err(err) = fs::rename(staged, active) {
+        if moved_old && backup.exists() {
+            let _ = fs::rename(backup, active);
+        }
+        return Err(err).with_context(|| format!("rename staged->active failed: {} -> {}", staged_path, active_path));
+    }
+
+    Ok(())
+}
+
+fn restore_backup_dir(active_path: &str, backup_path: &str) -> anyhow::Result<()> {
+    let active = Path::new(active_path);
+    let backup = Path::new(backup_path);
+    if !backup.exists() {
+        return Ok(());
+    }
+    if active.exists() {
+        fs::remove_dir_all(active).with_context(|| format!("remove active dir failed: {}", active_path))?;
+    }
+    fs::rename(backup, active).with_context(|| format!("restore backup failed: {} -> {}", backup_path, active_path))?;
+    Ok(())
+}
+
 fn build_reader(index: &Index, label: &str) -> IndexReader {
     let start = Instant::now();
     let reader = index
@@ -470,6 +848,41 @@ fn build_reader(index: &Index, label: &str) -> IndexReader {
         .unwrap_or_else(|e| panic!("failed to create tantivy {} reader: {}", label, e));
     debug!("Tantivy {} index.reader init {}ms", label, start.elapsed().as_millis());
     reader
+}
+
+fn extract_query_terms(query: &str) -> Vec<String> {
+    let mut terms =
+        chinese_tokenizer::FastChineseTokenizer::new(chinese_tokenizer::SegmentationMode::Search).segment(query);
+    terms.push(query.trim().to_string());
+    terms.retain(|t| !t.trim().is_empty());
+    terms.sort();
+    terms.dedup();
+    if terms.len() > MAX_QUERY_TERMS_FOR_SYNONYM_LOOKUP {
+        terms.truncate(MAX_QUERY_TERMS_FOR_SYNONYM_LOOKUP);
+    }
+    terms
+}
+
+fn insert_synonym(
+    synonym_map: &mut tantivy_engine::SynonymMap, source_term: &str, synonym_term: &str, boost: f32,
+    max_per_term: usize,
+) -> bool {
+    let source = source_term.trim();
+    let synonym = synonym_term.trim();
+    if source.is_empty() || synonym.is_empty() || source == synonym {
+        return false;
+    }
+
+    let entry = synonym_map.entry(source.to_string()).or_default();
+    if entry.iter().any(|candidate| candidate.term == synonym) {
+        return false;
+    }
+    if entry.len() >= max_per_term {
+        return false;
+    }
+
+    entry.push(tantivy_engine::SynonymTerm { term: synonym.to_string(), boost });
+    true
 }
 
 fn reload_reader(reader: &IndexReader, label: &str) -> tantivy::Result<()> {

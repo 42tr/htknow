@@ -1,5 +1,5 @@
 use axum::{
-    Extension, Router, routing::{get, post}
+    Extension, Router, routing::{get, post, put}
 };
 use sqlx::SqlitePool;
 use utoipa::OpenApi;
@@ -47,6 +47,18 @@ use crate::search::SearchEngine;
         search::search_with_graph,
         search::search_image,
         search::advanced_search_stream,
+        search::list_lexicons,
+        search::create_lexicon,
+        search::update_lexicon,
+        search::delete_lexicon,
+        search::toggle_lexicon_enabled,
+        search::reload_lexicon,
+        search::publish_lexicon,
+        search::list_synonyms,
+        search::create_synonym,
+        search::update_synonym,
+        search::delete_synonym,
+        search::toggle_synonym_enabled,
         // Graph
         graph::search_entities,
         graph::get_entity,
@@ -55,6 +67,7 @@ use crate::search::SearchEngine;
         system::heap_profile,
         system::heap_profile_pdf,
         system::lancedb_compact,
+        system::index_rebuild_status,
     ),
     components(
         schemas(
@@ -77,6 +90,20 @@ use crate::search::SearchEngine;
             search::FullSearchResultItem,
             search::FileInfo,
             search::KbInfo,
+            search::LexiconItem,
+            search::LexiconListResponse,
+            search::CreateLexiconReq,
+            search::UpdateLexiconReq,
+            search::ToggleLexiconReq,
+            search::DeleteLexiconResponse,
+            search::ReloadLexiconResponse,
+            search::PublishLexiconResponse,
+            search::SynonymItem,
+            search::SynonymListResponse,
+            search::CreateSynonymReq,
+            search::UpdateSynonymReq,
+            search::ToggleSynonymReq,
+            search::DeleteSynonymResponse,
             graph::EntityInfo,
             graph::EntityDetail,
             graph::NeighborInfo,
@@ -85,6 +112,7 @@ use crate::search::SearchEngine;
             system::MemoryUsage,
             system::HeapProfileStatus,
             system::LanceDbCompactStats,
+            system::IndexRebuildStatus,
         )
     ),
     tags(
@@ -126,6 +154,14 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/full", get(search::search_full))
         .route("/graph", get(search::search_with_graph))
         .route("/image", post(search::search_image))
+        .route("/lexicons", get(search::list_lexicons).post(search::create_lexicon))
+        .route("/lexicons/reload", post(search::reload_lexicon))
+        .route("/lexicons/publish", post(search::publish_lexicon))
+        .route("/lexicons/{id}", put(search::update_lexicon).delete(search::delete_lexicon))
+        .route("/lexicons/{id}/enabled", put(search::toggle_lexicon_enabled))
+        .route("/synonyms", get(search::list_synonyms).post(search::create_synonym))
+        .route("/synonyms/{id}", put(search::update_synonym).delete(search::delete_synonym))
+        .route("/synonyms/{id}/enabled", put(search::toggle_synonym_enabled))
         .route("/advanced/stream", get(search::advanced_search_stream));
     let graph_router = Router::new()
         .route("/entities", get(graph::search_entities))
@@ -134,7 +170,8 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
     let system_router = Router::new()
         .route("/heap", get(system::heap_profile))
         .route("/heap/pdf", get(system::heap_profile_pdf))
-        .route("/lancedb/compact", post(system::lancedb_compact));
+        .route("/lancedb/compact", post(system::lancedb_compact))
+        .route("/index/rebuild/status", get(system::index_rebuild_status));
 
     Router::new()
         .nest("/knowledge_base/", knowledge_router)
