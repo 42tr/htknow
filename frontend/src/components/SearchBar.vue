@@ -17,6 +17,9 @@ const advancedOptions = ref({
   contextChars: 2000,
   debug: false,
 })
+const sliceOptions = ref({
+  useAdvancedFlow: false,
+})
 
 const canSubmit = computed(() => {
   if (searchMode.value === 'image') {
@@ -78,7 +81,7 @@ const handleSearch = async () => {
     } else {
       results =
         searchMode.value === 'slice'
-          ? await api.search(query.value, localSelectedKb.value?.id)
+          ? await api.search(query.value, localSelectedKb.value?.id, null, { advanced: sliceOptions.value.useAdvancedFlow })
           : await api.searchFull(query.value, localSelectedKb.value?.id)
     }
     emit('search', results)
@@ -274,6 +277,25 @@ const handleKeydown = (e) => {
             <span
               class="inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform"
               :class="advancedOptions.debug ? 'translate-x-5' : 'translate-x-1'"
+            />
+          </button>
+        </div>
+      </div>
+      <div v-else-if="searchMode === 'slice'" class="bg-white border border-slate-200 rounded-2xl p-4 mb-2">
+        <div class="flex items-center justify-between gap-4">
+          <div>
+            <p class="text-xs font-medium text-slate-700">切片高级流程</p>
+            <p class="text-xs text-slate-500 mt-1">开启后会走高级搜索判定流程，但返回仍是普通切片搜索结果格式。</p>
+          </div>
+          <button
+            type="button"
+            class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors"
+            :class="sliceOptions.useAdvancedFlow ? 'bg-blue-600' : 'bg-slate-300'"
+            @click="sliceOptions.useAdvancedFlow = !sliceOptions.useAdvancedFlow"
+          >
+            <span
+              class="inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform"
+              :class="sliceOptions.useAdvancedFlow ? 'translate-x-5' : 'translate-x-1'"
             />
           </button>
         </div>

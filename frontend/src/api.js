@@ -30,13 +30,17 @@ const readErrorMessage = async (response, fallback) => {
 
 export const api = {
   // 搜索
-  async search(query, kbId = null, fileId = null) {
+  async search(query, kbId = null, fileId = null, options = {}) {
+    const { advanced = false } = options
     let url = `${API_BASE}/search/?query=${encodeURIComponent(query)}`
     if (kbId) {
       url += `&kb_id=${kbId}`
     }
     if (fileId) {
       url += `&file_id=${fileId}`
+    }
+    if (advanced) {
+      url += '&advanced=true'
     }
     const response = await fetch(url, {
       headers: getHeaders(),

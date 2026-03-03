@@ -38,6 +38,9 @@ pub struct SearchQuery {
     #[param(value_type = String, example = "1,2")]
     #[serde(default, deserialize_with = "deserialize_id_list")]
     pub kb_id: Option<Vec<i64>>,
+    /// 是否启用高级流程（仅切片搜索接口生效）
+    #[serde(default)]
+    pub advanced: bool,
 }
 
 fn default_max_sub_queries() -> usize {
@@ -397,6 +400,38 @@ pub async fn search(
     let kb_ids_to_search = resolve_kb_ids_to_search(&pool, &user_id, is_admin, params.kb_id.as_ref()).await?;
     if matches!(kb_ids_to_search.as_ref(), Some(ids) if ids.is_empty()) {
         return Ok(Json(SearchResult { results: vec![] }));
+    }
+
+    if params.advanced {
+        let request_id = uuid::Uuid::new_v4().to_string();
+        let advanced_params = AdvancedSearchQuery {
+            query: params.query.clone(),
+            file_id: params.file_id.clone(),
+            kb_id: params.kb_id.clone(),
+            max_sub_queries: default_max_sub_queries(),
+            per_query_limit: default_per_query_limit(),
+            context_chars: default_context_chars(),
+            debug: false,
+        };
+        info!(
+            "search advanced option enabled: request_id={}, user_id={}, query=\"{}\", file_filter={}, kb_scope={}",
+            request_id,
+            user_id,
+            preview_for_log(&params.query, 120),
+            format_id_filter(params.file_id.as_deref()),
+            summarize_kb_scope(kb_ids_to_search.as_deref())
+        );
+        let advanced_results = run_advanced_slice_search_non_stream(
+            &pool,
+            &search_engine,
+            &auth_user,
+            &advanced_params,
+            kb_ids_to_search.clone(),
+            &request_id,
+        )
+        .await
+        .map_err(|e| ApiError::internal(format!("Advanced search failed: {}", e)))?;
+        return Ok(Json(SearchResult { results: advanced_results }));
     }
 
     let raw_results = search_engine
@@ -811,6 +846,15 @@ struct SelectedAnswerCandidate {
     context_content: String,
 }
 
+struct AdvancedSelectedSliceResult {
+    base_slice_id: i64,
+    file: FileInfo,
+    kb: Option<KbInfo>,
+    score: f32,
+    content: String,
+    slice_ids: Vec<i64>,
+}
+
 async fn send_event_json<T: Serialize>(
     tx: &mpsc::Sender<Result<Event, Infallible>>, event: &str, payload: &T,
 ) -> anyhow::Result<()> {
@@ -964,6 +1008,201 @@ fn summarize_slice_candidates(candidates: &[SliceCandidate]) -> Vec<Value> {
             })
         })
         .collect()
+}
+
+async fn run_advanced_slice_search_non_stream(
+    pool: &SqlitePool, search_engine: &SearchEngine, auth_user: &AuthUser, params: &AdvancedSearchQuery,
+    kb_ids: Option<Vec<i64>>, request_id: &str,
+) -> anyhow::Result<Vec<SearchResultItem>> {
+    if matches!(kb_ids.as_ref(), Some(ids) if ids.is_empty()) {
+        return Ok(Vec::new());
+    }
+
+    let llm_client = LlmClient::new();
+    let planner = QueryPlanner::new(llm_client.clone());
+    let judge = RelevanceJudge::new(llm_client.clone());
+    let chunk_refiner = ChunkRefiner::new(llm_client);
+
+    let slice_limit = params.per_query_limit.max(1);
+    let context_chars = params.context_chars.max(1);
+    let user_id = auth_user.user_id.clone();
+    let is_admin = auth_user.is_admin();
+
+    let steps = planner.plan(&params.query, params.max_sub_queries.max(1)).await;
+    let mut slice_candidates: Vec<SliceCandidate> = Vec::new();
+    let mut selected: Option<AdvancedSelectedSliceResult> = None;
+
+    for step in steps {
+        match step.action {
+            PlanAction::RecentDocuments => {
+                slice_candidates = collect_relevant_slices(
+                    pool,
+                    search_engine,
+                    &params.query,
+                    params.file_id.as_ref(),
+                    kb_ids.as_ref(),
+                    slice_limit,
+                    &user_id,
+                    is_admin,
+                    request_id,
+                )
+                .await?;
+            }
+            PlanAction::PageContent => {
+                if slice_candidates.is_empty() {
+                    slice_candidates = collect_relevant_slices(
+                        pool,
+                        search_engine,
+                        &params.query,
+                        params.file_id.as_ref(),
+                        kb_ids.as_ref(),
+                        slice_limit,
+                        &user_id,
+                        is_admin,
+                        request_id,
+                    )
+                    .await?;
+                }
+                if slice_candidates.is_empty() {
+                    continue;
+                }
+                selected = execute_page_content_step_non_stream(
+                    pool,
+                    &slice_candidates,
+                    slice_limit,
+                    context_chars,
+                    &judge,
+                    &chunk_refiner,
+                    &params.query,
+                    request_id,
+                )
+                .await?;
+                if selected.is_some() {
+                    break;
+                }
+            }
+            PlanAction::DocumentStructure => {}
+        }
+    }
+
+    let Some(selected) = selected else {
+        return Ok(Vec::new());
+    };
+
+    let slice_positions_map = get_slice_positions(pool, &selected.slice_ids).await?;
+    let mut merged_positions = Vec::new();
+    for slice_id in &selected.slice_ids {
+        if let Some(positions) = slice_positions_map.get(slice_id) {
+            merged_positions.extend(positions.iter().cloned());
+        }
+    }
+    let positions = if merged_positions.is_empty() { None } else { Some(merged_positions) };
+
+    Ok(vec![SearchResultItem {
+        id: selected.base_slice_id,
+        file_id: selected.file.id,
+        content: selected.content,
+        score: selected.score,
+        file: Some(selected.file),
+        kb: selected.kb,
+        positions,
+    }])
+}
+
+async fn execute_page_content_step_non_stream(
+    pool: &SqlitePool, candidates: &[SliceCandidate], slice_limit: usize, context_chars: usize, judge: &RelevanceJudge,
+    chunk_refiner: &ChunkRefiner, query: &str, request_id: &str,
+) -> anyhow::Result<Option<AdvancedSelectedSliceResult>> {
+    let max_slices = slice_limit.max(1);
+    let mut selected_candidate: Option<SelectedAnswerCandidate> = None;
+    let mut best_candidate: Option<SelectedAnswerCandidate> = None;
+
+    for candidate in candidates.iter().take(max_slices) {
+        let base_slice = &candidate.slice;
+        let context_chunk = match assemble_context_chunk(pool, base_slice, context_chars).await {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                info!(
+                    "execute_page_content_step_non_stream context assemble failed: request_id={}, file_id={}, base_slice_id={}, error={}",
+                    request_id, candidate.file.id, base_slice.id, err
+                );
+                continue;
+            }
+        };
+
+        let judge_outcome = judge.judge(query, &context_chunk.content).await;
+        if !judge_outcome.is_relevant {
+            continue;
+        }
+
+        let current_candidate = SelectedAnswerCandidate {
+            file: candidate.file.clone(),
+            kb: candidate.kb.clone(),
+            base_slice_id: base_slice.id,
+            base_score: base_slice.score,
+            judge_score: judge_outcome.score,
+            judge_reason: judge_outcome.reason,
+            context_segments: context_chunk.segments,
+            context_content: context_chunk.content,
+        };
+
+        if current_candidate.judge_score > ADVANCED_JUDGE_EARLY_STOP_SCORE {
+            selected_candidate = Some(current_candidate);
+            break;
+        }
+
+        let should_replace_best = best_candidate.as_ref().map_or(true, |best| {
+            current_candidate.judge_score > best.judge_score
+                || ((current_candidate.judge_score - best.judge_score).abs() < f32::EPSILON
+                    && current_candidate.base_score > best.base_score)
+        });
+        if should_replace_best {
+            best_candidate = Some(current_candidate);
+        }
+    }
+
+    if selected_candidate.is_none() {
+        selected_candidate = best_candidate;
+    }
+
+    let Some(selected) = selected_candidate else {
+        return Ok(None);
+    };
+
+    let refine_outcome = match chunk_refiner.refine(query, &selected.context_segments).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            info!(
+                "execute_page_content_step_non_stream refine failed: request_id={}, file_id={}, base_slice_id={}, error={}",
+                request_id, selected.file.id, selected.base_slice_id, err
+            );
+            RefineOutcome {
+                segments: selected.context_segments.clone(),
+                reason: Some("切片筛选失败，保留全部上下文".to_string()),
+            }
+        }
+    };
+
+    let mut final_segments = refine_outcome.segments;
+    if final_segments.is_empty() {
+        final_segments = selected.context_segments.clone();
+    }
+    let mut final_content = final_segments.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>().join("\n");
+    if final_content.trim().is_empty() {
+        final_content = selected.context_content.clone();
+    }
+    if final_content.trim().is_empty() {
+        return Ok(None);
+    }
+
+    Ok(Some(AdvancedSelectedSliceResult {
+        base_slice_id: selected.base_slice_id,
+        file: selected.file,
+        kb: selected.kb,
+        score: selected.base_score,
+        content: final_content,
+        slice_ids: final_segments.into_iter().map(|seg| seg.slice_id).collect(),
+    }))
 }
 
 async fn execute_page_content_step(
