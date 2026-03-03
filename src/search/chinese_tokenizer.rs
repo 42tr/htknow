@@ -88,7 +88,7 @@ impl FastChineseTokenizer {
     pub fn segment(&self, text: &str) -> Vec<String> {
         let jieba = JIEBA.read().unwrap_or_else(|e| e.into_inner());
         let words = match self.mode {
-            SegmentationMode::All => {
+            SegmentationMode::Search => {
                 // 搜索模式：使用 cut_for_search，召回率高
                 jieba
                     .cut_for_search(text, false)
@@ -100,7 +100,7 @@ impl FastChineseTokenizer {
                     .map(|s| s.to_string())
                     .collect()
             }
-            SegmentationMode::Search => jieba
+            SegmentationMode::All => jieba
                 .cut_all(text)
                 .into_iter()
                 .filter(|s| {
