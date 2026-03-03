@@ -52,6 +52,8 @@ fn default_context_chars() -> usize {
     2000
 }
 
+const ADVANCED_JUDGE_EARLY_STOP_SCORE: f32 = 0.9;
+
 /// 高级搜索参数
 #[derive(Debug, Deserialize, IntoParams, Clone)]
 pub struct AdvancedSearchQuery {
@@ -609,19 +611,19 @@ async fn run_advanced_search_logic(
     tx: &mpsc::Sender<Result<Event, Infallible>>, request_id: &str,
 ) -> anyhow::Result<()> {
     let logic_started = Instant::now();
-    let doc_limit = params.per_query_limit.max(1);
+    let slice_limit = params.per_query_limit.max(1);
     let context_chars = params.context_chars.max(1);
     let user_id = auth_user.user_id.clone();
     let is_admin = auth_user.is_admin();
 
     info!(
-        "advanced_search_logic started: request_id={}, user_id={}, is_admin={}, file_filter={}, kb_scope={}, doc_limit={}, context_chars={}, debug={}",
+        "advanced_search_logic started: request_id={}, user_id={}, is_admin={}, file_filter={}, kb_scope={}, slice_limit={}, context_chars={}, debug={}",
         request_id,
         user_id,
         is_admin,
         format_id_filter(params.file_id.as_deref()),
         summarize_kb_scope(kb_ids.as_deref()),
-        doc_limit,
+        slice_limit,
         context_chars,
         params.debug
     );
@@ -651,7 +653,7 @@ async fn run_advanced_search_logic(
     }
     send_plan_event(tx, &steps).await?;
 
-    let mut doc_candidates: Vec<DocumentCandidate> = Vec::new();
+    let mut slice_candidates: Vec<SliceCandidate> = Vec::new();
 
     for (step_idx, step) in steps.into_iter().enumerate() {
         let step_started = Instant::now();
@@ -667,100 +669,76 @@ async fn run_advanced_search_logic(
         send_step_event(tx, &step, "started", None).await?;
         match step_action {
             PlanAction::RecentDocuments => {
-                doc_candidates = collect_recent_documents(
+                slice_candidates = collect_relevant_slices(
                     &pool,
                     &search_engine,
                     &params.query,
                     params.file_id.as_ref(),
                     kb_ids.as_ref(),
-                    doc_limit,
+                    slice_limit,
                     &user_id,
                     is_admin,
                     request_id,
                 )
                 .await?;
-                let summary = summarize_documents(&doc_candidates);
+                let summary = summarize_slice_candidates(&slice_candidates);
                 info!(
-                    "advanced_search_logic step completed: request_id={}, step_index={}, action=RecentDocuments, doc_candidates={}, elapsed_ms={}",
+                    "advanced_search_logic step completed: request_id={}, step_index={}, action=RecentDocuments, slice_candidates={}, elapsed_ms={}",
                     request_id,
                     step_idx + 1,
-                    doc_candidates.len(),
+                    slice_candidates.len(),
                     step_started.elapsed().as_millis()
                 );
-                send_step_event(tx, &step, "completed", Some(json!({ "documents": summary }))).await?;
+                send_step_event(
+                    tx,
+                    &step,
+                    "completed",
+                    Some(json!({ "count": slice_candidates.len(), "slices": summary })),
+                )
+                .await?;
             }
             PlanAction::DocumentStructure => {
-                if doc_candidates.is_empty() {
-                    info!(
-                        "advanced_search_logic step refilling docs: request_id={}, step_index={}, action=DocumentStructure",
-                        request_id,
-                        step_idx + 1
-                    );
-                    doc_candidates = collect_recent_documents(
-                        &pool,
-                        &search_engine,
-                        &params.query,
-                        params.file_id.as_ref(),
-                        kb_ids.as_ref(),
-                        doc_limit,
-                        &user_id,
-                        is_admin,
-                        request_id,
-                    )
-                    .await?;
-                }
-                if doc_candidates.is_empty() {
-                    info!(
-                        "advanced_search_logic step skipped: request_id={}, step_index={}, action=DocumentStructure, reason=no_documents",
-                        request_id,
-                        step_idx + 1
-                    );
-                    send_step_event(tx, &step, "skipped", Some(json!({ "reason": "未找到相关文档" }))).await?;
-                    continue;
-                }
-                let structures = describe_document_structure(&pool, &doc_candidates, doc_limit).await?;
                 info!(
-                    "advanced_search_logic step completed: request_id={}, step_index={}, action=DocumentStructure, documents={}, elapsed_ms={}",
+                    "advanced_search_logic step skipped: request_id={}, step_index={}, action=DocumentStructure, reason=flow_simplified",
                     request_id,
                     step_idx + 1,
-                    structures.len(),
-                    step_started.elapsed().as_millis()
                 );
-                send_step_event(tx, &step, "completed", Some(json!({ "documents": structures }))).await?;
+                send_step_event(tx, &step, "skipped", Some(json!({ "reason": "当前流程不执行文档结构分析" }))).await?;
             }
             PlanAction::PageContent => {
-                if doc_candidates.is_empty() {
+                if slice_candidates.is_empty() {
                     info!(
-                        "advanced_search_logic step refilling docs: request_id={}, step_index={}, action=PageContent",
+                        "advanced_search_logic step refilling slices: request_id={}, step_index={}, action=PageContent",
                         request_id,
                         step_idx + 1
                     );
-                    doc_candidates = collect_recent_documents(
+                    slice_candidates = collect_relevant_slices(
                         &pool,
                         &search_engine,
                         &params.query,
                         params.file_id.as_ref(),
                         kb_ids.as_ref(),
-                        doc_limit,
+                        slice_limit,
                         &user_id,
                         is_admin,
                         request_id,
                     )
                     .await?;
                 }
-                if doc_candidates.is_empty() {
+                if slice_candidates.is_empty() {
                     info!(
-                        "advanced_search_logic step skipped: request_id={}, step_index={}, action=PageContent, reason=no_documents",
+                        "advanced_search_logic step skipped: request_id={}, step_index={}, action=PageContent, reason=no_slices",
                         request_id,
                         step_idx + 1
                     );
-                    send_step_event(tx, &step, "skipped", Some(json!({ "reason": "未找到可提取内容" }))).await?;
+                    send_step_event(tx, &step, "skipped", Some(json!({ "reason": "未找到相关切片" }))).await?;
+                    send_status_event(tx, "结果", "未找到可用于回答问题的内容").await?;
                     continue;
                 }
                 let emitted = execute_page_content_step(
                     &pool,
-                    &doc_candidates,
-                    doc_limit,
+                    &slice_candidates,
+                    slice_limit,
                     context_chars,
                     &judge,
                     &chunk_refiner,
@@ -776,7 +754,16 @@ async fn run_advanced_search_logic(
                     emitted,
                     step_started.elapsed().as_millis()
                 );
-                send_step_event(tx, &step, "completed", Some(json!({ "emitted": emitted }))).await?;
+                if emitted > 0 {
+                    send_status_event(tx, "结果", "已找到可用于回答问题的内容，停止继续检索").await?;
+                } else {
+                    send_status_event(tx, "结果", "未找到可用于回答问题的内容").await?;
+                }
+                send_step_event(tx, &step, "completed", Some(json!({ "emitted": emitted, "found": emitted > 0 })))
+                    .await?;
+                if emitted > 0 {
+                    break;
+                }
             }
         }
     }
@@ -807,18 +794,10 @@ struct AdvancedResultPayload {
 }
 
 #[derive(Clone)]
-struct DocumentCandidate {
+struct SliceCandidate {
     file: FileInfo,
     kb: Option<KbInfo>,
-    slices: Vec<EngineSearchResultItem>,
-}
-
-#[derive(Debug, Serialize)]
-struct DocumentStructurePayload {
-    file: FileInfo,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    kb: Option<KbInfo>,
-    sections: Vec<String>,
+    slice: EngineSearchResultItem,
 }
 
 async fn send_event_json<T: Serialize>(
@@ -879,18 +858,18 @@ fn has_permission(file: Option<&FileInfo>, kb: Option<&KbInfo>, user_id: &str, i
     true
 }
 
-async fn collect_recent_documents(
+async fn collect_relevant_slices(
     pool: &SqlitePool, search_engine: &SearchEngine, query: &str, file_filter: Option<&Vec<i64>>,
-    kb_filter: Option<&Vec<i64>>, doc_limit: usize, user_id: &str, is_admin: bool, request_id: &str,
-) -> anyhow::Result<Vec<DocumentCandidate>> {
+    kb_filter: Option<&Vec<i64>>, slice_limit: usize, user_id: &str, is_admin: bool, request_id: &str,
+) -> anyhow::Result<Vec<SliceCandidate>> {
     let collect_started = Instant::now();
     info!(
-        "collect_recent_documents started: request_id={}, query=\"{}\", file_filter={}, kb_filter={}, doc_limit={}, user_id={}, is_admin={}",
+        "collect_relevant_slices started: request_id={}, query=\"{}\", file_filter={}, kb_filter={}, slice_limit={}, user_id={}, is_admin={}",
         request_id,
         preview_for_log(query, 120),
         format_id_filter(file_filter.map(Vec::as_slice)),
         format_id_filter(kb_filter.map(Vec::as_slice)),
-        doc_limit,
+        slice_limit,
         user_id,
         is_admin
     );
@@ -901,7 +880,7 @@ async fn collect_recent_documents(
 
     if raw_results.is_empty() {
         info!(
-            "collect_recent_documents no results: request_id={}, elapsed_ms={}",
+            "collect_relevant_slices no results: request_id={}, elapsed_ms={}",
             request_id,
             collect_started.elapsed().as_millis()
         );
@@ -913,306 +892,290 @@ async fn collect_recent_documents(
     let file_map = get_files_by_ids(pool, &file_ids).await?;
     let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(pool, &kb_ids).await? } else { HashMap::new() };
 
-    let mut grouped: HashMap<i64, Vec<EngineSearchResultItem>> = HashMap::new();
-    for item in raw_results.drain(..) {
-        grouped.entry(item.file_id).or_default().push(item);
-    }
+    raw_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 
-    let mut grouped_vec: Vec<(i64, Vec<EngineSearchResultItem>)> = grouped.into_iter().collect();
-    grouped_vec.sort_by(|a, b| {
-        let score_a = a.1.first().map(|s| s.score).unwrap_or(0.0);
-        let score_b = b.1.first().map(|s| s.score).unwrap_or(0.0);
-        score_b.partial_cmp(&score_a).unwrap_or(Ordering::Equal)
-    });
-    let grouped_doc_count = grouped_vec.len();
-
-    let mut documents = Vec::new();
+    let mut selected_slices = Vec::new();
     let mut missing_file_count = 0usize;
     let mut permission_denied_count = 0usize;
-    for (file_id, mut slices) in grouped_vec {
-        if documents.len() >= doc_limit {
+    let mut duplicate_slice_count = 0usize;
+    let mut seen_slice_ids: HashSet<i64> = HashSet::new();
+
+    for slice in raw_results {
+        if selected_slices.len() >= slice_limit {
             break;
         }
+        if !seen_slice_ids.insert(slice.id) {
+            duplicate_slice_count += 1;
+            continue;
+        }
+        let file_id = slice.file_id;
         let Some(file) = file_map.get(&file_id).cloned() else {
             missing_file_count += 1;
             continue;
         };
-        let kb = file.kb_id.and_then(|kid| kb_map.get(&kid).cloned());
+        let kb = slice
+            .kb_id
+            .and_then(|kid| kb_map.get(&kid).cloned())
+            .or_else(|| file.kb_id.and_then(|kid| kb_map.get(&kid).cloned()));
         if !has_permission(Some(&file), kb.as_ref(), user_id, is_admin) {
             permission_denied_count += 1;
             continue;
         }
-        slices.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
-        documents.push(DocumentCandidate { file, kb, slices });
+        selected_slices.push(SliceCandidate { file, kb, slice });
     }
 
     info!(
-        "collect_recent_documents completed: request_id={}, raw_slices={}, grouped_docs={}, selected_docs={}, missing_file={}, permission_denied={}, elapsed_ms={}",
+        "collect_relevant_slices completed: request_id={}, raw_slices={}, selected_slices={}, missing_file={}, permission_denied={}, duplicate_slice={}, elapsed_ms={}",
         request_id,
         raw_count,
-        grouped_doc_count,
-        documents.len(),
+        selected_slices.len(),
         missing_file_count,
         permission_denied_count,
+        duplicate_slice_count,
         collect_started.elapsed().as_millis()
     );
 
-    Ok(documents)
+    Ok(selected_slices)
 }
 
-fn summarize_documents(docs: &[DocumentCandidate]) -> Vec<Value> {
-    docs.iter()
-        .map(|doc| {
-            let preview = doc.slices.first().map(|s| preview_text(&s.content, 160)).unwrap_or_default();
+fn summarize_slice_candidates(candidates: &[SliceCandidate]) -> Vec<Value> {
+    candidates
+        .iter()
+        .map(|candidate| {
+            let preview = preview_text(&candidate.slice.content, 160);
             json!({
-                "file": doc.file.clone(),
-                "kb": doc.kb.clone(),
-                "top_score": doc.slices.first().map(|s| s.score),
+                "slice_id": candidate.slice.id,
+                "file_id": candidate.slice.file_id,
+                "file": candidate.file.clone(),
+                "kb": candidate.kb.clone(),
+                "score": candidate.slice.score,
                 "preview": preview,
             })
         })
         .collect()
 }
 
-async fn describe_document_structure(
-    pool: &SqlitePool, docs: &[DocumentCandidate], doc_limit: usize,
-) -> anyhow::Result<Vec<DocumentStructurePayload>> {
-    let mut snapshots = Vec::new();
-    let max_docs = doc_limit.max(1);
-    for doc in docs.iter().take(max_docs) {
-        let sections = fetch_document_sections(pool, doc.file.id, 3).await?;
-        snapshots.push(DocumentStructurePayload { file: doc.file.clone(), kb: doc.kb.clone(), sections });
-    }
-    Ok(snapshots)
-}
-
-async fn fetch_document_sections(pool: &SqlitePool, file_id: i64, limit: usize) -> anyhow::Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as("SELECT content FROM slices WHERE file_id = ? ORDER BY id LIMIT ?")
-        .bind(file_id)
-        .bind(limit as i64)
-        .fetch_all(pool)
-        .await?;
-    Ok(rows.into_iter().map(|(content,)| preview_text(&content, 160)).collect())
-}
-
 async fn execute_page_content_step(
-    pool: &SqlitePool, docs: &[DocumentCandidate], doc_limit: usize, context_chars: usize, judge: &RelevanceJudge,
+    pool: &SqlitePool, candidates: &[SliceCandidate], slice_limit: usize, context_chars: usize, judge: &RelevanceJudge,
     chunk_refiner: &ChunkRefiner, params: &AdvancedSearchQuery, tx: &mpsc::Sender<Result<Event, Infallible>>,
     request_id: &str,
 ) -> anyhow::Result<usize> {
     let step_started = Instant::now();
     let mut emitted = 0;
-    let mut seen_slice_ids: HashSet<i64> = HashSet::new();
-    let mut seen_big_chunks: HashSet<Vec<i64>> = HashSet::new();
-    let max_docs = doc_limit.max(1);
-    let mut inspected_docs = 0usize;
+    let max_slices = slice_limit.max(1);
     let mut inspected_slices = 0usize;
-    let mut duplicate_slice_count = 0usize;
     let mut context_error_count = 0usize;
     let mut refine_error_count = 0usize;
     let mut empty_slice_group_count = 0usize;
     let mut empty_content_count = 0usize;
-    let mut duplicate_chunk_count = 0usize;
     let mut judge_rejected_count = 0usize;
+    let mut best_payload: Option<AdvancedResultPayload> = None;
 
     info!(
-        "execute_page_content_step started: request_id={}, docs={}, max_docs={}, context_chars={}, debug={}",
+        "execute_page_content_step started: request_id={}, candidates={}, max_slices={}, context_chars={}, early_stop_score>{:.2}, debug={}",
         request_id,
-        docs.len(),
-        max_docs,
+        candidates.len(),
+        max_slices,
         context_chars,
+        ADVANCED_JUDGE_EARLY_STOP_SCORE,
         params.debug
     );
 
-    for doc in docs.iter().take(max_docs) {
-        inspected_docs += 1;
-        for slice in doc.slices.iter().take(2) {
-            inspected_slices += 1;
-            if !seen_slice_ids.insert(slice.id) {
-                duplicate_slice_count += 1;
-                continue;
-            }
-            let context_chunk = match assemble_context_chunk(pool, slice, context_chars).await {
-                Ok(chunk) => chunk,
-                Err(err) => {
-                    context_error_count += 1;
-                    info!(
-                        "execute_page_content_step context assemble failed: request_id={}, file_id={}, base_slice_id={}, error={}",
-                        request_id, doc.file.id, slice.id, err
-                    );
-                    if params.debug {
-                        let _ = send_event_json(
-                            tx,
-                            "candidate",
-                            &json!({
-                                "step_action": PlanAction::PageContent,
-                                "file": doc.file.clone(),
-                                "kb": doc.kb.clone(),
-                                "error": format!("上下文拼接失败: {}", err),
-                            }),
-                        )
-                        .await;
-                    }
-                    continue;
-                }
-            };
+    for candidate in candidates.iter().take(max_slices) {
+        inspected_slices += 1;
+        let base_slice = &candidate.slice;
+        info!(
+            "execute_page_content_step evaluating candidate before_context: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, base_score={:.4}, preview=\"{}\"",
+            request_id,
+            candidate.file.id,
+            candidate.kb.as_ref().map(|kb| kb.id),
+            base_slice.id,
+            base_slice.score,
+            preview_for_log(&base_slice.content, 120)
+        );
 
-            let refine_outcome = match chunk_refiner.refine(&params.query, &context_chunk.segments).await {
-                Ok(outcome) => outcome,
-                Err(err) => {
-                    refine_error_count += 1;
-                    info!(
-                        "execute_page_content_step refine failed: request_id={}, file_id={}, base_slice_id={}, error={}",
-                        request_id, doc.file.id, slice.id, err
-                    );
-                    if params.debug {
-                        let _ = send_event_json(
-                            tx,
-                            "candidate",
-                            &json!({
-                                "step_action": PlanAction::PageContent,
-                                "file": doc.file.clone(),
-                                "kb": doc.kb.clone(),
-                                "error": format!("切片筛选失败: {}", err),
-                            }),
-                        )
-                        .await;
-                    }
-                    RefineOutcome {
-                        segments: context_chunk.segments.clone(),
-                        reason: Some("切片筛选失败，保留全部上下文".to_string()),
-                    }
-                }
-            };
-
-            let refined_slice_ids: Vec<i64> = refine_outcome.segments.iter().map(|seg| seg.slice_id).collect();
-            if refined_slice_ids.is_empty() {
-                empty_slice_group_count += 1;
-                continue;
-            }
-            let refined_content =
-                refine_outcome.segments.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>().join("\n");
-            if refined_content.trim().is_empty() {
-                empty_content_count += 1;
-                continue;
-            }
-
-            let canonical_ids = canonical_slice_set(&refined_slice_ids);
-            if !seen_big_chunks.insert(canonical_ids) {
-                duplicate_chunk_count += 1;
+        let context_chunk = match assemble_context_chunk(pool, base_slice, context_chars).await {
+            Ok(chunk) => chunk,
+            Err(err) => {
+                context_error_count += 1;
                 info!(
-                    "execute_page_content_step duplicate chunk skipped: request_id={}, file_id={}, slice_ids={}",
-                    request_id,
-                    doc.file.id,
-                    format_id_filter(Some(refined_slice_ids.as_slice()))
+                    "execute_page_content_step context assemble failed: request_id={}, file_id={}, base_slice_id={}, error={}",
+                    request_id, candidate.file.id, base_slice.id, err
                 );
                 if params.debug {
                     let _ = send_event_json(
                         tx,
-                        "filtered",
+                        "candidate",
                         &json!({
                             "step_action": PlanAction::PageContent,
-                            "file": doc.file.clone(),
-                            "kb": doc.kb.clone(),
-                            "reason": "重复切片组合",
-                            "slice_ids": refined_slice_ids,
+                            "file": candidate.file.clone(),
+                            "kb": candidate.kb.clone(),
+                            "error": format!("上下文拼接失败: {}", err),
                         }),
                     )
                     .await;
                 }
                 continue;
             }
+        };
+        info!("context_chunk: {:?}", context_chunk);
 
-            if params.debug {
-                let preview = preview_text(&refined_content, 160);
-                let _ = send_event_json(
-                    tx,
-                    "candidate",
-                    &json!({
-                        "step_action": PlanAction::PageContent,
-                        "file": doc.file.clone(),
-                        "kb": doc.kb.clone(),
-                        "score": slice.score,
-                        "slice_ids": refined_slice_ids.clone(),
-                        "preview": preview,
-                        "refine_reason": refine_outcome.reason.clone(),
-                    }),
-                )
-                .await;
+        let refine_outcome = match chunk_refiner.refine(&params.query, &context_chunk.segments).await {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                refine_error_count += 1;
+                info!(
+                    "execute_page_content_step refine failed: request_id={}, file_id={}, base_slice_id={}, error={}",
+                    request_id, candidate.file.id, base_slice.id, err
+                );
+                if params.debug {
+                    let _ = send_event_json(
+                        tx,
+                        "candidate",
+                        &json!({
+                            "step_action": PlanAction::PageContent,
+                            "file": candidate.file.clone(),
+                            "kb": candidate.kb.clone(),
+                            "error": format!("切片筛选失败: {}", err),
+                        }),
+                    )
+                    .await;
+                }
+                RefineOutcome {
+                    segments: context_chunk.segments.clone(),
+                    reason: Some("切片筛选失败，保留全部上下文".to_string()),
+                }
             }
+        };
 
-            let judge_outcome = judge.judge(&params.query, &refined_content).await;
-            if judge_outcome.is_relevant {
-                let payload = AdvancedResultPayload {
-                    step_action: PlanAction::PageContent,
-                    file: Some(doc.file.clone()),
-                    kb: doc.kb.clone(),
-                    slice_ids: refined_slice_ids,
-                    score: slice.score,
-                    judge_score: judge_outcome.score,
-                    judge_reason: judge_outcome.reason.clone(),
-                    refine_reason: refine_outcome.reason.clone(),
-                    content: refined_content.clone(),
-                };
+        let refined_slice_ids: Vec<i64> = refine_outcome.segments.iter().map(|seg| seg.slice_id).collect();
+        if refined_slice_ids.is_empty() {
+            empty_slice_group_count += 1;
+            continue;
+        }
+        let refined_content =
+            refine_outcome.segments.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>().join("\n");
+        if refined_content.trim().is_empty() {
+            empty_content_count += 1;
+            continue;
+        }
+
+        if params.debug {
+            let preview = preview_text(&refined_content, 160);
+            let _ = send_event_json(
+                tx,
+                "candidate",
+                &json!({
+                    "step_action": PlanAction::PageContent,
+                    "file": candidate.file.clone(),
+                    "kb": candidate.kb.clone(),
+                    "score": base_slice.score,
+                    "slice_ids": refined_slice_ids.clone(),
+                    "preview": preview,
+                    "refine_reason": refine_outcome.reason.clone(),
+                }),
+            )
+            .await;
+        }
+
+        let judge_outcome = judge.judge(&params.query, &refined_content).await;
+        if judge_outcome.is_relevant {
+            let payload = AdvancedResultPayload {
+                step_action: PlanAction::PageContent,
+                file: Some(candidate.file.clone()),
+                kb: candidate.kb.clone(),
+                slice_ids: refined_slice_ids,
+                score: base_slice.score,
+                judge_score: judge_outcome.score,
+                judge_reason: judge_outcome.reason.clone(),
+                refine_reason: refine_outcome.reason.clone(),
+                content: refined_content.clone(),
+            };
+            if judge_outcome.score > ADVANCED_JUDGE_EARLY_STOP_SCORE {
                 send_event_json(tx, "result", &payload).await?;
                 emitted += 1;
                 info!(
-                    "execute_page_content_step emitted result: request_id={}, file_id={}, kb_id={:?}, slice_count={}, score={:.4}, judge_score={:.4}, refine_reason=\"{}\"",
+                    "execute_page_content_step emitted result with early stop: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, slice_count={}, score={:.4}, judge_score={:.4}, refine_reason=\"{}\"",
                     request_id,
-                    doc.file.id,
-                    doc.kb.as_ref().map(|kb| kb.id),
+                    candidate.file.id,
+                    candidate.kb.as_ref().map(|kb| kb.id),
+                    base_slice.id,
                     payload.slice_ids.len(),
-                    slice.score,
+                    base_slice.score,
                     judge_outcome.score,
                     preview_for_log(refine_outcome.reason.as_deref().unwrap_or("none"), 120)
                 );
-            } else if params.debug {
-                judge_rejected_count += 1;
-                info!(
-                    "execute_page_content_step candidate rejected: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, judge_score={:.4}, reason=\"{}\"",
-                    request_id,
-                    doc.file.id,
-                    doc.kb.as_ref().map(|kb| kb.id),
-                    slice.id,
-                    judge_outcome.score,
-                    preview_for_log(&judge_outcome.reason, 120)
-                );
-                let _ = send_event_json(
-                    tx,
-                    "filtered",
-                    &json!({
-                        "step_action": PlanAction::PageContent,
-                        "file": doc.file.clone(),
-                        "kb": doc.kb.clone(),
-                        "reason": judge_outcome.reason,
-                        "score": judge_outcome.score,
-                    }),
-                )
-                .await;
-            } else {
-                judge_rejected_count += 1;
-                info!(
-                    "execute_page_content_step candidate rejected: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, judge_score={:.4}, reason=\"{}\"",
-                    request_id,
-                    doc.file.id,
-                    doc.kb.as_ref().map(|kb| kb.id),
-                    slice.id,
-                    judge_outcome.score,
-                    preview_for_log(&judge_outcome.reason, 120)
-                );
+                break;
             }
+
+            let should_replace_best = best_payload.as_ref().map_or(true, |best| {
+                judge_outcome.score > best.judge_score
+                    || ((judge_outcome.score - best.judge_score).abs() < f32::EPSILON && base_slice.score > best.score)
+            });
+            if should_replace_best {
+                info!(
+                    "execute_page_content_step updated best candidate: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, score={:.4}, judge_score={:.4}",
+                    request_id,
+                    candidate.file.id,
+                    candidate.kb.as_ref().map(|kb| kb.id),
+                    base_slice.id,
+                    base_slice.score,
+                    judge_outcome.score
+                );
+                best_payload = Some(payload);
+            }
+            continue;
+        }
+
+        judge_rejected_count += 1;
+        info!(
+            "execute_page_content_step candidate rejected: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, judge_score={:.4}, reason=\"{}\"",
+            request_id,
+            candidate.file.id,
+            candidate.kb.as_ref().map(|kb| kb.id),
+            base_slice.id,
+            judge_outcome.score,
+            preview_for_log(&judge_outcome.reason, 120)
+        );
+
+        if params.debug {
+            let _ = send_event_json(
+                tx,
+                "filtered",
+                &json!({
+                    "step_action": PlanAction::PageContent,
+                    "file": candidate.file.clone(),
+                    "kb": candidate.kb.clone(),
+                    "reason": judge_outcome.reason,
+                    "score": judge_outcome.score,
+                }),
+            )
+            .await;
+        }
+    }
+
+    if emitted == 0 {
+        if let Some(payload) = best_payload {
+            send_event_json(tx, "result", &payload).await?;
+            emitted += 1;
+            info!(
+                "execute_page_content_step emitted best result after full scan: request_id={}, file_id={:?}, kb_id={:?}, slice_count={}, score={:.4}, judge_score={:.4}",
+                request_id,
+                payload.file.as_ref().map(|f| f.id),
+                payload.kb.as_ref().map(|kb| kb.id),
+                payload.slice_ids.len(),
+                payload.score,
+                payload.judge_score
+            );
         }
     }
 
     info!(
-        "execute_page_content_step completed: request_id={}, inspected_docs={}, inspected_slices={}, emitted={}, judge_rejected={}, duplicate_slice={}, duplicate_chunk={}, context_error={}, refine_error={}, empty_slice_group={}, empty_content={}, elapsed_ms={}",
+        "execute_page_content_step completed: request_id={}, inspected_slices={}, emitted={}, judge_rejected={}, context_error={}, refine_error={}, empty_slice_group={}, empty_content={}, elapsed_ms={}",
         request_id,
-        inspected_docs,
         inspected_slices,
         emitted,
         judge_rejected_count,
-        duplicate_slice_count,
-        duplicate_chunk_count,
         context_error_count,
         refine_error_count,
         empty_slice_group_count,
@@ -1262,13 +1225,6 @@ fn preview_text(text: &str, max_chars: usize) -> String {
         buf.push(ch);
     }
     buf
-}
-
-fn canonical_slice_set(ids: &[i64]) -> Vec<i64> {
-    let mut normalized: Vec<i64> = ids.iter().copied().collect();
-    normalized.sort_unstable();
-    normalized.dedup();
-    normalized
 }
 
 /// 全文搜索（仅 Tantivy 全文索引）

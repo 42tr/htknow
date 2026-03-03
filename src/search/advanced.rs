@@ -86,74 +86,28 @@ pub struct PlanStep {
 }
 
 pub struct QueryPlanner {
-    llm: LlmClient,
+    _llm: LlmClient,
 }
 
 impl QueryPlanner {
     pub fn new(llm: LlmClient) -> Self {
-        Self { llm }
+        Self { _llm: llm }
     }
 
-    pub async fn plan(&self, query: &str, max_steps: usize) -> Vec<PlanStep> {
-        let capped_steps = max_steps.max(1).min(10);
-        if query.trim().is_empty() {
-            return default_plan(capped_steps);
-        }
-        if !self.llm.is_enabled() {
-            return default_plan(capped_steps);
-        }
-
-        let prompt = format!(
-            r#"
-你需要为一个检索助手制定逐步计划。可用的动作有：
-1. recent_documents - 查找最新/最相关的文档
-2. document_structure - 根据候选文档提炼结构或章节
-3. page_content - 精确定位页面内容并提取文本
-
-请根据问题在不超过 {} 个步骤内给出动作序列和理由，输出 JSON：
-{{
-  "steps": [
-    {{"action": "recent_documents", "comment": "..." }}
-  ]
-}}
-
-问题：{}
-"#,
-            capped_steps, query
-        );
-
-        let result = self.llm.chat_json::<PlanResponse>(&prompt, 600, 0.2).await;
-        match result {
-            Ok(resp) => {
-                let mut steps: Vec<PlanStep> = resp
-                    .steps
-                    .into_iter()
-                    .filter(|s| {
-                        matches!(
-                            s.action,
-                            PlanAction::RecentDocuments | PlanAction::DocumentStructure | PlanAction::PageContent
-                        )
-                    })
-                    .collect();
-                if steps.is_empty() {
-                    steps = default_plan(capped_steps);
-                }
-                steps.truncate(capped_steps);
-                steps
-            }
-            Err(err) => {
-                warn!("LLM plan failed: {}", err);
-                default_plan(capped_steps)
-            }
-        }
+    pub async fn plan(&self, _query: &str, _max_steps: usize) -> Vec<PlanStep> {
+        default_plan(2)
     }
 }
 
 fn default_plan(max_steps: usize) -> Vec<PlanStep> {
     let mut steps = vec![
-        PlanStep { action: PlanAction::RecentDocuments, comment: "先确认有哪些相关文档".to_string() },
-        PlanStep { action: PlanAction::DocumentStructure, comment: "查看文档结构定位章节".to_string() },
-        PlanStep { action: PlanAction::PageContent, comment: "提取具体内容".to_string() },
+        PlanStep {
+            action: PlanAction::RecentDocuments, comment: "搜索相关文档并选出候选切片".to_string()
+        },
+        PlanStep {
+            action: PlanAction::PageContent,
+            comment: "按候选顺序补充上下文并由 LLM 判断可回答性，命中即停止".to_string(),
+        },
     ];
     steps.truncate(max_steps.min(steps.len()));
     steps
@@ -388,12 +342,6 @@ async fn fetch_after_slices(pool: &SqlitePool, file_id: i64, center_id: i64) -> 
     );
     let rows = sqlx::query_as::<_, SliceRow>(&sql).bind(file_id).bind(center_id).fetch_all(pool).await?;
     Ok(rows)
-}
-
-#[derive(Debug, Deserialize)]
-struct PlanResponse {
-    #[serde(default)]
-    steps: Vec<PlanStep>,
 }
 
 #[derive(Debug, Deserialize)]
