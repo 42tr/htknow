@@ -1,7 +1,7 @@
 use std::{collections::HashSet, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
-use log::warn;
+use log::{info, warn};
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -95,7 +95,7 @@ impl QueryPlanner {
     }
 
     pub async fn plan(&self, query: &str, max_steps: usize) -> Vec<PlanStep> {
-        let capped_steps = max_steps.max(1).min(5);
+        let capped_steps = max_steps.max(1).min(10);
         if query.trim().is_empty() {
             return default_plan(capped_steps);
         }
@@ -203,6 +203,7 @@ impl RelevanceJudge {
                 if !(0.0..=1.0).contains(&score) {
                     score = score.clamp(0.0, 1.0);
                 }
+                info!("result: {}\nscore: {}", context, score);
                 JudgeOutcome {
                     is_relevant: resp.relevant,
                     score,

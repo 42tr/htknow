@@ -1,5 +1,5 @@
 use std::{
-    cmp::Ordering, collections::{HashMap, HashSet}, convert::Infallible
+    cmp::Ordering, collections::{HashMap, HashSet}, convert::Infallible, time::Instant
 };
 
 use anyhow::anyhow;
@@ -45,7 +45,7 @@ fn default_max_sub_queries() -> usize {
 }
 
 fn default_per_query_limit() -> usize {
-    5
+    10
 }
 
 fn default_context_chars() -> usize {
@@ -71,7 +71,7 @@ pub struct AdvancedSearchQuery {
     pub max_sub_queries: usize,
     /// 每步处理的候选文档数量
     #[serde(default = "default_per_query_limit")]
-    #[param(example = 5)]
+    #[param(example = 10)]
     pub per_query_limit: usize,
     /// 组装上下文时，单侧字符数上限
     #[serde(default = "default_context_chars")]
@@ -489,7 +489,30 @@ pub async fn advanced_search_stream(
 ) -> ApiResult<Sse<KeepAliveStream<ReceiverStream<Result<Event, Infallible>>>>> {
     let is_admin = auth_user.is_admin();
     let user_id = auth_user.user_id.clone();
+    let request_id = uuid::Uuid::new_v4().to_string();
+
+    info!(
+        "advanced_search_stream request received: request_id={}, user_id={}, is_admin={}, query=\"{}\", file_filter={}, kb_filter={}, max_sub_queries={}, per_query_limit={}, context_chars={}, debug={}",
+        request_id,
+        user_id,
+        is_admin,
+        preview_for_log(&params.query, 120),
+        format_id_filter(params.file_id.as_deref()),
+        format_id_filter(params.kb_id.as_deref()),
+        params.max_sub_queries,
+        params.per_query_limit,
+        params.context_chars,
+        params.debug
+    );
+
+    let kb_resolve_started = Instant::now();
     let kb_ids_to_search = resolve_kb_ids_to_search(&pool, &user_id, is_admin, params.kb_id.as_ref()).await?;
+    info!(
+        "advanced_search_stream kb scope resolved: request_id={}, scope={}, elapsed_ms={}",
+        request_id,
+        summarize_kb_scope(kb_ids_to_search.as_deref()),
+        kb_resolve_started.elapsed().as_millis()
+    );
 
     let (tx, rx) = mpsc::channel(32);
     let pool_clone = pool.clone();
@@ -497,41 +520,83 @@ pub async fn advanced_search_stream(
     let auth_user_clone = auth_user.clone();
     let params_clone = params.clone();
     let kb_ids_clone = kb_ids_to_search.clone();
+    let request_id_for_task = request_id.clone();
 
     tokio::spawn(async move {
-        if let Err(err) =
-            run_advanced_search_flow(pool_clone, search_engine_clone, auth_user_clone, params_clone, kb_ids_clone, tx)
-                .await
+        if let Err(err) = run_advanced_search_flow(
+            pool_clone,
+            search_engine_clone,
+            auth_user_clone,
+            params_clone,
+            kb_ids_clone,
+            tx,
+            request_id_for_task.clone(),
+        )
+        .await
         {
-            error!("advanced search stream failed: {}", err);
+            error!("advanced search stream failed: request_id={}, error={}", request_id_for_task, err);
         }
     });
+
+    info!("advanced_search_stream task spawned: request_id={}, channel_capacity={}", request_id, 32);
 
     Ok(Sse::new(ReceiverStream::new(rx)).keep_alive(KeepAlive::new()))
 }
 
 async fn run_advanced_search_flow(
     pool: SqlitePool, search_engine: SearchEngine, auth_user: AuthUser, params: AdvancedSearchQuery,
-    kb_ids: Option<Vec<i64>>, tx: mpsc::Sender<Result<Event, Infallible>>,
+    kb_ids: Option<Vec<i64>>, tx: mpsc::Sender<Result<Event, Infallible>>, request_id: String,
 ) -> anyhow::Result<()> {
+    let flow_started = Instant::now();
     let llm_client = LlmClient::new();
+    let llm_enabled = llm_client.is_enabled();
+
+    info!(
+        "advanced_search_flow started: request_id={}, user_id={}, kb_scope={}, llm_enabled={}, query=\"{}\"",
+        request_id,
+        auth_user.user_id,
+        summarize_kb_scope(kb_ids.as_deref()),
+        llm_enabled,
+        preview_for_log(&params.query, 120)
+    );
+
     let planner = QueryPlanner::new(llm_client.clone());
     let judge = RelevanceJudge::new(llm_client.clone());
     let chunk_refiner = ChunkRefiner::new(llm_client);
 
-    let outcome =
-        run_advanced_search_logic(pool, search_engine, auth_user, params, kb_ids, planner, judge, chunk_refiner, &tx)
-            .await;
+    let outcome = run_advanced_search_logic(
+        pool,
+        search_engine,
+        auth_user,
+        params,
+        kb_ids,
+        planner,
+        judge,
+        chunk_refiner,
+        &tx,
+        &request_id,
+    )
+    .await;
 
     match outcome {
         Ok(_) => {
             let _ = send_status_event(&tx, "完成", "高级搜索已完成").await;
             let _ = send_done_event(&tx).await;
+            info!(
+                "advanced_search_flow completed: request_id={}, elapsed_ms={}",
+                request_id,
+                flow_started.elapsed().as_millis()
+            );
             Ok(())
         }
         Err(err) => {
             let _ = send_error_event(&tx, &err.to_string()).await;
             let _ = send_done_event(&tx).await;
+            info!(
+                "advanced_search_flow finished with error: request_id={}, elapsed_ms={}",
+                request_id,
+                flow_started.elapsed().as_millis()
+            );
             Err(err)
         }
     }
@@ -541,30 +606,66 @@ async fn run_advanced_search_flow(
 async fn run_advanced_search_logic(
     pool: SqlitePool, search_engine: SearchEngine, auth_user: AuthUser, params: AdvancedSearchQuery,
     kb_ids: Option<Vec<i64>>, planner: QueryPlanner, judge: RelevanceJudge, chunk_refiner: ChunkRefiner,
-    tx: &mpsc::Sender<Result<Event, Infallible>>,
+    tx: &mpsc::Sender<Result<Event, Infallible>>, request_id: &str,
 ) -> anyhow::Result<()> {
+    let logic_started = Instant::now();
+    let doc_limit = params.per_query_limit.max(1);
+    let context_chars = params.context_chars.max(1);
+    let user_id = auth_user.user_id.clone();
+    let is_admin = auth_user.is_admin();
+
+    info!(
+        "advanced_search_logic started: request_id={}, user_id={}, is_admin={}, file_filter={}, kb_scope={}, doc_limit={}, context_chars={}, debug={}",
+        request_id,
+        user_id,
+        is_admin,
+        format_id_filter(params.file_id.as_deref()),
+        summarize_kb_scope(kb_ids.as_deref()),
+        doc_limit,
+        context_chars,
+        params.debug
+    );
+
     if matches!(kb_ids.as_ref(), Some(ids) if ids.is_empty()) {
+        info!("advanced_search_logic exits early: request_id={}, reason=no_accessible_kb", request_id);
         send_status_event(tx, "权限校验", "无可访问的知识库，直接结束").await?;
         return Ok(());
     }
 
+    let planning_started = Instant::now();
     send_status_event(tx, "初始化", "生成执行计划").await?;
     let steps = planner.plan(&params.query, params.max_sub_queries.max(1)).await;
+    let step_actions = steps.iter().map(|step| format!("{:?}", step.action)).collect::<Vec<_>>().join(" -> ");
+    info!(
+        "advanced_search_logic plan generated: request_id={}, step_count={}, actions=\"{}\", elapsed_ms={}",
+        request_id,
+        steps.len(),
+        step_actions,
+        planning_started.elapsed().as_millis()
+    );
+
     if steps.is_empty() {
+        info!("advanced_search_logic exits early: request_id={}, reason=empty_plan", request_id);
         send_status_event(tx, "计划", "未生成有效计划").await?;
         return Ok(());
     }
     send_plan_event(tx, &steps).await?;
 
-    let doc_limit = params.per_query_limit.max(1);
-    let context_chars = params.context_chars.max(1);
-    let user_id = auth_user.user_id.clone();
-    let is_admin = auth_user.is_admin();
     let mut doc_candidates: Vec<DocumentCandidate> = Vec::new();
 
-    for step in steps {
+    for (step_idx, step) in steps.into_iter().enumerate() {
+        let step_started = Instant::now();
+        let step_action = step.action.clone();
+        info!(
+            "advanced_search_logic step started: request_id={}, step_index={}, action={:?}, comment=\"{}\"",
+            request_id,
+            step_idx + 1,
+            step_action,
+            preview_for_log(&step.comment, 120)
+        );
+
         send_step_event(tx, &step, "started", None).await?;
-        match step.action {
+        match step_action {
             PlanAction::RecentDocuments => {
                 doc_candidates = collect_recent_documents(
                     &pool,
@@ -575,13 +676,26 @@ async fn run_advanced_search_logic(
                     doc_limit,
                     &user_id,
                     is_admin,
+                    request_id,
                 )
                 .await?;
                 let summary = summarize_documents(&doc_candidates);
+                info!(
+                    "advanced_search_logic step completed: request_id={}, step_index={}, action=RecentDocuments, doc_candidates={}, elapsed_ms={}",
+                    request_id,
+                    step_idx + 1,
+                    doc_candidates.len(),
+                    step_started.elapsed().as_millis()
+                );
                 send_step_event(tx, &step, "completed", Some(json!({ "documents": summary }))).await?;
             }
             PlanAction::DocumentStructure => {
                 if doc_candidates.is_empty() {
+                    info!(
+                        "advanced_search_logic step refilling docs: request_id={}, step_index={}, action=DocumentStructure",
+                        request_id,
+                        step_idx + 1
+                    );
                     doc_candidates = collect_recent_documents(
                         &pool,
                         &search_engine,
@@ -591,18 +705,36 @@ async fn run_advanced_search_logic(
                         doc_limit,
                         &user_id,
                         is_admin,
+                        request_id,
                     )
                     .await?;
                 }
                 if doc_candidates.is_empty() {
+                    info!(
+                        "advanced_search_logic step skipped: request_id={}, step_index={}, action=DocumentStructure, reason=no_documents",
+                        request_id,
+                        step_idx + 1
+                    );
                     send_step_event(tx, &step, "skipped", Some(json!({ "reason": "未找到相关文档" }))).await?;
                     continue;
                 }
                 let structures = describe_document_structure(&pool, &doc_candidates, doc_limit).await?;
+                info!(
+                    "advanced_search_logic step completed: request_id={}, step_index={}, action=DocumentStructure, documents={}, elapsed_ms={}",
+                    request_id,
+                    step_idx + 1,
+                    structures.len(),
+                    step_started.elapsed().as_millis()
+                );
                 send_step_event(tx, &step, "completed", Some(json!({ "documents": structures }))).await?;
             }
             PlanAction::PageContent => {
                 if doc_candidates.is_empty() {
+                    info!(
+                        "advanced_search_logic step refilling docs: request_id={}, step_index={}, action=PageContent",
+                        request_id,
+                        step_idx + 1
+                    );
                     doc_candidates = collect_recent_documents(
                         &pool,
                         &search_engine,
@@ -612,10 +744,16 @@ async fn run_advanced_search_logic(
                         doc_limit,
                         &user_id,
                         is_admin,
+                        request_id,
                     )
                     .await?;
                 }
                 if doc_candidates.is_empty() {
+                    info!(
+                        "advanced_search_logic step skipped: request_id={}, step_index={}, action=PageContent, reason=no_documents",
+                        request_id,
+                        step_idx + 1
+                    );
                     send_step_event(tx, &step, "skipped", Some(json!({ "reason": "未找到可提取内容" }))).await?;
                     continue;
                 }
@@ -628,12 +766,26 @@ async fn run_advanced_search_logic(
                     &chunk_refiner,
                     &params,
                     tx,
+                    request_id,
                 )
                 .await?;
+                info!(
+                    "advanced_search_logic step completed: request_id={}, step_index={}, action=PageContent, emitted={}, elapsed_ms={}",
+                    request_id,
+                    step_idx + 1,
+                    emitted,
+                    step_started.elapsed().as_millis()
+                );
                 send_step_event(tx, &step, "completed", Some(json!({ "emitted": emitted }))).await?;
             }
         }
     }
+
+    info!(
+        "advanced_search_logic completed: request_id={}, elapsed_ms={}",
+        request_id,
+        logic_started.elapsed().as_millis()
+    );
 
     Ok(())
 }
@@ -729,12 +881,30 @@ fn has_permission(file: Option<&FileInfo>, kb: Option<&KbInfo>, user_id: &str, i
 
 async fn collect_recent_documents(
     pool: &SqlitePool, search_engine: &SearchEngine, query: &str, file_filter: Option<&Vec<i64>>,
-    kb_filter: Option<&Vec<i64>>, doc_limit: usize, user_id: &str, is_admin: bool,
+    kb_filter: Option<&Vec<i64>>, doc_limit: usize, user_id: &str, is_admin: bool, request_id: &str,
 ) -> anyhow::Result<Vec<DocumentCandidate>> {
+    let collect_started = Instant::now();
+    info!(
+        "collect_recent_documents started: request_id={}, query=\"{}\", file_filter={}, kb_filter={}, doc_limit={}, user_id={}, is_admin={}",
+        request_id,
+        preview_for_log(query, 120),
+        format_id_filter(file_filter.map(Vec::as_slice)),
+        format_id_filter(kb_filter.map(Vec::as_slice)),
+        doc_limit,
+        user_id,
+        is_admin
+    );
+
     let mut raw_results =
         search_engine.search(query, file_filter, kb_filter).await.map_err(|e| anyhow!("Search failed: {}", e))?;
+    let raw_count = raw_results.len();
 
     if raw_results.is_empty() {
+        info!(
+            "collect_recent_documents no results: request_id={}, elapsed_ms={}",
+            request_id,
+            collect_started.elapsed().as_millis()
+        );
         return Ok(Vec::new());
     }
 
@@ -754,22 +924,38 @@ async fn collect_recent_documents(
         let score_b = b.1.first().map(|s| s.score).unwrap_or(0.0);
         score_b.partial_cmp(&score_a).unwrap_or(Ordering::Equal)
     });
+    let grouped_doc_count = grouped_vec.len();
 
     let mut documents = Vec::new();
+    let mut missing_file_count = 0usize;
+    let mut permission_denied_count = 0usize;
     for (file_id, mut slices) in grouped_vec {
         if documents.len() >= doc_limit {
             break;
         }
         let Some(file) = file_map.get(&file_id).cloned() else {
+            missing_file_count += 1;
             continue;
         };
         let kb = file.kb_id.and_then(|kid| kb_map.get(&kid).cloned());
         if !has_permission(Some(&file), kb.as_ref(), user_id, is_admin) {
+            permission_denied_count += 1;
             continue;
         }
         slices.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
         documents.push(DocumentCandidate { file, kb, slices });
     }
+
+    info!(
+        "collect_recent_documents completed: request_id={}, raw_slices={}, grouped_docs={}, selected_docs={}, missing_file={}, permission_denied={}, elapsed_ms={}",
+        request_id,
+        raw_count,
+        grouped_doc_count,
+        documents.len(),
+        missing_file_count,
+        permission_denied_count,
+        collect_started.elapsed().as_millis()
+    );
 
     Ok(documents)
 }
@@ -812,20 +998,48 @@ async fn fetch_document_sections(pool: &SqlitePool, file_id: i64, limit: usize) 
 async fn execute_page_content_step(
     pool: &SqlitePool, docs: &[DocumentCandidate], doc_limit: usize, context_chars: usize, judge: &RelevanceJudge,
     chunk_refiner: &ChunkRefiner, params: &AdvancedSearchQuery, tx: &mpsc::Sender<Result<Event, Infallible>>,
+    request_id: &str,
 ) -> anyhow::Result<usize> {
+    let step_started = Instant::now();
     let mut emitted = 0;
     let mut seen_slice_ids: HashSet<i64> = HashSet::new();
     let mut seen_big_chunks: HashSet<Vec<i64>> = HashSet::new();
     let max_docs = doc_limit.max(1);
+    let mut inspected_docs = 0usize;
+    let mut inspected_slices = 0usize;
+    let mut duplicate_slice_count = 0usize;
+    let mut context_error_count = 0usize;
+    let mut refine_error_count = 0usize;
+    let mut empty_slice_group_count = 0usize;
+    let mut empty_content_count = 0usize;
+    let mut duplicate_chunk_count = 0usize;
+    let mut judge_rejected_count = 0usize;
+
+    info!(
+        "execute_page_content_step started: request_id={}, docs={}, max_docs={}, context_chars={}, debug={}",
+        request_id,
+        docs.len(),
+        max_docs,
+        context_chars,
+        params.debug
+    );
 
     for doc in docs.iter().take(max_docs) {
+        inspected_docs += 1;
         for slice in doc.slices.iter().take(2) {
+            inspected_slices += 1;
             if !seen_slice_ids.insert(slice.id) {
+                duplicate_slice_count += 1;
                 continue;
             }
             let context_chunk = match assemble_context_chunk(pool, slice, context_chars).await {
                 Ok(chunk) => chunk,
                 Err(err) => {
+                    context_error_count += 1;
+                    info!(
+                        "execute_page_content_step context assemble failed: request_id={}, file_id={}, base_slice_id={}, error={}",
+                        request_id, doc.file.id, slice.id, err
+                    );
                     if params.debug {
                         let _ = send_event_json(
                             tx,
@@ -846,6 +1060,11 @@ async fn execute_page_content_step(
             let refine_outcome = match chunk_refiner.refine(&params.query, &context_chunk.segments).await {
                 Ok(outcome) => outcome,
                 Err(err) => {
+                    refine_error_count += 1;
+                    info!(
+                        "execute_page_content_step refine failed: request_id={}, file_id={}, base_slice_id={}, error={}",
+                        request_id, doc.file.id, slice.id, err
+                    );
                     if params.debug {
                         let _ = send_event_json(
                             tx,
@@ -868,16 +1087,25 @@ async fn execute_page_content_step(
 
             let refined_slice_ids: Vec<i64> = refine_outcome.segments.iter().map(|seg| seg.slice_id).collect();
             if refined_slice_ids.is_empty() {
+                empty_slice_group_count += 1;
                 continue;
             }
             let refined_content =
                 refine_outcome.segments.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>().join("\n");
             if refined_content.trim().is_empty() {
+                empty_content_count += 1;
                 continue;
             }
 
             let canonical_ids = canonical_slice_set(&refined_slice_ids);
             if !seen_big_chunks.insert(canonical_ids) {
+                duplicate_chunk_count += 1;
+                info!(
+                    "execute_page_content_step duplicate chunk skipped: request_id={}, file_id={}, slice_ids={}",
+                    request_id,
+                    doc.file.id,
+                    format_id_filter(Some(refined_slice_ids.as_slice()))
+                );
                 if params.debug {
                     let _ = send_event_json(
                         tx,
@@ -928,7 +1156,27 @@ async fn execute_page_content_step(
                 };
                 send_event_json(tx, "result", &payload).await?;
                 emitted += 1;
+                info!(
+                    "execute_page_content_step emitted result: request_id={}, file_id={}, kb_id={:?}, slice_count={}, score={:.4}, judge_score={:.4}, refine_reason=\"{}\"",
+                    request_id,
+                    doc.file.id,
+                    doc.kb.as_ref().map(|kb| kb.id),
+                    payload.slice_ids.len(),
+                    slice.score,
+                    judge_outcome.score,
+                    preview_for_log(refine_outcome.reason.as_deref().unwrap_or("none"), 120)
+                );
             } else if params.debug {
+                judge_rejected_count += 1;
+                info!(
+                    "execute_page_content_step candidate rejected: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, judge_score={:.4}, reason=\"{}\"",
+                    request_id,
+                    doc.file.id,
+                    doc.kb.as_ref().map(|kb| kb.id),
+                    slice.id,
+                    judge_outcome.score,
+                    preview_for_log(&judge_outcome.reason, 120)
+                );
                 let _ = send_event_json(
                     tx,
                     "filtered",
@@ -941,11 +1189,63 @@ async fn execute_page_content_step(
                     }),
                 )
                 .await;
+            } else {
+                judge_rejected_count += 1;
+                info!(
+                    "execute_page_content_step candidate rejected: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, judge_score={:.4}, reason=\"{}\"",
+                    request_id,
+                    doc.file.id,
+                    doc.kb.as_ref().map(|kb| kb.id),
+                    slice.id,
+                    judge_outcome.score,
+                    preview_for_log(&judge_outcome.reason, 120)
+                );
             }
         }
     }
 
+    info!(
+        "execute_page_content_step completed: request_id={}, inspected_docs={}, inspected_slices={}, emitted={}, judge_rejected={}, duplicate_slice={}, duplicate_chunk={}, context_error={}, refine_error={}, empty_slice_group={}, empty_content={}, elapsed_ms={}",
+        request_id,
+        inspected_docs,
+        inspected_slices,
+        emitted,
+        judge_rejected_count,
+        duplicate_slice_count,
+        duplicate_chunk_count,
+        context_error_count,
+        refine_error_count,
+        empty_slice_group_count,
+        empty_content_count,
+        step_started.elapsed().as_millis()
+    );
+
     Ok(emitted)
+}
+
+fn format_id_filter(ids: Option<&[i64]>) -> String {
+    const MAX_IDS: usize = 12;
+    match ids {
+        None => "all".to_string(),
+        Some([]) => "[]".to_string(),
+        Some(list) if list.len() <= MAX_IDS => format!("{:?}", list),
+        Some(list) => {
+            let head = list.iter().take(MAX_IDS).map(|id| id.to_string()).collect::<Vec<_>>().join(",");
+            format!("[{}...](total={})", head, list.len())
+        }
+    }
+}
+
+fn summarize_kb_scope(kb_ids: Option<&[i64]>) -> String {
+    match kb_ids {
+        None => "all_accessible_kbs".to_string(),
+        Some([]) => "no_accessible_kbs".to_string(),
+        Some(ids) => format!("{} kbs {}", ids.len(), format_id_filter(Some(ids))),
+    }
+}
+
+fn preview_for_log(text: &str, max_chars: usize) -> String {
+    preview_text(&text.replace('\n', " "), max_chars)
 }
 
 fn preview_text(text: &str, max_chars: usize) -> String {

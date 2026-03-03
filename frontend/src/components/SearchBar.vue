@@ -13,7 +13,7 @@ const imageFile = ref(null)
 const fileInput = ref(null)
 const advancedOptions = ref({
   maxSteps: 3,
-  docLimit: 5,
+  docLimit: 10,
   contextChars: 2000,
   debug: false,
 })
