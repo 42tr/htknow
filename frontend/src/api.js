@@ -17,6 +17,17 @@ const getHeaders = (contentType = true) => {
   return headers
 }
 
+const readErrorMessage = async (response, fallback) => {
+  try {
+    const payload = await response.json()
+    if (payload?.error) return payload.error
+    if (payload?.message) return payload.message
+  } catch (_) {
+    // ignore json parse error
+  }
+  return fallback
+}
+
 export const api = {
   // 搜索
   async search(query, kbId = null, fileId = null) {
@@ -190,6 +201,141 @@ export const api = {
     if (!response.ok) throw new Error('图片搜索失败')
     const data = await response.json()
     return data.results || []
+  },
+
+  // 词表
+  async listLexicons(params = {}) {
+    const searchParams = new URLSearchParams()
+    if (params.q) searchParams.set('q', params.q)
+    if (params.enabled === true) searchParams.set('enabled', 'true')
+    if (params.enabled === false) searchParams.set('enabled', 'false')
+    if (params.limit) searchParams.set('limit', String(params.limit))
+    if (params.offset) searchParams.set('offset', String(params.offset))
+    const query = searchParams.toString()
+    const url = `${API_BASE}/search/lexicons${query ? `?${query}` : ''}`
+    const response = await fetch(url, { headers: getHeaders() })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '获取词表失败'))
+    return response.json()
+  },
+
+  async createLexicon(data) {
+    const response = await fetch(`${API_BASE}/search/lexicons`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(data),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '创建词条失败'))
+    return response.json()
+  },
+
+  async updateLexicon(id, data) {
+    const response = await fetch(`${API_BASE}/search/lexicons/${id}`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify(data),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '更新词条失败'))
+    return response.json()
+  },
+
+  async deleteLexicon(id) {
+    const response = await fetch(`${API_BASE}/search/lexicons/${id}`, {
+      method: 'DELETE',
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '删除词条失败'))
+    return response.json()
+  },
+
+  async toggleLexiconEnabled(id, enabled) {
+    const response = await fetch(`${API_BASE}/search/lexicons/${id}/enabled`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify({ enabled }),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '更新词条状态失败'))
+    return response.json()
+  },
+
+  async reloadLexicon() {
+    const response = await fetch(`${API_BASE}/search/lexicons/reload`, {
+      method: 'POST',
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '重载词表失败'))
+    return response.json()
+  },
+
+  async publishLexicon() {
+    const response = await fetch(`${API_BASE}/search/lexicons/publish`, {
+      method: 'POST',
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '发布词表失败'))
+    return response.json()
+  },
+
+  // 同义词
+  async listSynonyms(params = {}) {
+    const searchParams = new URLSearchParams()
+    if (params.q) searchParams.set('q', params.q)
+    if (params.enabled === true) searchParams.set('enabled', 'true')
+    if (params.enabled === false) searchParams.set('enabled', 'false')
+    if (params.limit) searchParams.set('limit', String(params.limit))
+    if (params.offset) searchParams.set('offset', String(params.offset))
+    const query = searchParams.toString()
+    const url = `${API_BASE}/search/synonyms${query ? `?${query}` : ''}`
+    const response = await fetch(url, { headers: getHeaders() })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '获取同义词失败'))
+    return response.json()
+  },
+
+  async createSynonym(data) {
+    const response = await fetch(`${API_BASE}/search/synonyms`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(data),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '创建同义词失败'))
+    return response.json()
+  },
+
+  async updateSynonym(id, data) {
+    const response = await fetch(`${API_BASE}/search/synonyms/${id}`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify(data),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '更新同义词失败'))
+    return response.json()
+  },
+
+  async deleteSynonym(id) {
+    const response = await fetch(`${API_BASE}/search/synonyms/${id}`, {
+      method: 'DELETE',
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '删除同义词失败'))
+    return response.json()
+  },
+
+  async toggleSynonymEnabled(id, enabled) {
+    const response = await fetch(`${API_BASE}/search/synonyms/${id}/enabled`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify({ enabled }),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '更新同义词状态失败'))
+    return response.json()
+  },
+
+  // 系统
+  async getIndexRebuildStatus() {
+    const response = await fetch(`${API_BASE}/system/index/rebuild/status`, {
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '获取重建状态失败'))
+    return response.json()
   },
 
   // 知识库

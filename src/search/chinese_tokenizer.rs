@@ -88,7 +88,7 @@ impl FastChineseTokenizer {
     pub fn segment(&self, text: &str) -> Vec<String> {
         let jieba = JIEBA.read().unwrap_or_else(|e| e.into_inner());
         let words = match self.mode {
-            SegmentationMode::Search => {
+            SegmentationMode::All => {
                 // 搜索模式：使用 cut_for_search，召回率高
                 jieba
                     .cut_for_search(text, false)
@@ -100,7 +100,7 @@ impl FastChineseTokenizer {
                     .map(|s| s.to_string())
                     .collect()
             }
-            SegmentationMode::All => jieba
+            SegmentationMode::Search => jieba
                 .cut_all(text)
                 .into_iter()
                 .filter(|s| {
@@ -110,14 +110,14 @@ impl FastChineseTokenizer {
                 .map(|s| s.to_string())
                 .collect(),
         };
-        info!("Segmented words: {:?}", words);
+        info!("Segmented mode: {:?}, text: {}, words: {:?}", self.mode, text, words);
         words
     }
 
     fn tokenize_with_offsets(&self, text: &str) -> Vec<TokenInfo> {
         let mode = match self.mode {
             SegmentationMode::Search => TokenizeMode::Search,
-            SegmentationMode::All => TokenizeMode::Search,
+            SegmentationMode::All => TokenizeMode::Default,
         };
         let jieba = JIEBA.read().unwrap_or_else(|e| e.into_inner());
         jieba

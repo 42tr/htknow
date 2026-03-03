@@ -6,6 +6,7 @@ import KnowledgeBaseList from './components/KnowledgeBaseList.vue'
 import FileUpload from './components/FileUpload.vue'
 import KnowledgeGraph from './components/KnowledgeGraph.vue'
 import AdvancedSearchPanel from './components/AdvancedSearchPanel.vue'
+import SearchDictionaryManager from './components/SearchDictionaryManager.vue'
 import { api } from './api'
 
 const activeTab = ref('search')
@@ -41,6 +42,7 @@ const sliceKey = (item) => {
 
 const tabs = [
   { id: 'search', name: '搜索', icon: '🔍' },
+  { id: 'dictionary', name: '词典', icon: '🧩' },
   { id: 'knowledge', name: '知识库', icon: '📚' },
   { id: 'graph', name: '知识图谱', icon: '🕸️' },
   { id: 'upload', name: '上传', icon: '📤' },
@@ -265,6 +267,14 @@ const clearAdvanced = () => {
           :results="searchResults"
           :loading="isSearching"
         />
+      </div>
+
+      <div v-if="activeTab === 'dictionary'" class="space-y-6">
+        <div class="text-center mb-8">
+          <h2 class="text-3xl font-bold text-slate-800 mb-2">词表与同义词</h2>
+          <p class="text-slate-500">管理搜索词表并发布重建索引，查看重建进度与 ETA</p>
+        </div>
+        <SearchDictionaryManager />
       </div>
 
       <!-- Knowledge Base Tab -->

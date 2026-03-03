@@ -218,7 +218,13 @@ pub async fn index_rebuild_status(
     };
 
     let now = Utc::now().timestamp();
-    let elapsed_secs = row.started_at.map(|start| (now - start).max(0));
+    let elapsed_secs = match row.started_at {
+        Some(start) => match row.status.as_str() {
+            "running" => Some((now - start).max(0)),
+            _ => row.finished_at.map(|finish| (finish - start).max(0)).or(Some((now - start).max(0))),
+        },
+        None => None,
+    };
     let eta_secs = if row.status == "running" && total_docs > processed_docs {
         match elapsed_secs {
             Some(elapsed) if elapsed > 0 && processed_docs > 0 => {
