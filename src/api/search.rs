@@ -395,10 +395,9 @@ pub async fn search(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Query(params): Query<SearchQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<SearchResult>> {
-    let is_admin = auth_user.is_admin();
-    let user_id = auth_user.user_id.clone();
-    let kb_ids_to_search = resolve_kb_ids_to_search(&pool, &user_id, is_admin, params.kb_id.as_ref()).await?;
-    if matches!(kb_ids_to_search.as_ref(), Some(ids) if ids.is_empty()) {
+    let (_is_admin, user_id, kb_ids_to_search) =
+        resolve_scope_for_user(&pool, &auth_user, params.kb_id.as_ref()).await?;
+    if no_accessible_kb_scope(kb_ids_to_search.as_deref()) {
         return Ok(Json(SearchResult { results: vec![] }));
     }
 
@@ -439,68 +438,7 @@ pub async fn search(
         .await
         .map_err(|e| crate::api::error::ApiError::internal(format!("Search failed: {}", e)))?;
 
-    if raw_results.is_empty() {
-        return Ok(Json(SearchResult { results: vec![] }));
-    }
-
-    // 收集所有 file_id、kb_id 和 slice_id
-    let file_ids: Vec<i64> = raw_results.iter().map(|r| r.file_id).collect();
-    let kb_ids: Vec<i64> = raw_results.iter().filter_map(|r| r.kb_id).collect();
-    let slice_ids: Vec<i64> = raw_results.iter().map(|r| r.id).collect();
-
-    // 批量查询文件信息
-    let file_map = get_files_by_ids(&pool, &file_ids).await?;
-
-    // 批量查询知识库信息
-    let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(&pool, &kb_ids).await? } else { HashMap::new() };
-    let slice_positions = get_slice_positions(&pool, &slice_ids).await?;
-
-    // 克隆 user_id 用于闭包
-    let user_id = auth_user.user_id.clone();
-
-    // 组装结果并过滤权限
-    let mut seen_contents: HashSet<String> = HashSet::new();
-    let mut results = Vec::new();
-    for r in raw_results {
-        let id = r.id;
-        let file_id = r.file_id;
-        let kb_id = r.kb_id;
-        let score = r.score;
-        let content = r.content;
-
-        let file = file_map.get(&file_id).cloned();
-        let kb = kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
-
-        // 权限检查
-        let has_permission = if is_admin {
-            true
-        } else if let Some(ref file_info) = file {
-            // 如果文件存在，检查文件权限
-            // 规则：私有文件（is_public=0）只有所有者可以查看
-            if !file_info.is_public && file_info.user_id != user_id { false } else { true }
-        } else if let Some(ref kb_info) = kb {
-            // 如果没有文件信息但有知识库信息，检查知识库权限
-            // 规则：私有知识库（is_public=0）只有所有者可以查看
-            if !kb_info.is_public && kb_info.user_id != user_id { false } else { true }
-        } else {
-            // 没有文件和知识库信息，默认允许
-            true
-        };
-
-        if has_permission {
-            if seen_contents.insert(content.clone()) {
-                results.push(SearchResultItem {
-                    id,
-                    file_id,
-                    content,
-                    score,
-                    file,
-                    kb,
-                    positions: slice_positions.get(&id).cloned(),
-                });
-            }
-        }
-    }
+    let results = build_slice_results_from_raw(&pool, raw_results, &auth_user, true).await?;
 
     Ok(Json(SearchResult { results }))
 }
@@ -524,8 +462,8 @@ pub async fn advanced_search_stream(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Query(params): Query<AdvancedSearchQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Sse<KeepAliveStream<ReceiverStream<Result<Event, Infallible>>>>> {
-    let is_admin = auth_user.is_admin();
-    let user_id = auth_user.user_id.clone();
+    let (is_admin, user_id, kb_ids_to_search) =
+        resolve_scope_for_user(&pool, &auth_user, params.kb_id.as_ref()).await?;
     let request_id = uuid::Uuid::new_v4().to_string();
 
     info!(
@@ -543,7 +481,6 @@ pub async fn advanced_search_stream(
     );
 
     let kb_resolve_started = Instant::now();
-    let kb_ids_to_search = resolve_kb_ids_to_search(&pool, &user_id, is_admin, params.kb_id.as_ref()).await?;
     info!(
         "advanced_search_stream kb scope resolved: request_id={}, scope={}, elapsed_ms={}",
         request_id,
@@ -663,145 +600,29 @@ async fn run_advanced_search_logic(
         params.debug
     );
 
-    if matches!(kb_ids.as_ref(), Some(ids) if ids.is_empty()) {
+    if no_accessible_kb_scope(kb_ids.as_deref()) {
         info!("advanced_search_logic exits early: request_id={}, reason=no_accessible_kb", request_id);
         send_status_event(tx, "权限校验", "无可访问的知识库，直接结束").await?;
         return Ok(());
     }
 
-    let planning_started = Instant::now();
-    send_status_event(tx, "初始化", "生成执行计划").await?;
-    let steps = planner.plan(&params.query, params.max_sub_queries.max(1)).await;
-    let step_actions = steps.iter().map(|step| format!("{:?}", step.action)).collect::<Vec<_>>().join(" -> ");
-    info!(
-        "advanced_search_logic plan generated: request_id={}, step_count={}, actions=\"{}\", elapsed_ms={}",
+    let _selected = run_advanced_plan_steps(
+        &pool,
+        &search_engine,
+        &params,
+        kb_ids.as_ref(),
+        &planner,
+        &judge,
+        &chunk_refiner,
+        slice_limit,
+        context_chars,
+        &user_id,
+        is_admin,
+        Some(tx),
         request_id,
-        steps.len(),
-        step_actions,
-        planning_started.elapsed().as_millis()
-    );
-
-    if steps.is_empty() {
-        info!("advanced_search_logic exits early: request_id={}, reason=empty_plan", request_id);
-        send_status_event(tx, "计划", "未生成有效计划").await?;
-        return Ok(());
-    }
-    send_plan_event(tx, &steps).await?;
-
-    let mut slice_candidates: Vec<SliceCandidate> = Vec::new();
-
-    for (step_idx, step) in steps.into_iter().enumerate() {
-        let step_started = Instant::now();
-        let step_action = step.action.clone();
-        info!(
-            "advanced_search_logic step started: request_id={}, step_index={}, action={:?}, comment=\"{}\"",
-            request_id,
-            step_idx + 1,
-            step_action,
-            preview_for_log(&step.comment, 120)
-        );
-
-        send_step_event(tx, &step, "started", None).await?;
-        match step_action {
-            PlanAction::RecentDocuments => {
-                slice_candidates = collect_relevant_slices(
-                    &pool,
-                    &search_engine,
-                    &params.query,
-                    params.file_id.as_ref(),
-                    kb_ids.as_ref(),
-                    slice_limit,
-                    &user_id,
-                    is_admin,
-                    request_id,
-                )
-                .await?;
-                let summary = summarize_slice_candidates(&slice_candidates);
-                info!(
-                    "advanced_search_logic step completed: request_id={}, step_index={}, action=RecentDocuments, slice_candidates={}, elapsed_ms={}",
-                    request_id,
-                    step_idx + 1,
-                    slice_candidates.len(),
-                    step_started.elapsed().as_millis()
-                );
-                send_step_event(
-                    tx,
-                    &step,
-                    "completed",
-                    Some(json!({ "count": slice_candidates.len(), "slices": summary })),
-                )
-                .await?;
-            }
-            PlanAction::DocumentStructure => {
-                info!(
-                    "advanced_search_logic step skipped: request_id={}, step_index={}, action=DocumentStructure, reason=flow_simplified",
-                    request_id,
-                    step_idx + 1,
-                );
-                send_step_event(tx, &step, "skipped", Some(json!({ "reason": "当前流程不执行文档结构分析" }))).await?;
-            }
-            PlanAction::PageContent => {
-                if slice_candidates.is_empty() {
-                    info!(
-                        "advanced_search_logic step refilling slices: request_id={}, step_index={}, action=PageContent",
-                        request_id,
-                        step_idx + 1
-                    );
-                    slice_candidates = collect_relevant_slices(
-                        &pool,
-                        &search_engine,
-                        &params.query,
-                        params.file_id.as_ref(),
-                        kb_ids.as_ref(),
-                        slice_limit,
-                        &user_id,
-                        is_admin,
-                        request_id,
-                    )
-                    .await?;
-                }
-                if slice_candidates.is_empty() {
-                    info!(
-                        "advanced_search_logic step skipped: request_id={}, step_index={}, action=PageContent, reason=no_slices",
-                        request_id,
-                        step_idx + 1
-                    );
-                    send_step_event(tx, &step, "skipped", Some(json!({ "reason": "未找到相关切片" }))).await?;
-                    send_status_event(tx, "结果", "未找到可用于回答问题的内容").await?;
-                    continue;
-                }
-                let emitted = execute_page_content_step(
-                    &pool,
-                    &slice_candidates,
-                    slice_limit,
-                    context_chars,
-                    &judge,
-                    &chunk_refiner,
-                    &params,
-                    tx,
-                    request_id,
-                )
-                .await?;
-                info!(
-                    "advanced_search_logic step completed: request_id={}, step_index={}, action=PageContent, emitted={}, elapsed_ms={}",
-                    request_id,
-                    step_idx + 1,
-                    emitted,
-                    step_started.elapsed().as_millis()
-                );
-                if emitted > 0 {
-                    send_status_event(tx, "结果", "已找到可用于回答问题的内容，停止继续检索").await?;
-                } else {
-                    send_status_event(tx, "结果", "未找到可用于回答问题的内容").await?;
-                }
-                send_step_event(tx, &step, "completed", Some(json!({ "emitted": emitted, "found": emitted > 0 })))
-                    .await?;
-                if emitted > 0 {
-                    break;
-                }
-            }
-        }
-    }
+        "advanced_search_logic",
+    )
+    .await?;
 
     info!(
         "advanced_search_logic completed: request_id={}, elapsed_ms={}",
@@ -855,11 +676,47 @@ struct AdvancedSelectedSliceResult {
     slice_ids: Vec<i64>,
 }
 
+#[derive(Default)]
+struct PageContentStepStats {
+    inspected_slices: usize,
+    context_error_count: usize,
+    judge_rejected_count: usize,
+    refine_error_count: usize,
+    empty_slice_group_count: usize,
+    empty_content_count: usize,
+}
+
+struct FinalizedAnswerCandidate {
+    file: FileInfo,
+    kb: Option<KbInfo>,
+    base_slice_id: i64,
+    base_score: f32,
+    judge_score: f32,
+    judge_reason: String,
+    final_segments: Vec<ChunkSegment>,
+    final_content: String,
+    refine_reason: Option<String>,
+}
+
+struct PageContentCoreOutcome {
+    selected: Option<FinalizedAnswerCandidate>,
+    stats: PageContentStepStats,
+}
+
 async fn send_event_json<T: Serialize>(
     tx: &mpsc::Sender<Result<Event, Infallible>>, event: &str, payload: &T,
 ) -> anyhow::Result<()> {
     let evt = Event::default().event(event).json_data(payload).map_err(|e| anyhow!("SSE JSON encode failed: {}", e))?;
     tx.send(Ok(evt)).await.map_err(|_| anyhow!("SSE client disconnected"))
+}
+
+async fn maybe_send_event_json<T: Serialize>(
+    tx: Option<&mpsc::Sender<Result<Event, Infallible>>>, event: &str, payload: &T,
+) -> anyhow::Result<()> {
+    if let Some(tx) = tx {
+        send_event_json(tx, event, payload).await?;
+    }
+    Ok(())
 }
 
 async fn send_plan_event(tx: &mpsc::Sender<Result<Event, Infallible>>, steps: &[PlanStep]) -> anyhow::Result<()> {
@@ -888,6 +745,33 @@ async fn send_status_event(
     send_event_json(tx, "status", &json!({ "phase": phase, "message": message })).await
 }
 
+async fn maybe_send_status_event(
+    tx: Option<&mpsc::Sender<Result<Event, Infallible>>>, phase: &str, message: &str,
+) -> anyhow::Result<()> {
+    if let Some(tx) = tx {
+        send_status_event(tx, phase, message).await?;
+    }
+    Ok(())
+}
+
+async fn maybe_send_step_event(
+    tx: Option<&mpsc::Sender<Result<Event, Infallible>>>, step: &PlanStep, status: &str, details: Option<Value>,
+) -> anyhow::Result<()> {
+    if let Some(tx) = tx {
+        send_step_event(tx, step, status, details).await?;
+    }
+    Ok(())
+}
+
+async fn maybe_send_plan_event(
+    tx: Option<&mpsc::Sender<Result<Event, Infallible>>>, steps: &[PlanStep],
+) -> anyhow::Result<()> {
+    if let Some(tx) = tx {
+        send_plan_event(tx, steps).await?;
+    }
+    Ok(())
+}
+
 async fn send_error_event(tx: &mpsc::Sender<Result<Event, Infallible>>, message: &str) -> anyhow::Result<()> {
     send_event_json(tx, "error", &json!({ "message": message })).await
 }
@@ -896,21 +780,87 @@ async fn send_done_event(tx: &mpsc::Sender<Result<Event, Infallible>>) -> anyhow
     send_event_json(tx, "done", &json!({})).await
 }
 
-fn has_permission(file: Option<&FileInfo>, kb: Option<&KbInfo>, user_id: &str, is_admin: bool) -> bool {
+fn has_visibility_permission(
+    file: Option<(bool, &str)>, kb: Option<(bool, &str)>, user_id: &str, is_admin: bool,
+) -> bool {
     if is_admin {
         return true;
     }
-    if let Some(file_info) = file {
-        if !file_info.is_public && file_info.user_id != user_id {
+    if let Some((is_public, owner_id)) = file {
+        if !is_public && owner_id != user_id {
             return false;
         }
     }
-    if let Some(kb_info) = kb {
-        if !kb_info.is_public && kb_info.user_id != user_id {
+    if let Some((is_public, owner_id)) = kb {
+        if !is_public && owner_id != user_id {
             return false;
         }
     }
     true
+}
+
+fn has_permission(file: Option<&FileInfo>, kb: Option<&KbInfo>, user_id: &str, is_admin: bool) -> bool {
+    has_visibility_permission(
+        file.map(|f| (f.is_public, f.user_id.as_str())),
+        kb.map(|k| (k.is_public, k.user_id.as_str())),
+        user_id,
+        is_admin,
+    )
+}
+
+fn no_accessible_kb_scope(kb_ids: Option<&[i64]>) -> bool {
+    matches!(kb_ids, Some(ids) if ids.is_empty())
+}
+
+async fn resolve_scope_for_user(
+    pool: &SqlitePool, auth_user: &AuthUser, kb_filter: Option<&Vec<i64>>,
+) -> ApiResult<(bool, String, Option<Vec<i64>>)> {
+    let is_admin = auth_user.is_admin();
+    let user_id = auth_user.user_id.clone();
+    let kb_ids = resolve_kb_ids_to_search(pool, &user_id, is_admin, kb_filter).await?;
+    Ok((is_admin, user_id, kb_ids))
+}
+
+async fn build_slice_results_from_raw(
+    pool: &SqlitePool, raw_results: Vec<EngineSearchResultItem>, auth_user: &AuthUser, dedupe_by_content: bool,
+) -> ApiResult<Vec<SearchResultItem>> {
+    if raw_results.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let is_admin = auth_user.is_admin();
+    let user_id = auth_user.user_id.clone();
+
+    let file_ids: Vec<i64> = raw_results.iter().map(|r| r.file_id).collect();
+    let kb_ids: Vec<i64> = raw_results.iter().filter_map(|r| r.kb_id).collect();
+    let slice_ids: Vec<i64> = raw_results.iter().map(|r| r.id).collect();
+
+    let file_map = get_files_by_ids(pool, &file_ids).await?;
+    let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(pool, &kb_ids).await? } else { HashMap::new() };
+    let slice_positions = get_slice_positions(pool, &slice_ids).await?;
+
+    let mut seen_contents: HashSet<String> = HashSet::new();
+    let mut results = Vec::new();
+    for r in raw_results {
+        let file = file_map.get(&r.file_id).cloned();
+        let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
+        if !has_permission(file.as_ref(), kb.as_ref(), &user_id, is_admin) {
+            continue;
+        }
+        if dedupe_by_content && !seen_contents.insert(r.content.clone()) {
+            continue;
+        }
+        results.push(SearchResultItem {
+            id: r.id,
+            file_id: r.file_id,
+            content: r.content,
+            score: r.score,
+            file,
+            kb,
+            positions: slice_positions.get(&r.id).cloned(),
+        });
+    }
+    Ok(results)
 }
 
 async fn collect_relevant_slices(
@@ -1010,11 +960,224 @@ fn summarize_slice_candidates(candidates: &[SliceCandidate]) -> Vec<Value> {
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_advanced_plan_steps(
+    pool: &SqlitePool, search_engine: &SearchEngine, params: &AdvancedSearchQuery, kb_ids: Option<&Vec<i64>>,
+    planner: &QueryPlanner, judge: &RelevanceJudge, chunk_refiner: &ChunkRefiner, slice_limit: usize,
+    context_chars: usize, user_id: &str, is_admin: bool, tx: Option<&mpsc::Sender<Result<Event, Infallible>>>,
+    request_id: &str, log_prefix: &str,
+) -> anyhow::Result<Option<AdvancedSelectedSliceResult>> {
+    let planning_started = Instant::now();
+    maybe_send_status_event(tx, "初始化", "生成执行计划").await?;
+    let steps = planner.plan(&params.query, params.max_sub_queries.max(1)).await;
+    let step_actions = steps.iter().map(|step| format!("{:?}", step.action)).collect::<Vec<_>>().join(" -> ");
+    info!(
+        "{} plan generated: request_id={}, step_count={}, actions=\"{}\", elapsed_ms={}",
+        log_prefix,
+        request_id,
+        steps.len(),
+        step_actions,
+        planning_started.elapsed().as_millis()
+    );
+
+    if steps.is_empty() {
+        info!("{} exits early: request_id={}, reason=empty_plan", log_prefix, request_id);
+        maybe_send_status_event(tx, "计划", "未生成有效计划").await?;
+        return Ok(None);
+    }
+    maybe_send_plan_event(tx, &steps).await?;
+
+    let mut slice_candidates: Vec<SliceCandidate> = Vec::new();
+    let mut selected: Option<AdvancedSelectedSliceResult> = None;
+
+    for (step_idx, step) in steps.into_iter().enumerate() {
+        let step_started = Instant::now();
+        let step_action = step.action.clone();
+        info!(
+            "{} step started: request_id={}, step_index={}, action={:?}, comment=\"{}\"",
+            log_prefix,
+            request_id,
+            step_idx + 1,
+            step_action,
+            preview_for_log(&step.comment, 120)
+        );
+        maybe_send_step_event(tx, &step, "started", None).await?;
+
+        match step_action {
+            PlanAction::RecentDocuments => {
+                slice_candidates = collect_relevant_slices(
+                    pool,
+                    search_engine,
+                    &params.query,
+                    params.file_id.as_ref(),
+                    kb_ids,
+                    slice_limit,
+                    user_id,
+                    is_admin,
+                    request_id,
+                )
+                .await?;
+
+                info!(
+                    "{} step completed: request_id={}, step_index={}, action=RecentDocuments, slice_candidates={}, elapsed_ms={}",
+                    log_prefix,
+                    request_id,
+                    step_idx + 1,
+                    slice_candidates.len(),
+                    step_started.elapsed().as_millis()
+                );
+                let summary = summarize_slice_candidates(&slice_candidates);
+                maybe_send_step_event(
+                    tx,
+                    &step,
+                    "completed",
+                    Some(json!({ "count": slice_candidates.len(), "slices": summary })),
+                )
+                .await?;
+            }
+            PlanAction::DocumentStructure => {
+                info!(
+                    "{} step skipped: request_id={}, step_index={}, action=DocumentStructure, reason=flow_simplified",
+                    log_prefix,
+                    request_id,
+                    step_idx + 1
+                );
+                maybe_send_step_event(tx, &step, "skipped", Some(json!({ "reason": "当前流程不执行文档结构分析" })))
+                    .await?;
+            }
+            PlanAction::PageContent => {
+                if slice_candidates.is_empty() {
+                    info!(
+                        "{} step refilling slices: request_id={}, step_index={}, action=PageContent",
+                        log_prefix,
+                        request_id,
+                        step_idx + 1
+                    );
+                    slice_candidates = collect_relevant_slices(
+                        pool,
+                        search_engine,
+                        &params.query,
+                        params.file_id.as_ref(),
+                        kb_ids,
+                        slice_limit,
+                        user_id,
+                        is_admin,
+                        request_id,
+                    )
+                    .await?;
+                }
+
+                if slice_candidates.is_empty() {
+                    info!(
+                        "{} step skipped: request_id={}, step_index={}, action=PageContent, reason=no_slices",
+                        log_prefix,
+                        request_id,
+                        step_idx + 1
+                    );
+                    maybe_send_step_event(tx, &step, "skipped", Some(json!({ "reason": "未找到相关切片" }))).await?;
+                    maybe_send_status_event(tx, "结果", "未找到可用于回答问题的内容").await?;
+                    continue;
+                }
+
+                let outcome = execute_page_content_step_core(
+                    pool,
+                    &slice_candidates,
+                    slice_limit,
+                    context_chars,
+                    judge,
+                    chunk_refiner,
+                    &params.query,
+                    request_id,
+                    if tx.is_some() { "execute_page_content_step" } else { "execute_page_content_step_non_stream" },
+                    tx,
+                    tx.is_some() && params.debug,
+                    tx.is_some(),
+                )
+                .await?;
+
+                let mut emitted = 0usize;
+                if let Some(finalized) = outcome.selected {
+                    let slice_ids = finalized.final_segments.iter().map(|seg| seg.slice_id).collect::<Vec<_>>();
+                    let payload = AdvancedResultPayload {
+                        step_action: PlanAction::PageContent,
+                        file: Some(finalized.file.clone()),
+                        kb: finalized.kb.clone(),
+                        slice_ids: slice_ids.clone(),
+                        score: finalized.base_score,
+                        judge_score: finalized.judge_score,
+                        judge_reason: finalized.judge_reason.clone(),
+                        refine_reason: finalized.refine_reason.clone(),
+                        content: finalized.final_content.clone(),
+                    };
+                    maybe_send_event_json(tx, "result", &payload).await?;
+                    if tx.is_some() {
+                        info!(
+                            "execute_page_content_step emitted result after refine: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, slice_count={}, score={:.4}, judge_score={:.4}, refine_reason=\"{}\"",
+                            request_id,
+                            finalized.file.id,
+                            finalized.kb.as_ref().map(|kb| kb.id),
+                            finalized.base_slice_id,
+                            payload.slice_ids.len(),
+                            finalized.base_score,
+                            finalized.judge_score,
+                            preview_for_log(finalized.refine_reason.as_deref().unwrap_or("none"), 120)
+                        );
+                    }
+
+                    selected = Some(AdvancedSelectedSliceResult {
+                        base_slice_id: finalized.base_slice_id,
+                        file: finalized.file,
+                        kb: finalized.kb,
+                        score: finalized.base_score,
+                        content: finalized.final_content,
+                        slice_ids,
+                    });
+                    emitted = 1;
+                }
+
+                info!(
+                    "{} step completed: request_id={}, step_index={}, action=PageContent, emitted={}, inspected_slices={}, judge_rejected={}, context_error={}, refine_error={}, empty_slice_group={}, empty_content={}, elapsed_ms={}",
+                    log_prefix,
+                    request_id,
+                    step_idx + 1,
+                    emitted,
+                    outcome.stats.inspected_slices,
+                    outcome.stats.judge_rejected_count,
+                    outcome.stats.context_error_count,
+                    outcome.stats.refine_error_count,
+                    outcome.stats.empty_slice_group_count,
+                    outcome.stats.empty_content_count,
+                    step_started.elapsed().as_millis()
+                );
+
+                if emitted > 0 {
+                    maybe_send_status_event(tx, "结果", "已找到可用于回答问题的内容，停止继续检索").await?;
+                } else {
+                    maybe_send_status_event(tx, "结果", "未找到可用于回答问题的内容").await?;
+                }
+                maybe_send_step_event(
+                    tx,
+                    &step,
+                    "completed",
+                    Some(json!({ "emitted": emitted, "found": emitted > 0 })),
+                )
+                .await?;
+
+                if emitted > 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    Ok(selected)
+}
+
 async fn run_advanced_slice_search_non_stream(
     pool: &SqlitePool, search_engine: &SearchEngine, auth_user: &AuthUser, params: &AdvancedSearchQuery,
     kb_ids: Option<Vec<i64>>, request_id: &str,
 ) -> anyhow::Result<Vec<SearchResultItem>> {
-    if matches!(kb_ids.as_ref(), Some(ids) if ids.is_empty()) {
+    if no_accessible_kb_scope(kb_ids.as_deref()) {
         return Ok(Vec::new());
     }
 
@@ -1028,62 +1191,23 @@ async fn run_advanced_slice_search_non_stream(
     let user_id = auth_user.user_id.clone();
     let is_admin = auth_user.is_admin();
 
-    let steps = planner.plan(&params.query, params.max_sub_queries.max(1)).await;
-    let mut slice_candidates: Vec<SliceCandidate> = Vec::new();
-    let mut selected: Option<AdvancedSelectedSliceResult> = None;
-
-    for step in steps {
-        match step.action {
-            PlanAction::RecentDocuments => {
-                slice_candidates = collect_relevant_slices(
-                    pool,
-                    search_engine,
-                    &params.query,
-                    params.file_id.as_ref(),
-                    kb_ids.as_ref(),
-                    slice_limit,
-                    &user_id,
-                    is_admin,
-                    request_id,
-                )
-                .await?;
-            }
-            PlanAction::PageContent => {
-                if slice_candidates.is_empty() {
-                    slice_candidates = collect_relevant_slices(
-                        pool,
-                        search_engine,
-                        &params.query,
-                        params.file_id.as_ref(),
-                        kb_ids.as_ref(),
-                        slice_limit,
-                        &user_id,
-                        is_admin,
-                        request_id,
-                    )
-                    .await?;
-                }
-                if slice_candidates.is_empty() {
-                    continue;
-                }
-                selected = execute_page_content_step_non_stream(
-                    pool,
-                    &slice_candidates,
-                    slice_limit,
-                    context_chars,
-                    &judge,
-                    &chunk_refiner,
-                    &params.query,
-                    request_id,
-                )
-                .await?;
-                if selected.is_some() {
-                    break;
-                }
-            }
-            PlanAction::DocumentStructure => {}
-        }
-    }
+    let selected = run_advanced_plan_steps(
+        pool,
+        search_engine,
+        params,
+        kb_ids.as_ref(),
+        &planner,
+        &judge,
+        &chunk_refiner,
+        slice_limit,
+        context_chars,
+        &user_id,
+        is_admin,
+        None,
+        request_id,
+        "advanced_slice_search_non_stream",
+    )
+    .await?;
 
     let Some(selected) = selected else {
         return Ok(Vec::new());
@@ -1109,211 +1233,109 @@ async fn run_advanced_slice_search_non_stream(
     }])
 }
 
-async fn execute_page_content_step_non_stream(
-    pool: &SqlitePool, candidates: &[SliceCandidate], slice_limit: usize, context_chars: usize, judge: &RelevanceJudge,
-    chunk_refiner: &ChunkRefiner, query: &str, request_id: &str,
-) -> anyhow::Result<Option<AdvancedSelectedSliceResult>> {
-    let max_slices = slice_limit.max(1);
+async fn execute_page_content_step_core(
+    pool: &SqlitePool, candidates: &[SliceCandidate], max_slices: usize, context_chars: usize, judge: &RelevanceJudge,
+    chunk_refiner: &ChunkRefiner, query: &str, request_id: &str, log_prefix: &str,
+    tx: Option<&mpsc::Sender<Result<Event, Infallible>>>, debug_events: bool, verbose_logs: bool,
+) -> anyhow::Result<PageContentCoreOutcome> {
+    let mut stats = PageContentStepStats::default();
+    let max_slices = max_slices.max(1);
     let mut selected_candidate: Option<SelectedAnswerCandidate> = None;
     let mut best_candidate: Option<SelectedAnswerCandidate> = None;
 
     for candidate in candidates.iter().take(max_slices) {
+        stats.inspected_slices += 1;
         let base_slice = &candidate.slice;
-        let context_chunk = match assemble_context_chunk(pool, base_slice, context_chars).await {
-            Ok(chunk) => chunk,
-            Err(err) => {
-                info!(
-                    "execute_page_content_step_non_stream context assemble failed: request_id={}, file_id={}, base_slice_id={}, error={}",
-                    request_id, candidate.file.id, base_slice.id, err
-                );
-                continue;
-            }
-        };
-
-        let judge_outcome = judge.judge(query, &context_chunk.content).await;
-        if !judge_outcome.is_relevant {
-            continue;
-        }
-
-        let current_candidate = SelectedAnswerCandidate {
-            file: candidate.file.clone(),
-            kb: candidate.kb.clone(),
-            base_slice_id: base_slice.id,
-            base_score: base_slice.score,
-            judge_score: judge_outcome.score,
-            judge_reason: judge_outcome.reason,
-            context_segments: context_chunk.segments,
-            context_content: context_chunk.content,
-        };
-
-        if current_candidate.judge_score > ADVANCED_JUDGE_EARLY_STOP_SCORE {
-            selected_candidate = Some(current_candidate);
-            break;
-        }
-
-        let should_replace_best = best_candidate.as_ref().map_or(true, |best| {
-            current_candidate.judge_score > best.judge_score
-                || ((current_candidate.judge_score - best.judge_score).abs() < f32::EPSILON
-                    && current_candidate.base_score > best.base_score)
-        });
-        if should_replace_best {
-            best_candidate = Some(current_candidate);
-        }
-    }
-
-    if selected_candidate.is_none() {
-        selected_candidate = best_candidate;
-    }
-
-    let Some(selected) = selected_candidate else {
-        return Ok(None);
-    };
-
-    let refine_outcome = match chunk_refiner.refine(query, &selected.context_segments).await {
-        Ok(outcome) => outcome,
-        Err(err) => {
+        if verbose_logs {
             info!(
-                "execute_page_content_step_non_stream refine failed: request_id={}, file_id={}, base_slice_id={}, error={}",
-                request_id, selected.file.id, selected.base_slice_id, err
+                "{} evaluating candidate before_context: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, base_score={:.4}, preview=\"{}\"",
+                log_prefix,
+                request_id,
+                candidate.file.id,
+                candidate.kb.as_ref().map(|kb| kb.id),
+                base_slice.id,
+                base_slice.score,
+                preview_for_log(&base_slice.content, 120)
             );
-            RefineOutcome {
-                segments: selected.context_segments.clone(),
-                reason: Some("切片筛选失败，保留全部上下文".to_string()),
-            }
         }
-    };
-
-    let mut final_segments = refine_outcome.segments;
-    if final_segments.is_empty() {
-        final_segments = selected.context_segments.clone();
-    }
-    let mut final_content = final_segments.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>().join("\n");
-    if final_content.trim().is_empty() {
-        final_content = selected.context_content.clone();
-    }
-    if final_content.trim().is_empty() {
-        return Ok(None);
-    }
-
-    Ok(Some(AdvancedSelectedSliceResult {
-        base_slice_id: selected.base_slice_id,
-        file: selected.file,
-        kb: selected.kb,
-        score: selected.base_score,
-        content: final_content,
-        slice_ids: final_segments.into_iter().map(|seg| seg.slice_id).collect(),
-    }))
-}
-
-async fn execute_page_content_step(
-    pool: &SqlitePool, candidates: &[SliceCandidate], slice_limit: usize, context_chars: usize, judge: &RelevanceJudge,
-    chunk_refiner: &ChunkRefiner, params: &AdvancedSearchQuery, tx: &mpsc::Sender<Result<Event, Infallible>>,
-    request_id: &str,
-) -> anyhow::Result<usize> {
-    let step_started = Instant::now();
-    let mut emitted = 0;
-    let max_slices = slice_limit.max(1);
-    let mut inspected_slices = 0usize;
-    let mut context_error_count = 0usize;
-    let mut refine_error_count = 0usize;
-    let mut empty_slice_group_count = 0usize;
-    let mut empty_content_count = 0usize;
-    let mut judge_rejected_count = 0usize;
-    let mut selected_candidate: Option<SelectedAnswerCandidate> = None;
-    let mut best_candidate: Option<SelectedAnswerCandidate> = None;
-
-    info!(
-        "execute_page_content_step started: request_id={}, candidates={}, max_slices={}, context_chars={}, early_stop_score>{:.2}, debug={}",
-        request_id,
-        candidates.len(),
-        max_slices,
-        context_chars,
-        ADVANCED_JUDGE_EARLY_STOP_SCORE,
-        params.debug
-    );
-
-    for candidate in candidates.iter().take(max_slices) {
-        inspected_slices += 1;
-        let base_slice = &candidate.slice;
-        info!(
-            "execute_page_content_step evaluating candidate before_context: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, base_score={:.4}, preview=\"{}\"",
-            request_id,
-            candidate.file.id,
-            candidate.kb.as_ref().map(|kb| kb.id),
-            base_slice.id,
-            base_slice.score,
-            preview_for_log(&base_slice.content, 120)
-        );
 
         let context_chunk = match assemble_context_chunk(pool, base_slice, context_chars).await {
             Ok(chunk) => chunk,
             Err(err) => {
-                context_error_count += 1;
+                stats.context_error_count += 1;
                 info!(
-                    "execute_page_content_step context assemble failed: request_id={}, file_id={}, base_slice_id={}, error={}",
-                    request_id, candidate.file.id, base_slice.id, err
+                    "{} context assemble failed: request_id={}, file_id={}, base_slice_id={}, error={}",
+                    log_prefix, request_id, candidate.file.id, base_slice.id, err
                 );
-                if params.debug {
-                    let _ = send_event_json(
-                        tx,
-                        "candidate",
-                        &json!({
-                            "step_action": PlanAction::PageContent,
-                            "file": candidate.file.clone(),
-                            "kb": candidate.kb.clone(),
-                            "error": format!("上下文拼接失败: {}", err),
-                        }),
-                    )
-                    .await;
+                if debug_events {
+                    if let Some(tx) = tx {
+                        let _ = send_event_json(
+                            tx,
+                            "candidate",
+                            &json!({
+                                "step_action": PlanAction::PageContent,
+                                "file": candidate.file.clone(),
+                                "kb": candidate.kb.clone(),
+                                "error": format!("上下文拼接失败: {}", err),
+                            }),
+                        )
+                        .await;
+                    }
                 }
                 continue;
             }
         };
 
-        if params.debug {
-            let preview = preview_text(&context_chunk.content, 160);
-            let _ = send_event_json(
-                tx,
-                "candidate",
-                &json!({
-                    "step_action": PlanAction::PageContent,
-                    "file": candidate.file.clone(),
-                    "kb": candidate.kb.clone(),
-                    "score": base_slice.score,
-                    "slice_ids": context_chunk.slice_ids.clone(),
-                    "preview": preview,
-                    "stage": "before_refine",
-                }),
-            )
-            .await;
-        }
-
-        let judge_outcome = judge.judge(&params.query, &context_chunk.content).await;
-        if !judge_outcome.is_relevant {
-            judge_rejected_count += 1;
-            info!(
-                "execute_page_content_step candidate rejected: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, judge_score={:.4}, reason=\"{}\"",
-                request_id,
-                candidate.file.id,
-                candidate.kb.as_ref().map(|kb| kb.id),
-                base_slice.id,
-                judge_outcome.score,
-                preview_for_log(&judge_outcome.reason, 120)
-            );
-
-            if params.debug {
+        if debug_events {
+            if let Some(tx) = tx {
+                let preview = preview_text(&context_chunk.content, 160);
                 let _ = send_event_json(
                     tx,
-                    "filtered",
+                    "candidate",
                     &json!({
                         "step_action": PlanAction::PageContent,
                         "file": candidate.file.clone(),
                         "kb": candidate.kb.clone(),
-                        "reason": judge_outcome.reason,
-                        "score": judge_outcome.score,
+                        "score": base_slice.score,
+                        "slice_ids": context_chunk.slice_ids.clone(),
+                        "preview": preview,
+                        "stage": "before_refine",
                     }),
                 )
                 .await;
+            }
+        }
+
+        let judge_outcome = judge.judge(query, &context_chunk.content).await;
+        if !judge_outcome.is_relevant {
+            stats.judge_rejected_count += 1;
+            if verbose_logs {
+                info!(
+                    "{} candidate rejected: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, judge_score={:.4}, reason=\"{}\"",
+                    log_prefix,
+                    request_id,
+                    candidate.file.id,
+                    candidate.kb.as_ref().map(|kb| kb.id),
+                    base_slice.id,
+                    judge_outcome.score,
+                    preview_for_log(&judge_outcome.reason, 120)
+                );
+            }
+            if debug_events {
+                if let Some(tx) = tx {
+                    let _ = send_event_json(
+                        tx,
+                        "filtered",
+                        &json!({
+                            "step_action": PlanAction::PageContent,
+                            "file": candidate.file.clone(),
+                            "kb": candidate.kb.clone(),
+                            "reason": judge_outcome.reason,
+                            "score": judge_outcome.score,
+                        }),
+                    )
+                    .await;
+                }
             }
             continue;
         }
@@ -1329,34 +1351,41 @@ async fn execute_page_content_step(
             context_content: context_chunk.content,
         };
 
-        if judge_outcome.score > ADVANCED_JUDGE_EARLY_STOP_SCORE {
-            info!(
-                "execute_page_content_step selected candidate for early stop: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, score={:.4}, judge_score={:.4}",
-                request_id,
-                candidate.file.id,
-                candidate.kb.as_ref().map(|kb| kb.id),
-                base_slice.id,
-                base_slice.score,
-                judge_outcome.score
-            );
+        if current_candidate.judge_score > ADVANCED_JUDGE_EARLY_STOP_SCORE {
+            if verbose_logs {
+                info!(
+                    "{} selected candidate for early stop: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, score={:.4}, judge_score={:.4}",
+                    log_prefix,
+                    request_id,
+                    candidate.file.id,
+                    candidate.kb.as_ref().map(|kb| kb.id),
+                    base_slice.id,
+                    base_slice.score,
+                    judge_outcome.score
+                );
+            }
             selected_candidate = Some(current_candidate);
             break;
         }
 
         let should_replace_best = best_candidate.as_ref().map_or(true, |best| {
-            judge_outcome.score > best.judge_score
-                || ((judge_outcome.score - best.judge_score).abs() < f32::EPSILON && base_slice.score > best.base_score)
+            current_candidate.judge_score > best.judge_score
+                || ((current_candidate.judge_score - best.judge_score).abs() < f32::EPSILON
+                    && current_candidate.base_score > best.base_score)
         });
         if should_replace_best {
-            info!(
-                "execute_page_content_step updated best candidate: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, score={:.4}, judge_score={:.4}",
-                request_id,
-                candidate.file.id,
-                candidate.kb.as_ref().map(|kb| kb.id),
-                base_slice.id,
-                base_slice.score,
-                judge_outcome.score
-            );
+            if verbose_logs {
+                info!(
+                    "{} updated best candidate: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, score={:.4}, judge_score={:.4}",
+                    log_prefix,
+                    request_id,
+                    candidate.file.id,
+                    candidate.kb.as_ref().map(|kb| kb.id),
+                    base_slice.id,
+                    base_slice.score,
+                    judge_outcome.score
+                );
+            }
             best_candidate = Some(current_candidate);
         }
     }
@@ -1365,91 +1394,72 @@ async fn execute_page_content_step(
         selected_candidate = best_candidate;
     }
 
-    if let Some(selected) = selected_candidate {
+    let Some(selected) = selected_candidate else {
+        return Ok(PageContentCoreOutcome { selected: None, stats });
+    };
+
+    if verbose_logs {
         info!(
-            "execute_page_content_step refining selected candidate: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, judge_score={:.4}",
+            "{} refining selected candidate: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, judge_score={:.4}",
+            log_prefix,
             request_id,
             selected.file.id,
             selected.kb.as_ref().map(|kb| kb.id),
             selected.base_slice_id,
             selected.judge_score
         );
-
-        let refine_outcome = match chunk_refiner.refine(&params.query, &selected.context_segments).await {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                refine_error_count += 1;
-                info!(
-                    "execute_page_content_step refine failed: request_id={}, file_id={}, base_slice_id={}, error={}",
-                    request_id, selected.file.id, selected.base_slice_id, err
-                );
-                RefineOutcome {
-                    segments: selected.context_segments.clone(),
-                    reason: Some("切片筛选失败，保留全部上下文".to_string()),
-                }
-            }
-        };
-
-        let refine_reason = refine_outcome.reason.clone();
-        let mut final_segments = refine_outcome.segments;
-        if final_segments.is_empty() {
-            empty_slice_group_count += 1;
-            final_segments = selected.context_segments.clone();
-        }
-
-        let mut final_content = final_segments.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>().join("\n");
-        if final_content.trim().is_empty() {
-            empty_content_count += 1;
-            final_content = selected.context_content.clone();
-        }
-
-        if final_content.trim().is_empty() {
-            info!(
-                "execute_page_content_step selected candidate has empty content after refine: request_id={}, file_id={}, base_slice_id={}",
-                request_id, selected.file.id, selected.base_slice_id
-            );
-        } else {
-            let payload = AdvancedResultPayload {
-                step_action: PlanAction::PageContent,
-                file: Some(selected.file.clone()),
-                kb: selected.kb.clone(),
-                slice_ids: final_segments.iter().map(|seg| seg.slice_id).collect(),
-                score: selected.base_score,
-                judge_score: selected.judge_score,
-                judge_reason: selected.judge_reason.clone(),
-                refine_reason: refine_reason.clone(),
-                content: final_content.clone(),
-            };
-            send_event_json(tx, "result", &payload).await?;
-            emitted += 1;
-            info!(
-                "execute_page_content_step emitted result after refine: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, slice_count={}, score={:.4}, judge_score={:.4}, refine_reason=\"{}\"",
-                request_id,
-                selected.file.id,
-                selected.kb.as_ref().map(|kb| kb.id),
-                selected.base_slice_id,
-                payload.slice_ids.len(),
-                selected.base_score,
-                selected.judge_score,
-                preview_for_log(refine_reason.as_deref().unwrap_or("none"), 120)
-            );
-        }
     }
 
-    info!(
-        "execute_page_content_step completed: request_id={}, inspected_slices={}, emitted={}, judge_rejected={}, context_error={}, refine_error={}, empty_slice_group={}, empty_content={}, elapsed_ms={}",
-        request_id,
-        inspected_slices,
-        emitted,
-        judge_rejected_count,
-        context_error_count,
-        refine_error_count,
-        empty_slice_group_count,
-        empty_content_count,
-        step_started.elapsed().as_millis()
-    );
+    let refine_outcome = match chunk_refiner.refine(query, &selected.context_segments).await {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            stats.refine_error_count += 1;
+            info!(
+                "{} refine failed: request_id={}, file_id={}, base_slice_id={}, error={}",
+                log_prefix, request_id, selected.file.id, selected.base_slice_id, err
+            );
+            RefineOutcome {
+                segments: selected.context_segments.clone(),
+                reason: Some("切片筛选失败，保留全部上下文".to_string()),
+            }
+        }
+    };
 
-    Ok(emitted)
+    let refine_reason = refine_outcome.reason.clone();
+    let mut final_segments = refine_outcome.segments;
+    if final_segments.is_empty() {
+        stats.empty_slice_group_count += 1;
+        final_segments = selected.context_segments.clone();
+    }
+    let mut final_content = final_segments.iter().map(|seg| seg.text.as_str()).collect::<Vec<_>>().join("\n");
+    if final_content.trim().is_empty() {
+        stats.empty_content_count += 1;
+        final_content = selected.context_content.clone();
+    }
+    if final_content.trim().is_empty() {
+        if verbose_logs {
+            info!(
+                "{} selected candidate has empty content after refine: request_id={}, file_id={}, base_slice_id={}",
+                log_prefix, request_id, selected.file.id, selected.base_slice_id
+            );
+        }
+        return Ok(PageContentCoreOutcome { selected: None, stats });
+    }
+
+    Ok(PageContentCoreOutcome {
+        selected: Some(FinalizedAnswerCandidate {
+            base_slice_id: selected.base_slice_id,
+            file: selected.file,
+            kb: selected.kb,
+            base_score: selected.base_score,
+            judge_score: selected.judge_score,
+            judge_reason: selected.judge_reason,
+            final_segments,
+            final_content,
+            refine_reason,
+        }),
+        stats,
+    })
 }
 
 fn format_id_filter(ids: Option<&[i64]>) -> String {
@@ -1513,10 +1523,9 @@ pub async fn search_full(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Query(params): Query<SearchQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<FullSearchResult>> {
-    let is_admin = auth_user.is_admin();
-    let user_id = auth_user.user_id.clone();
-    let kb_ids_to_search = resolve_kb_ids_to_search(&pool, &user_id, is_admin, params.kb_id.as_ref()).await?;
-    if matches!(kb_ids_to_search.as_ref(), Some(ids) if ids.is_empty()) {
+    let (is_admin, user_id, kb_ids_to_search) =
+        resolve_scope_for_user(&pool, &auth_user, params.kb_id.as_ref()).await?;
+    if no_accessible_kb_scope(kb_ids_to_search.as_deref()) {
         return Ok(Json(FullSearchResult { results: vec![] }));
     }
 
@@ -1539,9 +1548,6 @@ pub async fn search_full(
     // 批量查询知识库信息
     let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(&pool, &kb_ids).await? } else { HashMap::new() };
 
-    // 克隆 user_id 用于闭包
-    let user_id = auth_user.user_id.clone();
-
     // 组装结果并过滤权限
     let results = raw_results
         .into_iter()
@@ -1549,23 +1555,12 @@ pub async fn search_full(
             let file = file_map.get(&r.file_id).cloned();
             let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
 
-            // 权限检查
-            let has_permission = if is_admin {
-                true
-            } else if let Some(ref file_info) = file {
-                // 如果文件存在，检查文件权限
-                // 规则：私有文件（is_public=0）只有所有者可以查看
-                if !file_info.is_public && file_info.user_id != user_id { false } else { true }
-            } else if let Some(ref kb_info) = kb {
-                // 如果没有文件信息但有知识库信息，检查知识库权限
-                // 规则：私有知识库（is_public=0）只有所有者可以查看
-                if !kb_info.is_public && kb_info.user_id != user_id { false } else { true }
-            } else {
-                // 没有文件和知识库信息，默认允许
-                true
-            };
-
-            if has_permission {
+            if has_visibility_permission(
+                file.as_ref().map(|f| (f.is_public, f.user_id.as_str())),
+                kb.as_ref().map(|k| (k.is_public, k.user_id.as_str())),
+                &user_id,
+                is_admin,
+            ) {
                 Some(FullSearchResultItem { snippet: r.snippet, score: r.score, file, kb })
             } else {
                 None
@@ -1596,10 +1591,9 @@ pub async fn search_with_graph(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Query(params): Query<SearchQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<SearchResult>> {
-    let is_admin = auth_user.is_admin();
-    let user_id = auth_user.user_id.clone();
-    let kb_ids_to_search = resolve_kb_ids_to_search(&pool, &user_id, is_admin, params.kb_id.as_ref()).await?;
-    if matches!(kb_ids_to_search.as_ref(), Some(ids) if ids.is_empty()) {
+    let (_is_admin, _user_id, kb_ids_to_search) =
+        resolve_scope_for_user(&pool, &auth_user, params.kb_id.as_ref()).await?;
+    if no_accessible_kb_scope(kb_ids_to_search.as_deref()) {
         return Ok(Json(SearchResult { results: vec![] }));
     }
 
@@ -1608,64 +1602,7 @@ pub async fn search_with_graph(
         .await
         .map_err(|e| crate::api::error::ApiError::internal(format!("Graph search failed: {}", e)))?;
 
-    if raw_results.is_empty() {
-        return Ok(Json(SearchResult { results: vec![] }));
-    }
-
-    // 收集所有 file_id、kb_id 和 slice_id
-    let file_ids: Vec<i64> = raw_results.iter().map(|r| r.file_id).collect();
-    let kb_ids: Vec<i64> = raw_results.iter().filter_map(|r| r.kb_id).collect();
-    let slice_ids: Vec<i64> = raw_results.iter().map(|r| r.id).collect();
-
-    // 批量查询文件信息
-    let file_map = get_files_by_ids(&pool, &file_ids).await?;
-
-    // 批量查询知识库信息
-    let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(&pool, &kb_ids).await? } else { HashMap::new() };
-
-    let slice_positions = get_slice_positions(&pool, &slice_ids).await?;
-
-    // 克隆 user_id 用于闭包
-    let user_id = auth_user.user_id.clone();
-
-    // 组装结果并过滤权限
-    let results = raw_results
-        .into_iter()
-        .filter_map(|r| {
-            let file = file_map.get(&r.file_id).cloned();
-            let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
-
-            // 权限检查
-            let has_permission = if is_admin {
-                true
-            } else if let Some(ref file_info) = file {
-                // 如果文件存在，检查文件权限
-                // 规则：私有文件（is_public=0）只有所有者可以查看
-                if !file_info.is_public && file_info.user_id != user_id { false } else { true }
-            } else if let Some(ref kb_info) = kb {
-                // 如果没有文件信息但有知识库信息，检查知识库权限
-                // 规则：私有知识库（is_public=0）只有所有者可以查看
-                if !kb_info.is_public && kb_info.user_id != user_id { false } else { true }
-            } else {
-                // 没有文件和知识库信息，默认允许
-                true
-            };
-
-            if has_permission {
-                Some(SearchResultItem {
-                    id: r.id,
-                    file_id: r.file_id,
-                    content: r.content,
-                    score: r.score,
-                    file,
-                    kb,
-                    positions: slice_positions.get(&r.id).cloned(),
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
+    let results = build_slice_results_from_raw(&pool, raw_results, &auth_user, false).await?;
 
     Ok(Json(SearchResult { results }))
 }
@@ -1726,10 +1663,9 @@ pub async fn search_image(
         return Err(ApiError::BadRequest("file is required".to_string()));
     };
 
-    let is_admin = auth_user.is_admin();
-    let user_id = auth_user.user_id.clone();
-    let kb_ids_to_search = resolve_kb_ids_to_search(&pool, &user_id, is_admin, params.kb_id.as_ref()).await?;
-    if matches!(kb_ids_to_search.as_ref(), Some(ids) if ids.is_empty()) {
+    let (_is_admin, _user_id, kb_ids_to_search) =
+        resolve_scope_for_user(&pool, &auth_user, params.kb_id.as_ref()).await?;
+    if no_accessible_kb_scope(kb_ids_to_search.as_deref()) {
         return Ok(Json(SearchResult { results: vec![] }));
     }
 
@@ -1747,50 +1683,7 @@ pub async fn search_image(
         .await
         .map_err(|e| ApiError::internal(format!("Image search failed: {}", e)))?;
 
-    if raw_results.is_empty() {
-        return Ok(Json(SearchResult { results: vec![] }));
-    }
-
-    let file_ids: Vec<i64> = raw_results.iter().map(|r| r.file_id).collect();
-    let kb_ids: Vec<i64> = raw_results.iter().filter_map(|r| r.kb_id).collect();
-    let slice_ids: Vec<i64> = raw_results.iter().map(|r| r.id).collect();
-
-    let file_map = get_files_by_ids(&pool, &file_ids).await?;
-    let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(&pool, &kb_ids).await? } else { HashMap::new() };
-    let slice_positions = get_slice_positions(&pool, &slice_ids).await?;
-
-    let user_id = auth_user.user_id.clone();
-    let results = raw_results
-        .into_iter()
-        .filter_map(|r| {
-            let file = file_map.get(&r.file_id).cloned();
-            let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
-
-            let has_permission = if is_admin {
-                true
-            } else if let Some(ref file_info) = file {
-                if !file_info.is_public && file_info.user_id != user_id { false } else { true }
-            } else if let Some(ref kb_info) = kb {
-                if !kb_info.is_public && kb_info.user_id != user_id { false } else { true }
-            } else {
-                true
-            };
-
-            if has_permission {
-                Some(SearchResultItem {
-                    id: r.id,
-                    file_id: r.file_id,
-                    content: r.content,
-                    score: r.score,
-                    file,
-                    kb,
-                    positions: slice_positions.get(&r.id).cloned(),
-                })
-            } else {
-                None
-            }
-        })
-        .collect();
+    let results = build_slice_results_from_raw(&pool, raw_results, &auth_user, false).await?;
 
     Ok(Json(SearchResult { results }))
 }
