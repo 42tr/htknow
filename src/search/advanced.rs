@@ -23,7 +23,7 @@ impl LlmClient {
     pub fn new() -> Self {
         let cfg = config::get();
         let llm = cfg.llm.clone();
-        let client = Client::builder().timeout(Duration::from_secs(60)).build().expect("build reqwest client");
+        let client = Client::builder().timeout(Duration::from_secs(600)).build().expect("build reqwest client");
         Self { client, api_url: llm.api_url, api_key: llm.api_key, model: llm.model }
     }
 
@@ -45,7 +45,13 @@ impl LlmClient {
         let url = self.api_url.as_ref().ok_or_else(|| anyhow!("LLM not configured"))?;
         let request = ChatRequest {
             model: self.model.clone(),
-            messages: vec![Message { role: "user".to_string(), content: prompt.to_string() }],
+            messages: vec![
+                Message {
+                    role: "system".to_string(),
+                    content: "Do not output chain-of-thought. Only output final answer.".to_string(),
+                },
+                Message { role: "user".to_string(), content: prompt.to_string() },
+            ],
             max_tokens: Some(max_tokens),
             temperature: Some(temperature),
         };
@@ -151,7 +157,7 @@ impl RelevanceJudge {
             question, context
         );
 
-        match self.llm.chat_json::<JudgeResponse>(&prompt, 400, 0.0).await {
+        match self.llm.chat_json::<JudgeResponse>(&prompt, 50000, 0.2).await {
             Ok(resp) => {
                 let mut score = resp.score.unwrap_or(0.5);
                 if !(0.0..=1.0).contains(&score) {
@@ -223,7 +229,7 @@ impl ChunkRefiner {
             serde_json::to_string(&limited_segments)?
         );
 
-        match self.llm.chat_json::<RefineResponse>(&prompt, 600, 0.0).await {
+        match self.llm.chat_json::<RefineResponse>(&prompt, 50000, 0.2).await {
             Ok(resp) => {
                 let keep_ids: HashSet<i64> = if resp.keep_slice_ids.is_empty() {
                     segments.iter().map(|seg| seg.slice_id).collect()
@@ -394,6 +400,9 @@ struct ChatMessage {
 
 fn clean_json_like(input: &str) -> String {
     let mut text = input.trim();
+    if let Some(rest) = text.split_once("</think>") {
+        text = rest.1;
+    }
     if let Some(stripped) = text.strip_prefix("```json") {
         text = stripped.trim_start();
     } else if let Some(stripped) = text.strip_prefix("```") {
