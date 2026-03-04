@@ -61,6 +61,8 @@ pub struct ServerConfig {
     pub parse_enabled: bool,
     /// 是否启用重复文件复用
     pub reuse_duplicate_files: bool,
+    /// 文件解析后是否构建知识图谱
+    pub build_knowledge_graph: bool,
 }
 
 /// 外部服务配置
@@ -197,6 +199,7 @@ impl ServerConfig {
             lancedb_compact_cron: env_or("HTKNOW_LANCEDB_COMPACT_CRON", "0 0 3 * * *"),
             parse_enabled: env_or_parse("HTKNOW_PARSE_ENABLED", true),
             reuse_duplicate_files: env_or_parse("HTKNOW_REUSE_DUPLICATE_FILES", true),
+            build_knowledge_graph: env_or_parse("HTKNOW_BUILD_KNOWLEDGE_GRAPH", false),
         }
     }
 }
@@ -393,6 +396,7 @@ mod tests {
         let _guard = ENV_LOCK.lock().unwrap();
         unsafe {
             std::env::remove_var("HTKNOW_PARSE_ENABLED");
+            std::env::remove_var("HTKNOW_BUILD_KNOWLEDGE_GRAPH");
         }
         let config = AppConfig::from_env();
 
@@ -404,6 +408,7 @@ mod tests {
         assert_eq!(config.ai.embedding_dim, 1024);
         assert_eq!(config.ai.image_embedding_dim, 2048);
         assert!(config.server.parse_enabled);
+        assert!(!config.server.build_knowledge_graph);
     }
 
     #[test]
@@ -422,6 +427,19 @@ mod tests {
         assert!(!config.server.parse_enabled);
         unsafe {
             std::env::remove_var("HTKNOW_PARSE_ENABLED");
+        }
+    }
+
+    #[test]
+    fn test_build_knowledge_graph_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("HTKNOW_BUILD_KNOWLEDGE_GRAPH", "true");
+        }
+        let config = AppConfig::from_env();
+        assert!(config.server.build_knowledge_graph);
+        unsafe {
+            std::env::remove_var("HTKNOW_BUILD_KNOWLEDGE_GRAPH");
         }
     }
 }

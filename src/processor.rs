@@ -770,9 +770,7 @@ impl FileProcessor {
 
         info!("File {} processed successfully with {} custom slices", file.id, slices.len());
 
-        if let Err(e) = self.build_knowledge_graph(file).await {
-            error!("Failed to build knowledge graph for file {}: {}", file.id, e);
-        }
+        self.maybe_build_knowledge_graph(file).await;
 
         Ok(())
     }
@@ -1103,10 +1101,7 @@ impl FileProcessor {
         }
 
         // 构建知识图谱
-        if let Err(e) = self.build_knowledge_graph(file).await {
-            error!("Failed to build knowledge graph for file {}: {}", file.id, e);
-            // 不影响主流程，仅记录错误
-        }
+        self.maybe_build_knowledge_graph(file).await;
 
         if !self.ensure_file_exists(file.id, "before writing full index").await? {
             return Ok(());
@@ -1466,10 +1461,7 @@ impl FileProcessor {
         info!("File {} processed successfully with {} slices", file.id, slice_count);
 
         // 构建知识图谱
-        if let Err(e) = self.build_knowledge_graph(file).await {
-            error!("Failed to build knowledge graph for file {}: {}", file.id, e);
-            // 不影响主流程，仅记录错误
-        }
+        self.maybe_build_knowledge_graph(file).await;
 
         Ok(())
     }
@@ -2019,9 +2011,7 @@ impl FileProcessor {
 
         let mut updated_file = target.clone();
         updated_file.content = Some(full_content.clone());
-        if let Err(e) = self.build_knowledge_graph(&updated_file).await {
-            error!("Failed to build knowledge graph for reused file {}: {}", target.id, e);
-        }
+        self.maybe_build_knowledge_graph(&updated_file).await;
 
         Ok(())
     }
@@ -2257,6 +2247,18 @@ impl FileProcessor {
         };
         let new_name = format!("{}{}", replacement, stripped);
         if let Some(parent) = path.parent() { parent.join(new_name).to_string_lossy().to_string() } else { new_name }
+    }
+
+    async fn maybe_build_knowledge_graph(&self, file: &File) {
+        if !config::get().server.build_knowledge_graph {
+            debug!("Knowledge graph building disabled by config, skipping file {}", file.id);
+            return;
+        }
+
+        if let Err(e) = self.build_knowledge_graph(file).await {
+            error!("Failed to build knowledge graph for file {}: {}", file.id, e);
+            // 不影响主流程，仅记录错误
+        }
     }
 
     /// 构建知识图谱（完全由LLM生成）
