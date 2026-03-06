@@ -99,7 +99,7 @@ impl IntoResponse for ApiError {
             }
             ApiError::Internal(msg) => {
                 log::error!("Internal error: {}", msg);
-                (StatusCode::INTERNAL_SERVER_ERROR, "Internal server error".into())
+                (StatusCode::INTERNAL_SERVER_ERROR, msg.clone())
             }
         };
 

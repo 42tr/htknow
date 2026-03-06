@@ -427,7 +427,7 @@ export const api = {
       headers: getHeaders(false),
       body: formData,
     })
-    if (!response.ok) throw new Error('上传文件失败')
+    if (!response.ok) throw new Error(await readErrorMessage(response, '上传文件失败'))
     return response.json()
   },
 
