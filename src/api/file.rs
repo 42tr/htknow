@@ -312,11 +312,13 @@ pub async fn upload(
                         }
                     }
                     Some("immediate_parse") => {
+                        // 立刻开始解析
                         let parse_text = field.text().await?;
                         debug!("Immediate parse text: {}", parse_text);
                         immediate_parse = parse_text == "true" || parse_text == "1";
                     }
                     Some("sync") => {
+                        // 等待解析结果
                         let sync_text = field.text().await?;
                         debug!("Sync parse text: {}", sync_text);
                         sync = sync_text == "true" || sync_text == "1";
@@ -408,10 +410,54 @@ pub async fn upload(
                 let file_clone = file.clone();
                 let file_id = id;
                 spawn(async move {
-                    if let Err(e) =
-                        processor::try_reuse_file_with_file(pool_clone, search_engine_clone, file_clone).await
-                    {
-                        log::error!("Background reuse failed for file {}: {}", file_id, e);
+                    let reuse_result = processor::try_reuse_file_with_file(
+                        pool_clone.clone(),
+                        search_engine_clone.clone(),
+                        file_clone,
+                    )
+                    .await;
+
+                    match reuse_result {
+                        Ok(true) => {}
+                        Ok(false) => {
+                            let reuse_failed =
+                                match sqlx::query_scalar::<_, String>("SELECT log FROM files WHERE id = ?")
+                                    .bind(file_id)
+                                    .fetch_optional(&pool_clone)
+                                    .await
+                                {
+                                    Ok(Some(log)) => log.starts_with("Reuse failed:"),
+                                    Ok(None) => false,
+                                    Err(e) => {
+                                        warn!("Failed to read reuse log for file {}: {}", file_id, e);
+                                        false
+                                    }
+                                };
+                            if reuse_failed {
+                                warn!("Background reuse failed for file {}, falling back to normal parsing", file_id);
+                                if let Err(parse_err) =
+                                    processor::process_file_immediate(pool_clone, search_engine_clone, file_id).await
+                                {
+                                    log::error!(
+                                        "Fallback parse failed for file {} after reuse failure: {}",
+                                        file_id,
+                                        parse_err
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            log::error!("Background reuse failed for file {}: {}", file_id, e);
+                            if let Err(parse_err) =
+                                processor::process_file_immediate(pool_clone, search_engine_clone, file_id).await
+                            {
+                                log::error!(
+                                    "Fallback parse failed for file {} after reuse error: {}",
+                                    file_id,
+                                    parse_err
+                                );
+                            }
+                        }
                     }
                 });
             }
