@@ -372,6 +372,36 @@ impl FileProcessor {
         Ok(())
     }
 
+    async fn cleanup_processing_file_data_with_retry(&self, file_id: i64, max_attempts: usize) -> anyhow::Result<()> {
+        let max_attempts = max_attempts.max(1);
+        let mut attempt = 1usize;
+
+        loop {
+            match self.cleanup_processing_file_data(file_id).await {
+                Ok(()) => return Ok(()),
+                Err(err) => {
+                    if attempt >= max_attempts || !Self::is_pool_timeout_error(&err) {
+                        return Err(err);
+                    }
+
+                    let retry_in_ms = (attempt as u64) * 200;
+                    warn!(
+                        "Cleanup for file {} failed due to DB pool timeout (attempt {}/{}), retrying in {}ms",
+                        file_id, attempt, max_attempts, retry_in_ms
+                    );
+                    time::sleep(Duration::from_millis(retry_in_ms)).await;
+                    attempt += 1;
+                }
+            }
+        }
+    }
+
+    fn is_pool_timeout_error(err: &anyhow::Error) -> bool {
+        err.chain().any(|cause| {
+            cause.downcast_ref::<sqlx::Error>().is_some_and(|sqlx_err| matches!(sqlx_err, sqlx::Error::PoolTimedOut))
+        })
+    }
+
     async fn delete_processing_file_data(
         &self, tx: &mut sqlx::Transaction<'_, Sqlite>, file_id: i64,
     ) -> anyhow::Result<()> {
@@ -401,7 +431,15 @@ impl FileProcessor {
         }
 
         let cfg = config::get();
-        let concurrency = cfg.server.process_concurrency.max(1);
+        let configured_concurrency = cfg.server.process_concurrency.max(1);
+        let db_safe_concurrency = (cfg.database.max_connections as usize).saturating_sub(2).max(1);
+        let concurrency = configured_concurrency.min(db_safe_concurrency);
+        if concurrency < configured_concurrency {
+            warn!(
+                "Reducing file processing concurrency from {} to {} to avoid DB pool exhaustion (max_connections={})",
+                configured_concurrency, concurrency, cfg.database.max_connections
+            );
+        }
         info!("Found {} pending files to process (concurrency: {})", files.len(), concurrency);
 
         let results: Vec<_> = stream::iter(files)
@@ -419,7 +457,7 @@ impl FileProcessor {
         for (file, result) in results {
             if let Err(e) = result {
                 error!("Failed to process file {}: {}", file.id, e);
-                if let Err(cleanup_err) = self.cleanup_processing_file_data(file.id).await {
+                if let Err(cleanup_err) = self.cleanup_processing_file_data_with_retry(file.id, 3).await {
                     error!("Failed to cleanup processing data for file {}: {}", file.id, cleanup_err);
                 }
                 self.mark_file_failed(file.id, &e.to_string()).await?;
@@ -455,7 +493,7 @@ impl FileProcessor {
             Ok(_) => Ok(true),
             Err(err) => {
                 error!("Failed to reuse parsed data from file {} for file {}: {}", source_file.id, file.id, err);
-                if let Err(clean_err) = self.cleanup_processing_file_data(file.id).await {
+                if let Err(clean_err) = self.cleanup_processing_file_data_with_retry(file.id, 3).await {
                     warn!("Failed to cleanup file {} after reuse error: {}", file.id, clean_err);
                 }
                 sqlx::query("UPDATE files SET status = 0, log = ?, updated_at = strftime('%s','now') WHERE id = ?")
@@ -1980,7 +2018,7 @@ impl FileProcessor {
             .execute(&self.pool)
             .await?;
 
-        self.cleanup_processing_file_data(target.id).await?;
+        self.cleanup_processing_file_data_with_retry(target.id, 3).await?;
 
         let pdf_rows = self.fetch_pdf_content_rows(source.id).await?;
         let slice_rows = self.fetch_slice_rows(source.id).await?;

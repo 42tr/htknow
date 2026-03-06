@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet}, path::Component, time::Instant
+    collections::{HashMap, HashSet}, path::Component, sync::{Arc, OnceLock}, time::Instant
 };
 
 use anyhow::Result as AnyResult;
@@ -10,7 +10,9 @@ use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
-use tokio::{fs, io::AsyncWriteExt as _, spawn};
+use tokio::{
+    fs, io::AsyncWriteExt as _, spawn, sync::{OwnedSemaphorePermit, Semaphore}
+};
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
@@ -204,6 +206,28 @@ pub async fn get_file_status_breakdown_for_unassigned(
     pool: &SqlitePool, user_id: &str, is_admin: bool,
 ) -> AnyResult<FileStatusBreakdown> {
     query_file_status_breakdown(pool, FileStatsScope::UnassignedOnly, user_id, is_admin).await
+}
+
+static BACKGROUND_REUSE_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+
+fn background_reuse_semaphore() -> Arc<Semaphore> {
+    BACKGROUND_REUSE_SEMAPHORE
+        .get_or_init(|| {
+            let cfg = config::get();
+            let limit = cfg.server.process_concurrency.max(1).min(cfg.database.max_connections as usize).max(1);
+            Arc::new(Semaphore::new(limit))
+        })
+        .clone()
+}
+
+async fn acquire_background_reuse_permit(semaphore: Arc<Semaphore>, file_id: i64) -> Option<OwnedSemaphorePermit> {
+    match semaphore.acquire_owned().await {
+        Ok(permit) => Some(permit),
+        Err(e) => {
+            warn!("Background reuse semaphore closed for file {}: {}", file_id, e);
+            None
+        }
+    }
 }
 
 /// 上传文件（支持单个或多个文件）
@@ -409,7 +433,12 @@ pub async fn upload(
                 let search_engine_clone = search_engine.clone();
                 let file_clone = file.clone();
                 let file_id = id;
+                let semaphore = background_reuse_semaphore();
                 spawn(async move {
+                    let Some(_permit) = acquire_background_reuse_permit(semaphore, file_id).await else {
+                        return;
+                    };
+
                     let reuse_result = processor::try_reuse_file_with_file(
                         pool_clone.clone(),
                         search_engine_clone.clone(),
