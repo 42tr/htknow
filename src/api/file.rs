@@ -568,6 +568,45 @@ pub struct UpdateFileReq {
     pub meta: Option<serde_json::Value>,
 }
 
+const MAX_BATCH_DELETE_IDS: usize = 200;
+const SQLITE_DELETE_CHUNK_SIZE: usize = 900;
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct BatchDeleteFilesReq {
+    /// 待删除文件 ID 列表（会自动去重）
+    pub ids: Vec<i64>,
+    /// 严格模式：只要有任意文件不可删，则整批拒绝
+    #[serde(default)]
+    pub strict: bool,
+    /// 是否允许删除处理中(status=2)的文件，默认 false
+    #[serde(default)]
+    pub allow_processing: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BatchDeleteSkippedItem {
+    pub id: i64,
+    pub reason: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BatchDeleteCleanupFailedItem {
+    pub id: i64,
+    /// 清理阶段：file/pdf/search
+    pub stage: String,
+    pub error: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct BatchDeleteFilesResp {
+    pub requested: i64,
+    pub accepted: i64,
+    pub deleted: i64,
+    pub deleted_ids: Vec<i64>,
+    pub skipped: Vec<BatchDeleteSkippedItem>,
+    pub cleanup_failed: Vec<BatchDeleteCleanupFailedItem>,
+}
+
 /// 更新文件
 #[utoipa::path(
     put,
@@ -676,6 +715,32 @@ pub async fn update(
     Ok(Json(file))
 }
 
+/// 批量删除文件
+#[utoipa::path(
+    post,
+    path = "/api/v1/knowledge/files/batch-delete",
+    operation_id = "file_batch_delete",
+    tag = "file",
+    request_body = BatchDeleteFilesReq,
+    responses(
+        (status = 200, description = "批量删除完成（可能部分成功）", body = BatchDeleteFilesResp),
+        (status = 400, description = "请求参数错误"),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn batch_delete(
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
+    Extension(auth_user): Extension<AuthUser>, Json(req): Json<BatchDeleteFilesReq>,
+) -> ApiResult<Json<BatchDeleteFilesResp>> {
+    let result =
+        execute_batch_delete(&pool, &search_engine, &auth_user, req.ids, req.strict, req.allow_processing).await?;
+    Ok(Json(result))
+}
+
 /// 删除文件
 #[utoipa::path(
     delete,
@@ -687,66 +752,234 @@ pub async fn update(
     ),
     responses(
         (status = 200, description = "成功删除文件"),
+        (status = 401, description = "未授权"),
         (status = 404, description = "文件不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn delete(
-    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>, Path(id): Path<i64>,
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
+    Extension(auth_user): Extension<AuthUser>, Path(id): Path<i64>,
 ) -> ApiResult<()> {
-    let overall_start = Instant::now();
-    let step_start = Instant::now();
-    let query = "SELECT * FROM files WHERE id = ?";
-    let file: File = sqlx::query_as(query).bind(id).fetch_one(&pool).await?;
-    debug!("file_delete id={} fetch_file {}ms", id, step_start.elapsed().as_millis());
-
-    let image_paths = collect_image_paths_for_files(&pool, std::slice::from_ref(&id)).await?;
-
-    let step_start = Instant::now();
-    fs::remove_file(file.path).await?;
-    debug!("file_delete id={} remove_file {}ms", id, step_start.elapsed().as_millis());
-
-    let cfg = config::get();
-    let pdf_path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", id));
-    let step_start = Instant::now();
-    if let Err(e) = fs::remove_file(&pdf_path).await {
-        log::warn!("Failed to delete converted pdf {}: {}", pdf_path.display(), e);
+    let result = execute_batch_delete(&pool, &search_engine, &auth_user, vec![id], false, true).await?;
+    if result.deleted == 0 {
+        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
     }
-    debug!("file_delete id={} remove_pdf {}ms", id, step_start.elapsed().as_millis());
+    Ok(())
+}
+
+fn normalize_batch_delete_ids(ids: Vec<i64>) -> ApiResult<Vec<i64>> {
+    if ids.is_empty() {
+        return Err(ApiError::BadRequest("ids is required".to_string()));
+    }
+    if ids.len() > MAX_BATCH_DELETE_IDS {
+        return Err(ApiError::BadRequest(format!("Too many ids: max {}", MAX_BATCH_DELETE_IDS)));
+    }
+
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::with_capacity(ids.len());
+    for id in ids {
+        if id <= 0 {
+            return Err(ApiError::BadRequest(format!("Invalid file id: {}", id)));
+        }
+        if seen.insert(id) {
+            normalized.push(id);
+        }
+    }
+    Ok(normalized)
+}
+
+fn push_i64_list(qb: &mut QueryBuilder<Sqlite>, ids: &[i64]) {
+    let mut separated = qb.separated(", ");
+    for id in ids {
+        separated.push_bind(*id);
+    }
+}
+
+async fn query_deletable_files(pool: &SqlitePool, ids: &[i64], auth_user: &AuthUser) -> Result<Vec<File>, sqlx::Error> {
+    let mut qb = QueryBuilder::<Sqlite>::new("SELECT * FROM files WHERE id IN (");
+    push_i64_list(&mut qb, ids);
+    qb.push(")");
+    if !auth_user.is_admin() {
+        qb.push(" AND user_id = ").push_bind(&auth_user.user_id);
+    }
+    qb.build_query_as::<File>().fetch_all(pool).await
+}
+
+async fn delete_file_rows_in_tx(tx: &mut sqlx::Transaction<'_, Sqlite>, file_ids: &[i64]) -> Result<(), sqlx::Error> {
+    for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
+        let mut mentions_qb = QueryBuilder::<Sqlite>::new(
+            "DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id IN (",
+        );
+        push_i64_list(&mut mentions_qb, chunk);
+        mentions_qb.push("))");
+        mentions_qb.build().execute(&mut **tx).await?;
+    }
+
+    for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
+        let mut positions_qb = QueryBuilder::<Sqlite>::new(
+            "DELETE FROM slice_positions WHERE slice_id IN (SELECT id FROM slices WHERE file_id IN (",
+        );
+        push_i64_list(&mut positions_qb, chunk);
+        positions_qb.push("))");
+        positions_qb.build().execute(&mut **tx).await?;
+    }
+
+    for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
+        let mut slices_qb = QueryBuilder::<Sqlite>::new("DELETE FROM slices WHERE file_id IN (");
+        push_i64_list(&mut slices_qb, chunk);
+        slices_qb.push(")");
+        slices_qb.build().execute(&mut **tx).await?;
+    }
+
+    for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
+        let mut pdf_qb = QueryBuilder::<Sqlite>::new("DELETE FROM pdf_contents WHERE file_id IN (");
+        push_i64_list(&mut pdf_qb, chunk);
+        pdf_qb.push(")");
+        pdf_qb.build().execute(&mut **tx).await?;
+    }
+
+    for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
+        let mut files_qb = QueryBuilder::<Sqlite>::new("DELETE FROM files WHERE id IN (");
+        push_i64_list(&mut files_qb, chunk);
+        files_qb.push(")");
+        files_qb.build().execute(&mut **tx).await?;
+    }
+
+    Ok(())
+}
+
+async fn cleanup_deleted_files(
+    search_engine: &SearchEngine, files: &[File], image_paths: Vec<String>,
+) -> Vec<BatchDeleteCleanupFailedItem> {
+    let mut cleanup_failed = Vec::new();
+    let cfg = config::get();
+    for file in files {
+        if let Err(e) = fs::remove_file(&file.path).await {
+            if !matches!(e.kind(), std::io::ErrorKind::NotFound) {
+                warn!("Failed to delete file {}: {}", file.path, e);
+                cleanup_failed.push(BatchDeleteCleanupFailedItem {
+                    id: file.id,
+                    stage: "file".to_string(),
+                    error: e.to_string(),
+                });
+            }
+        }
+
+        let pdf_path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", file.id));
+        if let Err(e) = fs::remove_file(&pdf_path).await {
+            if !matches!(e.kind(), std::io::ErrorKind::NotFound) {
+                warn!("Failed to delete converted pdf {}: {}", pdf_path.display(), e);
+                cleanup_failed.push(BatchDeleteCleanupFailedItem {
+                    id: file.id,
+                    stage: "pdf".to_string(),
+                    error: e.to_string(),
+                });
+            }
+        }
+
+        if let Err(e) = search_engine.delete(Some(file.id), None).await {
+            warn!("Failed to delete search index for file {}: {}", file.id, e);
+            cleanup_failed.push(BatchDeleteCleanupFailedItem {
+                id: file.id,
+                stage: "search".to_string(),
+                error: e.to_string(),
+            });
+        }
+    }
 
     remove_image_files(image_paths).await;
+    cleanup_failed
+}
+
+async fn execute_batch_delete(
+    pool: &SqlitePool, search_engine: &SearchEngine, auth_user: &AuthUser, ids: Vec<i64>, strict: bool,
+    allow_processing: bool,
+) -> ApiResult<BatchDeleteFilesResp> {
+    let overall_start = Instant::now();
+    let ids = normalize_batch_delete_ids(ids)?;
+    let requested = ids.len() as i64;
 
     let step_start = Instant::now();
-    search_engine.delete(Some(id), None).await?;
-    debug!("file_delete id={} search_delete {}ms", id, step_start.elapsed().as_millis());
+    let deletable_files = query_deletable_files(pool, &ids, auth_user).await?;
+    debug!(
+        "file_batch_delete query_deletable count={} requested={} {}ms",
+        deletable_files.len(),
+        ids.len(),
+        step_start.elapsed().as_millis()
+    );
+
+    let mut file_map: HashMap<i64, File> = deletable_files.into_iter().map(|file| (file.id, file)).collect();
+    let mut files_to_delete = Vec::new();
+    let mut skipped = Vec::new();
+    for id in &ids {
+        let Some(file) = file_map.remove(id) else {
+            skipped.push(BatchDeleteSkippedItem { id: *id, reason: "not_found_or_no_permission".to_string() });
+            continue;
+        };
+        if !allow_processing && file.status == 2 {
+            skipped.push(BatchDeleteSkippedItem { id: *id, reason: "processing".to_string() });
+            continue;
+        }
+        files_to_delete.push(file);
+    }
+
+    if strict && !skipped.is_empty() {
+        let ids = skipped.iter().map(|item| item.id.to_string()).collect::<Vec<_>>().join(", ");
+        return Err(ApiError::BadRequest(format!("Batch delete precheck failed for ids: {}", ids)));
+    }
+
+    let file_ids: Vec<i64> = files_to_delete.iter().map(|file| file.id).collect();
+    let accepted = file_ids.len() as i64;
+    if file_ids.is_empty() {
+        return Ok(BatchDeleteFilesResp {
+            requested,
+            accepted,
+            deleted: 0,
+            deleted_ids: Vec::new(),
+            skipped,
+            cleanup_failed: Vec::new(),
+        });
+    }
 
     let step_start = Instant::now();
-    sqlx::query("DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
-        .bind(id)
-        .execute(&pool)
-        .await?;
-    debug!("file_delete id={} delete_mentions {}ms", id, step_start.elapsed().as_millis());
+    let image_paths = collect_image_paths_for_files(pool, &file_ids).await?;
+    debug!("file_batch_delete collect_image_paths ids={} {}ms", file_ids.len(), step_start.elapsed().as_millis());
 
     let step_start = Instant::now();
-    sqlx::query("DELETE FROM slice_positions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
-        .bind(id)
-        .execute(&pool)
-        .await?;
-    debug!("file_delete id={} delete_slice_positions {}ms", id, step_start.elapsed().as_millis());
+    let mut tx = pool.begin().await?;
+    delete_file_rows_in_tx(&mut tx, &file_ids).await?;
+    tx.commit().await?;
+    debug!("file_batch_delete delete_rows ids={} {}ms", file_ids.len(), step_start.elapsed().as_millis());
 
     let step_start = Instant::now();
-    sqlx::query("DELETE FROM slices WHERE file_id = ?").bind(id).execute(&pool).await?;
-    debug!("file_delete id={} delete_slices {}ms", id, step_start.elapsed().as_millis());
+    let cleanup_failed = cleanup_deleted_files(search_engine, &files_to_delete, image_paths).await;
+    debug!(
+        "file_batch_delete cleanup ids={} failed={} {}ms",
+        file_ids.len(),
+        cleanup_failed.len(),
+        step_start.elapsed().as_millis()
+    );
 
-    let step_start = Instant::now();
-    sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(id).execute(&pool).await?;
-    debug!("file_delete id={} delete_pdf_contents {}ms", id, step_start.elapsed().as_millis());
+    debug!(
+        "file_batch_delete total requested={} accepted={} deleted={} {}ms",
+        requested,
+        accepted,
+        file_ids.len(),
+        overall_start.elapsed().as_millis()
+    );
 
-    let step_start = Instant::now();
-    sqlx::query("DELETE FROM files WHERE id = ?").bind(id).execute(&pool).await?;
-    debug!("file_delete id={} delete_file_row {}ms", id, step_start.elapsed().as_millis());
-
-    debug!("file_delete id={} total {}ms", id, overall_start.elapsed().as_millis());
-    Ok(())
+    Ok(BatchDeleteFilesResp {
+        requested,
+        accepted,
+        deleted: file_ids.len() as i64,
+        deleted_ids: file_ids,
+        skipped,
+        cleanup_failed,
+    })
 }
 
 pub(crate) async fn collect_image_paths_for_files(

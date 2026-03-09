@@ -440,6 +440,25 @@ export const api = {
     return
   },
 
+  async batchDeleteFiles(ids, options = {}) {
+    const {
+      strict = false,
+      allowProcessing = false,
+    } = options
+
+    const response = await fetch(`${API_BASE}/files/batch-delete`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({
+        ids,
+        strict,
+        allow_processing: allowProcessing,
+      }),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '批量删除文件失败'))
+    return response.json()
+  },
+
   async getFiles(kbId, tag = null) {
     let url = `${API_BASE}/files/`
     const params = []
