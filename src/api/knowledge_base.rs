@@ -25,6 +25,14 @@ fn normalize_kb_type(kb_type: Option<String>) -> Result<String, ApiError> {
     }
 }
 
+fn normalize_parse_priority(parse_priority: Option<i64>) -> Result<i64, ApiError> {
+    let value = parse_priority.unwrap_or(50);
+    if !(0..=100).contains(&value) {
+        return Err(ApiError::BadRequest("Invalid parse_priority. Use integer in [0, 100].".to_string()));
+    }
+    Ok(value)
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
 pub struct Knowledge {
     pub id: i64,
@@ -35,6 +43,7 @@ pub struct Knowledge {
     pub kb_type: String,
     pub parent_id: Option<i64>,
     pub is_public: bool,
+    pub parse_priority: i64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
@@ -47,6 +56,7 @@ pub struct KnowledgeResponse {
     pub kb_type: String,
     pub parent_id: Option<i64>,
     pub is_public: bool,
+    pub parse_priority: i64,
     pub file_count: i64,
     pub children_kb_count: i64,
 }
@@ -61,6 +71,7 @@ pub struct KnowledgeDetailResponse {
     pub kb_type: String,
     pub parent_id: Option<i64>,
     pub is_public: bool,
+    pub parse_priority: i64,
     pub file_count: i64,
     pub children_kb_count: i64,
     pub children_kbs: Vec<KnowledgeResponse>,
@@ -120,6 +131,7 @@ pub struct KnowledgeTreeNode {
     pub kb_type: String,
     pub parent_id: Option<i64>,
     pub is_public: bool,
+    pub parse_priority: i64,
     pub files: Vec<FileWithoutContent>,
     #[schema(no_recursion)]
     pub children: Vec<KnowledgeTreeNode>,
@@ -183,7 +195,7 @@ pub async fn list(
 
     // Start building the query
     let mut qb = QueryBuilder::<Sqlite>::new(
-        "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE 1=1 ",
+        "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE 1=1 ",
     );
     if !is_admin {
         qb.push(" AND (user_id = ").push_bind(auth_user.user_id.clone()).push(" OR is_public = 1)");
@@ -235,6 +247,7 @@ pub async fn list(
             kb_type: kb.kb_type.clone(),
             parent_id: kb.parent_id,
             is_public: kb.is_public,
+            parse_priority: kb.parse_priority,
             file_count: *file_counts.get(&kb.id).unwrap_or(&0),
             children_kb_count: *children_counts.get(&kb.id).unwrap_or(&0),
         })
@@ -345,6 +358,7 @@ pub struct KnowledgeCreateReq {
     pub kb_type: Option<String>,
     pub parent_id: Option<i64>,
     pub is_public: Option<bool>,
+    pub parse_priority: Option<i64>,
 }
 
 /// 创建知识库
@@ -370,7 +384,8 @@ pub async fn create(
 ) -> ApiResult<Json<Knowledge>> {
     let is_public = if knowledge.is_public.unwrap_or(false) { 1 } else { 0 };
     let kb_type = normalize_kb_type(knowledge.kb_type)?;
-    let query = "INSERT INTO knowledge_bases (user_id, user_name, name, description, kb_type, parent_id, is_public) VALUES (?, ?, ?, ?, ?, ?, ?)";
+    let parse_priority = normalize_parse_priority(knowledge.parse_priority)?;
+    let query = "INSERT INTO knowledge_bases (user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
     let id = sqlx::query(query)
         .bind(auth_user.user_id)
         .bind(auth_user.user_name)
@@ -379,11 +394,12 @@ pub async fn create(
         .bind(kb_type)
         .bind(knowledge.parent_id)
         .bind(is_public)
+        .bind(parse_priority)
         .execute(&pool)
         .await?
         .last_insert_rowid();
     let kb = sqlx::query_as(
-        "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ?",
+        "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&pool)
@@ -399,6 +415,7 @@ pub struct KnowledgeUpdateReq {
     #[serde(default, with = "::serde_with::rust::double_option")]
     pub parent_id: Option<Option<i64>>,
     pub is_public: Option<bool>,
+    pub parse_priority: Option<i64>,
 }
 
 /// 更新知识库
@@ -425,6 +442,7 @@ pub async fn update(
     Path(id): Path<i64>, State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
     Json(knowledge): Json<KnowledgeUpdateReq>,
 ) -> ApiResult<Json<Knowledge>> {
+    let is_admin = auth_user.is_admin();
     // Prevent moving a knowledge base into itself.
     if let Some(Some(parent_id)) = knowledge.parent_id {
         if parent_id == id {
@@ -481,23 +499,43 @@ pub async fn update(
         qb.push_bind(if is_public { 1 } else { 0 });
         has_update = true;
     }
+    if let Some(parse_priority) = knowledge.parse_priority {
+        let parse_priority = normalize_parse_priority(Some(parse_priority))?;
+        if has_update {
+            qb.push(", ");
+        }
+        qb.push("parse_priority = ");
+        qb.push_bind(parse_priority);
+        has_update = true;
+    }
 
     if !has_update {
         // If nothing is being updated, just return the current state of kb, ensuring it exists and belongs to user.
-        let kb = sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
-        )
-        .bind(id)
-        .bind(auth_user.user_id)
-        .fetch_one(&pool)
-        .await?;
+        let kb = if is_admin {
+            sqlx::query_as(
+                "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
+            )
+            .bind(id)
+            .fetch_one(&pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ? AND user_id = ?",
+            )
+            .bind(id)
+            .bind(auth_user.user_id.clone())
+            .fetch_one(&pool)
+            .await?
+        };
         return Ok(Json(kb));
     }
 
     qb.push(" WHERE id = ");
     qb.push_bind(id);
-    qb.push(" AND user_id = ");
-    qb.push_bind(auth_user.user_id.clone());
+    if !is_admin {
+        qb.push(" AND user_id = ");
+        qb.push_bind(auth_user.user_id.clone());
+    }
 
     let result = qb.build().execute(&pool).await?;
 
@@ -507,13 +545,22 @@ pub async fn update(
         ));
     }
 
-    let kb = sqlx::query_as(
-        "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND user_id = ?",
-    )
-    .bind(id)
-    .bind(auth_user.user_id)
-    .fetch_one(&pool)
-    .await?;
+    let kb = if is_admin {
+        sqlx::query_as(
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await?
+    } else {
+        sqlx::query_as(
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ? AND user_id = ?",
+        )
+        .bind(id)
+        .bind(auth_user.user_id.clone())
+        .fetch_one(&pool)
+        .await?
+    };
     Ok(Json(kb))
 }
 
@@ -546,14 +593,14 @@ pub async fn get(
     // 1. Fetch the main knowledge base and verify ownership
     let main_kb: Knowledge = if is_admin {
         sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ?",
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
         )
         .bind(id)
         .fetch_one(&pool)
         .await?
     } else {
         sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
         )
         .bind(id)
         .bind(user_id.clone())
@@ -564,14 +611,14 @@ pub async fn get(
     // 2. Fetch children KBs and files in parallel
     let children_future = if is_admin {
         sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public \
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority \
              FROM knowledge_bases WHERE parent_id = ? ORDER BY name",
         )
         .bind(id)
         .fetch_all(&pool)
     } else {
         sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public \
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority \
              FROM knowledge_bases WHERE parent_id = ? AND (user_id = ? OR is_public = 1) ORDER BY name",
         )
         .bind(id)
@@ -619,6 +666,7 @@ pub async fn get(
             kb_type: kb.kb_type,
             parent_id: kb.parent_id,
             is_public: kb.is_public,
+            parse_priority: kb.parse_priority,
             file_count: *file_counts.get(&kb.id).unwrap_or(&0),
             children_kb_count: *children_counts.get(&kb.id).unwrap_or(&0),
         })
@@ -639,14 +687,14 @@ pub async fn get(
         // But for typical UI breadcrumbs, this iterative approach is simpler and often sufficient.
         let parent_kb: Knowledge = if is_admin {
             sqlx::query_as(
-                "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ?",
+                "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
             )
             .bind(parent_id)
             .fetch_one(&pool)
             .await?
         } else {
             sqlx::query_as(
-                "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
+                "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
             )
             .bind(parent_id)
             .bind(user_id.clone())
@@ -668,6 +716,7 @@ pub async fn get(
         kb_type: main_kb.kb_type,
         parent_id: main_kb.parent_id,
         is_public: main_kb.is_public,
+        parse_priority: main_kb.parse_priority,
         file_count,
         children_kb_count,
         children_kbs,
@@ -939,14 +988,14 @@ async fn build_tree_recursive(
 ) -> anyhow::Result<Vec<KnowledgeTreeNode>> {
     let children: Vec<Knowledge> = if is_admin {
         sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE parent_id IS NOT DISTINCT FROM ? ORDER BY name",
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE parent_id IS NOT DISTINCT FROM ? ORDER BY name",
         )
         .bind(parent_id)
         .fetch_all(pool)
         .await?
     } else {
         sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE parent_id IS NOT DISTINCT FROM ? AND (user_id = ? OR is_public = 1) ORDER BY name",
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE parent_id IS NOT DISTINCT FROM ? AND (user_id = ? OR is_public = 1) ORDER BY name",
         )
         .bind(parent_id)
         .bind(user_id)
@@ -971,6 +1020,7 @@ async fn build_tree_recursive(
             kb_type: kb.kb_type,
             parent_id: kb.parent_id,
             is_public: kb.is_public,
+            parse_priority: kb.parse_priority,
             files,
             children: sub_children,
         });
@@ -983,14 +1033,14 @@ async fn build_subtree_recursive(
 ) -> anyhow::Result<Option<KnowledgeTreeNode>> {
     let kb: Option<Knowledge> = if is_admin {
         sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ?",
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
         )
         .bind(kb_id)
         .fetch_optional(pool)
         .await?
     } else {
         sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
         )
         .bind(kb_id)
         .bind(user_id)
@@ -1015,6 +1065,7 @@ async fn build_subtree_recursive(
                 kb_type: kb_info.kb_type,
                 parent_id: kb_info.parent_id,
                 is_public: kb_info.is_public,
+                parse_priority: kb_info.parse_priority,
                 files,
                 children,
             }))

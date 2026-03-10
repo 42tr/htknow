@@ -27,6 +27,7 @@ CREATE TABLE IF NOT EXISTS knowledge_bases (
     kb_type TEXT NOT NULL DEFAULT 'analysis', -- 知识库类型: analysis-分析型, storage-存储型
     parent_id INTEGER, -- 父级知识库ID
     is_public INTEGER NOT NULL DEFAULT 0, -- 是否公开: 0-私有, 1-公开
+    parse_priority INTEGER NOT NULL DEFAULT 50, -- 解析优先级: 0-100，越大越优先
     created_at INTEGER DEFAULT (strftime('%s','now')),
     updated_at INTEGER DEFAULT (strftime('%s','now')),
     FOREIGN KEY(parent_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE

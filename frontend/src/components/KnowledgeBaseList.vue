@@ -14,6 +14,8 @@ const breadcrumbs = ref([])
 const loading = ref(true)
 const error = ref('')
 const reparseLoading = ref(false)
+const priorityDrafts = ref({})
+const prioritySaving = ref({})
 const createEmptyStats = () => ({
   total: 0,
   pending: 0,
@@ -81,6 +83,11 @@ const loadKbContent = async (kbId) => {
       newCurrentKb = { id: data.id, name: data.name, description: data.description, kb_type: data.kb_type }
       breadcrumbs.value = data.path || []
     }
+    const nextPriorityDrafts = {}
+    for (const kb of childrenKbs.value) {
+      nextPriorityDrafts[kb.id] = Number.isInteger(kb.parse_priority) ? kb.parse_priority : 50
+    }
+    priorityDrafts.value = nextPriorityDrafts
     currentKb.value = newCurrentKb;
     setCurrentKb(newCurrentKb); // Update global store
     await fetchStats(targetId)
@@ -143,6 +150,32 @@ const handleReparse = async () => {
     alert('重新解析失败：' + e.message)
   } finally {
     reparseLoading.value = false
+  }
+}
+
+const handleSaveParsePriority = async (e, kb) => {
+  e.stopPropagation()
+  if (!kb || kb.kb_type === 'storage') return
+
+  const raw = priorityDrafts.value[kb.id]
+  const value = Number(raw)
+  if (!Number.isInteger(value) || value < 0 || value > 100) {
+    alert('解析优先级必须是 0 到 100 的整数')
+    return
+  }
+  if (value === kb.parse_priority) {
+    return
+  }
+
+  prioritySaving.value[kb.id] = true
+  try {
+    await api.updateKnowledgeBase(kb.id, { parse_priority: value })
+    kb.parse_priority = value
+  } catch (err) {
+    alert('保存优先级失败：' + (err?.message || '未知错误'))
+    priorityDrafts.value[kb.id] = Number.isInteger(kb.parse_priority) ? kb.parse_priority : 50
+  } finally {
+    prioritySaving.value[kb.id] = false
   }
 }
 
@@ -280,6 +313,31 @@ onMounted(() => {
              </span>
            </h3>
            <p class="text-sm text-slate-500 line-clamp-2 mb-3">{{ kb.description || '暂无描述' }}</p>
+           <div class="mb-3 p-2 rounded-lg border border-slate-200 bg-slate-50" @click.stop>
+             <div class="flex items-center justify-between gap-2">
+               <label class="text-xs text-slate-600">解析优先级 (0-100)</label>
+               <span class="text-xs text-slate-400" v-if="kb.kb_type === 'storage'">存储型不参与解析</span>
+             </div>
+             <div class="mt-2 flex items-center gap-2">
+               <input
+                 v-model.number="priorityDrafts[kb.id]"
+                 type="number"
+                 min="0"
+                 max="100"
+                 step="1"
+                 :disabled="kb.kb_type === 'storage' || prioritySaving[kb.id]"
+                 class="w-24 px-2 py-1 text-sm border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-slate-100 disabled:text-slate-400"
+               />
+               <button
+                 type="button"
+                 :disabled="kb.kb_type === 'storage' || prioritySaving[kb.id]"
+                 @click="(e) => handleSaveParsePriority(e, kb)"
+                 class="px-2.5 py-1 text-xs font-medium rounded-md border border-slate-200 bg-white text-slate-700 hover:border-blue-300 hover:text-blue-600 disabled:bg-slate-100 disabled:text-slate-400 disabled:border-slate-200"
+               >
+                 {{ prioritySaving[kb.id] ? '保存中...' : '保存' }}
+               </button>
+             </div>
+           </div>
            <div class="flex items-center justify-between text-xs text-slate-400">
               <span>{{ kb.children_kb_count || 0 }} 个子知识库</span>
               <span>{{ kb.file_count || 0 }} 个文件</span>

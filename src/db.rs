@@ -40,6 +40,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     // 自动创建表
     create_tables(&pool).await?;
     ensure_kb_type_column(&pool).await?;
+    ensure_parse_priority_column(&pool).await?;
     ensure_user_name_columns(&pool).await?;
     ensure_file_size_column(&pool).await?;
     ensure_pdf_contents_bbox_column(&pool).await?;
@@ -133,6 +134,23 @@ async fn ensure_kb_type_column(pool: &SqlitePool) -> anyhow::Result<()> {
 
     if !has_kb_type {
         sqlx::query("ALTER TABLE knowledge_bases ADD COLUMN kb_type TEXT NOT NULL DEFAULT 'analysis'")
+            .execute(pool)
+            .await?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_parse_priority_column(pool: &SqlitePool) -> anyhow::Result<()> {
+    let columns = sqlx::query("PRAGMA table_info(knowledge_bases);").fetch_all(pool).await?;
+    let has_parse_priority = columns.iter().any(|row| row.get::<String, _>("name") == "parse_priority");
+
+    if !has_parse_priority {
+        sqlx::query("ALTER TABLE knowledge_bases ADD COLUMN parse_priority INTEGER NOT NULL DEFAULT 50")
+            .execute(pool)
+            .await?;
+    } else {
+        sqlx::query("UPDATE knowledge_bases SET parse_priority = 50 WHERE parse_priority IS NULL")
             .execute(pool)
             .await?;
     }

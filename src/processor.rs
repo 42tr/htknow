@@ -5,7 +5,6 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
-use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
 use lopdf::Document;
 use reqwest::multipart;
@@ -424,11 +423,6 @@ impl FileProcessor {
         if is_parse_paused() {
             return Ok(false);
         }
-        let files = self.fetch_pending_files().await?;
-
-        if files.is_empty() {
-            return Ok(false);
-        }
 
         let cfg = config::get();
         let configured_concurrency = cfg.server.process_concurrency.max(1);
@@ -440,22 +434,39 @@ impl FileProcessor {
                 configured_concurrency, concurrency, cfg.database.max_connections
             );
         }
-        info!("Found {} pending files to process (concurrency: {})", files.len(), concurrency);
+        info!("Processing pending queue with dynamic claiming (concurrency: {})", concurrency);
 
-        let results: Vec<_> = stream::iter(files)
-            .map(|file| {
-                let processor = Arc::clone(self);
-                async move {
-                    let result = processor.process_file(&file).await;
-                    (file, result)
-                }
-            })
-            .buffer_unordered(concurrency)
-            .collect()
-            .await;
+        let mut handles = Vec::with_capacity(concurrency);
+        for worker_idx in 0..concurrency {
+            let processor = Arc::clone(self);
+            handles.push(tokio::spawn(async move { processor.run_pending_worker(worker_idx).await }));
+        }
 
-        for (file, result) in results {
-            if let Err(e) = result {
+        let mut claimed_total = 0usize;
+        for handle in handles {
+            let worker_claimed = handle.await.map_err(|e| anyhow::anyhow!("pending worker join failed: {}", e))??;
+            claimed_total += worker_claimed;
+        }
+
+        Ok(claimed_total > 0)
+    }
+
+    async fn run_pending_worker(self: Arc<Self>, worker_idx: usize) -> anyhow::Result<usize> {
+        let mut claimed = 0usize;
+
+        loop {
+            if is_parse_paused() {
+                break;
+            }
+
+            let Some(file) = self.claim_next_pending_file().await? else {
+                break;
+            };
+            claimed += 1;
+
+            info!("Pending worker {} claimed file {} (kb_id={:?})", worker_idx, file.id, file.kb_id);
+
+            if let Err(e) = self.process_file_claimed(&file).await {
                 error!("Failed to process file {}: {}", file.id, e);
                 if let Err(cleanup_err) = self.cleanup_processing_file_data_with_retry(file.id, 3).await {
                     error!("Failed to cleanup processing data for file {}: {}", file.id, cleanup_err);
@@ -466,15 +477,30 @@ impl FileProcessor {
             }
         }
 
-        // 返回 true 表示可能还有更多文件（因为我们限制了每次查询的数量）
-        Ok(true)
+        Ok(claimed)
     }
 
-    /// 从数据库获取未处理的文件
-    async fn fetch_pending_files(&self) -> anyhow::Result<Vec<File>> {
-        let sql = "SELECT * FROM files WHERE status = 0 ORDER BY created_at ASC LIMIT 10";
-        let files = sqlx::query_as::<_, File>(sql).fetch_all(&self.pool).await?;
-        Ok(files)
+    /// 原子领取一个待处理文件，按知识库解析优先级排序
+    async fn claim_next_pending_file(&self) -> anyhow::Result<Option<File>> {
+        let mut tx = self.pool.begin().await?;
+        let file = sqlx::query_as::<_, File>(
+            "WITH candidate AS (
+                SELECT f.id
+                FROM files f
+                LEFT JOIN knowledge_bases kb ON kb.id = f.kb_id
+                WHERE f.status = 0
+                ORDER BY COALESCE(kb.parse_priority, 50) DESC, f.created_at ASC
+                LIMIT 1
+             )
+             UPDATE files
+             SET status = 2, updated_at = strftime('%s','now')
+             WHERE id = (SELECT id FROM candidate)
+             RETURNING *",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(file)
     }
 
     async fn try_reuse_existing_data(&self, file: &File) -> anyhow::Result<bool> {
@@ -508,6 +534,14 @@ impl FileProcessor {
 
     /// 处理单个文件
     async fn process_file(&self, file: &File) -> anyhow::Result<()> {
+        self.process_file_inner(file, false).await
+    }
+
+    async fn process_file_claimed(&self, file: &File) -> anyhow::Result<()> {
+        self.process_file_inner(file, true).await
+    }
+
+    async fn process_file_inner(&self, file: &File, already_claimed: bool) -> anyhow::Result<()> {
         if is_parse_paused() {
             anyhow::bail!("parse is paused for index maintenance");
         }
@@ -521,8 +555,12 @@ impl FileProcessor {
             .fetch_optional(&self.pool)
             .await?;
         if let Some(status) = current_status {
-            if status != 0 {
+            if !already_claimed && status != 0 {
                 info!("File {} status changed to {}, skipping processing", file.id, status);
+                return Ok(());
+            }
+            if already_claimed && status != 2 {
+                info!("Claimed file {} status changed to {}, skipping processing", file.id, status);
                 return Ok(());
             }
         }
