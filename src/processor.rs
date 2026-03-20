@@ -1,7 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet}, sync::{
-        Arc, atomic::{AtomicBool, Ordering}
-    }, time::Duration
+    collections::{HashMap, HashSet}, future::Future, sync::{
+        Arc, atomic::{AtomicBool, AtomicU64, Ordering}
+    }, time::{Duration, Instant, SystemTime, UNIX_EPOCH}
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -245,6 +245,175 @@ pub struct FileProcessor {
 }
 
 static PARSE_PAUSED: AtomicBool = AtomicBool::new(false);
+static PARSE_TIMING_RUN_SEQ: AtomicU64 = AtomicU64::new(1);
+
+struct ParseTimingCtx {
+    file_id: i64,
+    filename: String,
+    run_id: String,
+    pipeline: &'static str,
+    run_started: Instant,
+    step_seq: u32,
+}
+
+impl ParseTimingCtx {
+    fn new(file: &File, pipeline: &'static str) -> Self {
+        let seq = PARSE_TIMING_RUN_SEQ.fetch_add(1, Ordering::Relaxed);
+        let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or_default();
+        let run_id = format!("f{}-{}-{}", file.id, now_ms, seq);
+        let ctx = Self {
+            file_id: file.id,
+            filename: file.filename.clone(),
+            run_id,
+            pipeline,
+            run_started: Instant::now(),
+            step_seq: 0,
+        };
+        debug!(
+            target: "parse_timing",
+            "[parse_timing] event=run_start file_id={} filename={:?} run_id={} pipeline={}",
+            ctx.file_id,
+            ctx.filename,
+            ctx.run_id,
+            ctx.pipeline
+        );
+        ctx
+    }
+
+    fn set_pipeline(&mut self, pipeline: &'static str) {
+        if self.pipeline == pipeline {
+            return;
+        }
+        self.pipeline = pipeline;
+        debug!(
+            target: "parse_timing",
+            "[parse_timing] event=pipeline_switch file_id={} run_id={} pipeline={}",
+            self.file_id,
+            self.run_id,
+            self.pipeline
+        );
+    }
+
+    fn step_start(&mut self, step: &'static str) -> (u32, Instant) {
+        self.step_seq += 1;
+        let seq = self.step_seq;
+        debug!(
+            target: "parse_timing",
+            "[parse_timing] event=step_start file_id={} run_id={} pipeline={} seq={} step={}",
+            self.file_id,
+            self.run_id,
+            self.pipeline,
+            seq,
+            step
+        );
+        (seq, Instant::now())
+    }
+
+    fn step_ok(&self, step: &'static str, seq: u32, started_at: Instant) {
+        debug!(
+            target: "parse_timing",
+            "[parse_timing] event=step_end file_id={} run_id={} pipeline={} seq={} step={} status=ok duration_ms={}",
+            self.file_id,
+            self.run_id,
+            self.pipeline,
+            seq,
+            step,
+            started_at.elapsed().as_millis()
+        );
+    }
+
+    fn step_err(&self, step: &'static str, seq: u32, started_at: Instant, err: &anyhow::Error) {
+        let err_detail = format!("{:#}", err);
+        debug!(
+            target: "parse_timing",
+            "[parse_timing] event=step_end file_id={} run_id={} pipeline={} seq={} step={} status=err duration_ms={} err={:?}",
+            self.file_id,
+            self.run_id,
+            self.pipeline,
+            seq,
+            step,
+            started_at.elapsed().as_millis(),
+            err_detail
+        );
+    }
+
+    fn finish(&self, result: &anyhow::Result<()>) {
+        match result {
+            Ok(_) => {
+                debug!(
+                    target: "parse_timing",
+                    "[parse_timing] event=run_end file_id={} filename={:?} run_id={} pipeline={} status=ok total_duration_ms={} steps={}",
+                    self.file_id,
+                    self.filename,
+                    self.run_id,
+                    self.pipeline,
+                    self.run_started.elapsed().as_millis(),
+                    self.step_seq
+                );
+            }
+            Err(err) => {
+                let err_detail = format!("{:#}", err);
+                debug!(
+                    target: "parse_timing",
+                    "[parse_timing] event=run_end file_id={} filename={:?} run_id={} pipeline={} status=err total_duration_ms={} steps={} err={:?}",
+                    self.file_id,
+                    self.filename,
+                    self.run_id,
+                    self.pipeline,
+                    self.run_started.elapsed().as_millis(),
+                    self.step_seq,
+                    err_detail
+                );
+            }
+        }
+    }
+
+    async fn step<T, Fut>(&mut self, step: &'static str, fut: Fut) -> anyhow::Result<T>
+    where
+        Fut: Future<Output=anyhow::Result<T>>, {
+        let (seq, started_at) = self.step_start(step);
+        match fut.await {
+            Ok(value) => {
+                self.step_ok(step, seq, started_at);
+                Ok(value)
+            }
+            Err(err) => {
+                self.step_err(step, seq, started_at, &err);
+                Err(err)
+            }
+        }
+    }
+}
+
+async fn timed_step_opt<T, Fut>(
+    timing: Option<&mut ParseTimingCtx>, step: &'static str, fut: Fut,
+) -> anyhow::Result<T>
+where
+    Fut: Future<Output=anyhow::Result<T>>, {
+    match timing {
+        Some(ctx) => ctx.step(step, fut).await,
+        None => fut.await,
+    }
+}
+
+fn summarize_http_body(body_bytes: &[u8]) -> String {
+    if body_bytes.is_empty() {
+        return "<empty response body>".to_string();
+    }
+
+    let raw = String::from_utf8_lossy(body_bytes).trim().to_string();
+    if raw.is_empty() {
+        return "<blank response body>".to_string();
+    }
+
+    const MAX_CHARS: usize = 800;
+    if raw.chars().count() > MAX_CHARS {
+        let preview: String = raw.chars().take(MAX_CHARS).collect();
+        format!("{}...(truncated, {} bytes)", preview, body_bytes.len())
+    } else {
+        raw
+    }
+}
 
 pub fn set_parse_paused(paused: bool) {
     PARSE_PAUSED.store(paused, Ordering::SeqCst);
@@ -542,159 +711,200 @@ impl FileProcessor {
     }
 
     async fn process_file_inner(&self, file: &File, already_claimed: bool) -> anyhow::Result<()> {
-        if is_parse_paused() {
-            anyhow::bail!("parse is paused for index maintenance");
-        }
-        info!("Processing file: {} ({})", file.filename, file.id);
-        if !self.ensure_file_exists(file.id, "process start").await? {
-            return Ok(());
-        }
-
-        let current_status: Option<i32> = sqlx::query_scalar("SELECT status FROM files WHERE id = ?")
-            .bind(file.id)
-            .fetch_optional(&self.pool)
-            .await?;
-        if let Some(status) = current_status {
-            if !already_claimed && status != 0 {
-                info!("File {} status changed to {}, skipping processing", file.id, status);
+        let mut timing = ParseTimingCtx::new(file, "dispatch");
+        let result = async {
+            if is_parse_paused() {
+                anyhow::bail!("parse is paused for index maintenance");
+            }
+            info!("Processing file: {} ({})", file.filename, file.id);
+            if !self.ensure_file_exists(file.id, "process start").await? {
                 return Ok(());
             }
-            if already_claimed && status != 2 {
-                info!("Claimed file {} status changed to {}, skipping processing", file.id, status);
-                return Ok(());
-            }
-        }
 
-        if self.is_storage_kb(file.kb_id).await? {
-            info!("Skipping parsing for storage knowledge base file {}", file.id);
-            self.mark_file_storage_skipped(file.id).await?;
-            return Ok(());
-        }
-
-        if self.try_reuse_existing_data(file).await? {
-            info!("File {} reused existing parsed data, skipping processing pipeline", file.id);
-            return Ok(());
-        }
-
-        let sql = "UPDATE files SET status = 2, updated_at = strftime('%s','now') WHERE id = ?";
-        sqlx::query(sql).bind(file.id).execute(&self.pool).await?;
-
-        // 检查文件是否为 PDF 或图片
-        let filename_lower = file.filename.to_lowercase();
-        let is_pdf = filename_lower.ends_with(".pdf");
-        let is_image = Self::is_image_file(&filename_lower);
-        let is_audio = Self::is_audio_file(&filename_lower);
-
-        // 检查文件是否为 Word 或 Excel 文档
-        let is_word = filename_lower.ends_with(".doc") || filename_lower.ends_with(".docx");
-        let is_excel = filename_lower.ends_with(".xls") || filename_lower.ends_with(".xlsx");
-
-        let cfg = config::get();
-        let custom_url = cfg.services.custom_parse_url.as_deref();
-        let custom_reuse_url = cfg.services.custom_parse_reuse_url.as_deref();
-
-        if let Some(reuse_url) = custom_reuse_url {
-            info!("Custom parse reuse enabled");
-            match self.process_file_with_custom_reuse_parser(file, reuse_url).await {
-                Ok(true) => {
-                    info!(
-                        "Custom parse reuse enabled, reused existing pdf_contents for file {} via {}",
-                        file.id, reuse_url
-                    );
+            let current_status: Option<i32> = timing
+                .step("status_check", async {
+                    Ok(sqlx::query_scalar("SELECT status FROM files WHERE id = ?")
+                        .bind(file.id)
+                        .fetch_optional(&self.pool)
+                        .await?)
+                })
+                .await?;
+            if let Some(status) = current_status {
+                if !already_claimed && status != 0 {
+                    info!("File {} status changed to {}, skipping processing", file.id, status);
                     return Ok(());
                 }
-                Ok(false) => {}
-                Err(err) => {
-                    error!("Custom parse reuse failed for file {}: {}", file.id, err);
+                if already_claimed && status != 2 {
+                    info!("Claimed file {} status changed to {}, skipping processing", file.id, status);
+                    return Ok(());
                 }
             }
-        }
 
-        if is_word || is_excel {
-            if !self.ensure_file_exists(file.id, "before office conversion").await? {
+            let is_storage = timing.step("storage_kb_check", self.is_storage_kb(file.kb_id)).await?;
+            if is_storage {
+                info!("Skipping parsing for storage knowledge base file {}", file.id);
+                timing.step("mark_storage_skipped", self.mark_file_storage_skipped(file.id)).await?;
                 return Ok(());
             }
-            // Word/Excel 文档：先转换为 PDF，再按需要处理
-            let doc_kind = if is_word { "Word" } else { "Excel" };
-            info!("Detected {} document, converting to PDF: {}", doc_kind, file.filename);
+
+            if timing.step("reuse_check", self.try_reuse_existing_data(file)).await? {
+                timing.set_pipeline("reuse");
+                info!("File {} reused existing parsed data, skipping processing pipeline", file.id);
+                return Ok(());
+            }
+
+            timing
+                .step("set_processing_status", async {
+                    let sql = "UPDATE files SET status = 2, updated_at = strftime('%s','now') WHERE id = ?";
+                    sqlx::query(sql).bind(file.id).execute(&self.pool).await?;
+                    Ok(())
+                })
+                .await?;
+
+            // 检查文件是否为 PDF 或图片
+            let filename_lower = file.filename.to_lowercase();
+            let is_pdf = filename_lower.ends_with(".pdf");
+            let is_image = Self::is_image_file(&filename_lower);
+            let is_audio = Self::is_audio_file(&filename_lower);
+
+            // 检查文件是否为 Word 或 Excel 文档
+            let is_word = filename_lower.ends_with(".doc") || filename_lower.ends_with(".docx");
+            let is_excel = filename_lower.ends_with(".xls") || filename_lower.ends_with(".xlsx");
+
+            let cfg = config::get();
+            let custom_url = cfg.services.custom_parse_url.as_deref();
+            let custom_reuse_url = cfg.services.custom_parse_reuse_url.as_deref();
+
+            if let Some(reuse_url) = custom_reuse_url {
+                info!("Custom parse reuse enabled");
+                match self.process_file_with_custom_reuse_parser(file, reuse_url, Some(&mut timing)).await {
+                    Ok(true) => {
+                        timing.set_pipeline("custom_reuse");
+                        info!(
+                            "Custom parse reuse enabled, reused existing pdf_contents for file {} via {}",
+                            file.id, reuse_url
+                        );
+                        return Ok(());
+                    }
+                    Ok(false) => {}
+                    Err(err) => {
+                        error!("Custom parse reuse failed for file {}: {}", file.id, err);
+                    }
+                }
+            }
+
+            if is_word || is_excel {
+                timing.set_pipeline("office_pdf");
+                if !self.ensure_file_exists(file.id, "before office conversion").await? {
+                    return Ok(());
+                }
+                // Word/Excel 文档：先转换为 PDF，再按需要处理
+                let doc_kind = if is_word { "Word" } else { "Excel" };
+                info!("Detected {} document, converting to PDF: {}", doc_kind, file.filename);
+
+                if let Some(custom_url) = custom_url {
+                    let stored_pdf_path =
+                        timing.step("convert_office_to_pdf", self.convert_office_to_pdf(file)).await?;
+                    let mut temp_file = file.clone();
+                    temp_file.path = stored_pdf_path.to_string_lossy().to_string();
+                    temp_file.filename = format!("{}.pdf", file.id);
+
+                    if is_word {
+                        timing.set_pipeline("custom_parser");
+                        info!("Custom parse enabled, routing converted PDF for file {} to {}", file.id, custom_url);
+                        self.process_file_with_custom_parser(&temp_file, custom_url, Some(&mut timing)).await?;
+                        return Ok(());
+                    }
+
+                    timing.set_pipeline("pdf");
+                    self.process_pdf_file(&temp_file, None, false, Some(file.filename.as_str()), Some(&mut timing))
+                        .await?;
+                    return Ok(());
+                }
+
+                self.convert_office_to_pdf_and_process(file, Some(&mut timing)).await?;
+                return Ok(());
+            }
 
             if let Some(custom_url) = custom_url {
-                let stored_pdf_path = self.convert_office_to_pdf(file).await?;
-                let mut temp_file = file.clone();
-                temp_file.path = stored_pdf_path.to_string_lossy().to_string();
-                temp_file.filename = format!("{}.pdf", file.id);
-
-                if is_word {
-                    info!("Custom parse enabled, routing converted PDF for file {} to {}", file.id, custom_url);
-                    self.process_file_with_custom_parser(&temp_file, custom_url).await?;
+                if is_pdf {
+                    timing.set_pipeline("custom_parser");
+                    info!("Custom parse enabled, routing file {} to {}", file.id, custom_url);
+                    self.process_file_with_custom_parser(file, custom_url, Some(&mut timing)).await?;
                     return Ok(());
                 }
-
-                self.process_pdf_file(&temp_file, None, false, Some(file.filename.as_str())).await?;
-                return Ok(());
             }
 
-            self.convert_office_to_pdf_and_process(file).await?;
-            return Ok(());
-        }
-
-        if let Some(custom_url) = custom_url {
             if is_pdf {
-                info!("Custom parse enabled, routing file {} to {}", file.id, custom_url);
-                self.process_file_with_custom_parser(file, custom_url).await?;
-                return Ok(());
+                timing.set_pipeline("pdf");
+                if !self.ensure_file_exists(file.id, "before pdf processing").await? {
+                    return Ok(());
+                }
+                // 处理 PDF 或图片文件
+                self.process_pdf_file(file, None, false, None, Some(&mut timing)).await?;
+            } else if is_image {
+                timing.set_pipeline("image");
+                if !self.ensure_file_exists(file.id, "before image embedding").await? {
+                    return Ok(());
+                }
+                let image_embedding = timing
+                    .step(
+                        "get_image_embedding",
+                        search::embedding::get_image_embedding_from_path(&file.path, Some(&file.filename)),
+                    )
+                    .await?;
+                self.process_pdf_file(file, Some(image_embedding), true, None, Some(&mut timing)).await?;
+            } else if is_audio {
+                timing.set_pipeline("audio");
+                if !self.ensure_file_exists(file.id, "before audio processing").await? {
+                    return Ok(());
+                }
+                self.process_audio_file(file, Some(&mut timing)).await?;
+            } else {
+                timing.set_pipeline("text");
+                if !self.ensure_file_exists(file.id, "before text processing").await? {
+                    return Ok(());
+                }
+                // 处理普通文本文件
+                self.process_text_file(file, Some(&mut timing)).await?;
             }
-        }
 
-        if is_pdf {
-            if !self.ensure_file_exists(file.id, "before pdf processing").await? {
-                return Ok(());
-            }
-            // 处理 PDF 或图片文件
-            self.process_pdf_file(file, None, false, None).await?;
-        } else if is_image {
-            if !self.ensure_file_exists(file.id, "before image embedding").await? {
-                return Ok(());
-            }
-            let image_embedding =
-                search::embedding::get_image_embedding_from_path(&file.path, Some(&file.filename)).await?;
-            self.process_pdf_file(file, Some(image_embedding), true, None).await?;
-        } else if is_audio {
-            if !self.ensure_file_exists(file.id, "before audio processing").await? {
-                return Ok(());
-            }
-            self.process_audio_file(file).await?;
-        } else {
-            if !self.ensure_file_exists(file.id, "before text processing").await? {
-                return Ok(());
-            }
-            // 处理普通文本文件
-            self.process_text_file(file).await?;
+            Ok(())
         }
-
-        Ok(())
+        .await;
+        timing.finish(&result);
+        result
     }
 
-    async fn process_file_with_custom_parser(&self, file: &File, custom_url: &str) -> anyhow::Result<()> {
+    async fn process_file_with_custom_parser(
+        &self, file: &File, custom_url: &str, mut timing: Option<&mut ParseTimingCtx>,
+    ) -> anyhow::Result<()> {
         if !self.ensure_file_exists(file.id, "custom parse start").await? {
             return Ok(());
         }
 
-        let parse_data = self.call_custom_parse_api(file, custom_url).await?;
+        let parse_data =
+            timed_step_opt(timing.as_deref_mut(), "custom_parse_api", self.call_custom_parse_api(file, custom_url))
+                .await?;
 
         if let Some(images) = parse_data.images.as_ref() {
             if !images.is_empty() {
-                self.save_custom_images(images).await?;
+                self.save_custom_images(images, timing.as_deref_mut()).await?;
             }
         }
 
-        self.save_custom_slices(file, &parse_data.slices, parse_data.full_content.as_deref()).await?;
+        self.save_custom_slices(file, &parse_data.slices, parse_data.full_content.as_deref(), timing.as_deref_mut())
+            .await?;
 
         Ok(())
     }
 
-    async fn process_file_with_custom_reuse_parser(&self, file: &File, custom_reuse_url: &str) -> anyhow::Result<bool> {
-        let pdf_rows = self.fetch_pdf_content_rows(file.id).await?;
+    async fn process_file_with_custom_reuse_parser(
+        &self, file: &File, custom_reuse_url: &str, mut timing: Option<&mut ParseTimingCtx>,
+    ) -> anyhow::Result<bool> {
+        let pdf_rows =
+            timed_step_opt(timing.as_deref_mut(), "fetch_pdf_content_rows", self.fetch_pdf_content_rows(file.id))
+                .await?;
         if pdf_rows.is_empty() {
             debug!("Custom parse reuse skipped for file {} because pdf_contents are empty", file.id);
             return Ok(false);
@@ -702,26 +912,45 @@ impl FileProcessor {
 
         let payload = CustomParseReuseRequest { pdf_contents: &pdf_rows };
         let client = reqwest::Client::new();
-        let response = client.post(custom_reuse_url).json(&payload).send().await?;
+        let response = timed_step_opt(timing.as_deref_mut(), "custom_parse_reuse_api", async {
+            Ok(client.post(custom_reuse_url).json(&payload).send().await?)
+        })
+        .await?;
+        let response_url = response.url().to_string();
         let status = response.status();
+        let request_id =
+            response.headers().get("x-request-id").and_then(|v| v.to_str().ok()).unwrap_or("-").to_string();
         let body_bytes = response.bytes().await?;
         if !status.is_success() {
-            let error_text = String::from_utf8_lossy(&body_bytes);
-            return Err(anyhow::anyhow!("Custom parse reuse API failed: {}", error_text));
+            return Err(anyhow::anyhow!(
+                "Custom parse reuse API failed (status={}, url={}, request_id={}, body_len={}): {}",
+                status.as_u16(),
+                response_url,
+                request_id,
+                body_bytes.len(),
+                summarize_http_body(&body_bytes)
+            ));
         }
 
         let parsed: CustomParseResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
-            let body_text = String::from_utf8_lossy(&body_bytes);
-            anyhow::anyhow!("Custom parse reuse API response decode failed: {} - {}", e, body_text)
+            anyhow::anyhow!(
+                "Custom parse reuse API response decode failed (status={}, url={}, body_len={}): {} - {}",
+                status.as_u16(),
+                response_url,
+                body_bytes.len(),
+                e,
+                summarize_http_body(&body_bytes)
+            )
         })?;
 
         if parsed.code != 200 {
-            let msg = if parsed.message.is_empty() {
-                "Custom parse reuse API returned error".to_string()
-            } else {
-                parsed.message
-            };
-            return Err(anyhow::anyhow!("{}", msg));
+            let msg = if parsed.message.is_empty() { "<empty message>" } else { parsed.message.as_str() };
+            return Err(anyhow::anyhow!(
+                "Custom parse reuse API returned error code={} message={} url={}",
+                parsed.code,
+                msg,
+                response_url
+            ));
         }
 
         let data = parsed.data.ok_or_else(|| anyhow::anyhow!("Custom parse reuse API returned empty data"))?;
@@ -729,7 +958,7 @@ impl FileProcessor {
             return Err(anyhow::anyhow!("Custom parse reuse API returned empty slices"));
         }
 
-        self.save_custom_slices(file, &data.slices, data.full_content.as_deref()).await?;
+        self.save_custom_slices(file, &data.slices, data.full_content.as_deref(), timing.as_deref_mut()).await?;
 
         Ok(true)
     }
@@ -742,22 +971,41 @@ impl FileProcessor {
 
         let client = reqwest::Client::new();
         let response = client.post(custom_url).multipart(form).send().await?;
+        let response_url = response.url().to_string();
         let status = response.status();
+        let request_id =
+            response.headers().get("x-request-id").and_then(|v| v.to_str().ok()).unwrap_or("-").to_string();
         let body_bytes = response.bytes().await?;
         if !status.is_success() {
-            let error_text = String::from_utf8_lossy(&body_bytes);
-            return Err(anyhow::anyhow!("Custom parse API failed: {}", error_text));
+            return Err(anyhow::anyhow!(
+                "Custom parse API failed (status={}, url={}, request_id={}, body_len={}): {}",
+                status.as_u16(),
+                response_url,
+                request_id,
+                body_bytes.len(),
+                summarize_http_body(&body_bytes)
+            ));
         }
 
         let parsed: CustomParseResponse = serde_json::from_slice(&body_bytes).map_err(|e| {
-            let body_text = String::from_utf8_lossy(&body_bytes);
-            anyhow::anyhow!("Custom parse API response decode failed: {} - {}", e, body_text)
+            anyhow::anyhow!(
+                "Custom parse API response decode failed (status={}, url={}, body_len={}): {} - {}",
+                status.as_u16(),
+                response_url,
+                body_bytes.len(),
+                e,
+                summarize_http_body(&body_bytes)
+            )
         })?;
 
         if parsed.code != 200 {
-            let msg =
-                if parsed.message.is_empty() { "Custom parse API returned error".to_string() } else { parsed.message };
-            return Err(anyhow::anyhow!("{}", msg));
+            let msg = if parsed.message.is_empty() { "<empty message>" } else { parsed.message.as_str() };
+            return Err(anyhow::anyhow!(
+                "Custom parse API returned error code={} message={} url={}",
+                parsed.code,
+                msg,
+                response_url
+            ));
         }
 
         let data = parsed.data.ok_or_else(|| anyhow::anyhow!("Custom parse API returned empty data"))?;
@@ -769,7 +1017,7 @@ impl FileProcessor {
     }
 
     async fn save_custom_slices(
-        &self, file: &File, slices: &[CustomSlice], full_content: Option<&str>,
+        &self, file: &File, slices: &[CustomSlice], full_content: Option<&str>, mut timing: Option<&mut ParseTimingCtx>,
     ) -> anyhow::Result<()> {
         if !self.ensure_file_exists(file.id, "before writing custom slices").await? {
             return Ok(());
@@ -789,92 +1037,122 @@ impl FileProcessor {
             }
         };
 
-        let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
-        let mut search_docs = Vec::new();
-
-        for slice in slices {
-            let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
-            let id = sqlx::query(sql).bind(file.id).bind(&slice.content).execute(&self.pool).await?.last_insert_rowid();
-            for position in &slice.positions {
-                position_rows.push((id, position.clone()));
+        let (position_rows, search_docs) = timed_step_opt(timing.as_deref_mut(), "custom_insert_slices", async {
+            let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
+            let mut search_docs = Vec::new();
+            for slice in slices {
+                let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
+                let id =
+                    sqlx::query(sql).bind(file.id).bind(&slice.content).execute(&self.pool).await?.last_insert_rowid();
+                for position in &slice.positions {
+                    position_rows.push((id, position.clone()));
+                }
+                search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, slice.content.clone()));
             }
-            search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, slice.content.clone()));
-        }
+            Ok((position_rows, search_docs))
+        })
+        .await?;
 
         if !search_docs.is_empty() {
-            let embeddings = vec![None; search_docs.len()];
-            self.search_engine.write_batch(search_docs, embeddings).await?;
+            timed_step_opt(timing.as_deref_mut(), "custom_write_search_batch", async {
+                let embeddings = vec![None; search_docs.len()];
+                self.search_engine.write_batch(search_docs, embeddings).await?;
+                Ok(())
+            })
+            .await?;
         }
 
         if !position_rows.is_empty() {
-            let binds_per_row = 6_usize;
-            let max_vars = 999_usize;
-            let batch_size = std::cmp::max(1, max_vars / binds_per_row);
-            for chunk in position_rows.chunks(batch_size) {
-                let mut pos_sql =
-                    QueryBuilder::<Sqlite>::new("insert into slice_positions(slice_id, page_idx, x1, y1, x2, y2) ");
-                pos_sql.push_values(chunk.iter(), |mut b, (slice_id, position)| {
-                    b.push_bind(slice_id)
-                        .push_bind(position.page_idx)
-                        .push_bind(position.bbox[0])
-                        .push_bind(position.bbox[1])
-                        .push_bind(position.bbox[2])
-                        .push_bind(position.bbox[3]);
-                });
-                pos_sql.build().execute(&self.pool).await?;
-            }
+            timed_step_opt(timing.as_deref_mut(), "custom_insert_slice_positions", async {
+                let binds_per_row = 6_usize;
+                let max_vars = 999_usize;
+                let batch_size = std::cmp::max(1, max_vars / binds_per_row);
+                for chunk in position_rows.chunks(batch_size) {
+                    let mut pos_sql =
+                        QueryBuilder::<Sqlite>::new("insert into slice_positions(slice_id, page_idx, x1, y1, x2, y2) ");
+                    pos_sql.push_values(chunk.iter(), |mut b, (slice_id, position)| {
+                        b.push_bind(slice_id)
+                            .push_bind(position.page_idx)
+                            .push_bind(position.bbox[0])
+                            .push_bind(position.bbox[1])
+                            .push_bind(position.bbox[2])
+                            .push_bind(position.bbox[3]);
+                    });
+                    pos_sql.build().execute(&self.pool).await?;
+                }
+                Ok(())
+            })
+            .await?;
         }
 
         if !self.ensure_file_exists(file.id, "before writing custom full index").await? {
             return Ok(());
         }
-        let index_full_content = format!("{}\n\n{}", file.filename, derived_full_content);
-        self.search_engine
-            .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
-            .await?;
+        timed_step_opt(timing.as_deref_mut(), "custom_write_full_index", async {
+            let index_full_content = format!("{}\n\n{}", file.filename, derived_full_content);
+            self.search_engine
+                .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
+                .await?;
+            Ok(())
+        })
+        .await?;
 
         if !self.ensure_file_exists(file.id, "before updating custom status").await? {
             return Ok(());
         }
-        let sql = "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
-        sqlx::query(sql)
-            .bind(&derived_full_content)
-            .bind("Custom parse processed successfully")
-            .bind(file.id)
-            .execute(&self.pool)
-            .await?;
+        timed_step_opt(timing.as_deref_mut(), "custom_finalize_file_status", async {
+            let sql =
+                "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
+            sqlx::query(sql)
+                .bind(&derived_full_content)
+                .bind("Custom parse processed successfully")
+                .bind(file.id)
+                .execute(&self.pool)
+                .await?;
+            Ok(())
+        })
+        .await?;
 
         info!("File {} processed successfully with {} custom slices", file.id, slices.len());
 
-        self.maybe_build_knowledge_graph(file).await;
+        timed_step_opt(timing.as_deref_mut(), "build_knowledge_graph", async {
+            self.maybe_build_knowledge_graph(file).await;
+            Ok(())
+        })
+        .await?;
 
         Ok(())
     }
 
-    async fn save_custom_images(&self, images: &HashMap<String, String>) -> anyhow::Result<()> {
-        let cfg = config::get();
-        fs::create_dir_all(&cfg.storage.images_path).await?;
-        info!("custom image count: {}", images.len());
-        for (img_name, img_base64) in images {
-            let payload = match img_base64.find("base64,") {
-                Some(idx) => &img_base64[idx + "base64,".len()..],
-                None => img_base64.as_str(),
-            };
-            let preview: String = payload.chars().take(32).collect();
-            debug!("Decoding custom image {} (len={}, preview=\"{}\")", img_name, payload.len(), preview);
-            let bytes = STANDARD.decode(payload).map_err(|err| {
-                error!(
-                    "Failed to decode custom image {} (len={}, preview=\"{}\"): {}",
-                    img_name,
-                    payload.len(),
-                    preview,
-                    err
-                );
-                anyhow::anyhow!(err)
-            })?;
-            fs::write(format!("{}/{}", cfg.storage.images_path, img_name), bytes).await?;
-        }
-        Ok(())
+    async fn save_custom_images(
+        &self, images: &HashMap<String, String>, timing: Option<&mut ParseTimingCtx>,
+    ) -> anyhow::Result<()> {
+        timed_step_opt(timing, "custom_save_images", async {
+            let cfg = config::get();
+            fs::create_dir_all(&cfg.storage.images_path).await?;
+            info!("custom image count: {}", images.len());
+            for (img_name, img_base64) in images {
+                let payload = match img_base64.find("base64,") {
+                    Some(idx) => &img_base64[idx + "base64,".len()..],
+                    None => img_base64.as_str(),
+                };
+                let preview: String = payload.chars().take(32).collect();
+                debug!("Decoding custom image {} (len={}, preview=\"{}\")", img_name, payload.len(), preview);
+                let bytes = STANDARD.decode(payload).map_err(|err| {
+                    error!(
+                        "Failed to decode custom image {} (len={}, preview=\"{}\"): {}",
+                        img_name,
+                        payload.len(),
+                        preview,
+                        err
+                    );
+                    anyhow::anyhow!(err)
+                })?;
+                fs::write(format!("{}/{}", cfg.storage.images_path, img_name), bytes).await?;
+            }
+            Ok(())
+        })
+        .await
     }
 
     /// 将 Word/Excel 文档转换为 PDF
@@ -965,8 +1243,11 @@ impl FileProcessor {
     }
 
     /// 将 Word/Excel 文档转换为 PDF 并处理
-    async fn convert_office_to_pdf_and_process(&self, file: &File) -> anyhow::Result<()> {
-        let stored_pdf_path = self.convert_office_to_pdf(file).await?;
+    async fn convert_office_to_pdf_and_process(
+        &self, file: &File, mut timing: Option<&mut ParseTimingCtx>,
+    ) -> anyhow::Result<()> {
+        let stored_pdf_path =
+            timed_step_opt(timing.as_deref_mut(), "convert_office_to_pdf", self.convert_office_to_pdf(file)).await?;
 
         // 创建临时 File 结构用于处理 PDF
         let mut temp_file = file.clone();
@@ -974,12 +1255,13 @@ impl FileProcessor {
         temp_file.filename = format!("{}.pdf", file.id);
 
         // 使用 process_pdf_file 处理转换后的 PDF
-        self.process_pdf_file(&temp_file, None, false, Some(file.filename.as_str())).await
+        self.process_pdf_file(&temp_file, None, false, Some(file.filename.as_str()), timing.as_deref_mut()).await
     }
 
     /// 处理 PDF 文件，调用 MinerU API
     async fn process_pdf_file(
         &self, file: &File, image_embedding: Option<Vec<f32>>, is_image: bool, index_filename: Option<&str>,
+        mut timing: Option<&mut ParseTimingCtx>,
     ) -> anyhow::Result<()> {
         if !self.ensure_file_exists(file.id, "pdf processing start").await? {
             return Ok(());
@@ -987,11 +1269,16 @@ impl FileProcessor {
         info!("Processing PDF file: {}", file.filename);
 
         // 先检查 pdf_contents 表中是否已有该文件的数据
-        let check_sql = "SELECT COUNT(*) as count FROM pdf_contents WHERE file_id = ?";
-        let count: (i64,) = sqlx::query_as(check_sql).bind(file.id).fetch_one(&self.pool).await?;
-        let bbox_sql =
-            "SELECT COUNT(*) as count FROM pdf_contents WHERE file_id = ? AND bbox IS NOT NULL AND bbox != ''";
-        let bbox_count: (i64,) = sqlx::query_as(bbox_sql).bind(file.id).fetch_one(&self.pool).await?;
+        let (count, bbox_count): ((i64,), (i64,)) =
+            timed_step_opt(timing.as_deref_mut(), "pdf_existing_content_check", async {
+                let check_sql = "SELECT COUNT(*) as count FROM pdf_contents WHERE file_id = ?";
+                let count: (i64,) = sqlx::query_as(check_sql).bind(file.id).fetch_one(&self.pool).await?;
+                let bbox_sql =
+                    "SELECT COUNT(*) as count FROM pdf_contents WHERE file_id = ? AND bbox IS NOT NULL AND bbox != ''";
+                let bbox_count: (i64,) = sqlx::query_as(bbox_sql).bind(file.id).fetch_one(&self.pool).await?;
+                Ok((count, bbox_count))
+            })
+            .await?;
 
         let mut content_list: Vec<ContentItem>;
 
@@ -999,45 +1286,55 @@ impl FileProcessor {
             // 已有数据，直接从数据库读取
             info!("Found existing PDF contents in database for file {}, skipping MinerU API call", file.id);
 
-            let fetch_sql = "SELECT page_idx, bbox, text, text_level, img_path, table_body FROM pdf_contents WHERE file_id = ? ORDER BY page_idx, id";
-            let rows: Vec<(i32, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>)> =
-                sqlx::query_as(fetch_sql).bind(file.id).fetch_all(&self.pool).await?;
+            content_list = timed_step_opt(timing.as_deref_mut(), "load_existing_pdf_content", async {
+                let fetch_sql = "SELECT page_idx, bbox, text, text_level, img_path, table_body FROM pdf_contents WHERE file_id = ? ORDER BY page_idx, id";
+                let rows: Vec<(i32, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>)> =
+                    sqlx::query_as(fetch_sql).bind(file.id).fetch_all(&self.pool).await?;
 
-            // 将数据库记录转换为 ContentItem
-            content_list = rows
-                .iter()
-                .map(|row| {
-                    let typ = if row.2.is_some() {
-                        "text".to_string()
-                    } else if row.4.is_some() {
-                        "image".to_string()
-                    } else if row.5.is_some() {
-                        "table".to_string()
-                    } else {
-                        "unknown".to_string()
-                    };
+                // 将数据库记录转换为 ContentItem
+                let content_list = rows
+                    .iter()
+                    .map(|row| {
+                        let typ = if row.2.is_some() {
+                            "text".to_string()
+                        } else if row.4.is_some() {
+                            "image".to_string()
+                        } else if row.5.is_some() {
+                            "table".to_string()
+                        } else {
+                            "unknown".to_string()
+                        };
 
-                    let bbox =
-                        row.1.as_ref().and_then(|bbox| serde_json::from_str::<Vec<i32>>(bbox).ok()).unwrap_or_default();
+                        let bbox = row
+                            .1
+                            .as_ref()
+                            .and_then(|bbox| serde_json::from_str::<Vec<i32>>(bbox).ok())
+                            .unwrap_or_default();
 
-                    ContentItem {
-                        typ,
-                        bbox,
-                        page_idx: row.0,
-                        text: row.2.clone(),
-                        text_level: row.3,
-                        text_format: None,
-                        img_path: row.4.clone(),
-                        image_caption: None,
-                        table_body: row.5.clone(),
-                        table_caption: None,
-                    }
-                })
-                .collect();
+                        ContentItem {
+                            typ,
+                            bbox,
+                            page_idx: row.0,
+                            text: row.2.clone(),
+                            text_level: row.3,
+                            text_format: None,
+                            img_path: row.4.clone(),
+                            image_caption: None,
+                            table_body: row.5.clone(),
+                            table_caption: None,
+                        }
+                    })
+                    .collect();
+                Ok(content_list)
+            })
+            .await?;
         } else {
             // 没有数据，调用 MinerU API
-            let mut mineru_result = self.call_mineru_api(file, is_image).await?;
-            content_list = serde_json::from_str(&mineru_result.content_list)?;
+            let mut mineru_result = self.call_mineru_api(file, is_image, timing.as_deref_mut()).await?;
+            content_list = timed_step_opt(timing.as_deref_mut(), "parse_mineru_content_list", async {
+                Ok(serde_json::from_str(&mineru_result.content_list)?)
+            })
+            .await?;
             Self::prefix_images_for_file(file.id, &mut content_list, &mut mineru_result.images);
 
             if !self.ensure_file_exists(file.id, "before writing pdf contents").await? {
@@ -1050,134 +1347,172 @@ impl FileProcessor {
 
             // 只有在有有效内容时才插入数据库
             if !valid_content_items.is_empty() {
-                if count.0 > 0 {
-                    sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(file.id).execute(&self.pool).await?;
-                }
-                let binds_per_row = 7_usize;
-                let max_vars = 999_usize;
-                let batch_size = std::cmp::max(1, max_vars / binds_per_row);
-                for chunk in valid_content_items.chunks(batch_size) {
-                    let mut pdf_sql = QueryBuilder::<Sqlite>::new(
-                        "insert into pdf_contents(file_id, page_idx, bbox, text, text_level, img_path, table_body) ",
-                    );
-                    pdf_sql.push_values(chunk.iter(), |mut b, item| {
-                        let bbox = if item.bbox.is_empty() {
-                            None
-                        } else {
-                            Some(serde_json::to_string(&item.bbox).unwrap_or_default())
-                        };
-                        b.push_bind(file.id)
-                            .push_bind(item.page_idx)
-                            .push_bind(bbox)
-                            .push_bind(&item.text)
-                            .push_bind(item.text_level)
-                            .push_bind(&item.img_path)
-                            .push_bind(&item.table_body);
-                    });
-                    pdf_sql.build().execute(&self.pool).await?;
-                }
+                timed_step_opt(timing.as_deref_mut(), "write_pdf_contents", async {
+                    if count.0 > 0 {
+                        sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(file.id).execute(&self.pool).await?;
+                    }
+                    let binds_per_row = 7_usize;
+                    let max_vars = 999_usize;
+                    let batch_size = std::cmp::max(1, max_vars / binds_per_row);
+                    for chunk in valid_content_items.chunks(batch_size) {
+                        let mut pdf_sql = QueryBuilder::<Sqlite>::new(
+                            "insert into pdf_contents(file_id, page_idx, bbox, text, text_level, img_path, table_body) ",
+                        );
+                        pdf_sql.push_values(chunk.iter(), |mut b, item| {
+                            let bbox = if item.bbox.is_empty() {
+                                None
+                            } else {
+                                Some(serde_json::to_string(&item.bbox).unwrap_or_default())
+                            };
+                            b.push_bind(file.id)
+                                .push_bind(item.page_idx)
+                                .push_bind(bbox)
+                                .push_bind(&item.text)
+                                .push_bind(item.text_level)
+                                .push_bind(&item.img_path)
+                                .push_bind(&item.table_body);
+                        });
+                        pdf_sql.build().execute(&self.pool).await?;
+                    }
+                    Ok(())
+                })
+                .await?;
             }
 
             // 保存图片到本地
-            let cfg = config::get();
-            fs::create_dir_all(&cfg.storage.images_path).await?;
-            info!("image count: {}", mineru_result.images.len());
-            info!("images: {:?}", mineru_result.images.keys());
-            for (img_name, img_base64) in &mineru_result.images {
-                // 保存图片，如果以 data:image/jpeg;base64, 开头就去掉，没有也不报错
-                let base64_marker = "base64,";
-                let (prefix, payload) = match img_base64.find(base64_marker) {
-                    Some(idx) => (&img_base64[..idx + base64_marker.len()], &img_base64[idx + base64_marker.len()..]),
-                    None => ("(raw)", img_base64.as_str()),
-                };
-                let preview: String = payload.chars().take(32).collect();
-                debug!(
-                    "Decoding mineru image {} for file {} (prefix={}, len={}, preview=\"{}\")",
-                    img_name,
-                    file.id,
-                    prefix,
-                    payload.len(),
-                    preview
-                );
-                let bytes = STANDARD.decode(payload).map_err(|err| {
-                    error!(
-                        "Failed to decode mineru image {} for file {} (prefix={}, len={}, preview=\"{}\"): {}",
+            timed_step_opt(timing.as_deref_mut(), "save_mineru_images", async {
+                let cfg = config::get();
+                fs::create_dir_all(&cfg.storage.images_path).await?;
+                info!("image count: {}", mineru_result.images.len());
+                info!("images: {:?}", mineru_result.images.keys());
+                for (img_name, img_base64) in &mineru_result.images {
+                    // 保存图片，如果以 data:image/jpeg;base64, 开头就去掉，没有也不报错
+                    let base64_marker = "base64,";
+                    let (prefix, payload) = match img_base64.find(base64_marker) {
+                        Some(idx) => {
+                            (&img_base64[..idx + base64_marker.len()], &img_base64[idx + base64_marker.len()..])
+                        }
+                        None => ("(raw)", img_base64.as_str()),
+                    };
+                    let preview: String = payload.chars().take(32).collect();
+                    debug!(
+                        "Decoding mineru image {} for file {} (prefix={}, len={}, preview=\"{}\")",
                         img_name,
                         file.id,
                         prefix,
                         payload.len(),
-                        preview,
-                        err
+                        preview
                     );
-                    anyhow::anyhow!(err)
-                })?;
-                fs::write(format!("{}/{}", cfg.storage.images_path, img_name), bytes).await?;
-            }
+                    let bytes = STANDARD.decode(payload).map_err(|err| {
+                        error!(
+                            "Failed to decode mineru image {} for file {} (prefix={}, len={}, preview=\"{}\"): {}",
+                            img_name,
+                            file.id,
+                            prefix,
+                            payload.len(),
+                            preview,
+                            err
+                        );
+                        anyhow::anyhow!(err)
+                    })?;
+                    fs::write(format!("{}/{}", cfg.storage.images_path, img_name), bytes).await?;
+                }
+                Ok(())
+            })
+            .await?;
         }
 
-        let (full_content, full_segments) = self.build_full_content_and_segments(&content_list);
+        let (full_content, full_segments) = timed_step_opt(timing.as_deref_mut(), "build_full_content", async {
+            Ok(self.build_full_content_and_segments(&content_list))
+        })
+        .await?;
 
         // 根据 slice_type 决定切片方式
-        let slices = if file.slice_type == "smart" || file.slice_type.is_empty() {
-            // 智能切片：使用 content_list
-            self.smart_slice_content_with_positions(&content_list)?
-        } else if file.slice_type == "fixed" {
-            self.fixed_slice_content_with_positions(&full_content, &full_segments)?
-        } else {
-            self.slice_content(&full_content, &file.slice_type)?
-                .into_iter()
-                .map(|content| SliceWithPositions { content, positions: vec![] })
-                .collect()
-        };
+        let slices = timed_step_opt(timing.as_deref_mut(), "slice_build", async {
+            let slices = if file.slice_type == "smart" || file.slice_type.is_empty() {
+                // 智能切片：使用 content_list
+                self.smart_slice_content_with_positions(&content_list)?
+            } else if file.slice_type == "fixed" {
+                self.fixed_slice_content_with_positions(&full_content, &full_segments)?
+            } else {
+                self.slice_content(&full_content, &file.slice_type)?
+                    .into_iter()
+                    .map(|content| SliceWithPositions { content, positions: vec![] })
+                    .collect()
+            };
+            Ok(slices)
+        })
+        .await?;
 
         if !self.ensure_file_exists(file.id, "before writing slices").await? {
             return Ok(());
         }
 
         let slice_count = slices.len();
-        let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
-        let mut search_docs = Vec::new();
-        let mut search_embeddings = Vec::new();
-
-        for slice in slices {
-            let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
-            let id = sqlx::query(sql).bind(file.id).bind(&slice.content).execute(&self.pool).await?.last_insert_rowid();
-            if !slice.positions.is_empty() {
-                for position in slice.positions {
-                    position_rows.push((id, position));
+        let (position_rows, search_docs, search_embeddings) =
+            timed_step_opt(timing.as_deref_mut(), "insert_slices", async {
+                let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
+                let mut search_docs = Vec::new();
+                let mut search_embeddings = Vec::new();
+                for slice in slices {
+                    let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
+                    let id = sqlx::query(sql)
+                        .bind(file.id)
+                        .bind(&slice.content)
+                        .execute(&self.pool)
+                        .await?
+                        .last_insert_rowid();
+                    if !slice.positions.is_empty() {
+                        for position in slice.positions {
+                            position_rows.push((id, position));
+                        }
+                    }
+                    // 收集文档，稍后批量写入
+                    search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, slice.content));
+                    search_embeddings.push(image_embedding.clone());
                 }
-            }
-            // 收集文档，稍后批量写入
-            search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, slice.content));
-            search_embeddings.push(image_embedding.clone());
-        }
+                Ok((position_rows, search_docs, search_embeddings))
+            })
+            .await?;
 
         // 批量写入搜索引擎
         if !search_docs.is_empty() {
-            self.search_engine.write_batch(search_docs, search_embeddings).await?;
+            timed_step_opt(timing.as_deref_mut(), "write_search_batch", async {
+                self.search_engine.write_batch(search_docs, search_embeddings).await?;
+                Ok(())
+            })
+            .await?;
         }
 
         if !position_rows.is_empty() {
-            let binds_per_row = 6_usize;
-            let max_vars = 999_usize;
-            let batch_size = std::cmp::max(1, max_vars / binds_per_row);
-            for chunk in position_rows.chunks(batch_size) {
-                let mut pos_sql =
-                    QueryBuilder::<Sqlite>::new("insert into slice_positions(slice_id, page_idx, x1, y1, x2, y2) ");
-                pos_sql.push_values(chunk.iter(), |mut b, (slice_id, position)| {
-                    b.push_bind(slice_id)
-                        .push_bind(position.page_idx)
-                        .push_bind(position.bbox[0])
-                        .push_bind(position.bbox[1])
-                        .push_bind(position.bbox[2])
-                        .push_bind(position.bbox[3]);
-                });
-                pos_sql.build().execute(&self.pool).await?;
-            }
+            timed_step_opt(timing.as_deref_mut(), "insert_slice_positions", async {
+                let binds_per_row = 6_usize;
+                let max_vars = 999_usize;
+                let batch_size = std::cmp::max(1, max_vars / binds_per_row);
+                for chunk in position_rows.chunks(batch_size) {
+                    let mut pos_sql =
+                        QueryBuilder::<Sqlite>::new("insert into slice_positions(slice_id, page_idx, x1, y1, x2, y2) ");
+                    pos_sql.push_values(chunk.iter(), |mut b, (slice_id, position)| {
+                        b.push_bind(slice_id)
+                            .push_bind(position.page_idx)
+                            .push_bind(position.bbox[0])
+                            .push_bind(position.bbox[1])
+                            .push_bind(position.bbox[2])
+                            .push_bind(position.bbox[3]);
+                    });
+                    pos_sql.build().execute(&self.pool).await?;
+                }
+                Ok(())
+            })
+            .await?;
         }
 
         // 构建知识图谱
-        self.maybe_build_knowledge_graph(file).await;
+        timed_step_opt(timing.as_deref_mut(), "build_knowledge_graph", async {
+            self.maybe_build_knowledge_graph(file).await;
+            Ok(())
+        })
+        .await?;
 
         if !self.ensure_file_exists(file.id, "before writing full index").await? {
             return Ok(());
@@ -1186,28 +1521,39 @@ impl FileProcessor {
         let index_filename = index_filename.unwrap_or(file.filename.as_str());
         let index_full_content = format!("{}\n\n{}", index_filename, full_content);
         debug!("write full content: {}", index_full_content);
-        self.search_engine
-            .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
-            .await?;
+        timed_step_opt(timing.as_deref_mut(), "write_full_index", async {
+            self.search_engine
+                .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
+                .await?;
+            Ok(())
+        })
+        .await?;
 
         // 更新文件状态
         if !self.ensure_file_exists(file.id, "before updating status").await? {
             return Ok(());
         }
-        let sql = "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
-        sqlx::query(sql)
-            .bind(&full_content)
-            .bind("PDF processed successfully")
-            .bind(file.id)
-            .execute(&self.pool)
-            .await?;
+        timed_step_opt(timing.as_deref_mut(), "finalize_file_status", async {
+            let sql =
+                "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
+            sqlx::query(sql)
+                .bind(&full_content)
+                .bind("PDF processed successfully")
+                .bind(file.id)
+                .execute(&self.pool)
+                .await?;
+            Ok(())
+        })
+        .await?;
 
         info!("PDF file {} processed successfully with {} slices", file.id, slice_count);
 
         Ok(())
     }
 
-    async fn call_mineru_api(&self, file: &File, is_image: bool) -> anyhow::Result<Result> {
+    async fn call_mineru_api(
+        &self, file: &File, is_image: bool, mut timing: Option<&mut ParseTimingCtx>,
+    ) -> anyhow::Result<Result> {
         let cfg = config::get();
 
         if !is_image && cfg.services.mineru_max_pages > 0 {
@@ -1215,7 +1561,10 @@ impl FileProcessor {
                 Ok(doc) => {
                     let total_pages = doc.get_pages().len();
                     if total_pages > cfg.services.mineru_max_pages {
-                        return self.call_mineru_api_in_ranges(file, total_pages, cfg.services.mineru_max_pages).await;
+                        return timed_step_opt(timing.as_deref_mut(), "mineru_api_in_ranges", async {
+                            self.call_mineru_api_in_ranges(file, total_pages, cfg.services.mineru_max_pages).await
+                        })
+                        .await;
                     }
                 }
                 Err(e) => {
@@ -1227,7 +1576,10 @@ impl FileProcessor {
             }
         }
 
-        self.call_mineru_api_with_path(&file.path, &file.filename, is_image, None, None).await
+        timed_step_opt(timing.as_deref_mut(), "mineru_api", async {
+            self.call_mineru_api_with_path(&file.path, &file.filename, is_image, None, None).await
+        })
+        .await
     }
 
     async fn call_mineru_api_in_ranges(
@@ -1451,22 +1803,28 @@ impl FileProcessor {
     }
 
     /// 处理普通文本文件
-    async fn process_text_file(&self, file: &File) -> anyhow::Result<()> {
+    async fn process_text_file(&self, file: &File, mut timing: Option<&mut ParseTimingCtx>) -> anyhow::Result<()> {
         if !self.ensure_file_exists(file.id, "before reading text").await? {
             return Ok(());
         }
         // 示例：读取文件内容
-        let content = tokio::fs::read_to_string(file.path.as_str()).await?;
-        self.process_plain_text_content(file, &content, "Processing completed successfully").await
+        let content = timed_step_opt(timing.as_deref_mut(), "read_text_file", async {
+            Ok(tokio::fs::read_to_string(file.path.as_str()).await?)
+        })
+        .await?;
+        self.process_plain_text_content(file, &content, "Processing completed successfully", timing.as_deref_mut())
+            .await
     }
 
-    async fn process_audio_file(&self, file: &File) -> anyhow::Result<()> {
+    async fn process_audio_file(&self, file: &File, mut timing: Option<&mut ParseTimingCtx>) -> anyhow::Result<()> {
         info!("Processing audio file: {}", file.filename);
 
         if !self.ensure_file_exists(file.id, "before reading audio").await? {
             return Ok(());
         }
-        let file_bytes = tokio::fs::read(&file.path).await?;
+        let file_bytes =
+            timed_step_opt(timing.as_deref_mut(), "read_audio_file", async { Ok(tokio::fs::read(&file.path).await?) })
+                .await?;
         let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string();
 
         let form = multipart::Form::new()
@@ -1481,7 +1839,9 @@ impl FileProcessor {
             }
         }
 
-        let response = req_builder.send().await?;
+        let response =
+            timed_step_opt(timing.as_deref_mut(), "audio_transcription_api", async { Ok(req_builder.send().await?) })
+                .await?;
         if !response.status().is_success() {
             let error_text = response.text().await?;
             return Err(anyhow::anyhow!("Audio transcription API failed: {}", error_text));
@@ -1494,50 +1854,76 @@ impl FileProcessor {
             format!("Audio processed successfully (language: {})", language)
         };
 
-        self.process_plain_text_content(file, &text, &log_message).await
+        self.process_plain_text_content(file, &text, &log_message, timing.as_deref_mut()).await
     }
 
-    async fn process_plain_text_content(&self, file: &File, content: &str, log_message: &str) -> anyhow::Result<()> {
+    async fn process_plain_text_content(
+        &self, file: &File, content: &str, log_message: &str, mut timing: Option<&mut ParseTimingCtx>,
+    ) -> anyhow::Result<()> {
         if !self.ensure_file_exists(file.id, "before writing slices").await? {
             return Ok(());
         }
         // 示例：根据 slice_type 进行分片处理
-        let slices = self.slice_content(content, &file.slice_type)?;
+        let slices = timed_step_opt(timing.as_deref_mut(), "slice_build", async {
+            Ok(self.slice_content(content, &file.slice_type)?)
+        })
+        .await?;
         let slice_count = slices.len();
 
         // 保存分片到数据库并收集文档
-        let mut search_docs = Vec::new();
-        for slice in slices {
-            let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
-            let id = sqlx::query(sql).bind(file.id).bind(&slice).execute(&self.pool).await?.last_insert_rowid();
-            search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, slice));
-        }
+        let search_docs = timed_step_opt(timing.as_deref_mut(), "insert_slices", async {
+            let mut search_docs = Vec::new();
+            for slice in slices {
+                let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
+                let id = sqlx::query(sql).bind(file.id).bind(&slice).execute(&self.pool).await?.last_insert_rowid();
+                search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, slice));
+            }
+            Ok(search_docs)
+        })
+        .await?;
 
         // 批量写入搜索引擎
         if !search_docs.is_empty() {
-            let embeddings = vec![None; search_docs.len()];
-            self.search_engine.write_batch(search_docs, embeddings).await?;
+            timed_step_opt(timing.as_deref_mut(), "write_search_batch", async {
+                let embeddings = vec![None; search_docs.len()];
+                self.search_engine.write_batch(search_docs, embeddings).await?;
+                Ok(())
+            })
+            .await?;
         }
 
         if !self.ensure_file_exists(file.id, "before writing full index").await? {
             return Ok(());
         }
         let index_full_content = format!("{}\n\n{}", file.filename, content);
-        self.search_engine
-            .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
-            .await?;
+        timed_step_opt(timing.as_deref_mut(), "write_full_index", async {
+            self.search_engine
+                .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
+                .await?;
+            Ok(())
+        })
+        .await?;
 
         // 更新文件状态为已处理，并保存内容
         if !self.ensure_file_exists(file.id, "before updating status").await? {
             return Ok(());
         }
-        let sql = "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
-        sqlx::query(sql).bind(content).bind(log_message).bind(file.id).execute(&self.pool).await?;
+        timed_step_opt(timing.as_deref_mut(), "finalize_file_status", async {
+            let sql =
+                "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
+            sqlx::query(sql).bind(content).bind(log_message).bind(file.id).execute(&self.pool).await?;
+            Ok(())
+        })
+        .await?;
 
         info!("File {} processed successfully with {} slices", file.id, slice_count);
 
         // 构建知识图谱
-        self.maybe_build_knowledge_graph(file).await;
+        timed_step_opt(timing.as_deref_mut(), "build_knowledge_graph", async {
+            self.maybe_build_knowledge_graph(file).await;
+            Ok(())
+        })
+        .await?;
 
         Ok(())
     }
