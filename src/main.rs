@@ -16,6 +16,7 @@ use chrono::Local;
 use htknow::{api, auth, config, db, frontend, log4rs, processor, search};
 use tokio::net::TcpListener;
 use tokio_cron_scheduler::{Job, JobScheduler};
+use utoipa_swagger_ui::SwaggerUi;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -91,8 +92,8 @@ async fn main() -> anyhow::Result<()> {
 
     // Swagger 路由（不需要认证）
     let swagger = Router::new()
-        .route("/api-docs/openapi.json", get(|| async { axum::Json(api::openapi()) }))
-        .route("/docs", get(swagger_ui_handler));
+        .route("/docs", get(swagger_ui_handler))
+        .merge(SwaggerUi::new("/swagger-ui-assets").url("/api-docs/openapi.json", api::openapi()));
 
     // 合并路由：前端和 Swagger 不需要认证，API 需要认证
     let app = Router::new().merge(swagger).merge(api_router).merge(frontend::router());
@@ -100,7 +101,7 @@ async fn main() -> anyhow::Result<()> {
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     let listener = TcpListener::bind(&addr).await?;
     log::info!("Server listening on {}", addr);
-    log::info!("Swagger UI available at http://{}/swagger-ui", addr);
+    log::info!("Swagger UI available at http://{}/docs", addr);
     axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>()).await?;
     Ok(())
 }
@@ -115,12 +116,12 @@ async fn swagger_ui_handler() -> Html<&'static str> {
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>HTKnow API Documentation</title>
-    <link rel="stylesheet" href="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui.css">
+    <link rel="stylesheet" href="/swagger-ui-assets/swagger-ui.css">
 </head>
 <body>
     <div id="swagger-ui"></div>
-    <script src="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui-bundle.js"></script>
-    <script src="https://unpkg.com/swagger-ui-dist@5.10.5/swagger-ui-standalone-preset.js"></script>
+    <script src="/swagger-ui-assets/swagger-ui-bundle.js"></script>
+    <script src="/swagger-ui-assets/swagger-ui-standalone-preset.js"></script>
     <script>
         window.onload = function() {
             SwaggerUIBundle({
