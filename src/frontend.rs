@@ -21,6 +21,10 @@ async fn index_handler() -> impl IntoResponse {
 }
 
 fn serve_file(path: &str) -> Response {
+    if path == "favicon.ico" {
+        return Response::builder().status(StatusCode::NO_CONTENT).body(Body::empty()).unwrap();
+    }
+
     match Assets::get(path) {
         Some(content) => {
             let mime = mime_guess::from_path(path).first_or_octet_stream().to_string();
