@@ -28,6 +28,7 @@ use crate::search::SearchEngine;
         knowledge_base::get,
         knowledge_base::update,
         knowledge_base::reparse,
+        knowledge_base::reparse_by_id,
         knowledge_base::delete,
         knowledge_base::tree,
         // File
@@ -146,6 +147,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
     let knowledge_router = Router::new()
         .route("/", get(knowledge_base::list).post(knowledge_base::create))
         .route("/reparse", post(knowledge_base::reparse))
+        .route("/{id}/reparse", post(knowledge_base::reparse_by_id))
         .route("/tree", get(knowledge_base::tree))
         .route("/{id}", get(knowledge_base::get).put(knowledge_base::update).delete(knowledge_base::delete));
     let file_router = Router::new()

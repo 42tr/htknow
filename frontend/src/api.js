@@ -403,7 +403,16 @@ export const api = {
       method: 'POST',
       headers: getHeaders(),
     })
-    if (!response.ok) throw new Error('重新解析失败')
+    if (!response.ok) throw new Error(await readErrorMessage(response, '重新解析失败'))
+    return response.json()
+  },
+
+  async reparseKnowledgeBase(id) {
+    const response = await fetch(`${API_BASE}/knowledge_base/${id}/reparse`, {
+      method: 'POST',
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '重新解析指定知识库失败'))
     return response.json()
   },
 

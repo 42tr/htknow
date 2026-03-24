@@ -14,6 +14,8 @@ const breadcrumbs = ref([])
 const loading = ref(true)
 const error = ref('')
 const reparseLoading = ref(false)
+const currentKbReparseLoading = ref(false)
+const childKbReparseLoading = ref({})
 const priorityDrafts = ref({})
 const prioritySaving = ref({})
 const createEmptyStats = () => ({
@@ -153,6 +155,53 @@ const handleReparse = async () => {
   }
 }
 
+const submitKbReparse = async (kbId, kbName) => {
+  const result = await api.reparseKnowledgeBase(kbId)
+  const kbCount = result?.kb_count ?? 0
+  const fileCount = result?.file_count ?? 0
+  alert(`已提交「${kbName}」重新解析任务（含子知识库），覆盖 ${kbCount} 个知识库、${fileCount} 个文件`)
+}
+
+const handleReparseCurrentKb = async () => {
+  if (!currentKb.value || currentKb.value.id === null) return
+  if (currentKb.value.kb_type === 'storage') {
+    alert('存储型知识库不参与解析')
+    return
+  }
+  const kbName = currentKb.value.name || '当前知识库'
+  if (!confirm(`确定要重新解析「${kbName}」及其子知识库吗？`)) return
+
+  currentKbReparseLoading.value = true
+  try {
+    await submitKbReparse(currentKb.value.id, kbName)
+    await loadKbContent(getCurrentKbId())
+  } catch (e) {
+    alert('重新解析失败：' + e.message)
+  } finally {
+    currentKbReparseLoading.value = false
+  }
+}
+
+const handleReparseChildKb = async (e, kb) => {
+  e.stopPropagation()
+  if (!kb || kb.kb_type === 'storage') {
+    alert('存储型知识库不参与解析')
+    return
+  }
+  if (childKbReparseLoading.value[kb.id]) return
+  if (!confirm(`确定要重新解析「${kb.name}」及其子知识库吗？`)) return
+
+  childKbReparseLoading.value[kb.id] = true
+  try {
+    await submitKbReparse(kb.id, kb.name)
+    await loadKbContent(getCurrentKbId())
+  } catch (e) {
+    alert('重新解析失败：' + e.message)
+  } finally {
+    childKbReparseLoading.value[kb.id] = false
+  }
+}
+
 const handleSaveParsePriority = async (e, kb) => {
   e.stopPropagation()
   if (!kb || kb.kb_type === 'storage') return
@@ -223,6 +272,23 @@ onMounted(() => {
           </svg>
           {{ reparseLoading ? '解析中...' : '全部重新解析' }}
         </button>
+        <button
+          v-if="currentKb && currentKb.id !== null && currentKb.kb_type !== 'storage'"
+          @click="handleReparseCurrentKb"
+          :disabled="currentKbReparseLoading"
+          title="重新解析当前知识库及子知识库"
+          :class="[
+            'px-4 py-2.5 rounded-xl font-medium transition-all duration-200 border flex items-center gap-2',
+            currentKbReparseLoading
+              ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+              : 'bg-white text-slate-700 border-slate-200 hover:border-blue-300 hover:text-blue-600'
+          ]"
+        >
+          <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v6h6M20 20v-6h-6M5 19a9 9 0 0014-7M19 5a9 9 0 00-14 7" />
+          </svg>
+          {{ currentKbReparseLoading ? '解析中...' : '重新解析当前知识库' }}
+        </button>
         <CreateKnowledgeBase :parent-id="currentKb?.id" @created="handleKbCreated" />
       </div>
     </div>
@@ -285,6 +351,16 @@ onMounted(() => {
                  <svg v-else class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 012 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
                  </svg>
+               </button>
+               <button
+                 @click="(e) => handleReparseChildKb(e, kb)"
+                 :disabled="kb.kb_type === 'storage' || childKbReparseLoading[kb.id]"
+                 class="opacity-0 group-hover:opacity-100 p-2 text-slate-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                 :title="kb.kb_type === 'storage' ? '存储型知识库不参与解析' : (childKbReparseLoading[kb.id] ? '解析中...' : '重新解析该知识库')"
+               >
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v6h6M20 20v-6h-6M5 19a9 9 0 0014-7M19 5a9 9 0 00-14 7" />
+                </svg>
                </button>
                <button
                  @click="(e) => handleDeleteKb(e, kb.id)"
