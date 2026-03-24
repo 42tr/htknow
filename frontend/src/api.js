@@ -535,6 +535,18 @@ export const api = {
     return response.json()
   },
 
+  async moveFile(id, targetKbId) {
+    const response = await fetch(`${API_BASE}/files/${id}/move`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify({
+        target_kb_id: targetKbId ?? null,
+      }),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '移动文件失败'))
+    return response.json()
+  },
+
   async getFileSlices(fileId) {
     const response = await fetch(`${API_BASE}/files/${fileId}/slices`, {
       headers: getHeaders(),

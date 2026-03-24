@@ -36,6 +36,7 @@ use crate::search::SearchEngine;
         file::stats,
         file::get,
         file::update,
+        file::move_to_kb,
         file::batch_delete,
         file::delete,
         file::get_slices,
@@ -81,6 +82,7 @@ use crate::search::SearchEngine;
             knowledge_base::ReparseKnowledgeBaseResponse,
             file::File,
             file::UpdateFileReq,
+            file::MoveFileReq,
             file::BatchDeleteFilesReq,
             file::BatchDeleteFilesResp,
             file::BatchDeleteSkippedItem,
@@ -152,6 +154,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/stats", get(file::stats))
         .route("/images/{filename}", get(file::get_image_by_filename))
         .route("/{id}", get(file::get).put(file::update).delete(file::delete))
+        .route("/{id}/move", put(file::move_to_kb))
         .route("/{id}/slices", get(file::get_slices))
         .route("/{id}/download", get(file::download))
         .route("/{id}/highlighted-pdf", get(file::get_highlighted_pdf));

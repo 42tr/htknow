@@ -3,6 +3,7 @@ import { ref, computed } from 'vue'
 import { api } from '../api'
 import FileSlices from './FileSlices.vue'
 import FileGraph from './FileGraph.vue'
+import KnowledgeBaseSelector from './KnowledgeBaseSelector.vue'
 
 const props = defineProps({
   file: {
@@ -21,9 +22,11 @@ const showSlices = ref(false)
 const showSettings = ref(false)
 const showGraph = ref(false)
 const showTagsEditor = ref(false)
+const showMoveKbSelector = ref(false)
 const selectedSliceType = ref(props.file.slice_type || 'paragraph')
 const updating = ref(false)
 const downloading = ref(false)
+const moving = ref(false)
 const editingTags = ref([])
 const newTag = ref('')
 
@@ -178,6 +181,33 @@ const handleTogglePublic = async () => {
     updating.value = false
   }
 }
+
+const openMoveSelector = () => {
+  if (moving.value || props.file.status === 2) return
+  showMoveKbSelector.value = true
+}
+
+const handleMoveToKb = async (kb) => {
+  const targetKbId = kb?.id ?? null
+  const currentKbId = props.file.kb_id ?? null
+  if (targetKbId === currentKbId) {
+    alert('文件已在当前知识库中')
+    return
+  }
+
+  const targetName = kb?.name || '未分配知识库'
+  if (!confirm(`确定要将文件移动到「${targetName}」吗？移动后会重新进入解析流程。`)) return
+
+  moving.value = true
+  try {
+    await api.moveFile(props.file.id, targetKbId)
+    emit('updated')
+  } catch (e) {
+    alert('移动失败：' + e.message)
+  } finally {
+    moving.value = false
+  }
+}
 </script>
 
 <template>
@@ -284,6 +314,17 @@ const handleTogglePublic = async () => {
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+            </svg>
+          </button>
+          <button
+            @click="openMoveSelector"
+            :disabled="moving || file.status === 2"
+            class="p-2 text-slate-400 hover:text-indigo-500 hover:bg-indigo-50 rounded-lg transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+            :title="file.status === 2 ? '处理中不可移动' : (moving ? '移动中...' : '移动到其他知识库')"
+          >
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3 7h5l2 2h11v8a2 2 0 01-2 2H3V7z" />
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 13h6m0 0l-2-2m2 2l-2 2" />
             </svg>
           </button>
           <button
@@ -463,6 +504,12 @@ const handleTogglePublic = async () => {
       v-if="showGraph"
       :file="file"
       @close="showGraph = false"
+    />
+
+    <KnowledgeBaseSelector
+      :show="showMoveKbSelector"
+      @close="showMoveKbSelector = false"
+      @select="handleMoveToKb"
     />
   </div>
 </template>

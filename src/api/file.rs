@@ -568,6 +568,12 @@ pub struct UpdateFileReq {
     pub meta: Option<serde_json::Value>,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct MoveFileReq {
+    /// 目标知识库 ID。传 null 表示移出知识库（未分配）。
+    pub target_kb_id: Option<i64>,
+}
+
 const MAX_BATCH_DELETE_IDS: usize = 200;
 const SQLITE_DELETE_CHUNK_SIZE: usize = 900;
 
@@ -715,6 +721,116 @@ pub async fn update(
     Ok(Json(file))
 }
 
+/// 移动文件到另一个知识库
+#[utoipa::path(
+    put,
+    path = "/api/v1/knowledge/files/{id}/move",
+    operation_id = "file_move",
+    tag = "file",
+    params(
+        ("id" = i64, Path, description = "文件 ID")
+    ),
+    request_body = MoveFileReq,
+    responses(
+        (status = 200, description = "成功移动文件", body = File),
+        (status = 400, description = "请求参数错误"),
+        (status = 401, description = "未授权"),
+        (status = 404, description = "文件或知识库不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn move_to_kb(
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
+    Extension(auth_user): Extension<AuthUser>, Path(id): Path<i64>, Json(req): Json<MoveFileReq>,
+) -> ApiResult<Json<File>> {
+    if let Some(target_kb_id) = req.target_kb_id {
+        if target_kb_id <= 0 {
+            return Err(ApiError::BadRequest("Invalid target_kb_id".to_string()));
+        }
+    }
+
+    let is_admin = auth_user.is_admin();
+    let file = if is_admin {
+        sqlx::query_as::<_, File>("SELECT * FROM files WHERE id = ?").bind(id).fetch_optional(&pool).await?
+    } else {
+        sqlx::query_as::<_, File>("SELECT * FROM files WHERE id = ? AND user_id = ?")
+            .bind(id)
+            .bind(&auth_user.user_id)
+            .fetch_optional(&pool)
+            .await?
+    }
+    .ok_or_else(|| ApiError::NotFound("File not found or permission denied".to_string()))?;
+
+    if file.status == 2 {
+        return Err(ApiError::BadRequest("File is processing, cannot move now".to_string()));
+    }
+
+    if file.kb_id == req.target_kb_id {
+        return Ok(Json(file));
+    }
+
+    let target_kb_type = match req.target_kb_id {
+        Some(target_kb_id) => {
+            let kb_type = if is_admin {
+                sqlx::query_scalar::<_, String>("SELECT kb_type FROM knowledge_bases WHERE id = ?")
+                    .bind(target_kb_id)
+                    .fetch_optional(&pool)
+                    .await?
+            } else {
+                sqlx::query_scalar::<_, String>("SELECT kb_type FROM knowledge_bases WHERE id = ? AND user_id = ?")
+                    .bind(target_kb_id)
+                    .bind(&auth_user.user_id)
+                    .fetch_optional(&pool)
+                    .await?
+            }
+            .ok_or_else(|| ApiError::NotFound("Knowledge base not found or permission denied".to_string()))?;
+            Some(kb_type)
+        }
+        None => None,
+    };
+
+    let (next_status, next_log) =
+        if matches!(target_kb_type.as_deref(), Some("storage")) { (3, "Storage mode: not parsed") } else { (0, "") };
+
+    let image_paths = collect_image_paths_for_files(&pool, &[id]).await?;
+
+    let mut tx = pool.begin().await?;
+    let update_result = sqlx::query(
+        "UPDATE files SET kb_id = ?, status = ?, log = ?, content = NULL, updated_at = strftime('%s','now') WHERE id = ? AND status != 2 AND updated_at = ?",
+    )
+    .bind(req.target_kb_id)
+    .bind(next_status)
+    .bind(next_log)
+    .bind(id)
+    .bind(file.updated_at)
+    .execute(&mut *tx)
+    .await?;
+    if update_result.rows_affected() == 0 {
+        return Err(ApiError::BadRequest("File state changed, please retry".to_string()));
+    }
+    clear_file_parse_rows_in_tx(&mut tx, id).await?;
+    tx.commit().await?;
+
+    if let Err(e) = search_engine.delete(Some(id), None).await {
+        warn!("Failed to delete search index for moved file {}: {}", id, e);
+    }
+
+    remove_image_files(image_paths).await;
+    let cfg = config::get();
+    let pdf_path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", id));
+    if let Err(e) = fs::remove_file(&pdf_path).await {
+        if !matches!(e.kind(), std::io::ErrorKind::NotFound) {
+            warn!("Failed to delete converted pdf {} after file move: {}", pdf_path.display(), e);
+        }
+    }
+
+    let moved: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+    Ok(Json(moved))
+}
+
 /// 批量删除文件
 #[utoipa::path(
     post,
@@ -807,6 +923,20 @@ async fn query_deletable_files(pool: &SqlitePool, ids: &[i64], auth_user: &AuthU
         qb.push(" AND user_id = ").push_bind(&auth_user.user_id);
     }
     qb.build_query_as::<File>().fetch_all(pool).await
+}
+
+async fn clear_file_parse_rows_in_tx(tx: &mut sqlx::Transaction<'_, Sqlite>, file_id: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
+        .bind(file_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM slice_positions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
+        .bind(file_id)
+        .execute(&mut **tx)
+        .await?;
+    sqlx::query("DELETE FROM slices WHERE file_id = ?").bind(file_id).execute(&mut **tx).await?;
+    sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(file_id).execute(&mut **tx).await?;
+    Ok(())
 }
 
 async fn delete_file_rows_in_tx(tx: &mut sqlx::Transaction<'_, Sqlite>, file_ids: &[i64]) -> Result<(), sqlx::Error> {
