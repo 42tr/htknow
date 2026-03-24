@@ -1,13 +1,14 @@
 use std::{
-    collections::{HashMap, HashSet}, path::Path, time::Instant
+    collections::{HashMap, HashSet}, path::Path, time::{Duration, Instant}
 };
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
-use log::{debug, info};
+use log::{debug, info, warn};
 use serde::Serialize;
 use tantivy::{
-    Index, IndexReader, Result, TantivyDocument, Term, collector::TopDocs, doc, merge_policy::LogMergePolicy, query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, Query, TermQuery}, schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _}, tokenizer::{TokenStream, Tokenizer}
+    Index, IndexReader, Result, TantivyDocument, TantivyError, Term, collector::TopDocs, directory::error::LockError, doc, merge_policy::LogMergePolicy, query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, Query, TermQuery}, schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _}, tokenizer::{TokenStream, Tokenizer}
 };
+use tokio::time::sleep;
 
 use super::chinese_tokenizer;
 use crate::config;
@@ -15,6 +16,8 @@ use crate::config;
 const ALL_TOKENIZER: &str = "all";
 const SENTENCE_SHOULD_BOOST: f32 = 2.0;
 const SENTENCE_SLOP: u32 = 12;
+const INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS: usize = 8;
+const INDEX_WRITER_LOCK_RETRY_BASE_MS: u64 = 40;
 
 #[derive(Debug, Clone)]
 pub struct SynonymTerm {
@@ -83,18 +86,38 @@ pub fn init_with_path(path: &str) -> Result<(Schema, Index)> {
     Ok((schema, index))
 }
 
-fn create_writer(index: &Index) -> tantivy::Result<tantivy::IndexWriter> {
+fn is_lock_busy_error(err: &TantivyError) -> bool {
+    matches!(err, TantivyError::LockFailure(LockError::LockBusy, _))
+}
+
+async fn create_writer(index: &Index) -> tantivy::Result<tantivy::IndexWriter> {
     let writer_memory = config::get().search.tantivy_memory_mb * 1_000_000;
-    let writer = index.writer(writer_memory)?;
+    let mut delay_ms = INDEX_WRITER_LOCK_RETRY_BASE_MS;
 
-    // 设置 merge policy，减少小 segment 数量
-    writer.set_merge_policy(Box::new(LogMergePolicy::default()));
+    for attempt in 1..=INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS {
+        match index.writer(writer_memory) {
+            Ok(writer) => {
+                // 设置 merge policy，减少小 segment 数量
+                writer.set_merge_policy(Box::new(LogMergePolicy::default()));
+                return Ok(writer);
+            }
+            Err(err) if is_lock_busy_error(&err) && attempt < INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS => {
+                warn!(
+                    "Tantivy index writer lock busy (attempt {}/{}), retry in {}ms",
+                    attempt, INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS, delay_ms
+                );
+                sleep(Duration::from_millis(delay_ms)).await;
+                delay_ms = (delay_ms * 2).min(800);
+            }
+            Err(err) => return Err(err),
+        }
+    }
 
-    Ok(writer)
+    unreachable!("create_writer retry loop should always return or error")
 }
 
 pub async fn write_documents(index: &Index, schema: &Schema, doc: Document) -> tantivy::Result<()> {
-    let mut index_writer = create_writer(index)?;
+    let mut index_writer = create_writer(index).await?;
     index_writer.add_document(create_document(doc, schema))?;
     index_writer.commit()?;
     Ok(())
@@ -105,7 +128,7 @@ pub async fn write_documents_batch(index: &Index, schema: &Schema, docs: Vec<Doc
     if docs.is_empty() {
         return Ok(());
     }
-    let mut index_writer = create_writer(index)?;
+    let mut index_writer = create_writer(index).await?;
     for doc in docs {
         index_writer.add_document(create_document(doc, schema))?;
     }
@@ -191,7 +214,7 @@ pub async fn search_with_snippet(
 }
 
 pub async fn delete_by_file(index: &Index, schema: &Schema, file_id: i64) -> anyhow::Result<()> {
-    let mut writer = create_writer(index)?;
+    let mut writer = create_writer(index).await?;
     let file_id_field = get_field(schema, "file_id");
     let term = Term::from_field_i64(file_id_field, file_id);
     writer.delete_term(term);
@@ -200,7 +223,7 @@ pub async fn delete_by_file(index: &Index, schema: &Schema, file_id: i64) -> any
 }
 
 pub async fn delete_by_kb(index: &Index, schema: &Schema, kb_id: i64) -> anyhow::Result<()> {
-    let mut writer = create_writer(index)?;
+    let mut writer = create_writer(index).await?;
     let kb_id_field = get_field(schema, "kb_id");
     let term = Term::from_field_i64(kb_id_field, kb_id);
     writer.delete_term(term);

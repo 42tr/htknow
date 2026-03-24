@@ -230,6 +230,14 @@ async fn acquire_background_reuse_permit(semaphore: Arc<Semaphore>, file_id: i64
     }
 }
 
+fn map_search_engine_error(err: anyhow::Error) -> ApiError {
+    let msg = err.to_string();
+    if msg.contains("LockBusy") || msg.contains("Failed to acquire index lock") {
+        return ApiError::BadRequest("Search index is busy, please retry shortly.".to_string());
+    }
+    ApiError::Internal(format!("Internal error: {}", msg))
+}
+
 /// 上传文件（支持单个或多个文件）
 ///
 /// form-data 参数：
@@ -661,7 +669,7 @@ pub async fn update(
             return Err(ApiError::BadRequest("Storage knowledge base files do not support parsing.".to_string()));
         }
 
-        search_engine.delete(Some(id), None).await?;
+        search_engine.delete(Some(id), None).await.map_err(map_search_engine_error)?;
         let sql = "DELETE FROM slices WHERE file_id = ?";
         sqlx::query(sql).bind(id).execute(&pool).await?;
 
