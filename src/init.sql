@@ -123,6 +123,12 @@ CREATE TABLE IF NOT EXISTS graph_snapshots (
 );
 
 -- 索引
+CREATE INDEX IF NOT EXISTS idx_knowledge_bases_parent_id ON knowledge_bases(parent_id);
+CREATE INDEX IF NOT EXISTS idx_files_kb_id ON files(kb_id);
+CREATE INDEX IF NOT EXISTS idx_files_kb_id_filename ON files(kb_id, filename);
+CREATE INDEX IF NOT EXISTS idx_files_kb_id_updated_at ON files(kb_id, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_files_kb_id_status_updated_at ON files(kb_id, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_files_status_updated_at ON files(status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_nodes_type ON graph_nodes(entity_type);
 CREATE INDEX IF NOT EXISTS idx_nodes_kb ON graph_nodes(kb_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_file ON graph_nodes(file_id);

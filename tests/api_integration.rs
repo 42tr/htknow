@@ -320,6 +320,65 @@ async fn knowledge_base_public_and_reparse() {
 }
 
 #[tokio::test]
+async fn knowledge_base_tree_and_detail_flow() {
+    let app = app().await;
+    let pool = get_pool().await;
+    let env = setup_env();
+    let user = TestUser::new("kb-tree");
+
+    let root_kb_id = insert_kb(&pool, &user, "Root KB", "analysis", None, false).await;
+    let child_kb_id = insert_kb(&pool, &user, "Child KB", "analysis", Some(root_kb_id), false).await;
+
+    let file_dir = env.data_dir.join("files");
+    fs::create_dir_all(&file_dir).unwrap();
+    let root_file_path = file_dir.join(format!("root-file-{}.txt", next_seq()));
+    let child_file_path = file_dir.join(format!("child-file-{}.txt", next_seq()));
+    fs::write(&root_file_path, b"root file").unwrap();
+    fs::write(&child_file_path, b"child file").unwrap();
+
+    let root_file_id =
+        insert_file(&pool, &user, "root-file.txt", &root_file_path, Some(root_kb_id), vec!["root".to_string()], false)
+            .await;
+    let child_file_id = insert_file(
+        &pool,
+        &user,
+        "child-file.txt",
+        &child_file_path,
+        Some(child_kb_id),
+        vec!["child".to_string()],
+        false,
+    )
+    .await;
+
+    let tree_req =
+        authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/tree?kb_id={}", root_kb_id), &user);
+    let tree_res = app.clone().oneshot(tree_req).await.unwrap();
+    assert_eq!(tree_res.status(), StatusCode::OK);
+    let tree_json = response_json(tree_res).await;
+    let tree_nodes = tree_json.as_array().expect("tree nodes");
+    assert_eq!(tree_nodes.len(), 1);
+    let root_node = &tree_nodes[0];
+    assert_eq!(root_node["id"].as_i64(), Some(root_kb_id));
+    assert!(root_node["files"].as_array().unwrap().iter().any(|file| file["id"].as_i64() == Some(root_file_id)));
+    assert!(root_node["children"].as_array().unwrap().iter().any(|child| {
+        child["id"].as_i64() == Some(child_kb_id)
+            && child["files"].as_array().unwrap().iter().any(|file| file["id"].as_i64() == Some(child_file_id))
+    }));
+
+    let detail_req = authed_empty_request(
+        "GET",
+        format!("/api/v1/knowledge/knowledge_base/{}?filename=root-file", root_kb_id),
+        &user,
+    );
+    let detail_res = app.clone().oneshot(detail_req).await.unwrap();
+    assert_eq!(detail_res.status(), StatusCode::OK);
+    let detail_json = response_json(detail_res).await;
+    assert_eq!(detail_json["id"].as_i64(), Some(root_kb_id));
+    let detail_files = detail_json["files"].as_array().expect("detail files");
+    assert!(detail_files.iter().any(|file| file["id"].as_i64() == Some(root_file_id)));
+}
+
+#[tokio::test]
 async fn file_endpoints_flow() {
     let app = app().await;
     let pool = get_pool().await;

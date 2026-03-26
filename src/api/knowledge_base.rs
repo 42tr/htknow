@@ -80,7 +80,7 @@ pub struct KnowledgeDetailResponse {
     pub status_breakdown: FileStatusBreakdown,
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
+#[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
 pub struct FileWithoutContent {
     pub id: i64,
     pub user_id: String,
@@ -98,27 +98,6 @@ pub struct FileWithoutContent {
     pub meta: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
-}
-
-fn file_without_content(file: super::file::File) -> FileWithoutContent {
-    FileWithoutContent {
-        id: file.id,
-        user_id: file.user_id,
-        user_name: file.user_name,
-        hash: file.hash,
-        filename: file.filename,
-        path: file.path,
-        size: file.size,
-        tags: file.tags,
-        status: file.status,
-        log: file.log,
-        slice_type: file.slice_type,
-        kb_id: file.kb_id,
-        is_public: file.is_public,
-        meta: file.meta,
-        created_at: file.created_at,
-        updated_at: file.updated_at,
-    }
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
@@ -627,7 +606,9 @@ pub async fn get(
     };
 
     let files_future = async {
-        let mut qb = QueryBuilder::<Sqlite>::new("SELECT * FROM files WHERE kb_id = ");
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at FROM files WHERE kb_id = ",
+        );
         qb.push_bind(id);
         if !is_admin {
             qb.push(" AND (user_id = ").push_bind(user_id.clone()).push(" OR is_public = 1)");
@@ -636,12 +617,12 @@ pub async fn get(
             qb.push(" AND filename LIKE ").push_bind(format!("%{}%", filename));
         }
         qb.push(" ORDER BY updated_at DESC");
-        qb.build_query_as::<super::file::File>().fetch_all(&pool).await
+        qb.build_query_as::<FileWithoutContent>().fetch_all(&pool).await
     };
 
     let (children_kbs_res, files_res) = tokio::join!(children_future, files_future);
     let children_kbs: Vec<Knowledge> = children_kbs_res?;
-    let mut files: Vec<super::file::File> = files_res?;
+    let mut files: Vec<FileWithoutContent> = files_res?;
     let mut count_ids = Vec::with_capacity(children_kbs.len() + 1);
     count_ids.push(id);
     count_ids.extend(children_kbs.iter().map(|kb| kb.id));
@@ -677,7 +658,6 @@ pub async fn get(
             if let Ok(tags) = serde_json::from_str::<Vec<String>>(&file.tags) { tags.contains(tag) } else { false }
         });
     }
-    let files: Vec<FileWithoutContent> = files.into_iter().map(file_without_content).collect();
 
     // 3. Fetch the breadcrumb path
     let mut path = Vec::new();
@@ -1058,112 +1038,197 @@ pub async fn reparse_by_id(
     Ok(Json(ReparseKnowledgeBaseResponse { kb_count: analysis_kb_ids.len() as i64, file_count: file_ids.len() as i64 }))
 }
 
-async fn build_tree_recursive(
-    pool: &SqlitePool, parent_id: Option<i64>, user_id: &str, is_admin: bool,
-) -> anyhow::Result<Vec<KnowledgeTreeNode>> {
-    let children: Vec<Knowledge> = if is_admin {
-        sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE parent_id IS NOT DISTINCT FROM ? ORDER BY name",
-        )
-        .bind(parent_id)
-        .fetch_all(pool)
-        .await?
-    } else {
-        sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE parent_id IS NOT DISTINCT FROM ? AND (user_id = ? OR is_public = 1) ORDER BY name",
-        )
-        .bind(parent_id)
-        .bind(user_id)
-        .fetch_all(pool)
-        .await?
-    };
-
-    let mut tree_nodes = Vec::new();
-    for kb in children {
-        let (sub_children, files) = tokio::join!(
-            async { Box::pin(build_tree_recursive(pool, Some(kb.id), user_id, is_admin)).await },
-            get_files_for_kb(pool, kb.id, user_id, is_admin),
-        );
-        let sub_children = sub_children?;
-        let files = files?;
-        tree_nodes.push(KnowledgeTreeNode {
-            id: kb.id,
-            user_id: kb.user_id,
-            user_name: kb.user_name,
-            name: kb.name,
-            description: kb.description,
-            kb_type: kb.kb_type,
-            parent_id: kb.parent_id,
-            is_public: kb.is_public,
-            parse_priority: kb.parse_priority,
-            files,
-            children: sub_children,
-        });
-    }
-    Ok(tree_nodes)
-}
-
-async fn build_subtree_recursive(
-    pool: &SqlitePool, kb_id: i64, user_id: &str, is_admin: bool,
-) -> anyhow::Result<Option<KnowledgeTreeNode>> {
-    let kb: Option<Knowledge> = if is_admin {
-        sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
-        )
-        .bind(kb_id)
-        .fetch_optional(pool)
-        .await?
-    } else {
-        sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
-        )
-        .bind(kb_id)
-        .bind(user_id)
-        .fetch_optional(pool)
-        .await?
-    };
-
-    match kb {
-        Some(kb_info) => {
-            let (children, files) = tokio::join!(
-                async { Box::pin(build_tree_recursive(pool, Some(kb_info.id), user_id, is_admin)).await },
-                get_files_for_kb(pool, kb_info.id, user_id, is_admin),
-            );
-            let children = children?;
-            let files = files?;
-            Ok(Some(KnowledgeTreeNode {
-                id: kb_info.id,
-                user_id: kb_info.user_id,
-                user_name: kb_info.user_name,
-                name: kb_info.name,
-                description: kb_info.description,
-                kb_type: kb_info.kb_type,
-                parent_id: kb_info.parent_id,
-                is_public: kb_info.is_public,
-                parse_priority: kb_info.parse_priority,
-                files,
-                children,
-            }))
-        }
-        None => Ok(None),
-    }
-}
-
-async fn get_files_for_kb(
-    pool: &SqlitePool, kb_id: i64, user_id: &str, is_admin: bool,
-) -> anyhow::Result<Vec<FileWithoutContent>> {
-    let files: Vec<super::file::File> = if is_admin {
-        sqlx::query_as("SELECT * FROM files WHERE kb_id = ? ORDER BY filename").bind(kb_id).fetch_all(pool).await?
-    } else {
-        sqlx::query_as("SELECT * FROM files WHERE kb_id = ? AND (user_id = ? OR is_public = 1) ORDER BY filename")
+async fn load_tree_knowledges(
+    pool: &SqlitePool, root_kb_id: Option<i64>, user_id: &str, is_admin: bool,
+) -> anyhow::Result<Vec<Knowledge>> {
+    let rows = match (root_kb_id, is_admin) {
+        (Some(kb_id), true) => {
+            sqlx::query_as(
+                r#"
+                WITH RECURSIVE tree AS (
+                    SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority
+                    FROM knowledge_bases
+                    WHERE id = ?
+                    UNION ALL
+                    SELECT kb.id, kb.user_id, kb.user_name, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public, kb.parse_priority
+                    FROM knowledge_bases kb
+                    INNER JOIN tree t ON kb.parent_id = t.id
+                )
+                SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority
+                FROM tree
+                ORDER BY name
+                "#,
+            )
             .bind(kb_id)
+            .fetch_all(pool)
+            .await?
+        }
+        (Some(kb_id), false) => {
+            sqlx::query_as(
+                r#"
+                WITH RECURSIVE tree AS (
+                    SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority
+                    FROM knowledge_bases
+                    WHERE id = ? AND (user_id = ? OR is_public = 1)
+                    UNION ALL
+                    SELECT kb.id, kb.user_id, kb.user_name, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public, kb.parse_priority
+                    FROM knowledge_bases kb
+                    INNER JOIN tree t ON kb.parent_id = t.id
+                    WHERE kb.user_id = ? OR kb.is_public = 1
+                )
+                SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority
+                FROM tree
+                ORDER BY name
+                "#,
+            )
+            .bind(kb_id)
+            .bind(user_id)
             .bind(user_id)
             .fetch_all(pool)
             .await?
+        }
+        (None, true) => {
+            sqlx::query_as(
+                r#"
+                WITH RECURSIVE tree AS (
+                    SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority
+                    FROM knowledge_bases
+                    WHERE parent_id IS NULL
+                    UNION ALL
+                    SELECT kb.id, kb.user_id, kb.user_name, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public, kb.parse_priority
+                    FROM knowledge_bases kb
+                    INNER JOIN tree t ON kb.parent_id = t.id
+                )
+                SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority
+                FROM tree
+                ORDER BY name
+                "#,
+            )
+            .fetch_all(pool)
+            .await?
+        }
+        (None, false) => {
+            sqlx::query_as(
+                r#"
+                WITH RECURSIVE tree AS (
+                    SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority
+                    FROM knowledge_bases
+                    WHERE parent_id IS NULL AND (user_id = ? OR is_public = 1)
+                    UNION ALL
+                    SELECT kb.id, kb.user_id, kb.user_name, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public, kb.parse_priority
+                    FROM knowledge_bases kb
+                    INNER JOIN tree t ON kb.parent_id = t.id
+                    WHERE kb.user_id = ? OR kb.is_public = 1
+                )
+                SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority
+                FROM tree
+                ORDER BY name
+                "#,
+            )
+            .bind(user_id)
+            .bind(user_id)
+            .fetch_all(pool)
+            .await?
+        }
     };
-    // Convert to FileWithoutContent by excluding the content field
-    let files_without_content = files.into_iter().map(file_without_content).collect();
-    Ok(files_without_content)
+    Ok(rows)
+}
+
+async fn load_tree_files_by_kb(
+    pool: &SqlitePool, kb_ids: &[i64], user_id: &str, is_admin: bool,
+) -> anyhow::Result<HashMap<i64, Vec<FileWithoutContent>>> {
+    if kb_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at FROM files WHERE kb_id IN (",
+    );
+    push_i64_list(&mut qb, kb_ids);
+    qb.push(")");
+    if !is_admin {
+        qb.push(" AND (user_id = ").push_bind(user_id).push(" OR is_public = 1)");
+    }
+    qb.push(" ORDER BY kb_id, filename");
+
+    let files: Vec<FileWithoutContent> = qb.build_query_as().fetch_all(pool).await?;
+    let mut files_by_kb = HashMap::<i64, Vec<FileWithoutContent>>::new();
+    for file in files {
+        if let Some(kb_id) = file.kb_id {
+            files_by_kb.entry(kb_id).or_default().push(file);
+        }
+    }
+    Ok(files_by_kb)
+}
+
+fn build_tree_node(
+    kb_id: i64, knowledges: &HashMap<i64, Knowledge>, children_map: &HashMap<Option<i64>, Vec<i64>>,
+    files_by_kb: &mut HashMap<i64, Vec<FileWithoutContent>>,
+) -> Option<KnowledgeTreeNode> {
+    let kb = knowledges.get(&kb_id)?;
+    let child_ids = children_map.get(&Some(kb_id)).cloned().unwrap_or_default();
+    let mut children = Vec::with_capacity(child_ids.len());
+    for child_id in child_ids {
+        if let Some(child) = build_tree_node(child_id, knowledges, children_map, files_by_kb) {
+            children.push(child);
+        }
+    }
+
+    Some(KnowledgeTreeNode {
+        id: kb.id,
+        user_id: kb.user_id.clone(),
+        user_name: kb.user_name.clone(),
+        name: kb.name.clone(),
+        description: kb.description.clone(),
+        kb_type: kb.kb_type.clone(),
+        parent_id: kb.parent_id,
+        is_public: kb.is_public,
+        parse_priority: kb.parse_priority,
+        files: files_by_kb.remove(&kb_id).unwrap_or_default(),
+        children,
+    })
+}
+
+fn assemble_tree(
+    knowledges: Vec<Knowledge>, mut files_by_kb: HashMap<i64, Vec<FileWithoutContent>>, root_kb_id: Option<i64>,
+) -> Vec<KnowledgeTreeNode> {
+    if knowledges.is_empty() {
+        return Vec::new();
+    }
+
+    let mut knowledge_map = HashMap::<i64, Knowledge>::with_capacity(knowledges.len());
+    let mut children_map = HashMap::<Option<i64>, Vec<i64>>::new();
+    for kb in knowledges {
+        children_map.entry(kb.parent_id).or_default().push(kb.id);
+        knowledge_map.insert(kb.id, kb);
+    }
+
+    for child_ids in children_map.values_mut() {
+        child_ids.sort_by(|left_id, right_id| {
+            let left_name = knowledge_map.get(left_id).map(|kb| kb.name.as_str()).unwrap_or_default();
+            let right_name = knowledge_map.get(right_id).map(|kb| kb.name.as_str()).unwrap_or_default();
+            left_name.cmp(right_name)
+        });
+    }
+
+    let root_ids = match root_kb_id {
+        Some(root_id) => {
+            if knowledge_map.contains_key(&root_id) {
+                vec![root_id]
+            } else {
+                Vec::new()
+            }
+        }
+        None => children_map.get(&None).cloned().unwrap_or_default(),
+    };
+
+    let mut tree = Vec::with_capacity(root_ids.len());
+    for root_id in root_ids {
+        if let Some(node) = build_tree_node(root_id, &knowledge_map, &children_map, &mut files_by_kb) {
+            tree.push(node);
+        }
+    }
+    tree
 }
 
 /// 获取知识库树结构
@@ -1186,15 +1251,9 @@ pub async fn tree(
     State(pool): State<SqlitePool>, Query(params): Query<TreeQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<Vec<KnowledgeTreeNode>>> {
     let is_admin = auth_user.is_admin();
-    let tree = match params.kb_id {
-        Some(kb_id) => {
-            let subtree = build_subtree_recursive(&pool, kb_id, &auth_user.user_id, is_admin).await?;
-            match subtree {
-                Some(node) => vec![node],
-                None => vec![],
-            }
-        }
-        None => build_tree_recursive(&pool, None, &auth_user.user_id, is_admin).await?,
-    };
+    let knowledges = load_tree_knowledges(&pool, params.kb_id, &auth_user.user_id, is_admin).await?;
+    let kb_ids: Vec<i64> = knowledges.iter().map(|kb| kb.id).collect();
+    let files_by_kb = load_tree_files_by_kb(&pool, &kb_ids, &auth_user.user_id, is_admin).await?;
+    let tree = assemble_tree(knowledges, files_by_kb, params.kb_id);
     Ok(Json(tree))
 }
