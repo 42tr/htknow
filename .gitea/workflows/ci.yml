@@ -1,0 +1,942 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+      - main
+    tags:
+      - "*"
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  backend:
+    name: Backend (Rust)
+    if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/')
+    runs-on: amd
+    steps:
+      - name: Checkout (shell)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SERVER_URL="${CI_REPO_BASE_URL:-${GITHUB_SERVER_URL%/}}"
+          PRIMARY_URL="${SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          URLS="${PRIMARY_URL}"
+          case "${PRIMARY_URL}" in
+            https://*) URLS="${URLS} http://${PRIMARY_URL#https://}" ;;
+            http://*) URLS="${URLS} https://${PRIMARY_URL#http://}" ;;
+          esac
+
+          [ -d .git ] || git init .
+
+          BASIC_AUTH=""
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            BASIC_AUTH="$(printf '%s' "${GITHUB_ACTOR}:${GITHUB_TOKEN}" | base64 | tr -d '\n')"
+          fi
+          git_fetch() {
+            if [ -n "${BASIC_AUTH}" ]; then
+              git -c "http.extraHeader=Authorization: Basic ${BASIC_AUTH}" fetch --depth 1 origin "${GITHUB_SHA}"
+            else
+              git fetch --depth 1 origin "${GITHUB_SHA}"
+            fi
+          }
+
+          FETCH_OK=0
+          for URL in ${URLS}; do
+            if git remote get-url origin >/dev/null 2>&1; then
+              git remote set-url origin "${URL}"
+            else
+              git remote add origin "${URL}"
+            fi
+            if git_fetch; then
+              FETCH_OK=1
+              break
+            fi
+          done
+
+          if [ "${FETCH_OK}" -ne 1 ]; then
+            echo "Failed to fetch ${GITHUB_SHA} from ${PRIMARY_URL} (tried http/https)."
+            exit 1
+          fi
+          git checkout --force FETCH_HEAD
+
+      - name: Setup Rust
+        run: |
+          set -euo pipefail
+          as_root() {
+            if [ "$(id -u)" -eq 0 ]; then
+              "$@"
+            elif command -v sudo >/dev/null 2>&1; then
+              sudo "$@"
+            else
+              echo "Need root privileges to install system packages."
+              exit 1
+            fi
+          }
+          ensure_pkg() {
+            if command -v pacman >/dev/null 2>&1; then
+              as_root pacman -Sy --noconfirm --needed "$@"
+            elif command -v apt-get >/dev/null 2>&1; then
+              as_root apt-get update
+              as_root apt-get install -y "$@"
+            elif command -v apk >/dev/null 2>&1; then
+              as_root apk add --no-cache "$@"
+            elif command -v dnf >/dev/null 2>&1; then
+              as_root dnf install -y "$@"
+            else
+              echo "Unsupported package manager. Please preinstall required tools: $*"
+              exit 1
+            fi
+          }
+          ensure_cc_toolchain() {
+            if command -v cc >/dev/null 2>&1 && command -v make >/dev/null 2>&1; then
+              return
+            fi
+            if command -v pacman >/dev/null 2>&1; then
+              ensure_pkg gcc make pkgconf
+            elif command -v apt-get >/dev/null 2>&1; then
+              ensure_pkg build-essential pkg-config
+            elif command -v apk >/dev/null 2>&1; then
+              ensure_pkg build-base pkgconf
+            elif command -v dnf >/dev/null 2>&1; then
+              ensure_pkg gcc gcc-c++ make pkgconf-pkg-config
+            else
+              echo "Unsupported package manager. Please preinstall C toolchain (cc/make/pkg-config)."
+              exit 1
+            fi
+          }
+          ensure_protoc() {
+            has_protoc_include() {
+              PROTOC_BIN_LOCAL="$(command -v protoc || true)"
+              for CANDIDATE in \
+                "${PROTOC_INCLUDE:-}" \
+                /usr/include \
+                /usr/local/include \
+                /usr/include/x86_64-linux-gnu \
+                /usr/include/aarch64-linux-gnu \
+                /usr/lib/protobuf/include \
+                "$(dirname "${PROTOC_BIN_LOCAL}")/../include"; do
+                [ -n "${CANDIDATE}" ] || continue
+                if [ -f "${CANDIDATE}/google/protobuf/empty.proto" ]; then
+                  return 0
+                fi
+              done
+              return 1
+            }
+            if command -v protoc >/dev/null 2>&1 && has_protoc_include; then
+              return
+            fi
+            if command -v pacman >/dev/null 2>&1; then
+              ensure_pkg protobuf
+            elif command -v apt-get >/dev/null 2>&1; then
+              ensure_pkg protobuf-compiler libprotobuf-dev
+            elif command -v apk >/dev/null 2>&1; then
+              ensure_pkg protobuf protobuf-dev
+            elif command -v dnf >/dev/null 2>&1; then
+              ensure_pkg protobuf-compiler protobuf-devel
+            else
+              echo "Unsupported package manager. Please preinstall protoc."
+              exit 1
+            fi
+            if ! command -v protoc >/dev/null 2>&1; then
+              echo "protoc not found after installation."
+              exit 1
+            fi
+            if ! has_protoc_include; then
+              echo "protoc found but standard protobuf include files are missing."
+              exit 1
+            fi
+          }
+          ensure_cc_toolchain
+          ensure_protoc
+
+          if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
+            if command -v pacman >/dev/null 2>&1; then
+              ensure_pkg rust rustfmt
+            elif command -v apt-get >/dev/null 2>&1; then
+              ensure_pkg rustc cargo rustfmt
+            elif command -v apk >/dev/null 2>&1; then
+              ensure_pkg rust cargo
+            elif command -v dnf >/dev/null 2>&1; then
+              ensure_pkg rust cargo rustfmt
+            fi
+          fi
+
+          if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
+            if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+              ensure_pkg curl
+            fi
+            if command -v curl >/dev/null 2>&1; then
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --component rustfmt
+            else
+              wget -qO- https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal --component rustfmt
+            fi
+          fi
+          if [ -f "${HOME}/.cargo/env" ]; then
+            . "${HOME}/.cargo/env"
+          fi
+          export PATH="${HOME}/.cargo/bin:${PATH}"
+          PROTOC_BIN="$(command -v protoc || true)"
+          if [ -z "${PROTOC_BIN}" ]; then
+            echo "protoc not found after installation."
+            exit 1
+          fi
+          PROTOC_INC=""
+          for CANDIDATE in \
+            "${PROTOC_INCLUDE:-}" \
+            /usr/include \
+            /usr/local/include \
+            /usr/include/x86_64-linux-gnu \
+            /usr/include/aarch64-linux-gnu \
+            /usr/lib/protobuf/include \
+            "$(dirname "${PROTOC_BIN}")/../include"; do
+            [ -n "${CANDIDATE}" ] || continue
+            if [ -f "${CANDIDATE}/google/protobuf/empty.proto" ]; then
+              PROTOC_INC="$(cd "${CANDIDATE}" && pwd)"
+              break
+            fi
+          done
+          if [ -z "${PROTOC_INC}" ] && command -v find >/dev/null 2>&1; then
+            PROTO_FILE="$(find /usr /usr/local -type f -path '*/google/protobuf/empty.proto' 2>/dev/null | head -n 1 || true)"
+            if [ -n "${PROTO_FILE}" ]; then
+              PROTOC_INC="$(cd "$(dirname "$(dirname "$(dirname "${PROTO_FILE}")")")" && pwd)"
+            fi
+          fi
+          if [ -n "${PROTOC_INC}" ]; then
+            echo "PROTOC=${PROTOC_BIN}" >> "${GITHUB_ENV}"
+            echo "PROTOC_INCLUDE=${PROTOC_INC}" >> "${GITHUB_ENV}"
+            export PROTOC="${PROTOC_BIN}"
+            export PROTOC_INCLUDE="${PROTOC_INC}"
+          else
+            echo "Could not locate google/protobuf include dir for protoc."
+            exit 1
+          fi
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+          cargo --version
+          rustc --version
+          protoc --version
+          rustup component add rustfmt || true
+
+      - name: Check format
+        run: |
+          set -euo pipefail
+          NIGHTLY_ONLY_KEYS='^(indent_style|wrap_comments|normalize_comments|format_macro_matchers|format_macro_bodies|struct_lit_single_line|fn_single_line|imports_indent|imports_layout|imports_granularity|group_imports|type_punctuation_density|space_before_colon|space_after_colon|spaces_around_ranges|binop_separator|overflow_delimited_expr|match_arm_blocks|force_multiline_blocks|brace_style|control_brace_style|trailing_semicolon|trailing_comma)\s*='
+          if [ -f .rustfmt.toml ] && grep -Eq "${NIGHTLY_ONLY_KEYS}" .rustfmt.toml; then
+            echo "Skip rustfmt check: .rustfmt.toml includes nightly-only options."
+            exit 0
+          fi
+          cargo fmt --all -- --check
+
+      - name: Setup Node (shell)
+        run: |
+          set -euo pipefail
+          if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+            node --version
+            npm --version
+            exit 0
+          fi
+          as_root() {
+            if [ "$(id -u)" -eq 0 ]; then
+              "$@"
+            elif command -v sudo >/dev/null 2>&1; then
+              sudo "$@"
+            else
+              echo "Need root privileges to install nodejs/npm."
+              exit 1
+            fi
+          }
+          if command -v pacman >/dev/null 2>&1; then
+            as_root pacman -Sy --noconfirm --needed nodejs npm
+          elif command -v apt-get >/dev/null 2>&1; then
+            as_root apt-get update
+            as_root apt-get install -y nodejs npm
+          elif command -v apk >/dev/null 2>&1; then
+            as_root apk add --no-cache nodejs npm
+          elif command -v dnf >/dev/null 2>&1; then
+            as_root dnf install -y nodejs npm
+          else
+            echo "Unsupported package manager. Preinstall nodejs/npm on runner."
+            exit 1
+          fi
+          node --version
+          npm --version
+
+      - name: Build frontend assets for RustEmbed
+        working-directory: frontend
+        run: |
+          npm config set registry https://registry.npmjs.org
+          npm config set replace-registry-host always
+          npm ci --cache .npm-cache --prefer-online
+          npm run build
+
+      - name: Run tests
+        run: cargo test --workspace --all-features
+
+  frontend:
+    name: Frontend (Vite)
+    if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/')
+    runs-on: amd
+    steps:
+      - name: Checkout (shell)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SERVER_URL="${CI_REPO_BASE_URL:-${GITHUB_SERVER_URL%/}}"
+          PRIMARY_URL="${SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          URLS="${PRIMARY_URL}"
+          case "${PRIMARY_URL}" in
+            https://*) URLS="${URLS} http://${PRIMARY_URL#https://}" ;;
+            http://*) URLS="${URLS} https://${PRIMARY_URL#http://}" ;;
+          esac
+
+          [ -d .git ] || git init .
+
+          BASIC_AUTH=""
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            BASIC_AUTH="$(printf '%s' "${GITHUB_ACTOR}:${GITHUB_TOKEN}" | base64 | tr -d '\n')"
+          fi
+          git_fetch() {
+            if [ -n "${BASIC_AUTH}" ]; then
+              git -c "http.extraHeader=Authorization: Basic ${BASIC_AUTH}" fetch --depth 1 origin "${GITHUB_SHA}"
+            else
+              git fetch --depth 1 origin "${GITHUB_SHA}"
+            fi
+          }
+
+          FETCH_OK=0
+          for URL in ${URLS}; do
+            if git remote get-url origin >/dev/null 2>&1; then
+              git remote set-url origin "${URL}"
+            else
+              git remote add origin "${URL}"
+            fi
+            if git_fetch; then
+              FETCH_OK=1
+              break
+            fi
+          done
+
+          if [ "${FETCH_OK}" -ne 1 ]; then
+            echo "Failed to fetch ${GITHUB_SHA} from ${PRIMARY_URL} (tried http/https)."
+            exit 1
+          fi
+          git checkout --force FETCH_HEAD
+
+      - name: Setup Node (shell)
+        run: |
+          set -euo pipefail
+          if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+            node --version
+            npm --version
+            exit 0
+          fi
+          as_root() {
+            if [ "$(id -u)" -eq 0 ]; then
+              "$@"
+            elif command -v sudo >/dev/null 2>&1; then
+              sudo "$@"
+            else
+              echo "Need root privileges to install nodejs/npm."
+              exit 1
+            fi
+          }
+          if command -v pacman >/dev/null 2>&1; then
+            as_root pacman -Sy --noconfirm --needed nodejs npm
+          elif command -v apt-get >/dev/null 2>&1; then
+            as_root apt-get update
+            as_root apt-get install -y nodejs npm
+          elif command -v apk >/dev/null 2>&1; then
+            as_root apk add --no-cache nodejs npm
+          elif command -v dnf >/dev/null 2>&1; then
+            as_root dnf install -y nodejs npm
+          else
+            echo "Unsupported package manager. Preinstall nodejs/npm on runner."
+            exit 1
+          fi
+          node --version
+          npm --version
+
+      - name: Install dependencies
+        working-directory: frontend
+        run: |
+          npm config set registry https://registry.npmjs.org
+          npm config set replace-registry-host always
+          npm ci --cache .npm-cache --prefer-online
+
+      - name: Build
+        working-directory: frontend
+        run: npm run build
+
+  docker_release:
+    name: Docker Release Tar
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: amd
+    permissions:
+      contents: write
+      releases: write
+    steps:
+      - name: Checkout (shell)
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SERVER_URL="${CI_REPO_BASE_URL:-${GITHUB_SERVER_URL%/}}"
+          PRIMARY_URL="${SERVER_URL}/${GITHUB_REPOSITORY}.git"
+          URLS="${PRIMARY_URL}"
+          case "${PRIMARY_URL}" in
+            https://*) URLS="${URLS} http://${PRIMARY_URL#https://}" ;;
+            http://*) URLS="${URLS} https://${PRIMARY_URL#http://}" ;;
+          esac
+
+          [ -d .git ] || git init .
+
+          BASIC_AUTH=""
+          if [ -n "${GITHUB_TOKEN:-}" ]; then
+            BASIC_AUTH="$(printf '%s' "${GITHUB_ACTOR}:${GITHUB_TOKEN}" | base64 | tr -d '\n')"
+          fi
+          git_fetch() {
+            if [ -n "${BASIC_AUTH}" ]; then
+              git -c "http.extraHeader=Authorization: Basic ${BASIC_AUTH}" fetch --depth 1 origin "${GITHUB_SHA}"
+            else
+              git fetch --depth 1 origin "${GITHUB_SHA}"
+            fi
+          }
+
+          FETCH_OK=0
+          for URL in ${URLS}; do
+            if git remote get-url origin >/dev/null 2>&1; then
+              git remote set-url origin "${URL}"
+            else
+              git remote add origin "${URL}"
+            fi
+            if git_fetch; then
+              FETCH_OK=1
+              break
+            fi
+          done
+
+          if [ "${FETCH_OK}" -ne 1 ]; then
+            echo "Failed to fetch ${GITHUB_SHA} from ${PRIMARY_URL} (tried http/https)."
+            exit 1
+          fi
+          git checkout --force FETCH_HEAD
+
+      - name: Setup Rust
+        run: |
+          set -euo pipefail
+          as_root() {
+            if [ "$(id -u)" -eq 0 ]; then
+              "$@"
+            elif command -v sudo >/dev/null 2>&1; then
+              sudo "$@"
+            else
+              echo "Need root privileges to install system packages."
+              exit 1
+            fi
+          }
+          ensure_pkg() {
+            if command -v pacman >/dev/null 2>&1; then
+              as_root pacman -Sy --noconfirm --needed "$@"
+            elif command -v apt-get >/dev/null 2>&1; then
+              as_root apt-get update
+              as_root apt-get install -y "$@"
+            elif command -v apk >/dev/null 2>&1; then
+              as_root apk add --no-cache "$@"
+            elif command -v dnf >/dev/null 2>&1; then
+              as_root dnf install -y "$@"
+            else
+              echo "Unsupported package manager. Please preinstall required tools: $*"
+              exit 1
+            fi
+          }
+          ensure_cc_toolchain() {
+            if command -v cc >/dev/null 2>&1 && command -v make >/dev/null 2>&1; then
+              return
+            fi
+            if command -v pacman >/dev/null 2>&1; then
+              ensure_pkg gcc make pkgconf
+            elif command -v apt-get >/dev/null 2>&1; then
+              ensure_pkg build-essential pkg-config
+            elif command -v apk >/dev/null 2>&1; then
+              ensure_pkg build-base pkgconf
+            elif command -v dnf >/dev/null 2>&1; then
+              ensure_pkg gcc gcc-c++ make pkgconf-pkg-config
+            else
+              echo "Unsupported package manager. Please preinstall C toolchain (cc/make/pkg-config)."
+              exit 1
+            fi
+          }
+          ensure_protoc() {
+            has_protoc_include() {
+              PROTOC_BIN_LOCAL="$(command -v protoc || true)"
+              for CANDIDATE in \
+                "${PROTOC_INCLUDE:-}" \
+                /usr/include \
+                /usr/local/include \
+                /usr/include/x86_64-linux-gnu \
+                /usr/include/aarch64-linux-gnu \
+                /usr/lib/protobuf/include \
+                "$(dirname "${PROTOC_BIN_LOCAL}")/../include"; do
+                [ -n "${CANDIDATE}" ] || continue
+                if [ -f "${CANDIDATE}/google/protobuf/empty.proto" ]; then
+                  return 0
+                fi
+              done
+              return 1
+            }
+            if command -v protoc >/dev/null 2>&1 && has_protoc_include; then
+              return
+            fi
+            if command -v pacman >/dev/null 2>&1; then
+              ensure_pkg protobuf
+            elif command -v apt-get >/dev/null 2>&1; then
+              ensure_pkg protobuf-compiler libprotobuf-dev
+            elif command -v apk >/dev/null 2>&1; then
+              ensure_pkg protobuf protobuf-dev
+            elif command -v dnf >/dev/null 2>&1; then
+              ensure_pkg protobuf-compiler protobuf-devel
+            else
+              echo "Unsupported package manager. Please preinstall protoc."
+              exit 1
+            fi
+            if ! command -v protoc >/dev/null 2>&1; then
+              echo "protoc not found after installation."
+              exit 1
+            fi
+            if ! has_protoc_include; then
+              echo "protoc found but standard protobuf include files are missing."
+              exit 1
+            fi
+          }
+          ensure_cc_toolchain
+          ensure_protoc
+
+          if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
+            if command -v pacman >/dev/null 2>&1; then
+              ensure_pkg rust rustfmt
+            elif command -v apt-get >/dev/null 2>&1; then
+              ensure_pkg rustc cargo rustfmt
+            elif command -v apk >/dev/null 2>&1; then
+              ensure_pkg rust cargo
+            elif command -v dnf >/dev/null 2>&1; then
+              ensure_pkg rust cargo rustfmt
+            fi
+          fi
+
+          if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
+            if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+              ensure_pkg curl
+            fi
+            if command -v curl >/dev/null 2>&1; then
+              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal
+            else
+              wget -qO- https://sh.rustup.rs \
+                | sh -s -- -y --profile minimal
+            fi
+          fi
+          if [ -f "${HOME}/.cargo/env" ]; then
+            . "${HOME}/.cargo/env"
+          fi
+          export PATH="${HOME}/.cargo/bin:${PATH}"
+          PROTOC_BIN="$(command -v protoc || true)"
+          if [ -z "${PROTOC_BIN}" ]; then
+            echo "protoc not found after installation."
+            exit 1
+          fi
+          PROTOC_INC=""
+          for CANDIDATE in \
+            "${PROTOC_INCLUDE:-}" \
+            /usr/include \
+            /usr/local/include \
+            /usr/include/x86_64-linux-gnu \
+            /usr/include/aarch64-linux-gnu \
+            /usr/lib/protobuf/include \
+            "$(dirname "${PROTOC_BIN}")/../include"; do
+            [ -n "${CANDIDATE}" ] || continue
+            if [ -f "${CANDIDATE}/google/protobuf/empty.proto" ]; then
+              PROTOC_INC="$(cd "${CANDIDATE}" && pwd)"
+              break
+            fi
+          done
+          if [ -z "${PROTOC_INC}" ] && command -v find >/dev/null 2>&1; then
+            PROTO_FILE="$(find /usr /usr/local -type f -path '*/google/protobuf/empty.proto' 2>/dev/null | head -n 1 || true)"
+            if [ -n "${PROTO_FILE}" ]; then
+              PROTOC_INC="$(cd "$(dirname "$(dirname "$(dirname "${PROTO_FILE}")")")" && pwd)"
+            fi
+          fi
+          if [ -n "${PROTOC_INC}" ]; then
+            echo "PROTOC=${PROTOC_BIN}" >> "${GITHUB_ENV}"
+            echo "PROTOC_INCLUDE=${PROTOC_INC}" >> "${GITHUB_ENV}"
+            export PROTOC="${PROTOC_BIN}"
+            export PROTOC_INCLUDE="${PROTOC_INC}"
+          else
+            echo "Could not locate google/protobuf include dir for protoc."
+            exit 1
+          fi
+          echo "${HOME}/.cargo/bin" >> "${GITHUB_PATH}"
+          cargo --version
+          rustc --version
+          protoc --version
+
+      - name: Setup Node (shell)
+        run: |
+          set -euo pipefail
+          if command -v node >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+            node --version
+            npm --version
+            exit 0
+          fi
+          as_root() {
+            if [ "$(id -u)" -eq 0 ]; then
+              "$@"
+            elif command -v sudo >/dev/null 2>&1; then
+              sudo "$@"
+            else
+              echo "Need root privileges to install nodejs/npm."
+              exit 1
+            fi
+          }
+          if command -v pacman >/dev/null 2>&1; then
+            as_root pacman -Sy --noconfirm --needed nodejs npm
+          elif command -v apt-get >/dev/null 2>&1; then
+            as_root apt-get update
+            as_root apt-get install -y nodejs npm
+          elif command -v apk >/dev/null 2>&1; then
+            as_root apk add --no-cache nodejs npm
+          elif command -v dnf >/dev/null 2>&1; then
+            as_root dnf install -y nodejs npm
+          else
+            echo "Unsupported package manager. Preinstall nodejs/npm on runner."
+            exit 1
+          fi
+          node --version
+          npm --version
+
+      - name: Setup Docker (shell)
+        run: |
+          set -euo pipefail
+          as_root() {
+            if [ "$(id -u)" -eq 0 ]; then
+              "$@"
+            elif command -v sudo >/dev/null 2>&1; then
+              sudo "$@"
+            else
+              echo "Need root privileges to install/start docker."
+              exit 1
+            fi
+          }
+          if ! command -v docker >/dev/null 2>&1; then
+            if command -v pacman >/dev/null 2>&1; then
+              as_root pacman -Sy --noconfirm --needed docker
+            elif command -v apt-get >/dev/null 2>&1; then
+              as_root apt-get update
+              as_root apt-get install -y docker.io
+            elif command -v apk >/dev/null 2>&1; then
+              as_root apk add --no-cache docker
+            elif command -v dnf >/dev/null 2>&1; then
+              if ! as_root dnf install -y docker; then
+                as_root dnf install -y moby-engine
+              fi
+            else
+              echo "Unsupported package manager. Please preinstall docker."
+              exit 1
+            fi
+          fi
+
+          if ! docker info >/dev/null 2>&1; then
+            if command -v dockerd >/dev/null 2>&1; then
+              nohup dockerd >/tmp/dockerd.log 2>&1 &
+              for _ in $(seq 1 60); do
+                if docker info >/dev/null 2>&1; then
+                  break
+                fi
+                sleep 1
+              done
+            fi
+          fi
+
+          if ! docker info >/dev/null 2>&1; then
+            echo "Docker daemon is not available. Runner must support docker (daemon or mounted /var/run/docker.sock)."
+            [ -f /tmp/dockerd.log ] && tail -n 80 /tmp/dockerd.log || true
+            exit 1
+          fi
+
+          docker version
+
+      - name: Build Docker image by script
+        run: |
+          set -euo pipefail
+          TAG_NAME="${GITHUB_REF_NAME}"
+          SAFE_TAG="$(echo "${TAG_NAME}" | tr '/' '-')"
+          npm config set registry https://registry.npmjs.org
+          npm config set replace-registry-host always
+          IMAGE_TAG="${SAFE_TAG}" sh build-docker.sh
+          docker save "htknow:${SAFE_TAG}" -o "htknow-${SAFE_TAG}.tar"
+          echo "TAG_NAME=${TAG_NAME}" >> "${GITHUB_ENV}"
+          echo "SAFE_TAG=${SAFE_TAG}" >> "${GITHUB_ENV}"
+          echo "ASSET_FILE=htknow-${SAFE_TAG}.tar" >> "${GITHUB_ENV}"
+
+      - name: Create release (if needed) and upload tar
+        env:
+          RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN }}
+        run: |
+          set -euo pipefail
+          as_root() {
+            if [ "$(id -u)" -eq 0 ]; then
+              "$@"
+            elif command -v sudo >/dev/null 2>&1; then
+              sudo "$@"
+            else
+              echo "Need root privileges to install system packages."
+              exit 1
+            fi
+          }
+          ensure_pkg() {
+            if command -v pacman >/dev/null 2>&1; then
+              as_root pacman -Sy --noconfirm --needed "$@"
+            elif command -v apt-get >/dev/null 2>&1; then
+              as_root apt-get update
+              as_root apt-get install -y "$@"
+            elif command -v apk >/dev/null 2>&1; then
+              as_root apk add --no-cache "$@"
+            elif command -v dnf >/dev/null 2>&1; then
+              as_root dnf install -y "$@"
+            else
+              echo "Unsupported package manager. Please preinstall required tools: $*"
+              exit 1
+            fi
+          }
+          command -v curl >/dev/null 2>&1 || ensure_pkg curl
+          command -v jq >/dev/null 2>&1 || ensure_pkg jq
+
+          if [ -z "${RELEASE_TOKEN:-}" ]; then
+            echo "secrets.RELEASE_TOKEN is required to create releases and upload assets."
+            exit 1
+          fi
+
+          REPO_OWNER="${GITHUB_REPOSITORY%%/*}"
+          REPO_NAME="${GITHUB_REPOSITORY##*/}"
+          API_BASE="${GITHUB_API_URL:-${GITHUB_SERVER_URL}/api/v1}"
+          AUTH_HEADER="Authorization: token ${RELEASE_TOKEN}"
+          RELEASE_URL="${API_BASE}/repos/${REPO_OWNER}/${REPO_NAME}/releases"
+
+          LOOKUP_CODE="$(curl -sS -o release.json -w '%{http_code}' \
+            -H "${AUTH_HEADER}" \
+            "${RELEASE_URL}/tags/${TAG_NAME}")"
+
+          if [ "${LOOKUP_CODE}" = "200" ]; then
+            echo "Release for tag ${TAG_NAME} already exists."
+          elif [ "${LOOKUP_CODE}" = "404" ]; then
+            cat > create-release.json <<EOF
+          {"tag_name":"${TAG_NAME}","name":"${TAG_NAME}","body":"Automated Docker image tar for ${TAG_NAME}.","draft":false,"prerelease":false}
+          EOF
+            curl -sS -f -X POST \
+              -H "${AUTH_HEADER}" \
+              -H "Content-Type: application/json" \
+              --data @create-release.json \
+              "${RELEASE_URL}" \
+              -o release.json
+            echo "Created release for ${TAG_NAME}."
+          else
+            echo "Unexpected response (${LOOKUP_CODE}) while querying release:"
+            cat release.json
+            exit 1
+          fi
+
+          RELEASE_ID="$(jq -r '.id' release.json)"
+          if [ -z "${RELEASE_ID}" ] || [ "${RELEASE_ID}" = "null" ]; then
+            echo "Failed to resolve release id."
+            cat release.json
+            exit 1
+          fi
+
+          EXISTING_ASSET_ID="$(curl -sS -f \
+            -H "${AUTH_HEADER}" \
+            "${RELEASE_URL}/${RELEASE_ID}/assets" \
+            | jq -r --arg name "${ASSET_FILE}" '.[] | select(.name == $name) | .id')"
+          if [ -n "${EXISTING_ASSET_ID}" ] && [ "${EXISTING_ASSET_ID}" != "null" ]; then
+            curl -sS -f -X DELETE \
+              -H "${AUTH_HEADER}" \
+              "${RELEASE_URL}/${RELEASE_ID}/assets/${EXISTING_ASSET_ID}" >/dev/null
+            echo "Deleted existing asset ${ASSET_FILE}."
+          fi
+
+          curl -sS -f -X POST \
+            -H "${AUTH_HEADER}" \
+            -H "Content-Type: application/octet-stream" \
+            --data-binary @"${ASSET_FILE}" \
+            "${RELEASE_URL}/${RELEASE_ID}/assets?name=${ASSET_FILE}" >/dev/null
+
+          echo "Uploaded ${ASSET_FILE} to release ${TAG_NAME}."
+
+      - name: Deploy to target server
+        env:
+          DEPLOY_HOST: ${{ secrets.DEPLOY_HOST }}
+          DEPLOY_PORT: ${{ secrets.DEPLOY_PORT }}
+          DEPLOY_USER: ${{ secrets.DEPLOY_USER }}
+          DEPLOY_PASSWORD: ${{ secrets.DEPLOY_PASSWORD }}
+          DEPLOY_PATH: ${{ secrets.DEPLOY_PATH }}
+          DEPLOY_SSH_KEY: ${{ secrets.DEPLOY_SSH_KEY }}
+          DEPLOY_COMMAND: ${{ secrets.DEPLOY_COMMAND }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "${DEPLOY_HOST:-}" ] || [ -z "${DEPLOY_USER:-}" ]; then
+            echo "Deploy secrets not fully configured (DEPLOY_HOST/DEPLOY_USER). Skip deployment."
+            exit 0
+          fi
+          if [ -z "${DEPLOY_PASSWORD:-}" ] && [ -z "${DEPLOY_SSH_KEY:-}" ]; then
+            echo "Neither DEPLOY_PASSWORD nor DEPLOY_SSH_KEY is configured. Skip deployment."
+            exit 0
+          fi
+
+          as_root() {
+            if [ "$(id -u)" -eq 0 ]; then
+              "$@"
+            elif command -v sudo >/dev/null 2>&1; then
+              sudo "$@"
+            else
+              echo "Need root privileges to install openssh client."
+              exit 1
+            fi
+          }
+          ensure_pkg() {
+            if command -v pacman >/dev/null 2>&1; then
+              as_root pacman -Sy --noconfirm --needed "$@"
+            elif command -v apt-get >/dev/null 2>&1; then
+              as_root apt-get update
+              as_root apt-get install -y "$@"
+            elif command -v apk >/dev/null 2>&1; then
+              as_root apk add --no-cache "$@"
+            elif command -v dnf >/dev/null 2>&1; then
+              as_root dnf install -y "$@"
+            else
+              echo "Unsupported package manager. Please preinstall openssh client."
+              exit 1
+            fi
+          }
+
+          ensure_ssh_client() {
+            if command -v ssh >/dev/null 2>&1 && command -v scp >/dev/null 2>&1 && command -v ssh-keyscan >/dev/null 2>&1; then
+              return
+            fi
+            if command -v pacman >/dev/null 2>&1; then
+              ensure_pkg openssh
+            elif command -v apt-get >/dev/null 2>&1; then
+              ensure_pkg openssh-client
+            elif command -v apk >/dev/null 2>&1; then
+              ensure_pkg openssh-client
+            elif command -v dnf >/dev/null 2>&1; then
+              ensure_pkg openssh-clients
+            else
+              echo "Unsupported package manager. Please preinstall ssh/scp."
+              exit 1
+            fi
+          }
+          ensure_ssh_client
+
+          PORT="${DEPLOY_PORT:-22}"
+          REMOTE_PATH_RAW="${DEPLOY_PATH:-/tmp/htknow-release}"
+          case "${REMOTE_PATH_RAW}" in
+            "~") REMOTE_PATH_REMOTE="\$HOME" ;;
+            "~/"*) REMOTE_PATH_REMOTE="\$HOME/${REMOTE_PATH_RAW#~/}" ;;
+            *) REMOTE_PATH_REMOTE="${REMOTE_PATH_RAW}" ;;
+          esac
+          KNOWN_HOSTS="${HOME}/.ssh/known_hosts"
+
+          mkdir -p ~/.ssh
+          chmod 700 ~/.ssh
+          touch "${KNOWN_HOSTS}"
+          chmod 600 "${KNOWN_HOSTS}"
+          ssh-keyscan -T 10 -p "${PORT}" -H "${DEPLOY_HOST}" >> "${KNOWN_HOSTS}" 2>/dev/null || true
+
+          run_ssh() {
+            ssh -p "${PORT}" \
+              -o BatchMode=yes \
+              -o ConnectTimeout=10 \
+              -o ServerAliveInterval=10 \
+              -o ServerAliveCountMax=3 \
+              -o StrictHostKeyChecking=accept-new \
+              -o UserKnownHostsFile="${KNOWN_HOSTS}" \
+              -i "${HOME}/.ssh/id_deploy" \
+              "$@"
+          }
+          run_scp() {
+            scp -P "${PORT}" \
+              -o BatchMode=yes \
+              -o ConnectTimeout=10 \
+              -o ServerAliveInterval=10 \
+              -o ServerAliveCountMax=3 \
+              -o StrictHostKeyChecking=accept-new \
+              -o UserKnownHostsFile="${KNOWN_HOSTS}" \
+              -i "${HOME}/.ssh/id_deploy" \
+              "$@"
+          }
+
+          if [ -n "${DEPLOY_PASSWORD:-}" ]; then
+            command -v sshpass >/dev/null 2>&1 || ensure_pkg sshpass
+            export SSHPASS="${DEPLOY_PASSWORD}"
+            run_ssh() {
+              sshpass -e ssh -p "${PORT}" \
+                -o PreferredAuthentications=password \
+                -o PubkeyAuthentication=no \
+                -o ConnectTimeout=10 \
+                -o ServerAliveInterval=10 \
+                -o ServerAliveCountMax=3 \
+                -o StrictHostKeyChecking=accept-new \
+                -o UserKnownHostsFile="${KNOWN_HOSTS}" \
+                "$@"
+            }
+            run_scp() {
+              sshpass -e scp -P "${PORT}" \
+                -o PreferredAuthentications=password \
+                -o PubkeyAuthentication=no \
+                -o ConnectTimeout=10 \
+                -o ServerAliveInterval=10 \
+                -o ServerAliveCountMax=3 \
+                -o StrictHostKeyChecking=accept-new \
+                -o UserKnownHostsFile="${KNOWN_HOSTS}" \
+                "$@"
+            }
+          else
+            printf '%s\n' "${DEPLOY_SSH_KEY}" | sed 's/\r$//' > ~/.ssh/id_deploy
+            chmod 600 ~/.ssh/id_deploy
+          fi
+
+          if ! run_ssh "${DEPLOY_USER}@${DEPLOY_HOST}" "echo 'ssh connectivity ok'"; then
+            echo "SSH connectivity check failed. Verify DEPLOY_HOST/DEPLOY_PORT/DEPLOY_USER and DEPLOY_PASSWORD or DEPLOY_SSH_KEY."
+            exit 1
+          fi
+
+          if [ ! -f "${ASSET_FILE}" ]; then
+            echo "Local asset file not found: ${ASSET_FILE}"
+            ls -lah
+            exit 1
+          fi
+
+          run_ssh "${DEPLOY_USER}@${DEPLOY_HOST}" "sh -lc 'set -e; REMOTE_PATH=\"${REMOTE_PATH_REMOTE}\"; REMOTE_PATH=\$(eval echo \"\${REMOTE_PATH}\"); mkdir -p \"\${REMOTE_PATH}\"'"
+          run_ssh "${DEPLOY_USER}@${DEPLOY_HOST}" "sh -lc 'set -e; REMOTE_PATH=\"${REMOTE_PATH_REMOTE}\"; REMOTE_PATH=\$(eval echo \"\${REMOTE_PATH}\"); cat > \"\${REMOTE_PATH}/${ASSET_FILE}\"'" < "${ASSET_FILE}"
+          run_ssh "${DEPLOY_USER}@${DEPLOY_HOST}" "sh -lc 'set -e; REMOTE_PATH=\"${REMOTE_PATH_REMOTE}\"; REMOTE_PATH=\$(eval echo \"\${REMOTE_PATH}\"); ls -lh \"\${REMOTE_PATH}/${ASSET_FILE}\"'"
+
+          if [ -n "${DEPLOY_COMMAND:-}" ]; then
+            DEPLOY_CMD_B64="$(printf '%s' "${DEPLOY_COMMAND}" | base64 | tr -d '\n')"
+            run_ssh "${DEPLOY_USER}@${DEPLOY_HOST}" \
+              "ASSET_FILE='${ASSET_FILE}' SAFE_TAG='${SAFE_TAG}' DEPLOY_PATH='${REMOTE_PATH_REMOTE}' DEPLOY_CMD_B64='${DEPLOY_CMD_B64}' sh -lc 'DEPLOY_PATH=\$(eval echo \"\$DEPLOY_PATH\"); printf %s \"\$DEPLOY_CMD_B64\" | base64 -d | sh'"
+          else
+            run_ssh "${DEPLOY_USER}@${DEPLOY_HOST}" "sh -lc '
+              set -e
+              DEPLOY_PATH=\"${REMOTE_PATH_REMOTE}\"
+              DEPLOY_PATH=\$(eval echo \"\$DEPLOY_PATH\")
+              docker load -i \"\$DEPLOY_PATH/${ASSET_FILE}\"
+              docker rm -f htknow >/dev/null 2>&1 || true
+              docker run -d --name htknow --restart unless-stopped -p 8080:8080 -v /opt/htknow/data:/app/data \"htknow:${SAFE_TAG}\"
+            '"
+          fi
+
+          echo "Deployed htknow:${SAFE_TAG} to ${DEPLOY_USER}@${DEPLOY_HOST}:${REMOTE_PATH_RAW}"
