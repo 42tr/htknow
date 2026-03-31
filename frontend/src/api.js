@@ -518,6 +518,32 @@ export const api = {
     return response.json()
   },
 
+  async reparseFailedFiles(options = {}) {
+    const {
+      kbId = undefined,
+      includeDescendants = true,
+      includeUnassigned = true,
+      unassignedOnly = false,
+    } = options
+
+    const payload = {
+      include_descendants: includeDescendants,
+      include_unassigned: includeUnassigned,
+      unassigned_only: unassignedOnly,
+    }
+    if (kbId !== undefined) {
+      payload.kb_id = kbId ?? null
+    }
+
+    const response = await fetch(`${API_BASE}/files/reparse-failed`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(payload),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '重新解析失败文件失败'))
+    return response.json()
+  },
+
   async getFile(id) {
     const response = await fetch(`${API_BASE}/files/${id}`, {
       headers: getHeaders(),

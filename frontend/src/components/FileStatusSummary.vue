@@ -18,6 +18,10 @@ const props = defineProps({
     type: Boolean,
     default: false,
   },
+  retryFailedLoading: {
+    type: Boolean,
+    default: false,
+  },
   error: {
     type: String,
     default: '',
@@ -32,7 +36,7 @@ const props = defineProps({
   },
 })
 
-const emit = defineEmits(['retry'])
+const emit = defineEmits(['retry', 'reparse-failed'])
 
 const normalizedStats = computed(() => ({
   total: props.stats?.total ?? 0,
@@ -61,6 +65,7 @@ const cards = computed(() => {
 })
 
 const hasData = computed(() => normalizedStats.value.total > 0)
+const hasFailedFiles = computed(() => normalizedStats.value.failed > 0)
 const processingFiles = computed(() => props.stats?.processing_files ?? [])
 const hoveredCard = ref(null)
 
@@ -84,6 +89,14 @@ const formatTimestamp = (timestamp) => {
         <span class="text-base font-semibold text-slate-900">
           {{ normalizedStats.total.toLocaleString() }} <span class="ml-1 text-xs text-slate-400">文件总数</span>
         </span>
+        <button
+          v-if="!error && !loading && hasFailedFiles"
+          class="mt-1 w-fit px-2.5 py-1 text-xs font-medium rounded-lg border border-red-200 bg-red-50 text-red-700 hover:bg-red-100 disabled:opacity-60 disabled:cursor-not-allowed"
+          :disabled="retryFailedLoading"
+          @click="emit('reparse-failed')"
+        >
+          {{ retryFailedLoading ? '提交中...' : `重新解析失败文件 (${normalizedStats.failed})` }}
+        </button>
       </div>
 
       <div class="flex-1 min-w-0">

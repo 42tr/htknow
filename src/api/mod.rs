@@ -39,6 +39,7 @@ use crate::search::SearchEngine;
         file::update,
         file::move_to_kb,
         file::batch_delete,
+        file::reparse_failed,
         file::delete,
         file::get_slices,
         file::get_image_by_filename,
@@ -88,6 +89,8 @@ use crate::search::SearchEngine;
             file::BatchDeleteFilesResp,
             file::BatchDeleteSkippedItem,
             file::BatchDeleteCleanupFailedItem,
+            file::ReparseFailedFilesReq,
+            file::ReparseFailedFilesResp,
             file::Slice,
             file::SlicePosition,
             file::FileStatusBreakdown,
@@ -153,6 +156,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
     let file_router = Router::new()
         .route("/", get(file::list).post(file::upload))
         .route("/batch-delete", post(file::batch_delete))
+        .route("/reparse-failed", post(file::reparse_failed))
         .route("/stats", get(file::stats))
         .route("/images/{filename}", get(file::get_image_by_filename))
         .route("/{id}", get(file::get).put(file::update).delete(file::delete))

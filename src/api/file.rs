@@ -621,6 +621,30 @@ pub struct BatchDeleteFilesResp {
     pub cleanup_failed: Vec<BatchDeleteCleanupFailedItem>,
 }
 
+const fn default_true_flag() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct ReparseFailedFilesReq {
+    /// 指定知识库 ID；不传表示全局范围
+    pub kb_id: Option<i64>,
+    /// 指定知识库时是否包含子知识库，默认 true
+    #[serde(default = "default_true_flag")]
+    pub include_descendants: bool,
+    /// 全局范围时是否包含未分配文件，默认 true
+    #[serde(default = "default_true_flag")]
+    pub include_unassigned: bool,
+    /// 是否只处理未分配知识库中的失败文件，默认 false
+    #[serde(default)]
+    pub unassigned_only: bool,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ReparseFailedFilesResp {
+    pub file_count: i64,
+}
+
 /// 更新文件
 #[utoipa::path(
     put,
@@ -865,6 +889,32 @@ pub async fn batch_delete(
     Ok(Json(result))
 }
 
+/// 重新解析失败文件
+#[utoipa::path(
+    post,
+    path = "/api/v1/knowledge/files/reparse-failed",
+    operation_id = "file_reparse_failed",
+    tag = "file",
+    request_body = ReparseFailedFilesReq,
+    responses(
+        (status = 200, description = "已提交失败文件重新解析", body = ReparseFailedFilesResp),
+        (status = 400, description = "请求参数错误"),
+        (status = 401, description = "未授权"),
+        (status = 404, description = "知识库不存在或无权限")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn reparse_failed(
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
+    Extension(auth_user): Extension<AuthUser>, Json(req): Json<ReparseFailedFilesReq>,
+) -> ApiResult<Json<ReparseFailedFilesResp>> {
+    let result = execute_reparse_failed(&pool, &search_engine, &auth_user, req).await?;
+    Ok(Json(result))
+}
+
 /// 删除文件
 #[utoipa::path(
     delete,
@@ -934,20 +984,16 @@ async fn query_deletable_files(pool: &SqlitePool, ids: &[i64], auth_user: &AuthU
 }
 
 async fn clear_file_parse_rows_in_tx(tx: &mut sqlx::Transaction<'_, Sqlite>, file_id: i64) -> Result<(), sqlx::Error> {
-    sqlx::query("DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
-        .bind(file_id)
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query("DELETE FROM slice_positions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
-        .bind(file_id)
-        .execute(&mut **tx)
-        .await?;
-    sqlx::query("DELETE FROM slices WHERE file_id = ?").bind(file_id).execute(&mut **tx).await?;
-    sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(file_id).execute(&mut **tx).await?;
-    Ok(())
+    clear_file_parse_rows_for_ids_in_tx(tx, &[file_id]).await
 }
 
-async fn delete_file_rows_in_tx(tx: &mut sqlx::Transaction<'_, Sqlite>, file_ids: &[i64]) -> Result<(), sqlx::Error> {
+async fn clear_file_parse_rows_for_ids_in_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>, file_ids: &[i64],
+) -> Result<(), sqlx::Error> {
+    if file_ids.is_empty() {
+        return Ok(());
+    }
+
     for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
         let mut mentions_qb = QueryBuilder::<Sqlite>::new(
             "DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id IN (",
@@ -980,6 +1026,12 @@ async fn delete_file_rows_in_tx(tx: &mut sqlx::Transaction<'_, Sqlite>, file_ids
         pdf_qb.build().execute(&mut **tx).await?;
     }
 
+    Ok(())
+}
+
+async fn delete_file_rows_in_tx(tx: &mut sqlx::Transaction<'_, Sqlite>, file_ids: &[i64]) -> Result<(), sqlx::Error> {
+    clear_file_parse_rows_for_ids_in_tx(tx, file_ids).await?;
+
     for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
         let mut files_qb = QueryBuilder::<Sqlite>::new("DELETE FROM files WHERE id IN (");
         push_i64_list(&mut files_qb, chunk);
@@ -988,6 +1040,152 @@ async fn delete_file_rows_in_tx(tx: &mut sqlx::Transaction<'_, Sqlite>, file_ids
     }
 
     Ok(())
+}
+
+async fn ensure_kb_owned_for_mutation(pool: &SqlitePool, kb_id: i64, auth_user: &AuthUser) -> ApiResult<()> {
+    let exists = if auth_user.is_admin() {
+        sqlx::query_scalar::<_, i64>("SELECT id FROM knowledge_bases WHERE id = ?")
+            .bind(kb_id)
+            .fetch_optional(pool)
+            .await?
+    } else {
+        sqlx::query_scalar::<_, i64>("SELECT id FROM knowledge_bases WHERE id = ? AND user_id = ?")
+            .bind(kb_id)
+            .bind(&auth_user.user_id)
+            .fetch_optional(pool)
+            .await?
+    };
+
+    if exists.is_none() {
+        return Err(ApiError::NotFound("Knowledge base not found or permission denied".to_string()));
+    }
+
+    Ok(())
+}
+
+async fn query_failed_file_ids_for_reparse(
+    pool: &SqlitePool, auth_user: &AuthUser, req: &ReparseFailedFilesReq,
+) -> ApiResult<Vec<i64>> {
+    let is_admin = auth_user.is_admin();
+
+    if req.unassigned_only {
+        let mut qb = QueryBuilder::<Sqlite>::new("SELECT f.id FROM files f WHERE f.status = -1 AND f.kb_id IS NULL");
+        if !is_admin {
+            qb.push(" AND f.user_id = ").push_bind(&auth_user.user_id);
+        }
+        qb.push(" ORDER BY f.updated_at DESC");
+        let ids = qb.build_query_scalar::<i64>().fetch_all(pool).await?;
+        return Ok(ids);
+    }
+
+    if let Some(kb_id) = req.kb_id {
+        ensure_kb_owned_for_mutation(pool, kb_id, auth_user).await?;
+
+        if req.include_descendants {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "WITH RECURSIVE descendants AS (SELECT id, kb_type FROM knowledge_bases WHERE id = ",
+            );
+            qb.push_bind(kb_id);
+            if !is_admin {
+                qb.push(" AND user_id = ").push_bind(&auth_user.user_id);
+            }
+            qb.push(
+                " UNION ALL SELECT kb.id, kb.kb_type FROM knowledge_bases kb JOIN descendants d ON kb.parent_id = d.id",
+            );
+            if !is_admin {
+                qb.push(" WHERE kb.user_id = ").push_bind(&auth_user.user_id);
+            }
+            qb.push(
+                ") SELECT f.id FROM files f JOIN descendants d ON f.kb_id = d.id WHERE f.status = -1 AND d.kb_type != ",
+            );
+            qb.push_bind("storage");
+            if !is_admin {
+                qb.push(" AND f.user_id = ").push_bind(&auth_user.user_id);
+            }
+            qb.push(" ORDER BY f.updated_at DESC");
+            let ids = qb.build_query_scalar::<i64>().fetch_all(pool).await?;
+            return Ok(ids);
+        }
+
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT f.id FROM files f \
+             JOIN knowledge_bases kb ON kb.id = f.kb_id \
+             WHERE f.status = -1 AND f.kb_id = ",
+        );
+        qb.push_bind(kb_id);
+        qb.push(" AND kb.kb_type != ").push_bind("storage");
+        if !is_admin {
+            qb.push(" AND kb.user_id = ").push_bind(&auth_user.user_id);
+            qb.push(" AND f.user_id = ").push_bind(&auth_user.user_id);
+        }
+        qb.push(" ORDER BY f.updated_at DESC");
+        let ids = qb.build_query_scalar::<i64>().fetch_all(pool).await?;
+        return Ok(ids);
+    }
+
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "SELECT f.id FROM files f \
+         LEFT JOIN knowledge_bases kb ON kb.id = f.kb_id \
+         WHERE f.status = -1 AND (f.kb_id IS NULL OR kb.kb_type != ",
+    );
+    qb.push_bind("storage");
+    qb.push(")");
+    if !req.include_unassigned {
+        qb.push(" AND f.kb_id IS NOT NULL");
+    }
+    if !is_admin {
+        qb.push(" AND f.user_id = ").push_bind(&auth_user.user_id);
+    }
+    qb.push(" ORDER BY f.updated_at DESC");
+    let ids = qb.build_query_scalar::<i64>().fetch_all(pool).await?;
+    Ok(ids)
+}
+
+async fn remove_converted_pdfs(file_ids: &[i64]) {
+    if file_ids.is_empty() {
+        return;
+    }
+
+    let cfg = config::get();
+    let pdf_root = std::path::Path::new(&cfg.storage.pdf_path);
+    for file_id in file_ids {
+        let pdf_path = pdf_root.join(format!("{}.pdf", file_id));
+        if let Err(e) = fs::remove_file(&pdf_path).await {
+            if !matches!(e.kind(), std::io::ErrorKind::NotFound) {
+                warn!("Failed to delete converted pdf {}: {}", pdf_path.display(), e);
+            }
+        }
+    }
+}
+
+async fn execute_reparse_failed(
+    pool: &SqlitePool, search_engine: &SearchEngine, auth_user: &AuthUser, req: ReparseFailedFilesReq,
+) -> ApiResult<ReparseFailedFilesResp> {
+    let file_ids = query_failed_file_ids_for_reparse(pool, auth_user, &req).await?;
+    if file_ids.is_empty() {
+        return Ok(ReparseFailedFilesResp { file_count: 0 });
+    }
+
+    let image_paths = collect_image_paths_for_files(pool, &file_ids).await?;
+    for file_id in &file_ids {
+        search_engine.delete(Some(*file_id), None).await.map_err(map_search_engine_error)?;
+    }
+
+    let mut tx = pool.begin().await?;
+    clear_file_parse_rows_for_ids_in_tx(&mut tx, &file_ids).await?;
+
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "UPDATE files SET status = 0, log = '', content = NULL, updated_at = strftime('%s','now') WHERE status = -1 AND id IN (",
+    );
+    push_i64_list(&mut qb, &file_ids);
+    qb.push(")");
+    let updated = qb.build().execute(&mut *tx).await?.rows_affected() as i64;
+    tx.commit().await?;
+
+    remove_image_files(image_paths).await;
+    remove_converted_pdfs(&file_ids).await;
+
+    Ok(ReparseFailedFilesResp { file_count: updated })
 }
 
 async fn cleanup_deleted_files(

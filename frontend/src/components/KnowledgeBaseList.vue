@@ -14,6 +14,7 @@ const breadcrumbs = ref([])
 const loading = ref(true)
 const error = ref('')
 const reparseLoading = ref(false)
+const reparseFailedLoading = ref(false)
 const currentKbReparseLoading = ref(false)
 const childKbReparseLoading = ref({})
 const priorityDrafts = ref({})
@@ -152,6 +153,38 @@ const handleReparse = async () => {
     alert('重新解析失败：' + e.message)
   } finally {
     reparseLoading.value = false
+  }
+}
+
+const handleReparseFailedFiles = async () => {
+  const failedCount = stats.value?.failed ?? 0
+  if (failedCount <= 0) {
+    alert('当前范围内没有处理失败的文件')
+    return
+  }
+
+  const isRootScope = !currentKb.value || currentKb.value.id === null
+  const scopeLabel = isRootScope
+    ? '所有知识库及未分配文件中的失败文件'
+    : `「${currentKb.value.name || '当前知识库'}」及其子知识库中的失败文件`
+
+  if (!confirm(`确定要重新解析${scopeLabel}吗？`)) return
+
+  reparseFailedLoading.value = true
+  try {
+    const result = isRootScope
+      ? await api.reparseFailedFiles()
+      : await api.reparseFailedFiles({
+          kbId: currentKb.value.id,
+          includeDescendants: true,
+        })
+    const count = result?.file_count ?? 0
+    alert(count > 0 ? `已提交 ${count} 个失败文件重新解析` : '当前范围内没有可重新解析的失败文件')
+    await loadKbContent(getCurrentKbId())
+  } catch (e) {
+    alert('重新解析失败文件失败：' + e.message)
+  } finally {
+    reparseFailedLoading.value = false
   }
 }
 
@@ -297,10 +330,12 @@ onMounted(() => {
       class="mb-4"
       :stats="stats"
       :loading="statsLoading"
+      :retry-failed-loading="reparseFailedLoading"
       :error="statsError"
       :title="currentKb && currentKb.id !== null ? '知识库文件状态' : '全局文件状态'"
       :subtitle="statsSubtitle"
       @retry="fetchStats(getCurrentKbId())"
+      @reparse-failed="handleReparseFailedFiles"
     />
 
     <!-- Loading -->
