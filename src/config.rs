@@ -142,6 +142,10 @@ pub struct SearchConfig {
     pub tantivy_full_index_path: String,
     /// Tantivy 索引内存（MB）
     pub tantivy_memory_mb: usize,
+    /// 文本 embedding 请求超时（秒）
+    pub embedding_timeout_secs: u64,
+    /// rerank 请求超时（秒）
+    pub rerank_timeout_secs: u64,
     /// 是否启用同义词扩展
     pub synonym_enabled: bool,
     /// 同义词默认权重因子
@@ -271,6 +275,8 @@ impl SearchConfig {
                 &format!("{}/tantivy_full_index", data_dir),
             ),
             tantivy_memory_mb: env_or_parse("HTKNOW_TANTIVY_MEMORY_MB", 50),
+            embedding_timeout_secs: env_or_parse("HTKNOW_SEARCH_EMBEDDING_TIMEOUT_SECS", 30),
+            rerank_timeout_secs: env_or_parse("HTKNOW_SEARCH_RERANK_TIMEOUT_SECS", 20),
             synonym_enabled: env_or_parse("HTKNOW_SEARCH_SYNONYM_ENABLED", true),
             synonym_boost: env_or_parse("HTKNOW_SEARCH_SYNONYM_BOOST", 0.7),
             max_synonyms_per_term: env_or_parse("HTKNOW_SEARCH_MAX_SYNONYMS_PER_TERM", 5),
@@ -407,6 +413,8 @@ mod tests {
         assert_eq!(config.ai.embedding_model, "bge-m3");
         assert_eq!(config.ai.embedding_dim, 1024);
         assert_eq!(config.ai.image_embedding_dim, 2048);
+        assert_eq!(config.search.embedding_timeout_secs, 30);
+        assert_eq!(config.search.rerank_timeout_secs, 20);
         assert!(config.server.parse_enabled);
         assert!(!config.server.build_knowledge_graph);
     }

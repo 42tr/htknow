@@ -1,9 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet}, fs, path::Path, sync::Arc, time::{Instant, SystemTime, UNIX_EPOCH}
+    collections::{HashMap, HashSet}, fs, path::Path, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}
 };
 
 use anyhow::{Context, anyhow};
 use log::{debug, info, warn};
+use once_cell::sync::Lazy;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, SqlitePool};
 use tantivy::{Index, IndexReader, ReloadPolicy, schema::Schema};
@@ -22,6 +24,7 @@ pub use tantivy_engine::{FullSearchResultItem, SearchResultItem};
 const FULL_SNIPPET_MAX_CHARS: usize = 400;
 const MAX_QUERY_TERMS_FOR_SYNONYM_LOOKUP: usize = 100;
 const REBUILD_BATCH_SIZE: i64 = 500;
+static RERANK_HTTP_CLIENT: Lazy<Client> = Lazy::new(Client::new);
 
 #[derive(Debug, Serialize)]
 struct RerankRequest {
@@ -303,7 +306,6 @@ impl SearchEngine {
             lancedb_doc = lancedb_doc.with_image_embedding(image_embedding);
         }
         lancedb::write_documents(lancedb_doc).await?;
-
         Ok(())
     }
 
@@ -336,7 +338,6 @@ impl SearchEngine {
             .collect();
 
         lancedb::write_documents_batch(lancedb_docs).await?;
-
         Ok(())
     }
 
@@ -401,6 +402,7 @@ impl SearchEngine {
         &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     ) -> anyhow::Result<Vec<SearchResultItem>> {
         debug!("Searching for query: {}", query);
+
         let synonym_map = match self.load_query_synonyms(query).await {
             Ok(map) => map,
             Err(e) => {
@@ -414,14 +416,20 @@ impl SearchEngine {
         let tantivy_results =
             tantivy_engine::search(&self.index_reader, &self.schema, query, file_ids, kb_ids, synonym_ref).await?;
         debug!("Tantivy results count: {}", tantivy_results.len());
-        debug!("Tantivy results: {:?}", tantivy_results);
 
         // 使用 lancedb 搜索
         let lancedb_start = Instant::now();
-        let lancedb_results = lancedb::search(query, file_ids, kb_ids).await?;
-        debug!("LanceDB search {}ms", lancedb_start.elapsed().as_millis());
-        debug!("LanceDB results count: {}", lancedb_results.len());
-        debug!("LanceDB results: {:?}", lancedb_results);
+        let lancedb_results = match lancedb::search(query, file_ids, kb_ids).await {
+            Ok(results) => {
+                debug!("LanceDB search {}ms", lancedb_start.elapsed().as_millis());
+                debug!("LanceDB results count: {}", results.len());
+                results
+            }
+            Err(err) => {
+                warn!("Vector search failed for query {:?}, falling back to Tantivy-only results: {}", query, err);
+                Vec::new()
+            }
+        };
 
         // 合并结果：使用 HashMap 按 id 去重，保留最高分数，同时去除内容为空的结果
         let mut merged_map: HashMap<i64, SearchResultItem> = HashMap::new();
@@ -463,10 +471,25 @@ impl SearchEngine {
         }
 
         // 使用 BGE-Rerank 重排序
-        let reranked_results = self.rerank(query, merged_results).await?;
-        info!("Reranked results count: {}", reranked_results.len());
+        let fallback_results = merged_results.clone();
+        let final_results = match self.rerank(query, merged_results).await {
+            Ok(reranked_results) => {
+                info!("Reranked results count: {}", reranked_results.len());
+                reranked_results
+            }
+            Err(err) => {
+                warn!("Rerank failed for query {:?}, returning merged search results without rerank: {}", query, err);
+                fallback_results
+            }
+        };
 
-        Ok(reranked_results)
+        let mut final_results = final_results;
+        let limit = config::get().search.limit.max(1);
+        if final_results.len() > limit {
+            final_results.truncate(limit);
+        }
+
+        Ok(final_results)
     }
 
     pub async fn search_full(
@@ -521,19 +544,23 @@ impl SearchEngine {
         let rerank_request = RerankRequest { model: cfg.ai.rerank_model.clone(), query: query.to_string(), documents };
 
         // 调用 BGE-Rerank API
-        let client = reqwest::Client::new();
         let rerank_http_start = Instant::now();
-        let response = client.post(&cfg.services.rerank_url).json(&rerank_request).send().await?;
+        let response = RERANK_HTTP_CLIENT
+            .post(&cfg.services.rerank_url)
+            .timeout(Duration::from_secs(cfg.search.rerank_timeout_secs))
+            .json(&rerank_request)
+            .send()
+            .await?;
         debug!("Rerank HTTP request {}ms", rerank_http_start.elapsed().as_millis());
 
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
             anyhow::bail!(
-                "Rerank API failed with status {}: {}; rerank_request: {:?}",
+                "Rerank API failed with status {}: {}; documents={}",
                 status,
                 error_text,
-                rerank_request
+                rerank_request.documents.len()
             );
         }
 
@@ -541,7 +568,6 @@ impl SearchEngine {
         let rerank_read_start = Instant::now();
         let response_text = response.text().await?;
         debug!("Rerank response read {}ms", rerank_read_start.elapsed().as_millis());
-        debug!("Rerank API response: {}", response_text);
 
         // 解析 JSON 响应
         let rerank_parse_start = Instant::now();

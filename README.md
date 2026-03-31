@@ -66,7 +66,9 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | `HTKNOW_SERVER_PORT` | `3000` | 监听端口 |
 | `HTKNOW_SERVER_UPLOAD_LIMIT_MB` | `500` | 上传大小限制（MB） |
 | `HTKNOW_SERVER_PROCESS_INTERVAL_SECS` | `10` | 文件处理间隔（秒） |
+| `HTKNOW_SERVER_PROCESS_CONCURRENCY` | `1` | 后台文件处理并发数 |
 | `HTKNOW_PARSE_ENABLED` | `true` | 是否启动后台文件解析（false 时仅即时解析生效） |
+| `HTKNOW_REUSE_DUPLICATE_FILES` | `true` | 是否复用重复文件的已解析结果 |
 | `HTKNOW_BUILD_KNOWLEDGE_GRAPH` | `false` | 文件解析完成后是否构建知识图谱（依赖 LLM 配置） |
 | `HTKNOW_LANCEDB_COMPACT_CRON` | `0 0 3 * * *` | LanceDB 自动压缩 cron 表达式（本地时区，off/disabled/0 禁用） |
 
@@ -75,9 +77,11 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `HTKNOW_MINERU_URL` | `http://192.168.0.46:10001/file_parse` | MinerU PDF 解析 |
-| `HTKNOW_MINERU_MAX_PAGES` | `0` | MinerU 单次解析 PDF 最大页数（0 表示不限制） |
+| `HTKNOW_MINERU_MAX_PAGES` | `50` | MinerU 单次解析 PDF 最大页数（0 表示不限制） |
 | `HTKNOW_CUSTOM_PARSE_URL` | 空 | 自定义解析服务地址（配置后仅 Word/PDF 解析走该服务，需返回已切片数据） |
 | `HTKNOW_CUSTOM_PARSE_REUSE_URL` | 空 | 自定义解析复用服务地址（仅输入 pdf_contents，不包含图片） |
+| `HTKNOW_AUDIO_TRANSCRIPTION_URL` | `http://192.168.0.46:59805/api/v1/audio/transcriptions` | 音频转写服务 |
+| `HTKNOW_AUDIO_TRANSCRIPTION_KEY` | 空 | 音频转写服务 API Key |
 | `HTKNOW_EMBEDDING_URL` | `http://222.190.139.186:59700/v1/embeddings` | 文本向量服务 |
 | `HTKNOW_IMAGE_EMBEDDING_URL` | `http://192.168.0.46:59802/v1/embeddings/file` | 图片向量服务 |
 | `HTKNOW_RERANK_URL` | `http://222.190.139.186:59600/v1/rerank` | Rerank 服务 |
@@ -95,7 +99,7 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `DATABASE_URL` | `sqlite://data/app.sqlite` | 数据库连接 |
-| `HTKNOW_DB_MAX_CONNECTIONS` | `10` | 最大连接数 |
+| `HTKNOW_DB_MAX_CONNECTIONS` | `50` | 最大连接数 |
 | `HTKNOW_DB_BUSY_TIMEOUT_MS` | `5000` | busy_timeout（毫秒） |
 | `HTKNOW_DB_INIT_DEFAULT_KBS` | `true` | 是否初始化默认知识库 |
 
@@ -116,6 +120,8 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | `HTKNOW_TANTIVY_INDEX_PATH` | `data/tantivy_index` | Tantivy 索引路径 |
 | `HTKNOW_TANTIVY_FULL_INDEX_PATH` | `data/tantivy_full_index` | Tantivy 全文索引 |
 | `HTKNOW_TANTIVY_MEMORY_MB` | `50` | Tantivy 内存（MB） |
+| `HTKNOW_SEARCH_EMBEDDING_TIMEOUT_SECS` | `30` | embedding / 图片 embedding 请求超时（秒） |
+| `HTKNOW_SEARCH_RERANK_TIMEOUT_SECS` | `20` | rerank 请求超时（秒） |
 | `HTKNOW_SEARCH_SYNONYM_ENABLED` | `true` | 是否启用同义词查询扩展 |
 | `HTKNOW_SEARCH_SYNONYM_BOOST` | `0.7` | 同义词权重因子（与行权重相乘） |
 | `HTKNOW_SEARCH_MAX_SYNONYMS_PER_TERM` | `5` | 每个词最多扩展同义词数 |

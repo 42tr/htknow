@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use anyhow::Result;
 use once_cell::sync::Lazy;
 use reqwest::{Client, multipart};
@@ -43,7 +45,12 @@ pub async fn get_image_embedding_from_bytes(
     }
     let form = multipart::Form::new().part("file", part).text("text", text.unwrap_or(file_name).to_string());
 
-    let response = HTTP_CLIENT.post(&cfg.services.image_embedding_url).multipart(form).send().await?;
+    let response = HTTP_CLIENT
+        .post(&cfg.services.image_embedding_url)
+        .timeout(Duration::from_secs(cfg.search.embedding_timeout_secs))
+        .multipart(form)
+        .send()
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -64,24 +71,34 @@ pub async fn get_image_embedding_from_bytes(
 /// 获取文本的 embedding 向量
 pub async fn get_embedding(text: &str) -> Result<Vec<f32>> {
     let cfg = config::get();
-    let request = EmbeddingRequest { model: cfg.ai.embedding_model.clone(), input: vec![text.to_string()] };
+    let query = text.trim();
+    if query.is_empty() {
+        anyhow::bail!("Embedding query cannot be empty");
+    }
+    let request = EmbeddingRequest { model: cfg.ai.embedding_model.clone(), input: vec![query.to_string()] };
 
-    let response = HTTP_CLIENT.post(&cfg.services.embedding_url).json(&request).send().await?;
+    let response = HTTP_CLIENT
+        .post(&cfg.services.embedding_url)
+        .timeout(Duration::from_secs(cfg.search.embedding_timeout_secs))
+        .json(&request)
+        .send()
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
-        anyhow::bail!("Embedding API error: {} - {}, origin_text: {}", status, error_text, text);
+        anyhow::bail!("Embedding API error: {} - {}, input_chars={}", status, error_text, text.chars().count());
     }
 
     let embedding_response: EmbeddingResponse = response.json().await?;
 
-    embedding_response
+    let embedding = embedding_response
         .data
         .into_iter()
         .next()
         .map(|data| data.embedding)
-        .ok_or_else(|| anyhow::anyhow!("No embedding returned"))
+        .ok_or_else(|| anyhow::anyhow!("No embedding returned"))?;
+    Ok(embedding)
 }
 
 /// 批量获取文本的 embedding 向量
@@ -93,12 +110,23 @@ pub async fn get_embeddings(texts: &[String]) -> Result<Vec<Vec<f32>>> {
     let cfg = config::get();
     let request = EmbeddingRequest { model: cfg.ai.embedding_model.clone(), input: texts.to_vec() };
 
-    let response = HTTP_CLIENT.post(&cfg.services.embedding_url).json(&request).send().await?;
+    let response = HTTP_CLIENT
+        .post(&cfg.services.embedding_url)
+        .timeout(Duration::from_secs(cfg.search.embedding_timeout_secs))
+        .json(&request)
+        .send()
+        .await?;
 
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
-        anyhow::bail!("Embedding API error: {} - {}, origin_texts: {:?}", status, error_text, texts);
+        anyhow::bail!(
+            "Embedding API error: {} - {}, batch_size={}, total_chars={}",
+            status,
+            error_text,
+            texts.len(),
+            texts.iter().map(|text| text.chars().count()).sum::<usize>()
+        );
     }
 
     let embedding_response: EmbeddingResponse = response.json().await?;

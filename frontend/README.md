@@ -1,5 +1,20 @@
-# Vue 3 + Vite
+# Frontend
 
-This template should help get you started developing with Vue 3 in Vite. The template uses Vue 3 `<script setup>` SFCs, check out the [script setup docs](https://v3.vuejs.org/api/sfc-script-setup.html#sfc-script-setup) to learn more.
+前端使用 `Vue 3 + Vite + Tailwind CSS 4`，构建产物输出到 `frontend/dist`，由后端通过 `rust-embed` 内嵌并提供静态资源服务。
 
-Learn more about IDE Support for Vue in the [Vue Docs Scaling up Guide](https://vuejs.org/guide/scaling-up/tooling.html#ide-support).
+## 开发
+
+```bash
+npm ci
+npm run dev
+```
+
+默认开发代理会把 `/api` 转发到 `http://localhost:3000`。
+
+## 构建
+
+```bash
+npm run build
+```
+
+构建完成后，后端重新编译时会把 `dist/` 打包进二进制。

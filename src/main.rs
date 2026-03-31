@@ -2,7 +2,7 @@
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
-#[cfg(debug_assertions)]
+#[cfg(all(debug_assertions, feature = "profiling"))]
 #[unsafe(export_name = "_rjem_malloc_conf")]
 // lg_prof_sample:0 表示每次分配都采样(最详细,但性能开销大)
 // lg_prof_sample:10 表示每 1KB 采样一次(推荐)

@@ -1494,41 +1494,17 @@ pub async fn list(
                     .await?
             } else {
                 sqlx::query_as(
-                        "SELECT * FROM files WHERE kb_id IS NULL AND (user_id = ? OR is_public = 1) ORDER BY created_at DESC",
-                    )
-                    .bind(&auth_user.user_id)
-                    .fetch_all(&pool)
-                    .await?
+                    "SELECT * FROM files WHERE kb_id IS NULL AND (user_id = ? OR is_public = 1) ORDER BY created_at DESC",
+                )
+                .bind(&auth_user.user_id)
+                .fetch_all(&pool)
+                .await?
             }
         }
         // 查询特定知识库的文件
         Some(kb_id_str) => {
             let kb_id = kb_id_str.parse::<i64>().map_err(|_| ApiError::internal("Invalid kb_id format"))?;
-            // 检查知识库权限
-            if is_admin {
-                let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM knowledge_bases WHERE id = ?")
-                    .bind(kb_id)
-                    .fetch_optional(&pool)
-                    .await?;
-                if exists.is_none() {
-                    return Err(ApiError::NotFound("Knowledge base not found".to_string()));
-                }
-            } else {
-                let kb: Option<(String, bool)> =
-                    sqlx::query_as("SELECT user_id, is_public FROM knowledge_bases WHERE id = ?")
-                        .bind(kb_id)
-                        .fetch_optional(&pool)
-                        .await?;
-
-                if let Some((kb_owner, is_public)) = kb {
-                    if !is_public && kb_owner != auth_user.user_id {
-                        return Err(ApiError::NotFound("Knowledge base not found or permission denied".to_string()));
-                    }
-                } else {
-                    return Err(ApiError::NotFound("Knowledge base not found".to_string()));
-                }
-            }
-
+            ensure_kb_accessible(&pool, kb_id, &auth_user.user_id, is_admin).await?;
             if is_admin {
                 sqlx::query_as("SELECT * FROM files WHERE kb_id = ? ORDER BY created_at DESC")
                     .bind(kb_id)
@@ -1536,7 +1512,7 @@ pub async fn list(
                     .await?
             } else {
                 sqlx::query_as(
-                    "SELECT * FROM files WHERE kb_id = ? AND (user_id = ? OR is_public) ORDER BY created_at DESC",
+                    "SELECT * FROM files WHERE kb_id = ? AND (user_id = ? OR is_public = 1) ORDER BY created_at DESC",
                 )
                 .bind(kb_id)
                 .bind(&auth_user.user_id)
@@ -1557,15 +1533,13 @@ pub async fn list(
         }
     };
 
-    // 如果指定了标签，进行过滤
     if let Some(tag) = &query.tag {
         files.retain(|file: &File| {
             if let Ok(tags) = serde_json::from_str::<Vec<String>>(&file.tags) { tags.contains(tag) } else { false }
         });
     }
 
-    // List view hides the potentially large/敏感 file body; single-file fetch still exposes it.
-    for file in files.iter_mut() {
+    for file in &mut files {
         file.content = None;
     }
 

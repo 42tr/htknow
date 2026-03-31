@@ -2652,7 +2652,6 @@ dependencies = [
  "log",
  "log4rs",
  "lopdf",
- "lru",
  "mime_guess",
  "once_cell",
  "petgraph 0.6.5",

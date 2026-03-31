@@ -124,11 +124,18 @@ CREATE TABLE IF NOT EXISTS graph_snapshots (
 
 -- 索引
 CREATE INDEX IF NOT EXISTS idx_knowledge_bases_parent_id ON knowledge_bases(parent_id);
+CREATE INDEX IF NOT EXISTS idx_knowledge_bases_user_public_parent ON knowledge_bases(user_id, is_public, parent_id);
 CREATE INDEX IF NOT EXISTS idx_files_kb_id ON files(kb_id);
+CREATE INDEX IF NOT EXISTS idx_files_kb_id_created_at ON files(kb_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_files_kb_id_filename ON files(kb_id, filename);
 CREATE INDEX IF NOT EXISTS idx_files_kb_id_updated_at ON files(kb_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_files_kb_id_status_updated_at ON files(kb_id, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_files_status_updated_at ON files(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_files_user_id_created_at ON files(user_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_files_hash_slice_type_status_updated_at ON files(hash, slice_type, status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_slices_file_id_id ON slices(file_id, id);
+CREATE INDEX IF NOT EXISTS idx_pdf_contents_file_id_id ON pdf_contents(file_id, id);
+CREATE INDEX IF NOT EXISTS idx_pdf_contents_file_id_page_id ON pdf_contents(file_id, page_idx, id);
 CREATE INDEX IF NOT EXISTS idx_nodes_type ON graph_nodes(entity_type);
 CREATE INDEX IF NOT EXISTS idx_nodes_kb ON graph_nodes(kb_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_file ON graph_nodes(file_id);

@@ -3,7 +3,7 @@ use std::{
 };
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
-use log::{debug, info, warn};
+use log::{debug, warn};
 use serde::Serialize;
 use tantivy::{
     Index, IndexReader, Result, TantivyDocument, TantivyError, Term, collector::TopDocs, directory::error::LockError, doc, merge_policy::LogMergePolicy, query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, Query, TermQuery}, schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _}, tokenizer::{TokenStream, Tokenizer}
@@ -300,7 +300,6 @@ fn create_document(doc: Document, schema: &Schema) -> TantivyDocument {
     if let Some(kb_id) = doc.kb_id {
         document.add_i64(get_field(schema, "kb_id"), kb_id);
     }
-    info!("Document: {:?}", document);
     document
 }
 
