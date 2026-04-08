@@ -5,9 +5,10 @@ FROM docker.1ms.run/debian:bookworm-slim
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG APT_MIRROR=http://mirrors.aliyun.com
-ARG APT_FAST_VERSION=1.10.0
 
-# Switch Debian APT to Aliyun mirror and bootstrap apt-fast.
+COPY docker/apt-fast /usr/local/sbin/apt-fast
+
+# Switch Debian APT to Aliyun mirror and bootstrap vendored apt-fast.
 RUN set -eux; \
     for sources in /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list; do \
         if [ -f "${sources}" ]; then \
@@ -22,8 +23,7 @@ RUN set -eux; \
         fi; \
     done; \
     apt-get update; \
-    apt-get install -y --no-install-recommends ca-certificates curl aria2; \
-    curl -fsSL "https://raw.githubusercontent.com/ilikenwf/apt-fast/${APT_FAST_VERSION}/apt-fast" -o /usr/local/sbin/apt-fast; \
+    apt-get install -y --no-install-recommends ca-certificates aria2; \
     chmod +x /usr/local/sbin/apt-fast; \
     printf '%s\n' \
         '_APTMGR=apt-get' \
