@@ -3,10 +3,43 @@
 
 FROM docker.1ms.run/debian:bookworm-slim
 
+ARG DEBIAN_FRONTEND=noninteractive
+ARG APT_MIRROR=http://mirrors.aliyun.com
+ARG APT_FAST_VERSION=1.10.0
+
+# Switch Debian APT to Aliyun mirror and bootstrap apt-fast.
+RUN set -eux; \
+    for sources in /etc/apt/sources.list.d/debian.sources /etc/apt/sources.list; do \
+        if [ -f "${sources}" ]; then \
+            sed -i \
+                -e "s|http://deb.debian.org/debian|${APT_MIRROR}/debian|g" \
+                -e "s|https://deb.debian.org/debian|${APT_MIRROR}/debian|g" \
+                -e "s|http://deb.debian.org/debian-security|${APT_MIRROR}/debian-security|g" \
+                -e "s|https://deb.debian.org/debian-security|${APT_MIRROR}/debian-security|g" \
+                -e "s|http://security.debian.org/debian-security|${APT_MIRROR}/debian-security|g" \
+                -e "s|https://security.debian.org/debian-security|${APT_MIRROR}/debian-security|g" \
+                "${sources}"; \
+        fi; \
+    done; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends ca-certificates curl aria2; \
+    curl -fsSL "https://raw.githubusercontent.com/ilikenwf/apt-fast/${APT_FAST_VERSION}/apt-fast" -o /usr/local/sbin/apt-fast; \
+    chmod +x /usr/local/sbin/apt-fast; \
+    printf '%s\n' \
+        '_APTMGR=apt-get' \
+        'DOWNLOADBEFORE=true' \
+        '_MAXNUM=8' \
+        '_MAXCONPERSRV=8' \
+        '_SPLITCON=8' \
+        "MIRRORS=(" \
+        "  '${APT_MIRROR}/debian,http://mirrors.tuna.tsinghua.edu.cn/debian,http://mirrors.ustc.edu.cn/debian'" \
+        "  '${APT_MIRROR}/debian-security,http://mirrors.tuna.tsinghua.edu.cn/debian-security,http://mirrors.ustc.edu.cn/debian-security'" \
+        ')' \
+        > /etc/apt-fast.conf; \
+    rm -rf /var/lib/apt/lists/*
+
 # Install runtime dependencies + debug tools
-RUN apt-get update && apt-get install -y \
-    # SSL certificates for HTTPS requests
-    ca-certificates \
+RUN apt-fast update && apt-fast install -y \
     # Timezone data
     tzdata \
     # sqlite3
@@ -45,7 +78,6 @@ RUN apt-get update && apt-get install -y \
     graphviz \
     binutils \
     # Optional: useful debug utilities
-    curl \
     htop \
     # Clean up
     && rm -rf /var/lib/apt/lists/*
