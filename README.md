@@ -77,6 +77,7 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `HTKNOW_MINERU_URL` | `http://192.168.0.46:10001/file_parse` | MinerU PDF 解析 |
+| `HTKNOW_REQUEST_TIMEOUT_SECS` | `600` | 外部接口请求超时（秒），适用于文件解析相关接口 |
 | `HTKNOW_MINERU_MAX_PAGES` | `50` | MinerU 单次解析 PDF 最大页数（0 表示不限制） |
 | `HTKNOW_CUSTOM_PARSE_URL` | 空 | 自定义解析服务地址（配置后仅 Word/PDF 解析走该服务，需返回已切片数据） |
 | `HTKNOW_CUSTOM_PARSE_REUSE_URL` | 空 | 自定义解析复用服务地址（仅输入 pdf_contents，不包含图片） |

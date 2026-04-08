@@ -439,6 +439,11 @@ impl FileProcessor {
         Self { pool, search_engine, interval: Duration::from_secs(interval_secs) }
     }
 
+    fn services_http_client(&self) -> anyhow::Result<reqwest::Client> {
+        let timeout = Duration::from_secs(config::get().services.request_timeout_secs);
+        Ok(reqwest::Client::builder().timeout(timeout).build()?)
+    }
+
     /// 启动后台处理任务
     pub fn start(self) {
         let processor = Arc::new(self);
@@ -911,7 +916,7 @@ impl FileProcessor {
         }
 
         let payload = CustomParseReuseRequest { pdf_contents: &pdf_rows };
-        let client = reqwest::Client::new();
+        let client = self.services_http_client()?;
         let response = timed_step_opt(timing.as_deref_mut(), "custom_parse_reuse_api", async {
             Ok(client.post(custom_reuse_url).json(&payload).send().await?)
         })
@@ -969,7 +974,7 @@ impl FileProcessor {
         let form = multipart::Form::new()
             .part("file", multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str(&mime_type)?);
 
-        let client = reqwest::Client::new();
+        let client = self.services_http_client()?;
         let response = client.post(custom_url).multipart(form).send().await?;
         let response_url = response.url().to_string();
         let status = response.status();
@@ -1663,7 +1668,7 @@ impl FileProcessor {
         let cfg = config::get();
         let mineru_url = cfg.services.mineru_url.trim_end_matches('/');
 
-        let client = reqwest::Client::new();
+        let client = self.services_http_client()?;
         if mineru_url.ends_with("/file_parse") {
             // 构建 multipart form
             let mime_type = if is_image {
@@ -1830,7 +1835,7 @@ impl FileProcessor {
         let form = multipart::Form::new()
             .part("file", multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str(&mime_type)?);
 
-        let client = reqwest::Client::new();
+        let client = self.services_http_client()?;
         let cfg = config::get();
         let mut req_builder = client.post(&cfg.services.audio_transcription_url).multipart(form);
         if let Some(key) = &cfg.services.audio_transcription_key {

@@ -70,6 +70,8 @@ pub struct ServerConfig {
 pub struct ServicesConfig {
     /// MinerU PDF 解析服务地址
     pub mineru_url: String,
+    /// 外部接口请求超时（秒）
+    pub request_timeout_secs: u64,
     /// MinerU 单次解析 PDF 最大页数（0 表示不限制）
     pub mineru_max_pages: usize,
     /// 自定义解析服务地址（配置后仅 Word/PDF 走该服务）
@@ -212,6 +214,7 @@ impl ServicesConfig {
     fn from_env() -> Self {
         Self {
             mineru_url: env_or("HTKNOW_MINERU_URL", "http://192.168.0.46:10001/file_parse"),
+            request_timeout_secs: env_or_parse("HTKNOW_REQUEST_TIMEOUT_SECS", 600),
             mineru_max_pages: env_or_parse("HTKNOW_MINERU_MAX_PAGES", 50),
             custom_parse_url: env_optional("HTKNOW_CUSTOM_PARSE_URL"),
             custom_parse_reuse_url: env_optional("HTKNOW_CUSTOM_PARSE_REUSE_URL"),
@@ -403,6 +406,7 @@ mod tests {
         unsafe {
             std::env::remove_var("HTKNOW_PARSE_ENABLED");
             std::env::remove_var("HTKNOW_BUILD_KNOWLEDGE_GRAPH");
+            std::env::remove_var("HTKNOW_REQUEST_TIMEOUT_SECS");
         }
         let config = AppConfig::from_env();
 
@@ -413,6 +417,7 @@ mod tests {
         assert_eq!(config.ai.embedding_model, "bge-m3");
         assert_eq!(config.ai.embedding_dim, 1024);
         assert_eq!(config.ai.image_embedding_dim, 2048);
+        assert_eq!(config.services.request_timeout_secs, 600);
         assert_eq!(config.search.embedding_timeout_secs, 30);
         assert_eq!(config.search.rerank_timeout_secs, 20);
         assert!(config.server.parse_enabled);
@@ -448,6 +453,19 @@ mod tests {
         assert!(config.server.build_knowledge_graph);
         unsafe {
             std::env::remove_var("HTKNOW_BUILD_KNOWLEDGE_GRAPH");
+        }
+    }
+
+    #[test]
+    fn test_request_timeout_env_override() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("HTKNOW_REQUEST_TIMEOUT_SECS", "120");
+        }
+        let config = AppConfig::from_env();
+        assert_eq!(config.services.request_timeout_secs, 120);
+        unsafe {
+            std::env::remove_var("HTKNOW_REQUEST_TIMEOUT_SECS");
         }
     }
 }
