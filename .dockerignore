@@ -32,8 +32,12 @@ README.md
 docs/
 
 # CI/CD
+.gitea
 .github
 .gitlab-ci.yml
 
 # Development files
 clear.sh
+
+# Frontend is embedded into the Rust binary before docker build
+frontend/

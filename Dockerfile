@@ -99,9 +99,6 @@ RUN mkdir -p /app/data/images /app/data/temp /app/data/db
 # Make sure to build with: cargo build --release
 COPY target/release/htknow /app/htknow
 
-# Copy frontend files if needed
-COPY frontend /app/frontend
-
 # Set permissions
 RUN chmod +x /app/htknow
 
