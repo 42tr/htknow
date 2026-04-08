@@ -1,7 +1,7 @@
 # Runtime image for htknow
 # Binary should be compiled outside the container using: cargo build --release
 
-FROM docker.1ms.run/debian:bookworm-slim
+FROM docker.1ms.run/debian:bookworm-20260406-slim
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG APT_MIRROR=http://mirrors.aliyun.com
