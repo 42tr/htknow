@@ -714,9 +714,11 @@ jobs:
           npm config set replace-registry-host always
           IMAGE_TAG="${SAFE_TAG}" sh build-docker.sh
           docker save "htknow:${SAFE_TAG}" -o "htknow-${SAFE_TAG}.tar"
+          tar -czvf "htknow-${SAFE_TAG}.tar.gz" "htknow-${SAFE_TAG}.tar"
+          rm -f "htknow-${SAFE_TAG}.tar"
           echo "TAG_NAME=${TAG_NAME}" >> "${GITHUB_ENV}"
           echo "SAFE_TAG=${SAFE_TAG}" >> "${GITHUB_ENV}"
-          echo "ASSET_FILE=htknow-${SAFE_TAG}.tar" >> "${GITHUB_ENV}"
+          echo "ASSET_FILE=htknow-${SAFE_TAG}.tar.gz" >> "${GITHUB_ENV}"
 
       - name: Create release (if needed) and upload tar
         env:
@@ -770,7 +772,7 @@ jobs:
             echo "Release for tag ${TAG_NAME} already exists."
           elif [ "${LOOKUP_CODE}" = "404" ]; then
             cat > create-release.json <<EOF
-          {"tag_name":"${TAG_NAME}","name":"${TAG_NAME}","body":"Automated Docker image tar for ${TAG_NAME}.","draft":false,"prerelease":false}
+          {"tag_name":"${TAG_NAME}","name":"${TAG_NAME}","body":"Automated Docker image tar.gz for ${TAG_NAME}.","draft":false,"prerelease":false}
           EOF
             curl -sS -f -X POST \
               -H "${AUTH_HEADER}" \
@@ -969,7 +971,10 @@ jobs:
               set -e
               DEPLOY_PATH=\"${REMOTE_PATH_REMOTE}\"
               DEPLOY_PATH=\$(eval echo \"\$DEPLOY_PATH\")
-              docker load -i \"\$DEPLOY_PATH/${ASSET_FILE}\"
+              ASSET_TAR_FILE=\"${ASSET_FILE%.gz}\"
+              tar -xzvf \"\$DEPLOY_PATH/${ASSET_FILE}\" -C \"\$DEPLOY_PATH\"
+              docker load -i \"\$DEPLOY_PATH/\$ASSET_TAR_FILE\"
+              rm -f \"\$DEPLOY_PATH/\$ASSET_TAR_FILE\"
               docker rm -f htknow >/dev/null 2>&1 || true
               docker run -d --name htknow --restart unless-stopped -p 8080:8080 -v /opt/htknow/data:/app/data \"htknow:${SAFE_TAG}\"
             '"
