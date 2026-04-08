@@ -149,8 +149,13 @@ jobs:
               exit 1
             fi
           }
+          version_ge() {
+            [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n 1)" = "$2" ]
+          }
           ensure_cc_toolchain
           ensure_protoc
+
+          REQUIRED_RUST_VERSION="1.88.0"
 
           if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
             if command -v pacman >/dev/null 2>&1; then
@@ -164,22 +169,35 @@ jobs:
             fi
           fi
 
-          if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
+          CURRENT_RUST_VERSION=""
+          if command -v rustc >/dev/null 2>&1; then
+            CURRENT_RUST_VERSION="$(rustc --version | awk '{print $2}')"
+          fi
+
+          if ! command -v cargo >/dev/null 2>&1 \
+            || ! command -v rustc >/dev/null 2>&1 \
+            || [ -z "${CURRENT_RUST_VERSION}" ] \
+            || ! version_ge "${CURRENT_RUST_VERSION}" "${REQUIRED_RUST_VERSION}" \
+            || ! command -v rustup >/dev/null 2>&1; then
             if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
               ensure_pkg curl
             fi
-            if command -v curl >/dev/null 2>&1; then
-              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-                | sh -s -- -y --profile minimal --component rustfmt
-            else
-              wget -qO- https://sh.rustup.rs \
-                | sh -s -- -y --profile minimal --component rustfmt
+            if ! command -v rustup >/dev/null 2>&1; then
+              if command -v curl >/dev/null 2>&1; then
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                  | sh -s -- -y --profile minimal --component rustfmt
+              else
+                wget -qO- https://sh.rustup.rs \
+                  | sh -s -- -y --profile minimal --component rustfmt
+              fi
             fi
           fi
           if [ -f "${HOME}/.cargo/env" ]; then
             . "${HOME}/.cargo/env"
           fi
           export PATH="${HOME}/.cargo/bin:${PATH}"
+          rustup toolchain install "${REQUIRED_RUST_VERSION}" --profile minimal --component rustfmt
+          rustup default "${REQUIRED_RUST_VERSION}"
           PROTOC_BIN="$(command -v protoc || true)"
           if [ -z "${PROTOC_BIN}" ]; then
             echo "protoc not found after installation."
@@ -219,7 +237,7 @@ jobs:
           cargo --version
           rustc --version
           protoc --version
-          rustup component add rustfmt || true
+          rustup component add rustfmt --toolchain "${REQUIRED_RUST_VERSION}" || true
 
       - name: Check format
         run: |
@@ -513,8 +531,13 @@ jobs:
               exit 1
             fi
           }
+          version_ge() {
+            [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -n 1)" = "$2" ]
+          }
           ensure_cc_toolchain
           ensure_protoc
+
+          REQUIRED_RUST_VERSION="1.88.0"
 
           if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
             if command -v pacman >/dev/null 2>&1; then
@@ -528,22 +551,35 @@ jobs:
             fi
           fi
 
-          if ! command -v cargo >/dev/null 2>&1 || ! command -v rustc >/dev/null 2>&1; then
+          CURRENT_RUST_VERSION=""
+          if command -v rustc >/dev/null 2>&1; then
+            CURRENT_RUST_VERSION="$(rustc --version | awk '{print $2}')"
+          fi
+
+          if ! command -v cargo >/dev/null 2>&1 \
+            || ! command -v rustc >/dev/null 2>&1 \
+            || [ -z "${CURRENT_RUST_VERSION}" ] \
+            || ! version_ge "${CURRENT_RUST_VERSION}" "${REQUIRED_RUST_VERSION}" \
+            || ! command -v rustup >/dev/null 2>&1; then
             if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
               ensure_pkg curl
             fi
-            if command -v curl >/dev/null 2>&1; then
-              curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
-                | sh -s -- -y --profile minimal
-            else
-              wget -qO- https://sh.rustup.rs \
-                | sh -s -- -y --profile minimal
+            if ! command -v rustup >/dev/null 2>&1; then
+              if command -v curl >/dev/null 2>&1; then
+                curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+                  | sh -s -- -y --profile minimal --component rustfmt
+              else
+                wget -qO- https://sh.rustup.rs \
+                  | sh -s -- -y --profile minimal --component rustfmt
+              fi
             fi
           fi
           if [ -f "${HOME}/.cargo/env" ]; then
             . "${HOME}/.cargo/env"
           fi
           export PATH="${HOME}/.cargo/bin:${PATH}"
+          rustup toolchain install "${REQUIRED_RUST_VERSION}" --profile minimal --component rustfmt
+          rustup default "${REQUIRED_RUST_VERSION}"
           PROTOC_BIN="$(command -v protoc || true)"
           if [ -z "${PROTOC_BIN}" ]; then
             echo "protoc not found after installation."
