@@ -78,6 +78,7 @@ use crate::search::SearchEngine;
             knowledge_base::Knowledge,
             knowledge_base::KnowledgeResponse,
             knowledge_base::KnowledgeDetailResponse,
+            knowledge_base::KnowledgeTreeFile,
             knowledge_base::KnowledgeTreeNode,
             knowledge_base::KnowledgeCreateReq,
             knowledge_base::KnowledgeUpdateReq,

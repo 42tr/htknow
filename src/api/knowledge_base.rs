@@ -100,18 +100,24 @@ pub struct FileWithoutContent {
     pub updated_at: i64,
 }
 
+#[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
+pub struct KnowledgeTreeFile {
+    pub id: i64,
+    pub size: i64,
+    pub filename: String,
+    pub meta: Option<String>,
+    pub kb_id: Option<i64>,
+    pub is_public: bool,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
 pub struct KnowledgeTreeNode {
     pub id: i64,
-    pub user_id: String,
-    pub user_name: String,
     pub name: String,
     pub description: String,
-    pub kb_type: String,
-    pub parent_id: Option<i64>,
     pub is_public: bool,
-    pub parse_priority: i64,
-    pub files: Vec<FileWithoutContent>,
+    pub kb_type: String,
+    pub files: Vec<KnowledgeTreeFile>,
     #[schema(no_recursion)]
     pub children: Vec<KnowledgeTreeNode>,
 }
@@ -1040,21 +1046,21 @@ pub async fn reparse_by_id(
 
 async fn load_tree_knowledges(
     pool: &SqlitePool, root_kb_id: Option<i64>, user_id: &str, is_admin: bool,
-) -> anyhow::Result<Vec<Knowledge>> {
+) -> anyhow::Result<Vec<TreeKnowledge>> {
     let rows = match (root_kb_id, is_admin) {
         (Some(kb_id), true) => {
             sqlx::query_as(
                 r#"
                 WITH RECURSIVE tree AS (
-                    SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority
+                    SELECT id, name, description, kb_type, parent_id, is_public
                     FROM knowledge_bases
                     WHERE id = ?
                     UNION ALL
-                    SELECT kb.id, kb.user_id, kb.user_name, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public, kb.parse_priority
+                    SELECT kb.id, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public
                     FROM knowledge_bases kb
                     INNER JOIN tree t ON kb.parent_id = t.id
                 )
-                SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority
+                SELECT id, name, description, kb_type, parent_id, is_public
                 FROM tree
                 ORDER BY name
                 "#,
@@ -1067,16 +1073,16 @@ async fn load_tree_knowledges(
             sqlx::query_as(
                 r#"
                 WITH RECURSIVE tree AS (
-                    SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority
+                    SELECT id, name, description, kb_type, parent_id, is_public
                     FROM knowledge_bases
                     WHERE id = ? AND (user_id = ? OR is_public = 1)
                     UNION ALL
-                    SELECT kb.id, kb.user_id, kb.user_name, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public, kb.parse_priority
+                    SELECT kb.id, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public
                     FROM knowledge_bases kb
                     INNER JOIN tree t ON kb.parent_id = t.id
                     WHERE kb.user_id = ? OR kb.is_public = 1
                 )
-                SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority
+                SELECT id, name, description, kb_type, parent_id, is_public
                 FROM tree
                 ORDER BY name
                 "#,
@@ -1091,15 +1097,15 @@ async fn load_tree_knowledges(
             sqlx::query_as(
                 r#"
                 WITH RECURSIVE tree AS (
-                    SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority
+                    SELECT id, name, description, kb_type, parent_id, is_public
                     FROM knowledge_bases
                     WHERE parent_id IS NULL
                     UNION ALL
-                    SELECT kb.id, kb.user_id, kb.user_name, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public, kb.parse_priority
+                    SELECT kb.id, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public
                     FROM knowledge_bases kb
                     INNER JOIN tree t ON kb.parent_id = t.id
                 )
-                SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority
+                SELECT id, name, description, kb_type, parent_id, is_public
                 FROM tree
                 ORDER BY name
                 "#,
@@ -1111,16 +1117,16 @@ async fn load_tree_knowledges(
             sqlx::query_as(
                 r#"
                 WITH RECURSIVE tree AS (
-                    SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority
+                    SELECT id, name, description, kb_type, parent_id, is_public
                     FROM knowledge_bases
                     WHERE parent_id IS NULL AND (user_id = ? OR is_public = 1)
                     UNION ALL
-                    SELECT kb.id, kb.user_id, kb.user_name, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public, kb.parse_priority
+                    SELECT kb.id, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public
                     FROM knowledge_bases kb
                     INNER JOIN tree t ON kb.parent_id = t.id
                     WHERE kb.user_id = ? OR kb.is_public = 1
                 )
-                SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority
+                SELECT id, name, description, kb_type, parent_id, is_public
                 FROM tree
                 ORDER BY name
                 "#,
@@ -1134,15 +1140,25 @@ async fn load_tree_knowledges(
     Ok(rows)
 }
 
+#[derive(Clone, Debug, sqlx::FromRow)]
+struct TreeKnowledge {
+    id: i64,
+    name: String,
+    description: String,
+    kb_type: String,
+    parent_id: Option<i64>,
+    is_public: bool,
+}
+
 async fn load_tree_files_by_kb(
     pool: &SqlitePool, kb_ids: &[i64], user_id: &str, is_admin: bool,
-) -> anyhow::Result<HashMap<i64, Vec<FileWithoutContent>>> {
+) -> anyhow::Result<HashMap<i64, Vec<KnowledgeTreeFile>>> {
     if kb_ids.is_empty() {
         return Ok(HashMap::new());
     }
 
     let mut qb = QueryBuilder::<Sqlite>::new(
-        "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at FROM files WHERE kb_id IN (",
+        "SELECT id, size, filename, meta, kb_id, is_public FROM files WHERE kb_id IN (",
     );
     push_i64_list(&mut qb, kb_ids);
     qb.push(")");
@@ -1151,8 +1167,8 @@ async fn load_tree_files_by_kb(
     }
     qb.push(" ORDER BY kb_id, filename");
 
-    let files: Vec<FileWithoutContent> = qb.build_query_as().fetch_all(pool).await?;
-    let mut files_by_kb = HashMap::<i64, Vec<FileWithoutContent>>::new();
+    let files: Vec<KnowledgeTreeFile> = qb.build_query_as().fetch_all(pool).await?;
+    let mut files_by_kb = HashMap::<i64, Vec<KnowledgeTreeFile>>::new();
     for file in files {
         if let Some(kb_id) = file.kb_id {
             files_by_kb.entry(kb_id).or_default().push(file);
@@ -1162,8 +1178,8 @@ async fn load_tree_files_by_kb(
 }
 
 fn build_tree_node(
-    kb_id: i64, knowledges: &HashMap<i64, Knowledge>, children_map: &HashMap<Option<i64>, Vec<i64>>,
-    files_by_kb: &mut HashMap<i64, Vec<FileWithoutContent>>,
+    kb_id: i64, knowledges: &HashMap<i64, TreeKnowledge>, children_map: &HashMap<Option<i64>, Vec<i64>>,
+    files_by_kb: &mut HashMap<i64, Vec<KnowledgeTreeFile>>,
 ) -> Option<KnowledgeTreeNode> {
     let kb = knowledges.get(&kb_id)?;
     let child_ids = children_map.get(&Some(kb_id)).cloned().unwrap_or_default();
@@ -1176,27 +1192,23 @@ fn build_tree_node(
 
     Some(KnowledgeTreeNode {
         id: kb.id,
-        user_id: kb.user_id.clone(),
-        user_name: kb.user_name.clone(),
         name: kb.name.clone(),
         description: kb.description.clone(),
-        kb_type: kb.kb_type.clone(),
-        parent_id: kb.parent_id,
         is_public: kb.is_public,
-        parse_priority: kb.parse_priority,
+        kb_type: kb.kb_type.clone(),
         files: files_by_kb.remove(&kb_id).unwrap_or_default(),
         children,
     })
 }
 
 fn assemble_tree(
-    knowledges: Vec<Knowledge>, mut files_by_kb: HashMap<i64, Vec<FileWithoutContent>>, root_kb_id: Option<i64>,
+    knowledges: Vec<TreeKnowledge>, mut files_by_kb: HashMap<i64, Vec<KnowledgeTreeFile>>, root_kb_id: Option<i64>,
 ) -> Vec<KnowledgeTreeNode> {
     if knowledges.is_empty() {
         return Vec::new();
     }
 
-    let mut knowledge_map = HashMap::<i64, Knowledge>::with_capacity(knowledges.len());
+    let mut knowledge_map = HashMap::<i64, TreeKnowledge>::with_capacity(knowledges.len());
     let mut children_map = HashMap::<Option<i64>, Vec<i64>>::new();
     for kb in knowledges {
         children_map.entry(kb.parent_id).or_default().push(kb.id);
