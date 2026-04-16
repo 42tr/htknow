@@ -370,8 +370,7 @@ jobs:
           npm config set replace-registry-host always
           IMAGE_TAG="${SAFE_TAG}" sh build-docker.sh
           docker save "htknow:${SAFE_TAG}" -o "htknow-${SAFE_TAG}.tar"
-          tar -czvf "htknow-${SAFE_TAG}.tar.gz" "htknow-${SAFE_TAG}.tar"
-          rm -f "htknow-${SAFE_TAG}.tar"
+          gzip -f "htknow-${SAFE_TAG}.tar"
           echo "TAG_NAME=${TAG_NAME}" >> "${GITHUB_ENV}"
           echo "SAFE_TAG=${SAFE_TAG}" >> "${GITHUB_ENV}"
           echo "ASSET_FILE=htknow-${SAFE_TAG}.tar.gz" >> "${GITHUB_ENV}"
@@ -627,10 +626,10 @@ jobs:
               set -e
               DEPLOY_PATH=\"${REMOTE_PATH_REMOTE}\"
               DEPLOY_PATH=\$(eval echo \"\$DEPLOY_PATH\")
-              ASSET_TAR_FILE=\"${ASSET_FILE%.gz}\"
-              tar -xzvf \"\$DEPLOY_PATH/${ASSET_FILE}\" -C \"\$DEPLOY_PATH\"
-              docker load -i \"\$DEPLOY_PATH/\$ASSET_TAR_FILE\"
-              rm -f \"\$DEPLOY_PATH/\$ASSET_TAR_FILE\"
+              EXTRACTED_TAR_FILE=\"${ASSET_FILE%.gz}\"
+              gzip -dc \"\$DEPLOY_PATH/${ASSET_FILE}\" > \"\$DEPLOY_PATH/\$EXTRACTED_TAR_FILE\"
+              docker load -i \"\$DEPLOY_PATH/\$EXTRACTED_TAR_FILE\"
+              rm -f \"\$DEPLOY_PATH/\$EXTRACTED_TAR_FILE\"
               docker rm -f htknow >/dev/null 2>&1 || true
               docker run -d --name htknow --restart unless-stopped -p 8080:8080 -v /opt/htknow/data:/app/data \"htknow:${SAFE_TAG}\"
             '"

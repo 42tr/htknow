@@ -12,7 +12,7 @@ TAR_FILE="$DEPLOY_PATH/$ASSET_FILE"
 COMPOSE_FILE="$DEPLOY_PATH/docker-compose.yaml"   # 或写绝对路径
 
 EXTRACTED_TAR="${TAR_FILE%.gz}"
-tar -xzvf "$TAR_FILE" -C "$DEPLOY_PATH"
+gzip -dc "$TAR_FILE" > "$EXTRACTED_TAR"
 docker load -i "$EXTRACTED_TAR"
 rm -f "$EXTRACTED_TAR"
 
