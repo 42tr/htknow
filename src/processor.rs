@@ -1160,36 +1160,37 @@ impl FileProcessor {
         .await
     }
 
-    /// 将 Word/Excel 文档转换为 PDF
+    /// 调用外部服务将 Word/Excel 文档转换为 PDF
     async fn convert_office_to_pdf(&self, file: &File) -> anyhow::Result<std::path::PathBuf> {
-        // 创建临时目录用于存放转换后的 PDF
         let cfg = config::get();
-        let temp_dir = std::path::Path::new(&cfg.storage.temp_path);
-        fs::create_dir_all(temp_dir).await?;
         let pdf_dir = std::path::Path::new(&cfg.storage.pdf_path);
         fs::create_dir_all(pdf_dir).await?;
 
-        // 生成临时 PDF 文件路径
         let pdf_filename = format!("{}.pdf", file.id);
+        let stored_pdf_path = pdf_dir.join(&pdf_filename);
+        let temp_pdf_path = pdf_dir.join(format!(".{}.pdf.tmp", file.id));
+        let file_bytes = tokio::fs::read(&file.path).await?;
+        let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string();
+        let mut convert_url = reqwest::Url::parse(&cfg.services.office_convert_url)?;
+        if !convert_url.query_pairs().any(|(key, _)| key == "target_format") {
+            convert_url.query_pairs_mut().append_pair("target_format", "pdf");
+        }
 
-        // 使用 LibreOffice 将 Word/Excel 转换为 PDF
-        // 注意：这需要系统中安装了 LibreOffice
-        let mut converted_ok = false;
         let mut last_error: Option<String> = None;
-        let convert_timeout = Duration::from_secs(120);
         for attempt in 0..2 {
-            let mut command = tokio::process::Command::new("soffice");
-            command
-                .args(&["--headless", "--convert-to", "pdf", "--outdir", temp_dir.to_str().unwrap(), &file.path])
-                .kill_on_drop(true);
+            let form = multipart::Form::new().part(
+                "file",
+                multipart::Part::bytes(file_bytes.clone()).file_name(file.filename.clone()).mime_str(&mime_type)?,
+            );
 
-            let output = match time::timeout(convert_timeout, command.output()).await {
-                Ok(result) => result?,
-                Err(_) => {
-                    last_error = Some(format!("LibreOffice timed out after {}s", convert_timeout.as_secs()));
+            let client = self.services_http_client()?;
+            let response = match client.post(convert_url.clone()).multipart(form).send().await {
+                Ok(response) => response,
+                Err(err) => {
+                    last_error = Some(format!("Office convert API request failed (url={}): {}", convert_url, err));
                     if attempt == 0 {
                         warn!(
-                            "LibreOffice convert timed out, retrying in 3s: {}",
+                            "Office convert API request failed, retrying in 3s: {}",
                             last_error.as_deref().unwrap_or("unknown error")
                         );
                         time::sleep(Duration::from_secs(3)).await;
@@ -1198,53 +1199,45 @@ impl FileProcessor {
                 }
             };
 
-            if output.status.success() {
-                converted_ok = true;
-                break;
+            let response_url = response.url().to_string();
+            let status = response.status();
+            let body_bytes = response.bytes().await?;
+            if !status.is_success() {
+                last_error = Some(format!(
+                    "Office convert API failed (status={}, url={}, body_len={}): {}",
+                    status.as_u16(),
+                    response_url,
+                    body_bytes.len(),
+                    summarize_http_body(&body_bytes)
+                ));
+            } else if body_bytes.is_empty() {
+                last_error = Some(format!("Office convert API returned empty PDF body (url={})", response_url));
+            } else if !body_bytes.starts_with(b"%PDF-") {
+                last_error = Some(format!(
+                    "Office convert API returned non-PDF body (status={}, url={}, body_len={}): {}",
+                    status.as_u16(),
+                    response_url,
+                    body_bytes.len(),
+                    summarize_http_body(&body_bytes)
+                ));
+            } else {
+                fs::write(&temp_pdf_path, &body_bytes).await?;
+                fs::rename(&temp_pdf_path, &stored_pdf_path).await?;
+                return Ok(stored_pdf_path);
             }
 
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            let error_msg =
-                if stderr.is_empty() { format!("LibreOffice exited with {}", output.status) } else { stderr };
-            last_error = Some(error_msg);
-
+            let _ = fs::remove_file(&temp_pdf_path).await;
             if attempt == 0 {
                 warn!(
-                    "LibreOffice convert failed, retrying in 3s: {}",
+                    "Office convert API failed, retrying in 3s: {}",
                     last_error.as_deref().unwrap_or("unknown error")
                 );
                 time::sleep(Duration::from_secs(3)).await;
             }
         }
 
-        if !converted_ok {
-            let error_msg = last_error.unwrap_or_else(|| "unknown error".to_string());
-            return Err(anyhow::anyhow!("Failed to convert office document to PDF: {}", error_msg));
-        }
-
-        // 查找生成的 PDF 文件
-        // LibreOffice 会使用原文件名（不含扩展名）+ .pdf
-        let converted_pdf_path = temp_dir.join(format!(
-            "{}.pdf",
-            std::path::Path::new(&file.path)
-                .file_name()
-                .and_then(|name| name.to_str())
-                .ok_or_else(|| anyhow::anyhow!("Invalid file path: {}", file.path))?
-        ));
-        let stored_pdf_path = pdf_dir.join(&pdf_filename);
-
-        // 检查转换后的 PDF 是否存在
-        if !tokio::fs::try_exists(&converted_pdf_path).await? {
-            return Err(anyhow::anyhow!("Converted PDF file not found: {:?}", converted_pdf_path));
-        }
-
-        // 保存转换后的 PDF 以便溯源高亮
-        fs::copy(&converted_pdf_path, &stored_pdf_path).await?;
-
-        // 清理临时 PDF 文件
-        let _ = fs::remove_file(&converted_pdf_path).await;
-
-        Ok(stored_pdf_path)
+        let error_msg = last_error.unwrap_or_else(|| "unknown error".to_string());
+        Err(anyhow::anyhow!("Failed to convert office document to PDF: {}", error_msg))
     }
 
     /// 将 Word/Excel 文档转换为 PDF 并处理

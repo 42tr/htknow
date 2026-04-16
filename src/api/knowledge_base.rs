@@ -1157,9 +1157,8 @@ async fn load_tree_files_by_kb(
         return Ok(HashMap::new());
     }
 
-    let mut qb = QueryBuilder::<Sqlite>::new(
-        "SELECT id, size, filename, meta, kb_id, is_public FROM files WHERE kb_id IN (",
-    );
+    let mut qb =
+        QueryBuilder::<Sqlite>::new("SELECT id, size, filename, meta, kb_id, is_public FROM files WHERE kb_id IN (");
     push_i64_list(&mut qb, kb_ids);
     qb.push(")");
     if !is_admin {

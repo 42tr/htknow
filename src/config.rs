@@ -74,6 +74,8 @@ pub struct ServicesConfig {
     pub request_timeout_secs: u64,
     /// MinerU 单次解析 PDF 最大页数（0 表示不限制）
     pub mineru_max_pages: usize,
+    /// Office 文档转 PDF 服务地址
+    pub office_convert_url: String,
     /// 自定义解析服务地址（配置后仅 Word/PDF 走该服务）
     pub custom_parse_url: Option<String>,
     /// 自定义解析复用服务地址（仅输入 pdf_contents）
@@ -216,6 +218,7 @@ impl ServicesConfig {
             mineru_url: env_or("HTKNOW_MINERU_URL", "http://192.168.0.46:10001/file_parse"),
             request_timeout_secs: env_or_parse("HTKNOW_REQUEST_TIMEOUT_SECS", 600),
             mineru_max_pages: env_or_parse("HTKNOW_MINERU_MAX_PAGES", 50),
+            office_convert_url: env_or("HTKNOW_OFFICE_CONVERT_URL", "http://192.168.0.46:8003/convert"),
             custom_parse_url: env_optional("HTKNOW_CUSTOM_PARSE_URL"),
             custom_parse_reuse_url: env_optional("HTKNOW_CUSTOM_PARSE_REUSE_URL"),
             audio_transcription_url: env_or(

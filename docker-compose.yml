@@ -24,6 +24,7 @@ services:
       - HTKNOW_MINERU_URL=http://192.168.0.46:10001/file_parse
       - HTKNOW_REQUEST_TIMEOUT_SECS=600
       - HTKNOW_MINERU_MAX_PAGES=0
+      - HTKNOW_OFFICE_CONVERT_URL=http://192.168.0.46:8003/convert
       - HTKNOW_EMBEDDING_URL=http://192.168.0.46:9700/v1/embeddings
       - HTKNOW_RERANK_URL=http://192.168.0.46:9600/v1/rerank
       # AI 模型配置

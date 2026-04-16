@@ -79,6 +79,7 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | `HTKNOW_MINERU_URL` | `http://192.168.0.46:10001/file_parse` | MinerU PDF 解析 |
 | `HTKNOW_REQUEST_TIMEOUT_SECS` | `600` | 外部接口请求超时（秒），适用于文件解析相关接口 |
 | `HTKNOW_MINERU_MAX_PAGES` | `50` | MinerU 单次解析 PDF 最大页数（0 表示不限制） |
+| `HTKNOW_OFFICE_CONVERT_URL` | `http://192.168.0.46:8003/convert` | Office 文档转 PDF 服务，使用 multipart `file` 字段并自动追加 `target_format=pdf` |
 | `HTKNOW_CUSTOM_PARSE_URL` | 空 | 自定义解析服务地址（配置后仅 Word/PDF 解析走该服务，需返回已切片数据） |
 | `HTKNOW_CUSTOM_PARSE_REUSE_URL` | 空 | 自定义解析复用服务地址（仅输入 pdf_contents，不包含图片） |
 | `HTKNOW_AUDIO_TRANSCRIPTION_URL` | `http://192.168.0.46:59805/api/v1/audio/transcriptions` | 音频转写服务 |
