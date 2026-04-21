@@ -18,6 +18,7 @@ use crate::config;
 static LANCEDB: OnceCell<Arc<Connection>> = OnceCell::new();
 static TABLE_NAME: &str = "documents";
 static IS_DELETED_COLUMN: &str = "is_deleted";
+static SEARCH_SELECT_COLUMNS: &[&str] = &["id", "file_id", "kb_id", "content", "_distance"];
 
 #[derive(Debug, Clone)]
 pub struct CompactStats {
@@ -111,6 +112,10 @@ pub async fn write_documents_batch(docs: Vec<Document>) -> Result<()> {
 pub async fn search(
     query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
 ) -> Result<Vec<SearchResultItem>> {
+    if has_empty_scope(file_ids, kb_ids) {
+        return Ok(Vec::new());
+    }
+
     let cfg = config::get();
     let conn = get_connection()?;
     let table = conn.open_table(TABLE_NAME).execute().await?;
@@ -121,30 +126,11 @@ pub async fn search(
     debug!("LanceDB embedding {}ms", embedding_start.elapsed().as_millis());
 
     // 使用向量搜索
-    let mut query_builder = table.query().nearest_to(query_vector)?.column("vector").select(Select::columns(&[
-        "id",
-        "file_id",
-        "kb_id",
-        "content",
-        "_distance",
-    ]));
+    let mut query_builder =
+        table.query().nearest_to(query_vector)?.column("vector").select(Select::columns(SEARCH_SELECT_COLUMNS));
 
     // 应用过滤条件
-    let mut filter_conditions = Vec::new();
-    filter_conditions.push(format!("({} = false OR {} IS NULL)", IS_DELETED_COLUMN, IS_DELETED_COLUMN));
-    filter_conditions.push("is_image = false".to_string());
-    if let Some(fids) = file_ids {
-        if !fids.is_empty() {
-            let ids_str = fids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
-            filter_conditions.push(format!("file_id IN ({})", ids_str));
-        }
-    }
-    if let Some(kids) = kb_ids {
-        if !kids.is_empty() {
-            let ids_str = kids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
-            filter_conditions.push(format!("kb_id IN ({})", ids_str));
-        }
-    }
+    let filter_conditions = build_filter_conditions(false, file_ids, kb_ids);
 
     if !filter_conditions.is_empty() {
         query_builder = query_builder.only_if(&filter_conditions.join(" AND "));
@@ -154,52 +140,13 @@ pub async fn search(
     let mut result_stream = query_builder.limit(cfg.search.limit).execute().await?;
     debug!("LanceDB execute {}ms", execute_start.elapsed().as_millis());
 
-    let mut search_results = Vec::new();
+    let mut search_results = Vec::with_capacity(cfg.search.limit);
 
     // 从 stream 中读取数据
     let read_start = std::time::Instant::now();
     while let Some(batch_result) = result_stream.next().await {
         let batch = batch_result?;
-        let num_rows = batch.num_rows();
-
-        let id_array = batch
-            .column_by_name("id")
-            .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
-            .ok_or_else(|| anyhow::anyhow!("Missing or invalid id column"))?;
-
-        let file_id_array = batch
-            .column_by_name("file_id")
-            .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
-            .ok_or_else(|| anyhow::anyhow!("Missing or invalid file_id column"))?;
-
-        let kb_id_array = batch.column_by_name("kb_id").and_then(|col| col.as_any().downcast_ref::<Int64Array>());
-
-        let content_array = batch
-            .column_by_name("content")
-            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
-            .ok_or_else(|| anyhow::anyhow!("Missing or invalid content column"))?;
-
-        // 获取距离分数（如果有的话）
-        let distance_array =
-            batch.column_by_name("_distance").and_then(|col| col.as_any().downcast_ref::<Float32Array>());
-
-        for i in 0..num_rows {
-            let id = id_array.value(i);
-            let file_id = file_id_array.value(i);
-            let kb_id = kb_id_array.and_then(|arr| if arr.is_null(i) { None } else { Some(arr.value(i)) });
-            let content = content_array.value(i).to_string();
-
-            // 使用向量距离作为分数（距离越小，分数越高）
-            let score = if let Some(dist_arr) = distance_array {
-                let distance = dist_arr.value(i);
-                // 将距离转换为相似度分数 (0-1)，距离越小分数越高
-                (1.0 / (1.0 + distance)).max(0.0).min(1.0)
-            } else {
-                0.5 // 默认分数
-            };
-
-            search_results.push(SearchResultItem { id, file_id, kb_id, content, score });
-        }
+        decode_search_batch(&batch, &mut search_results)?;
     }
 
     // 按分数排序
@@ -212,6 +159,10 @@ pub async fn search(
 pub async fn search_image(
     query_vector: Vec<f32>, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
 ) -> Result<Vec<SearchResultItem>> {
+    if has_empty_scope(file_ids, kb_ids) {
+        return Ok(Vec::new());
+    }
+
     let cfg = config::get();
     let conn = get_connection()?;
     let table = conn.open_table(TABLE_NAME).execute().await?;
@@ -221,30 +172,13 @@ pub async fn search_image(
         anyhow::bail!("Image embedding dimension mismatch: expected {}, got {}", image_vector_dim, query_vector.len());
     }
 
-    let mut query_builder = table.query().nearest_to(query_vector)?.column("image_vector").select(Select::columns(&[
-        "id",
-        "file_id",
-        "kb_id",
-        "content",
-        "_distance",
-    ]));
+    let mut query_builder = table
+        .query()
+        .nearest_to(query_vector)?
+        .column("image_vector")
+        .select(Select::columns(SEARCH_SELECT_COLUMNS));
 
-    let mut filter_conditions = vec![
-        format!("({} = false OR {} IS NULL)", IS_DELETED_COLUMN, IS_DELETED_COLUMN),
-        "is_image = true".to_string(),
-    ];
-    if let Some(fids) = file_ids {
-        if !fids.is_empty() {
-            let ids_str = fids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
-            filter_conditions.push(format!("file_id IN ({})", ids_str));
-        }
-    }
-    if let Some(kids) = kb_ids {
-        if !kids.is_empty() {
-            let ids_str = kids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
-            filter_conditions.push(format!("kb_id IN ({})", ids_str));
-        }
-    }
+    let filter_conditions = build_filter_conditions(true, file_ids, kb_ids);
 
     if !filter_conditions.is_empty() {
         query_builder = query_builder.only_if(&filter_conditions.join(" AND "));
@@ -252,46 +186,10 @@ pub async fn search_image(
 
     let mut result_stream = query_builder.limit(cfg.search.limit).execute().await?;
 
-    let mut search_results = Vec::new();
+    let mut search_results = Vec::with_capacity(cfg.search.limit);
     while let Some(batch_result) = result_stream.next().await {
         let batch = batch_result?;
-        let num_rows = batch.num_rows();
-
-        let id_array = batch
-            .column_by_name("id")
-            .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
-            .ok_or_else(|| anyhow::anyhow!("Missing or invalid id column"))?;
-
-        let file_id_array = batch
-            .column_by_name("file_id")
-            .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
-            .ok_or_else(|| anyhow::anyhow!("Missing or invalid file_id column"))?;
-
-        let kb_id_array = batch.column_by_name("kb_id").and_then(|col| col.as_any().downcast_ref::<Int64Array>());
-
-        let content_array = batch
-            .column_by_name("content")
-            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
-            .ok_or_else(|| anyhow::anyhow!("Missing or invalid content column"))?;
-
-        let distance_array =
-            batch.column_by_name("_distance").and_then(|col| col.as_any().downcast_ref::<Float32Array>());
-
-        for i in 0..num_rows {
-            let id = id_array.value(i);
-            let file_id = file_id_array.value(i);
-            let kb_id = kb_id_array.and_then(|arr| if arr.is_null(i) { None } else { Some(arr.value(i)) });
-            let content = content_array.value(i).to_string();
-
-            let score = if let Some(dist_arr) = distance_array {
-                let distance = dist_arr.value(i);
-                (1.0 / (1.0 + distance)).max(0.0).min(1.0)
-            } else {
-                0.5
-            };
-
-            search_results.push(SearchResultItem { id, file_id, kb_id, content, score });
-        }
+        decode_search_batch(&batch, &mut search_results)?;
     }
 
     search_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
@@ -357,6 +255,67 @@ pub async fn compact() -> Result<CompactStats> {
 
 fn get_connection() -> Result<Arc<Connection>> {
     LANCEDB.get().cloned().ok_or_else(|| anyhow::anyhow!("LanceDB not initialized"))
+}
+
+fn has_empty_scope(file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>) -> bool {
+    matches!(file_ids, Some(ids) if ids.is_empty()) || matches!(kb_ids, Some(ids) if ids.is_empty())
+}
+
+fn build_filter_conditions(is_image: bool, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>) -> Vec<String> {
+    let mut filter_conditions = vec![
+        format!("({} = false OR {} IS NULL)", IS_DELETED_COLUMN, IS_DELETED_COLUMN),
+        format!("is_image = {}", is_image),
+    ];
+
+    if let Some(fids) = file_ids {
+        let ids_str = fids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+        filter_conditions.push(format!("file_id IN ({})", ids_str));
+    }
+    if let Some(kids) = kb_ids {
+        let ids_str = kids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+        filter_conditions.push(format!("kb_id IN ({})", ids_str));
+    }
+
+    filter_conditions
+}
+
+fn decode_search_batch(batch: &RecordBatch, search_results: &mut Vec<SearchResultItem>) -> Result<()> {
+    let num_rows = batch.num_rows();
+
+    let id_array = batch
+        .column_by_name("id")
+        .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(|| anyhow::anyhow!("Missing or invalid id column"))?;
+
+    let file_id_array = batch
+        .column_by_name("file_id")
+        .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(|| anyhow::anyhow!("Missing or invalid file_id column"))?;
+
+    let kb_id_array = batch.column_by_name("kb_id").and_then(|col| col.as_any().downcast_ref::<Int64Array>());
+
+    let content_array = batch
+        .column_by_name("content")
+        .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| anyhow::anyhow!("Missing or invalid content column"))?;
+
+    let distance_array = batch.column_by_name("_distance").and_then(|col| col.as_any().downcast_ref::<Float32Array>());
+
+    for i in 0..num_rows {
+        let id = id_array.value(i);
+        let file_id = file_id_array.value(i);
+        let kb_id = kb_id_array.and_then(|arr| if arr.is_null(i) { None } else { Some(arr.value(i)) });
+        let content = content_array.value(i).to_string();
+        let score = distance_array.map_or(0.5, |arr| distance_to_score(arr.value(i)));
+
+        search_results.push(SearchResultItem { id, file_id, kb_id, content, score });
+    }
+
+    Ok(())
+}
+
+fn distance_to_score(distance: f32) -> f32 {
+    (1.0 / (1.0 + distance)).clamp(0.0, 1.0)
 }
 
 fn dir_size_bytes(path: &Path) -> Result<u64> {
