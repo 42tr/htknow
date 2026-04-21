@@ -6,7 +6,7 @@ use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use log::{debug, warn};
 use serde::Serialize;
 use tantivy::{
-    Index, IndexReader, Result, TantivyDocument, TantivyError, Term, collector::TopDocs, directory::error::LockError, doc, merge_policy::LogMergePolicy, query::{BooleanQuery, BoostQuery, Occur, PhraseQuery, Query, TermQuery}, schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _}, tokenizer::{TokenStream, Tokenizer}
+    Index, IndexReader, Result, TantivyDocument, TantivyError, Term, collector::TopDocs, directory::error::LockError, doc, merge_policy::LogMergePolicy, query::{BooleanQuery, BoostQuery, Occur, Query, TermQuery}, schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _}
 };
 use tokio::time::sleep;
 
@@ -14,8 +14,6 @@ use super::chinese_tokenizer;
 use crate::config;
 
 const ALL_TOKENIZER: &str = "all";
-const SENTENCE_SHOULD_BOOST: f32 = 2.0;
-const SENTENCE_SLOP: u32 = 12;
 const INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS: usize = 8;
 const INDEX_WRITER_LOCK_RETRY_BASE_MS: u64 = 40;
 
@@ -299,9 +297,6 @@ fn build_query(
             }
         }
     }
-    if let Some(sentence_query) = build_sentence_query(input, schema) {
-        subqueries.push((Occur::Should, sentence_query));
-    }
     Ok(Box::new(BooleanQuery::new(subqueries)))
 }
 
@@ -438,33 +433,6 @@ fn build_query_terms(input: &str, synonym_map: Option<&SynonymMap>) -> Vec<Query
     }
 
     terms
-}
-
-fn build_sentence_query(input: &str, schema: &Schema) -> Option<Box<dyn Query>> {
-    let mut tokenizer = chinese_tokenizer::FastChineseTokenizer::new(chinese_tokenizer::SegmentationMode::Search);
-    let mut stream = tokenizer.token_stream(input);
-    let mut phrase_terms = Vec::new();
-    let mut last_term: Option<String> = None;
-    while stream.advance() {
-        let term_text = stream.token().text.trim();
-        if term_text.is_empty() {
-            continue;
-        }
-        if last_term.as_deref() == Some(term_text) {
-            continue;
-        }
-        phrase_terms.push(term_text.to_string());
-        last_term = Some(term_text.to_string());
-    }
-    if phrase_terms.len() < 2 {
-        return None;
-    }
-
-    let field = get_field(schema, "content");
-    let terms: Vec<Term> = phrase_terms.into_iter().map(|t| Term::from_field_text(field, t.as_str())).collect();
-    let mut phrase = PhraseQuery::new(terms);
-    phrase.set_slop(SENTENCE_SLOP);
-    Some(Box::new(BoostQuery::new(Box::new(phrase), SENTENCE_SHOULD_BOOST)))
 }
 
 fn build_matcher(terms: &[String]) -> Option<AhoCorasick> {
