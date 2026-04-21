@@ -136,7 +136,7 @@ pub async fn write_documents_batch(index: &Index, schema: &Schema, docs: Vec<Doc
     Ok(())
 }
 
-pub async fn search(
+pub fn search_sync(
     reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     synonym_map: Option<&SynonymMap>,
 ) -> anyhow::Result<Vec<SearchResultItem>> {
@@ -175,7 +175,14 @@ pub async fn search(
     Ok(results)
 }
 
-pub async fn search_with_snippet(
+pub async fn search(
+    reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
+    synonym_map: Option<&SynonymMap>,
+) -> anyhow::Result<Vec<SearchResultItem>> {
+    search_sync(reader, schema, query, file_ids, kb_ids, synonym_map)
+}
+
+pub fn search_with_snippet_sync(
     reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     max_chars: usize, synonym_map: Option<&SynonymMap>,
 ) -> anyhow::Result<Vec<FullSearchResultItem>> {
@@ -211,6 +218,13 @@ pub async fn search_with_snippet(
     debug!("Tantivy full searcher.doc total={}ms max={}ms count={}", doc_total_ms, doc_max_ms, doc_count);
 
     Ok(results)
+}
+
+pub async fn search_with_snippet(
+    reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
+    max_chars: usize, synonym_map: Option<&SynonymMap>,
+) -> anyhow::Result<Vec<FullSearchResultItem>> {
+    search_with_snippet_sync(reader, schema, query, file_ids, kb_ids, max_chars, synonym_map)
 }
 
 pub async fn delete_by_file(index: &Index, schema: &Schema, file_id: i64) -> anyhow::Result<()> {

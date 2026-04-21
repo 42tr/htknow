@@ -395,9 +395,19 @@ pub async fn search(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Query(params): Query<SearchQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<SearchResult>> {
+    let total_started = Instant::now();
     let (_is_admin, user_id, kb_ids_to_search) =
         resolve_scope_for_user(&pool, &auth_user, params.kb_id.as_ref()).await?;
     if no_accessible_kb_scope(kb_ids_to_search.as_deref()) {
+        info!(
+            "search request completed: user_id={}, query=\"{}\", advanced={}, file_filter={}, kb_scope={}, raw_results=0, final_results=0, elapsed_ms={}",
+            user_id,
+            preview_for_log(&params.query, 120),
+            params.advanced,
+            format_id_filter(params.file_id.as_deref()),
+            summarize_kb_scope(kb_ids_to_search.as_deref()),
+            total_started.elapsed().as_millis()
+        );
         return Ok(Json(SearchResult { results: vec![] }));
     }
 
@@ -438,7 +448,18 @@ pub async fn search(
         .await
         .map_err(|e| crate::api::error::ApiError::internal(format!("Search failed: {}", e)))?;
 
+    let assemble_started = Instant::now();
     let results = build_slice_results_from_raw(&pool, raw_results, &auth_user, true).await?;
+    info!(
+        "search request completed: user_id={}, query=\"{}\", advanced=false, file_filter={}, kb_scope={}, final_results={}, assemble_elapsed_ms={}, elapsed_ms={}",
+        user_id,
+        preview_for_log(&params.query, 120),
+        format_id_filter(params.file_id.as_deref()),
+        summarize_kb_scope(kb_ids_to_search.as_deref()),
+        results.len(),
+        assemble_started.elapsed().as_millis(),
+        total_started.elapsed().as_millis()
+    );
 
     Ok(Json(SearchResult { results }))
 }

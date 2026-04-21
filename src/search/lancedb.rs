@@ -9,6 +9,7 @@ use futures::stream::StreamExt;
 use lancedb::{
     Connection, connect, query::{ExecutableQuery, QueryBase, Select}, table::{CompactionOptions, Duration, NewColumnTransform, OptimizeAction, OptimizeOptions}
 };
+use log::debug;
 use once_cell::sync::OnceCell;
 
 use super::{embedding, tantivy_engine::SearchResultItem};
@@ -115,7 +116,9 @@ pub async fn search(
     let table = conn.open_table(TABLE_NAME).execute().await?;
 
     // 获取查询文本的 embedding
+    let embedding_start = std::time::Instant::now();
     let query_vector = embedding::get_embedding(query).await?;
+    debug!("LanceDB embedding {}ms", embedding_start.elapsed().as_millis());
 
     // 使用向量搜索
     let mut query_builder = table.query().nearest_to(query_vector)?.column("vector").select(Select::columns(&[
@@ -147,11 +150,14 @@ pub async fn search(
         query_builder = query_builder.only_if(&filter_conditions.join(" AND "));
     }
 
+    let execute_start = std::time::Instant::now();
     let mut result_stream = query_builder.limit(cfg.search.limit).execute().await?;
+    debug!("LanceDB execute {}ms", execute_start.elapsed().as_millis());
 
     let mut search_results = Vec::new();
 
     // 从 stream 中读取数据
+    let read_start = std::time::Instant::now();
     while let Some(batch_result) = result_stream.next().await {
         let batch = batch_result?;
         let num_rows = batch.num_rows();
@@ -198,6 +204,7 @@ pub async fn search(
 
     // 按分数排序
     search_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    debug!("LanceDB read+decode {}ms", read_start.elapsed().as_millis());
 
     Ok(search_results)
 }

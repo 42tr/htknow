@@ -401,8 +401,10 @@ impl SearchEngine {
     pub async fn search(
         &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     ) -> anyhow::Result<Vec<SearchResultItem>> {
+        let total_start = Instant::now();
         debug!("Searching for query: {}", query);
 
+        let synonym_start = Instant::now();
         let synonym_map = match self.load_query_synonyms(query).await {
             Ok(map) => map,
             Err(e) => {
@@ -410,18 +412,46 @@ impl SearchEngine {
                 HashMap::new()
             }
         };
-        let synonym_ref = if synonym_map.is_empty() { None } else { Some(&synonym_map) };
+        debug!(
+            "Search synonym lookup {}ms count={}",
+            synonym_start.elapsed().as_millis(),
+            synonym_map.values().map(Vec::len).sum::<usize>()
+        );
+
+        let index_reader = self.index_reader.clone();
+        let schema = self.schema.clone();
+        let tantivy_query = query.to_string();
+        let tantivy_file_ids = file_ids.cloned();
+        let tantivy_kb_ids = kb_ids.cloned();
+        let tantivy_synonym_map = synonym_map.clone();
+        let tantivy_started = Instant::now();
+        let tantivy_task = tokio::task::spawn_blocking(move || {
+            let synonym_ref = if tantivy_synonym_map.is_empty() { None } else { Some(&tantivy_synonym_map) };
+            let results = tantivy_engine::search_sync(
+                &index_reader,
+                &schema,
+                &tantivy_query,
+                tantivy_file_ids.as_ref(),
+                tantivy_kb_ids.as_ref(),
+                synonym_ref,
+            )?;
+            debug!("Tantivy branch total {}ms", tantivy_started.elapsed().as_millis());
+            anyhow::Ok(results)
+        });
+
+        let lancedb_started = Instant::now();
+        let lancedb_result = lancedb::search(query, file_ids, kb_ids).await;
+        debug!("LanceDB branch total {}ms", lancedb_started.elapsed().as_millis());
+        let tantivy_result =
+            tantivy_task.await.map_err(|err| anyhow!("Tantivy search task failed: {}", err))?;
 
         // 使用 tantivy 搜索
-        let tantivy_results =
-            tantivy_engine::search(&self.index_reader, &self.schema, query, file_ids, kb_ids, synonym_ref).await?;
+        let tantivy_results = tantivy_result?;
         debug!("Tantivy results count: {}", tantivy_results.len());
 
         // 使用 lancedb 搜索
-        let lancedb_start = Instant::now();
-        let lancedb_results = match lancedb::search(query, file_ids, kb_ids).await {
+        let lancedb_results = match lancedb_result {
             Ok(results) => {
-                debug!("LanceDB search {}ms", lancedb_start.elapsed().as_millis());
                 debug!("LanceDB results count: {}", results.len());
                 results
             }
@@ -489,6 +519,7 @@ impl SearchEngine {
             final_results.truncate(limit);
         }
 
+        debug!("Search total {}ms", total_start.elapsed().as_millis());
         Ok(final_results)
     }
 
