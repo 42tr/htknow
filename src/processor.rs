@@ -1998,7 +1998,16 @@ impl FileProcessor {
                 // 按段落分片（以双换行符分隔）
                 Ok(content.split("\n\n").map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
             }
-            "fixed" => {
+            "sentence" => {
+                // 按句子分片（简单实现：以句号、问号、感叹号分隔）
+                Ok(content
+                    .split(|c| c == '。' || c == '.' || c == '?' || c == '!' || c == '？' || c == '！')
+                    .map(|s| s.trim())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string())
+                    .collect())
+            }
+            _ => {
                 // 固定长度分片（每8000字符，重叠100字符）
                 let cfg = config::get();
                 let chunk_size = cfg.slice.smart_slice_max_chars;
@@ -2025,19 +2034,6 @@ impl FileProcessor {
                 }
 
                 Ok(slices)
-            }
-            "sentence" => {
-                // 按句子分片（简单实现：以句号、问号、感叹号分隔）
-                Ok(content
-                    .split(|c| c == '。' || c == '.' || c == '?' || c == '!' || c == '？' || c == '！')
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect())
-            }
-            _ => {
-                // 默认：整个文件作为一个分片
-                Ok(vec![content.to_string()])
             }
         }
     }
