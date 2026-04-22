@@ -293,14 +293,11 @@ impl SearchEngine {
     }
 
     pub async fn write(&self, doc: tantivy_engine::Document, image_embedding: Option<Vec<f32>>) -> anyhow::Result<()> {
-        // 写入 tantivy
         {
             let _guard = self.index_write_lock.lock().await;
             tantivy_engine::write_documents(&self.index, &self.schema, doc.clone()).await?;
         }
-        reload_reader(&self.index_reader, "index")?;
 
-        // 写入 lancedb
         let mut lancedb_doc = lancedb::Document::new(doc.id, doc.file_id, doc.kb_id, doc.content);
         if let Some(image_embedding) = image_embedding {
             lancedb_doc = lancedb_doc.with_image_embedding(image_embedding);
@@ -309,7 +306,6 @@ impl SearchEngine {
         Ok(())
     }
 
-    /// 批量写入文档，减少 commit 次数
     pub async fn write_batch(
         &self, docs: Vec<tantivy_engine::Document>, image_embeddings: Vec<Option<Vec<f32>>>,
     ) -> anyhow::Result<()> {
@@ -317,14 +313,11 @@ impl SearchEngine {
             return Ok(());
         }
 
-        // 批量写入 tantivy
         {
             let _guard = self.index_write_lock.lock().await;
             tantivy_engine::write_documents_batch(&self.index, &self.schema, docs.clone()).await?;
         }
-        reload_reader(&self.index_reader, "index")?;
 
-        // 批量写入 lancedb：收集所有 lancedb 文档后一次性写入
         let lancedb_docs: Vec<lancedb::Document> = docs
             .iter()
             .zip(image_embeddings.iter())
@@ -346,6 +339,11 @@ impl SearchEngine {
             let _guard = self.full_index_write_lock.lock().await;
             tantivy_engine::write_documents(&self.full_index, &self.full_schema, doc).await?;
         }
+        Ok(())
+    }
+
+    pub fn reload_readers(&self) -> anyhow::Result<()> {
+        reload_reader(&self.index_reader, "index")?;
         reload_reader(&self.full_index_reader, "full_index")?;
         Ok(())
     }

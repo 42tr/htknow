@@ -1042,19 +1042,20 @@ impl FileProcessor {
             }
         };
 
-        let (position_rows, search_docs) = timed_step_opt(timing.as_deref_mut(), "custom_insert_slices", async {
-            let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
-            let mut search_docs = Vec::new();
-            for slice in slices {
-                let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
-                let id =
-                    sqlx::query(sql).bind(file.id).bind(&slice.content).execute(&self.pool).await?.last_insert_rowid();
-                for position in &slice.positions {
-                    position_rows.push((id, position.clone()));
-                }
-                search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, slice.content.clone()));
+        let search_docs = timed_step_opt(timing.as_deref_mut(), "custom_insert_slices", async {
+            let owned_slices: Vec<SliceWithPositions> = slices
+                .iter()
+                .map(|slice| SliceWithPositions {
+                    content: slice.content.clone(),
+                    positions: slice.positions.clone(),
+                })
+                .collect();
+            let persisted = self.insert_slices_and_positions(file.id, owned_slices).await?;
+            let mut search_docs = Vec::with_capacity(persisted.len());
+            for (id, content) in persisted {
+                search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, content));
             }
-            Ok((position_rows, search_docs))
+            Ok(search_docs)
         })
         .await?;
 
@@ -1062,29 +1063,6 @@ impl FileProcessor {
             timed_step_opt(timing.as_deref_mut(), "custom_write_search_batch", async {
                 let embeddings = vec![None; search_docs.len()];
                 self.search_engine.write_batch(search_docs, embeddings).await?;
-                Ok(())
-            })
-            .await?;
-        }
-
-        if !position_rows.is_empty() {
-            timed_step_opt(timing.as_deref_mut(), "custom_insert_slice_positions", async {
-                let binds_per_row = 6_usize;
-                let max_vars = 999_usize;
-                let batch_size = std::cmp::max(1, max_vars / binds_per_row);
-                for chunk in position_rows.chunks(batch_size) {
-                    let mut pos_sql =
-                        QueryBuilder::<Sqlite>::new("insert into slice_positions(slice_id, page_idx, x1, y1, x2, y2) ");
-                    pos_sql.push_values(chunk.iter(), |mut b, (slice_id, position)| {
-                        b.push_bind(slice_id)
-                            .push_bind(position.page_idx)
-                            .push_bind(position.bbox[0])
-                            .push_bind(position.bbox[1])
-                            .push_bind(position.bbox[2])
-                            .push_bind(position.bbox[3]);
-                    });
-                    pos_sql.build().execute(&self.pool).await?;
-                }
                 Ok(())
             })
             .await?;
@@ -1119,6 +1097,8 @@ impl FileProcessor {
         .await?;
 
         info!("File {} processed successfully with {} custom slices", file.id, slices.len());
+
+        self.search_engine.reload_readers()?;
 
         timed_step_opt(timing.as_deref_mut(), "build_knowledge_graph", async {
             self.maybe_build_knowledge_graph(file).await;
@@ -1447,29 +1427,16 @@ impl FileProcessor {
         }
 
         let slice_count = slices.len();
-        let (position_rows, search_docs, search_embeddings) =
+        let (search_docs, search_embeddings) =
             timed_step_opt(timing.as_deref_mut(), "insert_slices", async {
-                let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
-                let mut search_docs = Vec::new();
-                let mut search_embeddings = Vec::new();
-                for slice in slices {
-                    let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
-                    let id = sqlx::query(sql)
-                        .bind(file.id)
-                        .bind(&slice.content)
-                        .execute(&self.pool)
-                        .await?
-                        .last_insert_rowid();
-                    if !slice.positions.is_empty() {
-                        for position in slice.positions {
-                            position_rows.push((id, position));
-                        }
-                    }
-                    // 收集文档，稍后批量写入
-                    search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, slice.content));
+                let persisted = self.insert_slices_and_positions(file.id, slices).await?;
+                let mut search_docs = Vec::with_capacity(persisted.len());
+                let mut search_embeddings = Vec::with_capacity(persisted.len());
+                for (id, content) in persisted {
+                    search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, content));
                     search_embeddings.push(image_embedding.clone());
                 }
-                Ok((position_rows, search_docs, search_embeddings))
+                Ok((search_docs, search_embeddings))
             })
             .await?;
 
@@ -1477,29 +1444,6 @@ impl FileProcessor {
         if !search_docs.is_empty() {
             timed_step_opt(timing.as_deref_mut(), "write_search_batch", async {
                 self.search_engine.write_batch(search_docs, search_embeddings).await?;
-                Ok(())
-            })
-            .await?;
-        }
-
-        if !position_rows.is_empty() {
-            timed_step_opt(timing.as_deref_mut(), "insert_slice_positions", async {
-                let binds_per_row = 6_usize;
-                let max_vars = 999_usize;
-                let batch_size = std::cmp::max(1, max_vars / binds_per_row);
-                for chunk in position_rows.chunks(batch_size) {
-                    let mut pos_sql =
-                        QueryBuilder::<Sqlite>::new("insert into slice_positions(slice_id, page_idx, x1, y1, x2, y2) ");
-                    pos_sql.push_values(chunk.iter(), |mut b, (slice_id, position)| {
-                        b.push_bind(slice_id)
-                            .push_bind(position.page_idx)
-                            .push_bind(position.bbox[0])
-                            .push_bind(position.bbox[1])
-                            .push_bind(position.bbox[2])
-                            .push_bind(position.bbox[3]);
-                    });
-                    pos_sql.build().execute(&self.pool).await?;
-                }
                 Ok(())
             })
             .await?;
@@ -1545,6 +1489,8 @@ impl FileProcessor {
         .await?;
 
         info!("PDF file {} processed successfully with {} slices", file.id, slice_count);
+
+        self.search_engine.reload_readers()?;
 
         Ok(())
     }
@@ -1870,11 +1816,12 @@ impl FileProcessor {
 
         // 保存分片到数据库并收集文档
         let search_docs = timed_step_opt(timing.as_deref_mut(), "insert_slices", async {
-            let mut search_docs = Vec::new();
-            for slice in slices {
-                let sql = "INSERT INTO slices (file_id, content) VALUES (?, ?)";
-                let id = sqlx::query(sql).bind(file.id).bind(&slice).execute(&self.pool).await?.last_insert_rowid();
-                search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, slice));
+            let wrapped: Vec<SliceWithPositions> =
+                slices.into_iter().map(|content| SliceWithPositions { content, positions: vec![] }).collect();
+            let persisted = self.insert_slices_and_positions(file.id, wrapped).await?;
+            let mut search_docs = Vec::with_capacity(persisted.len());
+            for (id, content) in persisted {
+                search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, content));
             }
             Ok(search_docs)
         })
@@ -1916,6 +1863,8 @@ impl FileProcessor {
 
         info!("File {} processed successfully with {} slices", file.id, slice_count);
 
+        self.search_engine.reload_readers()?;
+
         // 构建知识图谱
         timed_step_opt(timing.as_deref_mut(), "build_knowledge_graph", async {
             self.maybe_build_knowledge_graph(file).await;
@@ -1937,6 +1886,52 @@ impl FileProcessor {
         let sql = "UPDATE files SET status = 3, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
         sqlx::query(sql).bind("Storage mode: not parsed").bind(file_id).execute(&self.pool).await?;
         Ok(())
+    }
+
+    /// 事务化写入 slices 和 slice_positions，减少单条 INSERT 的提交开销。
+    /// 返回每个 slice 的 (id, content) 供后续构建搜索文档使用。
+    async fn insert_slices_and_positions(
+        &self, file_id: i64, slices: Vec<SliceWithPositions>,
+    ) -> anyhow::Result<Vec<(i64, String)>> {
+        if slices.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut tx = self.pool.begin().await?;
+        let mut persisted: Vec<(i64, String)> = Vec::with_capacity(slices.len());
+        let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
+        for slice in slices {
+            let id = sqlx::query("INSERT INTO slices (file_id, content) VALUES (?, ?)")
+                .bind(file_id)
+                .bind(&slice.content)
+                .execute(&mut *tx)
+                .await?
+                .last_insert_rowid();
+            for position in slice.positions {
+                position_rows.push((id, position));
+            }
+            persisted.push((id, slice.content));
+        }
+        if !position_rows.is_empty() {
+            let binds_per_row = 6_usize;
+            let max_vars = 999_usize;
+            let batch_size = std::cmp::max(1, max_vars / binds_per_row);
+            for chunk in position_rows.chunks(batch_size) {
+                let mut pos_sql = QueryBuilder::<Sqlite>::new(
+                    "insert into slice_positions(slice_id, page_idx, x1, y1, x2, y2) ",
+                );
+                pos_sql.push_values(chunk.iter(), |mut b, (slice_id, position)| {
+                    b.push_bind(slice_id)
+                        .push_bind(position.page_idx)
+                        .push_bind(position.bbox[0])
+                        .push_bind(position.bbox[1])
+                        .push_bind(position.bbox[2])
+                        .push_bind(position.bbox[3]);
+                });
+                pos_sql.build().execute(&mut *tx).await?;
+            }
+        }
+        tx.commit().await?;
+        Ok(persisted)
     }
 
     async fn ensure_file_exists(&self, file_id: i64, stage: &str) -> anyhow::Result<bool> {
@@ -2454,6 +2449,8 @@ impl FileProcessor {
         self.copy_converted_pdf(source.id, target.id).await?;
 
         let full_content = self.reindex_cloned_slices(target, &cloned_slices, source).await?;
+
+        self.search_engine.reload_readers()?;
 
         let final_log = format!("Reused parsed data from file {}", source.id);
         sqlx::query(
