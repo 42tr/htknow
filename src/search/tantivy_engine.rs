@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet}, path::Path, time::{Duration, Instant}
+    collections::{HashMap, HashSet}, path::Path, thread, time::{Duration, Instant}
 };
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -89,16 +89,11 @@ fn is_lock_busy_error(err: &TantivyError) -> bool {
 }
 
 async fn create_writer(index: &Index) -> tantivy::Result<tantivy::IndexWriter> {
-    let writer_memory = config::get().search.tantivy_memory_mb * 1_000_000;
     let mut delay_ms = INDEX_WRITER_LOCK_RETRY_BASE_MS;
 
     for attempt in 1..=INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS {
-        match index.writer(writer_memory) {
-            Ok(writer) => {
-                // 设置 merge policy，减少小 segment 数量
-                writer.set_merge_policy(Box::new(LogMergePolicy::default()));
-                return Ok(writer);
-            }
+        match open_writer(index) {
+            Ok(writer) => return Ok(writer),
             Err(err) if is_lock_busy_error(&err) && attempt < INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS => {
                 warn!(
                     "Tantivy index writer lock busy (attempt {}/{}), retry in {}ms",
@@ -114,11 +109,45 @@ async fn create_writer(index: &Index) -> tantivy::Result<tantivy::IndexWriter> {
     unreachable!("create_writer retry loop should always return or error")
 }
 
-pub async fn create_writer_with_timing(
-    index: &Index, label: &str,
-) -> tantivy::Result<tantivy::IndexWriter> {
+fn open_writer(index: &Index) -> tantivy::Result<tantivy::IndexWriter> {
+    let writer_memory = config::get().search.tantivy_memory_mb * 1_000_000;
+    let writer = index.writer(writer_memory)?;
+    // 设置 merge policy，减少小 segment 数量
+    writer.set_merge_policy(Box::new(LogMergePolicy::default()));
+    Ok(writer)
+}
+
+fn create_writer_blocking(index: &Index) -> tantivy::Result<tantivy::IndexWriter> {
+    let mut delay_ms = INDEX_WRITER_LOCK_RETRY_BASE_MS;
+
+    for attempt in 1..=INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS {
+        match open_writer(index) {
+            Ok(writer) => return Ok(writer),
+            Err(err) if is_lock_busy_error(&err) && attempt < INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS => {
+                warn!(
+                    "Tantivy index writer lock busy (attempt {}/{}), retry in {}ms",
+                    attempt, INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS, delay_ms
+                );
+                thread::sleep(Duration::from_millis(delay_ms));
+                delay_ms = (delay_ms * 2).min(800);
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    unreachable!("create_writer_blocking retry loop should always return or error")
+}
+
+pub async fn create_writer_with_timing(index: &Index, label: &str) -> tantivy::Result<tantivy::IndexWriter> {
     let start = Instant::now();
     let writer = create_writer(index).await?;
+    debug!("tantivy_writer_create label={} duration_ms={}", label, start.elapsed().as_millis());
+    Ok(writer)
+}
+
+fn create_writer_with_timing_blocking(index: &Index, label: &str) -> tantivy::Result<tantivy::IndexWriter> {
+    let start = Instant::now();
+    let writer = create_writer_blocking(index)?;
     debug!("tantivy_writer_create label={} duration_ms={}", label, start.elapsed().as_millis());
     Ok(writer)
 }
@@ -239,22 +268,7 @@ pub async fn delete_by_file(index: &Index, schema: &Schema, file_id: i64) -> any
 }
 
 pub async fn delete_by_files(index: &Index, schema: &Schema, file_ids: &[i64]) -> anyhow::Result<()> {
-    if file_ids.is_empty() {
-        return Ok(());
-    }
-
-    let mut writer = create_writer_with_timing(index, "delete_by_files").await?;
-    let file_id_field = get_field(schema, "file_id");
-    let delete_start = Instant::now();
-    for file_id in file_ids {
-        let term = Term::from_field_i64(file_id_field, *file_id);
-        writer.delete_term(term);
-    }
-    debug!("tantivy_delete_terms target=file_id count={} duration_ms={}", file_ids.len(), delete_start.elapsed().as_millis());
-    let commit_start = Instant::now();
-    writer.commit()?;
-    debug!("tantivy_commit target=file_id count={} duration_ms={}", file_ids.len(), commit_start.elapsed().as_millis());
-    Ok(())
+    delete_by_i64_terms(index, schema, "file_id", file_ids, "delete_by_files").await
 }
 
 pub async fn delete_by_kb(index: &Index, schema: &Schema, kb_id: i64) -> anyhow::Result<()> {
@@ -262,21 +276,48 @@ pub async fn delete_by_kb(index: &Index, schema: &Schema, kb_id: i64) -> anyhow:
 }
 
 pub async fn delete_by_kbs(index: &Index, schema: &Schema, kb_ids: &[i64]) -> anyhow::Result<()> {
-    if kb_ids.is_empty() {
+    delete_by_i64_terms(index, schema, "kb_id", kb_ids, "delete_by_kbs").await
+}
+
+async fn delete_by_i64_terms(
+    index: &Index, schema: &Schema, field_name: &'static str, ids: &[i64], writer_label: &'static str,
+) -> anyhow::Result<()> {
+    if ids.is_empty() {
         return Ok(());
     }
 
-    let mut writer = create_writer_with_timing(index, "delete_by_kbs").await?;
-    let kb_id_field = get_field(schema, "kb_id");
+    let index = index.clone();
+    let schema = schema.clone();
+    let ids = ids.to_vec();
+    tokio::task::spawn_blocking(move || delete_by_i64_terms_blocking(&index, &schema, field_name, &ids, writer_label))
+        .await
+        .map_err(|err| anyhow::anyhow!("tantivy delete task failed: {}", err))?
+}
+
+fn delete_by_i64_terms_blocking(
+    index: &Index, schema: &Schema, field_name: &str, ids: &[i64], writer_label: &str,
+) -> anyhow::Result<()> {
+    let mut writer = create_writer_with_timing_blocking(index, writer_label)?;
+    let field = get_field(schema, field_name);
     let delete_start = Instant::now();
-    for kb_id in kb_ids {
-        let term = Term::from_field_i64(kb_id_field, *kb_id);
+    for id in ids {
+        let term = Term::from_field_i64(field, *id);
         writer.delete_term(term);
     }
-    debug!("tantivy_delete_terms target=kb_id count={} duration_ms={}", kb_ids.len(), delete_start.elapsed().as_millis());
+    debug!(
+        "tantivy_delete_terms target={} count={} duration_ms={}",
+        field_name,
+        ids.len(),
+        delete_start.elapsed().as_millis()
+    );
     let commit_start = Instant::now();
     writer.commit()?;
-    debug!("tantivy_commit target=kb_id count={} duration_ms={}", kb_ids.len(), commit_start.elapsed().as_millis());
+    debug!(
+        "tantivy_commit target={} count={} duration_ms={}",
+        field_name,
+        ids.len(),
+        commit_start.elapsed().as_millis()
+    );
     Ok(())
 }
 
