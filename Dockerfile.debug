@@ -1,7 +1,7 @@
 # Debug image for htknow with jemalloc profiling tools
 # Binary should be compiled outside the container using: cargo build --profile dev
 
-FROM docker.1ms.run/debian:bookworm-slim
+FROM docker.hjkl01.cn/debian:bookworm-slim
 
 ARG DEBIAN_FRONTEND=noninteractive
 ARG APT_MIRROR=http://mirrors.aliyun.com
