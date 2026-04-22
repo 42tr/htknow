@@ -1,10 +1,12 @@
 use std::{
-    collections::HashSet, fs::OpenOptions, path::{Path, PathBuf}
+    collections::HashSet, fs::OpenOptions, path::{Path, PathBuf}, time::Duration
 };
 
 use anyhow::Context;
 use log::info;
-use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
+use sqlx::{
+    Row, SqlitePool, sqlite::{SqliteConnectOptions, SqlitePoolOptions}
+};
 
 use crate::config;
 
@@ -24,18 +26,36 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
         info!("Detected non-file SQLite URL or in-memory DB; skipping file creation");
     }
 
+    anyhow::ensure!(
+        cfg.database.busy_timeout_ms <= i32::MAX as u64,
+        "HTKNOW_DB_BUSY_TIMEOUT_MS is too large for sqlite busy_timeout: {}",
+        cfg.database.busy_timeout_ms
+    );
+
+    let is_file_db = sqlite_path_from_url(database_url).is_some();
+    let connect_options = database_url
+        .parse::<SqliteConnectOptions>()
+        .with_context(|| format!("failed to parse sqlite database url: {}", database_url))?
+        .create_if_missing(is_file_db)
+        .foreign_keys(true)
+        .busy_timeout(Duration::from_millis(cfg.database.busy_timeout_ms));
+
     info!("Connecting to SQLite database...");
 
-    let pool = SqlitePoolOptions::new().max_connections(cfg.database.max_connections).connect(database_url).await?;
+    let pool =
+        SqlitePoolOptions::new().max_connections(cfg.database.max_connections).connect_with(connect_options).await?;
 
     info!("SQLite database connected successfully");
 
-    // 可选：设置一些 PRAGMA，以优化并保证行为
-    // 开启 WAL 模式与外键支持，设置 busy_timeout（毫秒）
-    // 忽略这些 PRAGMA 的错误以兼容不同环境（例如某些内存 DB URL）
-    sqlx::query("PRAGMA journal_mode = WAL;").execute(&pool).await.ok();
-    sqlx::query("PRAGMA foreign_keys = ON;").execute(&pool).await.ok();
-    sqlx::query(&format!("PRAGMA busy_timeout = {};", cfg.database.busy_timeout_ms)).execute(&pool).await.ok();
+    // WAL 是数据库文件级设置；foreign_keys 和 busy_timeout 已通过连接选项应用到每条连接。
+    if is_file_db {
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode = WAL;").fetch_one(&pool).await?;
+        anyhow::ensure!(
+            journal_mode.eq_ignore_ascii_case("wal"),
+            "failed to enable sqlite WAL journal mode, actual mode: {}",
+            journal_mode
+        );
+    }
 
     // 自动创建表
     create_tables(&pool).await?;
@@ -76,11 +96,15 @@ async fn create_tables(pool: &SqlitePool) -> anyhow::Result<()> {
     info!("Creating tables if not exists...");
 
     let init_sql = include_str!("init.sql");
-    for sql in init_sql.split(";") {
+    for (idx, sql) in init_sql.split(";").enumerate() {
+        let sql = sql.trim();
         if sql.is_empty() {
             continue;
         }
-        sqlx::query(sql).execute(pool).await.expect("Failed to execute SQL");
+        sqlx::query(sql)
+            .execute(pool)
+            .await
+            .with_context(|| format!("failed to execute init.sql statement {}", idx + 1))?;
     }
 
     info!("Tables created successfully");
@@ -213,8 +237,7 @@ async fn ensure_pdf_contents_bbox_column(pool: &SqlitePool) -> anyhow::Result<()
 fn sqlite_path_from_url(url: &str) -> Option<PathBuf> {
     let s = url.trim();
 
-    // 常见内存标识：包含 "memory"
-    if s.contains("memory") {
+    if is_sqlite_memory_url(s) {
         return None;
     }
 
@@ -222,7 +245,7 @@ fn sqlite_path_from_url(url: &str) -> Option<PathBuf> {
     if let Some(rest) = s.strip_prefix("sqlite://") {
         // 有可能是 sqlite:///absolute/path（多一个斜杠），也可能是相对路径 sqlite://./db.sqlite
         // 对于前者，rest 以 / 开头，PathBuf 能正确处理
-        let path = rest.to_string();
+        let path = strip_uri_suffix(rest).to_string();
         if path.is_empty() {
             return None;
         }
@@ -232,7 +255,7 @@ fn sqlite_path_from_url(url: &str) -> Option<PathBuf> {
     // sqlite:... 例如 sqlite:./db.sqlite 或 sqlite::memory:
     if let Some(rest) = s.strip_prefix("sqlite:") {
         // 如果是 ::memory: 或 :memory: 等，上面已通过 contains("memory") 处理
-        let path = rest.trim_start_matches("//").to_string();
+        let path = strip_uri_suffix(rest.trim_start_matches("//")).to_string();
         if path.is_empty() {
             return None;
         }
@@ -241,11 +264,11 @@ fn sqlite_path_from_url(url: &str) -> Option<PathBuf> {
 
     // file: URI
     if let Some(rest) = s.strip_prefix("file:") {
-        if rest.contains("memory") {
+        if is_sqlite_memory_url(rest) {
             return None;
         }
         // file: would be followed by a path
-        let path = rest.trim_start_matches("//").to_string();
+        let path = strip_uri_suffix(rest.trim_start_matches("//")).to_string();
         if path.is_empty() {
             return None;
         }
@@ -260,6 +283,16 @@ fn sqlite_path_from_url(url: &str) -> Option<PathBuf> {
 
     // 其它情况（例如带有其他 scheme），不处理
     None
+}
+
+fn is_sqlite_memory_url(url: &str) -> bool {
+    url == ":memory:" || url.contains(":memory:") || url.contains("mode=memory")
+}
+
+fn strip_uri_suffix(value: &str) -> &str {
+    let query_idx = value.find('?').unwrap_or(value.len());
+    let fragment_idx = value.find('#').unwrap_or(value.len());
+    &value[..query_idx.min(fragment_idx)]
 }
 
 /// 确保数据库文件以及其父目录存在。如果父目录不存在会创建，数据库文件不存在会创建空文件。

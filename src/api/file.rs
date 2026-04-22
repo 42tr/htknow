@@ -540,8 +540,7 @@ pub async fn upload(
                 }
                 qb.push(")");
                 let rows: Vec<File> = qb.build_query_as().fetch_all(&pool).await?;
-                let order: HashMap<i64, usize> =
-                    uploaded_file_ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+                let order: HashMap<i64, usize> = uploaded_file_ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
                 let mut sorted = rows;
                 sorted.sort_by_key(|f| order.get(&f.id).copied().unwrap_or(usize::MAX));
                 uploaded_files = sorted;
@@ -699,6 +698,8 @@ pub async fn update(
 ) -> ApiResult<Json<File>> {
     let mut has_updates = false;
     let update_is_public = req.is_public.is_some();
+    let mut reset_parse_data = false;
+    let mut image_paths_to_remove = Vec::new();
     debug!("update_is_public: {}", update_is_public);
     if update_is_public {
         let owner: Option<String> =
@@ -721,12 +722,13 @@ pub async fn update(
             return Err(ApiError::BadRequest("Storage knowledge base files do not support parsing.".to_string()));
         }
 
-        search_engine.delete(Some(id), None).await.map_err(map_search_engine_error)?;
-        let sql = "DELETE FROM slices WHERE file_id = ?";
-        sqlx::query(sql).bind(id).execute(&pool).await?;
+        image_paths_to_remove = collect_image_paths_for_files(&pool, &[id]).await?;
+        reset_parse_data = true;
 
         separated.push("slice_type = ").push_bind_unseparated(slice_type);
         separated.push("status = ").push_bind_unseparated(0);
+        separated.push("log = ").push_bind_unseparated("");
+        separated.push("content = NULL");
         has_updates = true;
     }
 
@@ -767,7 +769,20 @@ pub async fn update(
         qb.push(" AND user_id = ");
         qb.push_bind(&auth_user.user_id);
     }
-    qb.build().execute(&pool).await?;
+    if reset_parse_data {
+        let mut tx = pool.begin().await?;
+        clear_file_parse_rows_in_tx(&mut tx, id).await?;
+        qb.build().execute(&mut *tx).await?;
+        tx.commit().await?;
+
+        if let Err(e) = search_engine.delete(Some(id), None).await {
+            warn!("Failed to delete search index for updated file {}: {}", id, e);
+        }
+        remove_image_files(image_paths_to_remove).await;
+        remove_converted_pdfs(&[id]).await;
+    } else {
+        qb.build().execute(&pool).await?;
+    }
 
     let file = if update_is_public {
         sqlx::query_as("SELECT * FROM files WHERE id = ? AND user_id = ?")
@@ -1057,7 +1072,9 @@ async fn clear_file_parse_rows_for_ids_in_tx(
     Ok(())
 }
 
-async fn delete_file_rows_in_tx(tx: &mut sqlx::Transaction<'_, Sqlite>, file_ids: &[i64]) -> Result<(), sqlx::Error> {
+pub(crate) async fn delete_file_rows_in_tx(
+    tx: &mut sqlx::Transaction<'_, Sqlite>, file_ids: &[i64],
+) -> Result<(), sqlx::Error> {
     clear_file_parse_rows_for_ids_in_tx(tx, file_ids).await?;
 
     for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
@@ -1216,7 +1233,7 @@ async fn execute_reparse_failed(
     Ok(ReparseFailedFilesResp { file_count: updated })
 }
 
-async fn cleanup_deleted_files(
+pub(crate) async fn cleanup_deleted_files(
     search_engine: &SearchEngine, files: &[File], image_paths: Vec<String>,
 ) -> Vec<BatchDeleteCleanupFailedItem> {
     let mut cleanup_failed = Vec::new();

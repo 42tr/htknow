@@ -5,12 +5,11 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
-use tokio::fs;
 use utoipa::{IntoParams, ToSchema};
 
 use super::file::{self, FileStatusBreakdown};
 use crate::{
-    AuthUser, api::error::{ApiError, ApiResult}, config, search::SearchEngine
+    AuthUser, api::error::{ApiError, ApiResult}, search::SearchEngine
 };
 
 const KB_TYPE_ANALYSIS: &str = "analysis";
@@ -737,123 +736,83 @@ pub async fn delete(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>, Path(id): Path<i64>,
     Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<()> {
-    // 1. Get the list of all KB IDs to delete (the given one and all its descendants)
-    // Use a recursive CTE to find all descendant knowledge bases, ensuring the root belongs to the user.
+    let is_admin = auth_user.is_admin();
     let all_kb_ids: Vec<i64> = sqlx::query_scalar(
         r#"
         WITH RECURSIVE kb_hierarchy AS (
-            SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)
+            SELECT id FROM knowledge_bases WHERE id = ? AND (? OR user_id = ?)
             UNION ALL
             SELECT kb.id FROM knowledge_bases kb
             INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
+            WHERE ? OR kb.user_id = ?
         )
         SELECT id FROM kb_hierarchy;
         "#,
     )
     .bind(id)
-    .bind(auth_user.user_id.clone())
+    .bind(is_admin)
+    .bind(&auth_user.user_id)
+    .bind(is_admin)
+    .bind(&auth_user.user_id)
     .fetch_all(&pool)
     .await?;
 
     if all_kb_ids.is_empty() {
-        // This means the initial ID was not found or didn't belong to the user
         return Err(crate::api::error::ApiError::NotFound(
             "Knowledge base not found or permission denied.".to_string(),
         ));
     }
 
-    // 2. Delete all associated data for these KBs
-
-    // Find all files in all these KBs
     let mut files_qb = QueryBuilder::new("SELECT * FROM files WHERE kb_id IN (");
     let mut files_separated = files_qb.separated(", ");
     for kb_id in &all_kb_ids {
         files_separated.push_bind(kb_id);
     }
     files_qb.push(")");
+    if !is_admin {
+        files_qb.push(" AND user_id = ").push_bind(&auth_user.user_id);
+    }
     let files: Vec<super::file::File> = files_qb.build_query_as().fetch_all(&pool).await?;
 
-    if !files.is_empty() {
-        let file_ids: Vec<i64> = files.iter().map(|f| f.id).collect();
-        let image_paths = super::file::collect_image_paths_for_files(&pool, &file_ids).await?;
+    let file_ids: Vec<i64> = files.iter().map(|f| f.id).collect();
+    let image_paths = super::file::collect_image_paths_for_files(&pool, &file_ids).await?;
 
-        let mut mentions_qb = QueryBuilder::<Sqlite>::new(
-            "DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id IN (",
-        );
-        let mut mentions_sep = mentions_qb.separated(", ");
-        for file_id in &file_ids {
-            mentions_sep.push_bind(file_id);
-        }
-        mentions_qb.push("))");
-        mentions_qb.build().execute(&pool).await?;
+    let mut tx = pool.begin().await?;
 
-        let mut positions_qb = QueryBuilder::<Sqlite>::new(
-            "DELETE FROM slice_positions WHERE slice_id IN (SELECT id FROM slices WHERE file_id IN (",
-        );
-        let mut positions_sep = positions_qb.separated(", ");
-        for file_id in &file_ids {
-            positions_sep.push_bind(file_id);
-        }
-        positions_qb.push("))");
-        positions_qb.build().execute(&pool).await?;
+    super::file::delete_file_rows_in_tx(&mut tx, &file_ids).await?;
 
-        let mut pdf_contents_qb = QueryBuilder::<Sqlite>::new("DELETE FROM pdf_contents WHERE file_id IN (");
-        let mut pdf_contents_sep = pdf_contents_qb.separated(", ");
-        for file_id in &file_ids {
-            pdf_contents_sep.push_bind(file_id);
-        }
-        pdf_contents_qb.push(")");
-        pdf_contents_qb.build().execute(&pool).await?;
-
-        // Delete slices for all found files
-        let mut slices_qb = QueryBuilder::new("DELETE FROM slices WHERE file_id IN (");
-        let mut slices_separated = slices_qb.separated(", ");
-        for file_id in &file_ids {
-            slices_separated.push_bind(file_id);
-        }
-        slices_qb.push(")");
-        slices_qb.build().execute(&pool).await?;
-
-        // Delete physical files on disk
-        let cfg = config::get();
-        for file in &files {
-            if let Err(e) = fs::remove_file(&file.path).await {
-                log::warn!("Failed to delete file {}: {}", &file.path, e);
-            }
-            let pdf_path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", file.id));
-            if let Err(e) = fs::remove_file(&pdf_path).await {
-                log::warn!("Failed to delete converted pdf {}: {}", pdf_path.display(), e);
-            }
-        }
-        super::file::remove_image_files(image_paths).await;
-
-        // Delete the file records themselves
-        let mut del_files_qb = QueryBuilder::new("DELETE FROM files WHERE id IN (");
-        let mut del_files_separated = del_files_qb.separated(", ");
-        for file_id in &file_ids {
-            del_files_separated.push_bind(file_id);
-        }
-        del_files_qb.push(")");
-        del_files_qb.build().execute(&pool).await?;
-    }
-
-    // Delete from search engine for all KBs
-    for kb_id in &all_kb_ids {
-        search_engine.delete(None, Some(*kb_id)).await?;
-    }
-
-    // 3. Delete the top-level KB. The ON DELETE CASCADE will handle the rest in knowledge_bases table.
-    let result = sqlx::query("DELETE FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)")
-        .bind(id)
-        .bind(auth_user.user_id)
-        .execute(&pool)
-        .await?;
+    let result = if is_admin {
+        sqlx::query("DELETE FROM knowledge_bases WHERE id = ?").bind(id).execute(&mut *tx).await?
+    } else {
+        sqlx::query("DELETE FROM knowledge_bases WHERE id = ? AND user_id = ?")
+            .bind(id)
+            .bind(&auth_user.user_id)
+            .execute(&mut *tx)
+            .await?
+    };
 
     if result.rows_affected() == 0 {
-        // This case should theoretically be caught by the descendant check, but as a safeguard:
         return Err(crate::api::error::ApiError::NotFound(
             "Knowledge base not found or permission denied.".to_string(),
         ));
+    }
+
+    tx.commit().await?;
+
+    let cleanup_failed = super::file::cleanup_deleted_files(&search_engine, &files, image_paths).await;
+    for failure in cleanup_failed {
+        log::warn!(
+            "Knowledge base delete cleanup failed for file {} at {}: {}",
+            failure.id,
+            failure.stage,
+            failure.error
+        );
+    }
+
+    for kb_id in &all_kb_ids {
+        if let Err(e) = search_engine.delete(None, Some(*kb_id)).await {
+            log::warn!("Failed to delete search index for knowledge base {}: {}", kb_id, e);
+        }
     }
 
     Ok(())
