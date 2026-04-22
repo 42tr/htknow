@@ -510,13 +510,41 @@ pub async fn upload(
 
     if immediate_parse || sync {
         if sync {
+            let reuse_already_tried = reuse_duplicates;
+            let concurrency = config::get().server.process_concurrency.max(1);
+            let semaphore = Arc::new(Semaphore::new(concurrency));
+            let mut handles = Vec::with_capacity(parse_file_ids.len());
             for file_id in parse_file_ids {
-                processor::process_file_immediate(pool.clone(), search_engine.clone(), file_id).await?;
+                let pool_c = pool.clone();
+                let se_c = search_engine.clone();
+                let sem_c = semaphore.clone();
+                let reuse_tried = reuse_already_tried;
+                handles.push(spawn(async move {
+                    let _permit = sem_c.acquire().await;
+                    if reuse_tried {
+                        processor::process_file_immediate_skip_reuse(pool_c, se_c, file_id).await
+                    } else {
+                        processor::process_file_immediate(pool_c, se_c, file_id).await
+                    }
+                }));
+            }
+            for handle in handles {
+                handle.await.map_err(|e| ApiError::internal(format!("parse join error: {}", e)))??;
             }
             uploaded_files.clear();
-            for file_id in uploaded_file_ids {
-                let file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(file_id).fetch_one(&pool).await?;
-                uploaded_files.push(file);
+            if !uploaded_file_ids.is_empty() {
+                let mut qb = QueryBuilder::<Sqlite>::new("SELECT * FROM files WHERE id IN (");
+                let mut sep = qb.separated(", ");
+                for id in &uploaded_file_ids {
+                    sep.push_bind(*id);
+                }
+                qb.push(")");
+                let rows: Vec<File> = qb.build_query_as().fetch_all(&pool).await?;
+                let order: HashMap<i64, usize> =
+                    uploaded_file_ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
+                let mut sorted = rows;
+                sorted.sort_by_key(|f| order.get(&f.id).copied().unwrap_or(usize::MAX));
+                uploaded_files = sorted;
             }
         } else {
             let pool = pool.clone();

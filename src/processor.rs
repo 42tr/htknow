@@ -708,14 +708,18 @@ impl FileProcessor {
 
     /// 处理单个文件
     async fn process_file(&self, file: &File) -> anyhow::Result<()> {
-        self.process_file_inner(file, false).await
+        self.process_file_inner(file, false, false).await
     }
 
     async fn process_file_claimed(&self, file: &File) -> anyhow::Result<()> {
-        self.process_file_inner(file, true).await
+        self.process_file_inner(file, true, false).await
     }
 
-    async fn process_file_inner(&self, file: &File, already_claimed: bool) -> anyhow::Result<()> {
+    async fn process_file_skip_reuse(&self, file: &File) -> anyhow::Result<()> {
+        self.process_file_inner(file, false, true).await
+    }
+
+    async fn process_file_inner(&self, file: &File, already_claimed: bool, skip_reuse: bool) -> anyhow::Result<()> {
         let mut timing = ParseTimingCtx::new(file, "dispatch");
         let result = async {
             if is_parse_paused() {
@@ -752,10 +756,12 @@ impl FileProcessor {
                 return Ok(());
             }
 
-            if timing.step("reuse_check", self.try_reuse_existing_data(file)).await? {
-                timing.set_pipeline("reuse");
-                info!("File {} reused existing parsed data, skipping processing pipeline", file.id);
-                return Ok(());
+            if !skip_reuse {
+                if timing.step("reuse_check", self.try_reuse_existing_data(file)).await? {
+                    timing.set_pipeline("reuse");
+                    info!("File {} reused existing parsed data, skipping processing pipeline", file.id);
+                    return Ok(());
+                }
             }
 
             timing
@@ -2802,6 +2808,19 @@ pub async fn process_file_immediate(pool: SqlitePool, search_engine: SearchEngin
 
     let processor = FileProcessor::new(pool, search_engine, 0);
     processor.process_file(&file).await
+}
+
+pub async fn process_file_immediate_skip_reuse(
+    pool: SqlitePool, search_engine: SearchEngine, file_id: i64,
+) -> anyhow::Result<()> {
+    if is_parse_paused() {
+        anyhow::bail!("parse is paused for index maintenance");
+    }
+    let sql = "SELECT * FROM files WHERE id = ?";
+    let file: File = sqlx::query_as(sql).bind(file_id).fetch_one(&pool).await?;
+
+    let processor = FileProcessor::new(pool, search_engine, 0);
+    processor.process_file_skip_reuse(&file).await
 }
 
 pub async fn try_reuse_file_with_file(
