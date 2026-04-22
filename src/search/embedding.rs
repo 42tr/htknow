@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
 use reqwest::{Client, multipart};
 use serde::{Deserialize, Serialize};
@@ -50,7 +50,13 @@ pub async fn get_image_embedding_from_bytes(
         .timeout(Duration::from_secs(cfg.search.embedding_timeout_secs))
         .multipart(form)
         .send()
-        .await?;
+        .await
+        .with_context(|| {
+            format!(
+                "image embedding request failed: url={}, file={}, timeout={}s",
+                cfg.services.image_embedding_url, file_name, cfg.search.embedding_timeout_secs
+            )
+        })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -58,7 +64,8 @@ pub async fn get_image_embedding_from_bytes(
         anyhow::bail!("Image embedding API error: {} - {}", status, error_text);
     }
 
-    let embedding_response: EmbeddingResponse = response.json().await?;
+    let embedding_response: EmbeddingResponse = response.json().await
+        .context("image embedding response decode failed")?;
 
     embedding_response
         .data
@@ -82,7 +89,15 @@ pub async fn get_embedding(text: &str) -> Result<Vec<f32>> {
         .timeout(Duration::from_secs(cfg.search.embedding_timeout_secs))
         .json(&request)
         .send()
-        .await?;
+        .await
+        .with_context(|| {
+            format!(
+                "embedding request failed: url={}, input_chars={}, timeout={}s",
+                cfg.services.embedding_url,
+                text.chars().count(),
+                cfg.search.embedding_timeout_secs
+            )
+        })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -90,7 +105,8 @@ pub async fn get_embedding(text: &str) -> Result<Vec<f32>> {
         anyhow::bail!("Embedding API error: {} - {}, input_chars={}", status, error_text, text.chars().count());
     }
 
-    let embedding_response: EmbeddingResponse = response.json().await?;
+    let embedding_response: EmbeddingResponse = response.json().await
+        .context("embedding response decode failed")?;
 
     let embedding = embedding_response
         .data
@@ -115,7 +131,16 @@ pub async fn get_embeddings(texts: &[String]) -> Result<Vec<Vec<f32>>> {
         .timeout(Duration::from_secs(cfg.search.embedding_timeout_secs))
         .json(&request)
         .send()
-        .await?;
+        .await
+        .with_context(|| {
+            format!(
+                "batch embedding request failed: url={}, batch_size={}, total_chars={}, timeout={}s",
+                cfg.services.embedding_url,
+                texts.len(),
+                texts.iter().map(|t| t.chars().count()).sum::<usize>(),
+                cfg.search.embedding_timeout_secs
+            )
+        })?;
 
     if !response.status().is_success() {
         let status = response.status();
@@ -129,7 +154,8 @@ pub async fn get_embeddings(texts: &[String]) -> Result<Vec<Vec<f32>>> {
         );
     }
 
-    let embedding_response: EmbeddingResponse = response.json().await?;
+    let embedding_response: EmbeddingResponse = response.json().await
+        .context("batch embedding response decode failed")?;
 
     Ok(embedding_response.data.into_iter().map(|data| data.embedding).collect())
 }
