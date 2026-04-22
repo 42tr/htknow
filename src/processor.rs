@@ -1902,41 +1902,47 @@ impl FileProcessor {
         if slices.is_empty() {
             return Ok(Vec::new());
         }
-        let mut tx = self.pool.begin().await?;
+        // 每批最多 500 条 slice 一个事务，避免长时间持有 SQLite 写锁阻塞其他写操作
+        const SLICE_TX_BATCH: usize = 500;
         let mut persisted: Vec<(i64, String)> = Vec::with_capacity(slices.len());
-        let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
-        for slice in slices {
-            let id = sqlx::query("INSERT INTO slices (file_id, content) VALUES (?, ?)")
-                .bind(file_id)
-                .bind(&slice.content)
-                .execute(&mut *tx)
-                .await?
-                .last_insert_rowid();
-            for position in slice.positions {
-                position_rows.push((id, position));
+        for slice_chunk in slices.chunks(SLICE_TX_BATCH) {
+            let mut tx = self.pool.begin().await?;
+            let mut chunk_persisted: Vec<(i64, String)> = Vec::with_capacity(slice_chunk.len());
+            let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
+            for slice in slice_chunk {
+                let id = sqlx::query("INSERT INTO slices (file_id, content) VALUES (?, ?)")
+                    .bind(file_id)
+                    .bind(&slice.content)
+                    .execute(&mut *tx)
+                    .await?
+                    .last_insert_rowid();
+                for position in &slice.positions {
+                    position_rows.push((id, position.clone()));
+                }
+                chunk_persisted.push((id, slice.content.clone()));
             }
-            persisted.push((id, slice.content));
-        }
-        if !position_rows.is_empty() {
-            let binds_per_row = 6_usize;
-            let max_vars = 999_usize;
-            let batch_size = std::cmp::max(1, max_vars / binds_per_row);
-            for chunk in position_rows.chunks(batch_size) {
-                let mut pos_sql = QueryBuilder::<Sqlite>::new(
-                    "insert into slice_positions(slice_id, page_idx, x1, y1, x2, y2) ",
-                );
-                pos_sql.push_values(chunk.iter(), |mut b, (slice_id, position)| {
-                    b.push_bind(slice_id)
-                        .push_bind(position.page_idx)
-                        .push_bind(position.bbox[0])
-                        .push_bind(position.bbox[1])
-                        .push_bind(position.bbox[2])
-                        .push_bind(position.bbox[3]);
-                });
-                pos_sql.build().execute(&mut *tx).await?;
+            if !position_rows.is_empty() {
+                let binds_per_row = 6_usize;
+                let max_vars = 999_usize;
+                let batch_size = std::cmp::max(1, max_vars / binds_per_row);
+                for chunk in position_rows.chunks(batch_size) {
+                    let mut pos_sql = QueryBuilder::<Sqlite>::new(
+                        "insert into slice_positions(slice_id, page_idx, x1, y1, x2, y2) ",
+                    );
+                    pos_sql.push_values(chunk.iter(), |mut b, (slice_id, position)| {
+                        b.push_bind(slice_id)
+                            .push_bind(position.page_idx)
+                            .push_bind(position.bbox[0])
+                            .push_bind(position.bbox[1])
+                            .push_bind(position.bbox[2])
+                            .push_bind(position.bbox[3]);
+                    });
+                    pos_sql.build().execute(&mut *tx).await?;
+                }
             }
+            tx.commit().await?;
+            persisted.extend(chunk_persisted);
         }
-        tx.commit().await?;
         Ok(persisted)
     }
 

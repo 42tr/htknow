@@ -131,6 +131,7 @@ CREATE INDEX IF NOT EXISTS idx_files_kb_id_filename ON files(kb_id, filename);
 CREATE INDEX IF NOT EXISTS idx_files_kb_id_updated_at ON files(kb_id, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_files_kb_id_status_updated_at ON files(kb_id, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_files_status_updated_at ON files(status, updated_at DESC);
+CREATE INDEX IF NOT EXISTS idx_files_pending_created_at ON files(created_at) WHERE status = 0;
 CREATE INDEX IF NOT EXISTS idx_files_user_id_created_at ON files(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_files_hash_slice_type_status_updated_at ON files(hash, slice_type, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_slices_file_id_id ON slices(file_id, id);
