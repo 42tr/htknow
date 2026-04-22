@@ -507,6 +507,7 @@ const handleMoveToKb = async (kb) => {
     />
 
     <KnowledgeBaseSelector
+      v-if="showMoveKbSelector"
       :show="showMoveKbSelector"
       @close="showMoveKbSelector = false"
       @select="handleMoveToKb"
