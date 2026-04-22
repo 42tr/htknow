@@ -2,7 +2,7 @@ use std::{path::Path, sync::Arc};
 
 use anyhow::Result;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Int64Array, RecordBatch, RecordBatchIterator, StringArray, builder::{FixedSizeListBuilder, Float32Builder}
+    Array, ArrayRef, BooleanArray, Float32Array, Int64Array, RecordBatch, StringArray, builder::{FixedSizeListBuilder, Float32Builder}
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::stream::StreamExt;
@@ -75,9 +75,7 @@ pub async fn init() -> Result<()> {
     if !table_exists {
         // 表不存在，创建新表
         let empty_batch = create_empty_batch(&schema)?;
-        conn.create_table(TABLE_NAME, Box::new(RecordBatchIterator::new(vec![Ok(empty_batch)], schema.clone())))
-            .execute()
-            .await?;
+        conn.create_table(TABLE_NAME, empty_batch).execute().await?;
     } else {
         let table = conn.open_table(TABLE_NAME).execute().await?;
         ensure_is_deleted_column(&table).await?;
@@ -92,7 +90,7 @@ pub async fn write_documents(doc: Document) -> Result<()> {
     let table = conn.open_table(TABLE_NAME).execute().await?;
     let schema = create_schema();
     let batch = create_record_batch(vec![doc], &schema).await?;
-    table.add(Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema))).execute().await?;
+    table.add(batch).execute().await?;
     Ok(())
 }
 
@@ -105,7 +103,7 @@ pub async fn write_documents_batch(docs: Vec<Document>) -> Result<()> {
     let table = conn.open_table(TABLE_NAME).execute().await?;
     let schema = create_schema();
     let batch = create_record_batch(docs, &schema).await?;
-    table.add(Box::new(RecordBatchIterator::new(vec![Ok(batch)], schema))).execute().await?;
+    table.add(batch).execute().await?;
     Ok(())
 }
 
