@@ -68,3 +68,10 @@ profiling = ["tikv-jemalloc-ctl"]
 [dev-dependencies]
 http-body-util = "0.1"
 tower = "0.5"
+
+[profile.release]
+opt-level = "s"
+lto = "thin"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
