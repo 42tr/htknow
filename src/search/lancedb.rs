@@ -196,17 +196,43 @@ pub async fn search_image(
 }
 
 pub async fn delete_by_file(file_id: i64) -> Result<()> {
+    delete_by_files(&[file_id]).await
+}
+
+pub async fn delete_by_files(file_ids: &[i64]) -> Result<()> {
+    if file_ids.is_empty() {
+        return Ok(());
+    }
+
     let conn = get_connection()?;
     let table = conn.open_table(TABLE_NAME).execute().await?;
-    let predicate = format!("file_id = {}", file_id);
+    let predicate = if file_ids.len() == 1 {
+        format!("file_id = {}", file_ids[0])
+    } else {
+        let ids = file_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+        format!("file_id IN ({})", ids)
+    };
     table.update().only_if(predicate).column(IS_DELETED_COLUMN, "true").execute().await?;
     Ok(())
 }
 
 pub async fn delete_by_kb(kb_id: i64) -> Result<()> {
+    delete_by_kbs(&[kb_id]).await
+}
+
+pub async fn delete_by_kbs(kb_ids: &[i64]) -> Result<()> {
+    if kb_ids.is_empty() {
+        return Ok(());
+    }
+
     let conn = get_connection()?;
     let table = conn.open_table(TABLE_NAME).execute().await?;
-    let predicate = format!("kb_id = {}", kb_id);
+    let predicate = if kb_ids.len() == 1 {
+        format!("kb_id = {}", kb_ids[0])
+    } else {
+        let ids = kb_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+        format!("kb_id IN ({})", ids)
+    };
     table.update().only_if(predicate).column(IS_DELETED_COLUMN, "true").execute().await?;
     Ok(())
 }

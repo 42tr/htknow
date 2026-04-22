@@ -349,50 +349,89 @@ impl SearchEngine {
     }
 
     pub async fn delete(&self, file_id: Option<i64>, kb_id: Option<i64>) -> anyhow::Result<()> {
+        let file_buf = file_id.map(|id| [id]);
+        let kb_buf = kb_id.map(|id| [id]);
+        self.delete_batch(
+            file_buf.as_ref().map(|ids| &ids[..]),
+            kb_buf.as_ref().map(|ids| &ids[..]),
+        )
+        .await
+    }
+
+    pub async fn delete_batch(&self, file_ids: Option<&[i64]>, kb_ids: Option<&[i64]>) -> anyhow::Result<()> {
         let overall_start = Instant::now();
-        if let Some(file_id) = file_id {
+        if let Some(file_ids) = file_ids.filter(|ids| !ids.is_empty()) {
             let step_start = Instant::now();
             {
                 let _guard = self.index_write_lock.lock().await;
-                tantivy_engine::delete_by_file(&self.index, &self.schema, file_id).await?;
+                if file_ids.len() == 1 {
+                    tantivy_engine::delete_by_file(&self.index, &self.schema, file_ids[0]).await?;
+                } else {
+                    tantivy_engine::delete_by_files(&self.index, &self.schema, file_ids).await?;
+                }
             }
             reload_reader(&self.index_reader, "index")?;
-            debug!("search_delete file_id={} tantivy {}ms", file_id, step_start.elapsed().as_millis());
+            debug!("search_delete file_count={} tantivy {}ms", file_ids.len(), step_start.elapsed().as_millis());
 
             let step_start = Instant::now();
-            lancedb::delete_by_file(file_id).await?;
-            debug!("search_delete file_id={} lancedb {}ms", file_id, step_start.elapsed().as_millis());
+            if file_ids.len() == 1 {
+                lancedb::delete_by_file(file_ids[0]).await?;
+            } else {
+                lancedb::delete_by_files(file_ids).await?;
+            }
+            debug!("search_delete file_count={} lancedb {}ms", file_ids.len(), step_start.elapsed().as_millis());
 
             let step_start = Instant::now();
             {
                 let _guard = self.full_index_write_lock.lock().await;
-                tantivy_engine::delete_by_file(&self.full_index, &self.full_schema, file_id).await?;
+                if file_ids.len() == 1 {
+                    tantivy_engine::delete_by_file(&self.full_index, &self.full_schema, file_ids[0]).await?;
+                } else {
+                    tantivy_engine::delete_by_files(&self.full_index, &self.full_schema, file_ids).await?;
+                }
             }
             reload_reader(&self.full_index_reader, "full_index")?;
-            debug!("search_delete file_id={} tantivy_full {}ms", file_id, step_start.elapsed().as_millis());
+            debug!("search_delete file_count={} tantivy_full {}ms", file_ids.len(), step_start.elapsed().as_millis());
         }
-        if let Some(kb_id) = kb_id {
+        if let Some(kb_ids) = kb_ids.filter(|ids| !ids.is_empty()) {
             let step_start = Instant::now();
             {
                 let _guard = self.index_write_lock.lock().await;
-                tantivy_engine::delete_by_kb(&self.index, &self.schema, kb_id).await?;
+                if kb_ids.len() == 1 {
+                    tantivy_engine::delete_by_kb(&self.index, &self.schema, kb_ids[0]).await?;
+                } else {
+                    tantivy_engine::delete_by_kbs(&self.index, &self.schema, kb_ids).await?;
+                }
             }
             reload_reader(&self.index_reader, "index")?;
-            debug!("search_delete kb_id={} tantivy {}ms", kb_id, step_start.elapsed().as_millis());
+            debug!("search_delete kb_count={} tantivy {}ms", kb_ids.len(), step_start.elapsed().as_millis());
 
             let step_start = Instant::now();
-            lancedb::delete_by_kb(kb_id).await?;
-            debug!("search_delete kb_id={} lancedb {}ms", kb_id, step_start.elapsed().as_millis());
+            if kb_ids.len() == 1 {
+                lancedb::delete_by_kb(kb_ids[0]).await?;
+            } else {
+                lancedb::delete_by_kbs(kb_ids).await?;
+            }
+            debug!("search_delete kb_count={} lancedb {}ms", kb_ids.len(), step_start.elapsed().as_millis());
 
             let step_start = Instant::now();
             {
                 let _guard = self.full_index_write_lock.lock().await;
-                tantivy_engine::delete_by_kb(&self.full_index, &self.full_schema, kb_id).await?;
+                if kb_ids.len() == 1 {
+                    tantivy_engine::delete_by_kb(&self.full_index, &self.full_schema, kb_ids[0]).await?;
+                } else {
+                    tantivy_engine::delete_by_kbs(&self.full_index, &self.full_schema, kb_ids).await?;
+                }
             }
             reload_reader(&self.full_index_reader, "full_index")?;
-            debug!("search_delete kb_id={} tantivy_full {}ms", kb_id, step_start.elapsed().as_millis());
+            debug!("search_delete kb_count={} tantivy_full {}ms", kb_ids.len(), step_start.elapsed().as_millis());
         }
-        debug!("search_delete total {}ms file_id={:?} kb_id={:?}", overall_start.elapsed().as_millis(), file_id, kb_id);
+        debug!(
+            "search_delete total {}ms file_count={:?} kb_count={:?}",
+            overall_start.elapsed().as_millis(),
+            file_ids.map(|ids| ids.len()),
+            kb_ids.map(|ids| ids.len())
+        );
         Ok(())
     }
 

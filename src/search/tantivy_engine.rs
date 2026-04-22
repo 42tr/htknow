@@ -226,19 +226,39 @@ pub async fn search_with_snippet(
 }
 
 pub async fn delete_by_file(index: &Index, schema: &Schema, file_id: i64) -> anyhow::Result<()> {
+    delete_by_files(index, schema, &[file_id]).await
+}
+
+pub async fn delete_by_files(index: &Index, schema: &Schema, file_ids: &[i64]) -> anyhow::Result<()> {
+    if file_ids.is_empty() {
+        return Ok(());
+    }
+
     let mut writer = create_writer(index).await?;
     let file_id_field = get_field(schema, "file_id");
-    let term = Term::from_field_i64(file_id_field, file_id);
-    writer.delete_term(term);
+    for file_id in file_ids {
+        let term = Term::from_field_i64(file_id_field, *file_id);
+        writer.delete_term(term);
+    }
     writer.commit()?;
     Ok(())
 }
 
 pub async fn delete_by_kb(index: &Index, schema: &Schema, kb_id: i64) -> anyhow::Result<()> {
+    delete_by_kbs(index, schema, &[kb_id]).await
+}
+
+pub async fn delete_by_kbs(index: &Index, schema: &Schema, kb_ids: &[i64]) -> anyhow::Result<()> {
+    if kb_ids.is_empty() {
+        return Ok(());
+    }
+
     let mut writer = create_writer(index).await?;
     let kb_id_field = get_field(schema, "kb_id");
-    let term = Term::from_field_i64(kb_id_field, kb_id);
-    writer.delete_term(term);
+    for kb_id in kb_ids {
+        let term = Term::from_field_i64(kb_id_field, *kb_id);
+        writer.delete_term(term);
+    }
     writer.commit()?;
     Ok(())
 }

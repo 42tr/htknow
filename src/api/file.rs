@@ -1212,9 +1212,7 @@ async fn execute_reparse_failed(
     }
 
     let image_paths = collect_image_paths_for_files(pool, &file_ids).await?;
-    for file_id in &file_ids {
-        search_engine.delete(Some(*file_id), None).await.map_err(map_search_engine_error)?;
-    }
+    search_engine.delete_batch(Some(&file_ids), None).await.map_err(map_search_engine_error)?;
 
     let mut tx = pool.begin().await?;
     clear_file_parse_rows_for_ids_in_tx(&mut tx, &file_ids).await?;

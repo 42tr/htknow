@@ -852,12 +852,8 @@ async fn reset_reparse_scope(
     file_ids: &[i64], clear_unassigned_graph: bool,
 ) -> ApiResult<()> {
     // 清理搜索索引
-    for kb_id in analysis_kb_ids {
-        search_engine.delete(None, Some(*kb_id)).await?;
-    }
-    for file_id in unassigned_file_ids {
-        search_engine.delete(Some(*file_id), None).await?;
-    }
+    search_engine.delete_batch(None, Some(analysis_kb_ids)).await?;
+    search_engine.delete_batch(Some(unassigned_file_ids), None).await?;
 
     // 清理知识图谱数据（节点会级联删除边和提及）
     if !analysis_kb_ids.is_empty() {
