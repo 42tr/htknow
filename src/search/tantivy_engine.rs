@@ -114,6 +114,15 @@ async fn create_writer(index: &Index) -> tantivy::Result<tantivy::IndexWriter> {
     unreachable!("create_writer retry loop should always return or error")
 }
 
+pub async fn create_writer_with_timing(
+    index: &Index, label: &str,
+) -> tantivy::Result<tantivy::IndexWriter> {
+    let start = Instant::now();
+    let writer = create_writer(index).await?;
+    debug!("tantivy_writer_create label={} duration_ms={}", label, start.elapsed().as_millis());
+    Ok(writer)
+}
+
 pub async fn write_documents(index: &Index, schema: &Schema, doc: Document) -> tantivy::Result<()> {
     let mut index_writer = create_writer(index).await?;
     index_writer.add_document(create_document(doc, schema))?;
@@ -234,13 +243,17 @@ pub async fn delete_by_files(index: &Index, schema: &Schema, file_ids: &[i64]) -
         return Ok(());
     }
 
-    let mut writer = create_writer(index).await?;
+    let mut writer = create_writer_with_timing(index, "delete_by_files").await?;
     let file_id_field = get_field(schema, "file_id");
+    let delete_start = Instant::now();
     for file_id in file_ids {
         let term = Term::from_field_i64(file_id_field, *file_id);
         writer.delete_term(term);
     }
+    debug!("tantivy_delete_terms target=file_id count={} duration_ms={}", file_ids.len(), delete_start.elapsed().as_millis());
+    let commit_start = Instant::now();
     writer.commit()?;
+    debug!("tantivy_commit target=file_id count={} duration_ms={}", file_ids.len(), commit_start.elapsed().as_millis());
     Ok(())
 }
 
@@ -253,13 +266,17 @@ pub async fn delete_by_kbs(index: &Index, schema: &Schema, kb_ids: &[i64]) -> an
         return Ok(());
     }
 
-    let mut writer = create_writer(index).await?;
+    let mut writer = create_writer_with_timing(index, "delete_by_kbs").await?;
     let kb_id_field = get_field(schema, "kb_id");
+    let delete_start = Instant::now();
     for kb_id in kb_ids {
         let term = Term::from_field_i64(kb_id_field, *kb_id);
         writer.delete_term(term);
     }
+    debug!("tantivy_delete_terms target=kb_id count={} duration_ms={}", kb_ids.len(), delete_start.elapsed().as_millis());
+    let commit_start = Instant::now();
     writer.commit()?;
+    debug!("tantivy_commit target=kb_id count={} duration_ms={}", kb_ids.len(), commit_start.elapsed().as_millis());
     Ok(())
 }
 
