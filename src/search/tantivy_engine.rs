@@ -173,16 +173,41 @@ pub async fn write_documents(index: &Index, schema: &Schema, doc: Document) -> t
     Ok(())
 }
 
+pub async fn create_rebuild_writer(index: &Index, label: &str) -> tantivy::Result<tantivy::IndexWriter> {
+    create_writer_with_timing(index, label).await
+}
+
+pub fn add_documents(
+    index_writer: &mut tantivy::IndexWriter, schema: &Schema, docs: impl IntoIterator<Item=Document>,
+) -> tantivy::Result<usize> {
+    let mut count = 0_usize;
+    for doc in docs {
+        index_writer.add_document(create_document(doc, schema))?;
+        count += 1;
+    }
+    Ok(count)
+}
+
+pub fn commit_writer(index_writer: &mut tantivy::IndexWriter, label: &str, doc_count: usize) -> tantivy::Result<()> {
+    let commit_start = Instant::now();
+    index_writer.commit()?;
+    debug!(
+        "tantivy_commit label={} docs={} duration_ms={}",
+        label,
+        doc_count,
+        commit_start.elapsed().as_millis()
+    );
+    Ok(())
+}
+
 /// 批量写入文档，减少 commit 次数，避免产生大量小 segment
 pub async fn write_documents_batch(index: &Index, schema: &Schema, docs: Vec<Document>) -> tantivy::Result<()> {
     if docs.is_empty() {
         return Ok(());
     }
     let mut index_writer = create_writer(index).await?;
-    for doc in docs {
-        index_writer.add_document(create_document(doc, schema))?;
-    }
-    index_writer.commit()?; // 一次 commit
+    let doc_count = add_documents(&mut index_writer, schema, docs)?;
+    commit_writer(&mut index_writer, "write_documents_batch", doc_count)?;
     Ok(())
 }
 

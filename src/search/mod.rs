@@ -182,6 +182,14 @@ impl SearchEngine {
                 .with_context(|| format!("init temp slice index failed: {}", slice_temp_path))?;
             let (full_schema, full_temp_index) = tantivy_engine::init_with_path(&full_temp_path)
                 .with_context(|| format!("init temp full index failed: {}", full_temp_path))?;
+            let mut slice_writer = tantivy_engine::create_rebuild_writer(&slice_temp_index, "rebuild_slice")
+                .await
+                .context("create temp slice writer failed")?;
+            let mut full_writer = tantivy_engine::create_rebuild_writer(&full_temp_index, "rebuild_full")
+                .await
+                .context("create temp full writer failed")?;
+            let mut total_slice_docs = 0_usize;
+            let mut total_full_docs = 0_usize;
 
             on_progress(RebuildProgress { phase: "build_slice".to_string(), total_docs, processed_docs }).await;
             let mut last_slice_id = 0_i64;
@@ -207,10 +215,12 @@ impl SearchEngine {
                     .into_iter()
                     .map(|row| tantivy_engine::Document::new(row.id, row.file_id, row.kb_id, row.content))
                     .collect();
-                tantivy_engine::write_documents_batch(&slice_temp_index, &slice_schema, docs).await?;
+                total_slice_docs += tantivy_engine::add_documents(&mut slice_writer, &slice_schema, docs)?;
                 processed_docs += batch_size;
                 on_progress(RebuildProgress { phase: "build_slice".to_string(), total_docs, processed_docs }).await;
             }
+            tantivy_engine::commit_writer(&mut slice_writer, "rebuild_slice", total_slice_docs)
+                .context("commit temp slice writer failed")?;
 
             on_progress(RebuildProgress { phase: "build_full".to_string(), total_docs, processed_docs }).await;
             let mut last_file_id = 0_i64;
@@ -247,10 +257,15 @@ impl SearchEngine {
                         tantivy_engine::Document::new(row.id, row.id, row.kb_id, index_content)
                     })
                     .collect();
-                tantivy_engine::write_documents_batch(&full_temp_index, &full_schema, docs).await?;
+                total_full_docs += tantivy_engine::add_documents(&mut full_writer, &full_schema, docs)?;
                 processed_docs += batch_size;
                 on_progress(RebuildProgress { phase: "build_full".to_string(), total_docs, processed_docs }).await;
             }
+            tantivy_engine::commit_writer(&mut full_writer, "rebuild_full", total_full_docs)
+                .context("commit temp full writer failed")?;
+
+            drop(slice_writer);
+            drop(full_writer);
 
             drop(slice_temp_index);
             drop(full_temp_index);
