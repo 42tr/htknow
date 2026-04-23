@@ -823,6 +823,23 @@ impl SearchEngine {
         lancedb::compact().await
     }
 
+    /// 强制合并 Tantivy segment，减少碎片与已删除文档 tombstone。
+    pub async fn force_merge_tantivy_indexes(
+        &self,
+    ) -> anyhow::Result<(tantivy_engine::ForceMergeStats, tantivy_engine::ForceMergeStats)> {
+        let _rebuild_guard = self.rebuild_lock.lock().await;
+        let _slice_write_guard = self.index_write_lock.lock().await;
+        let _full_write_guard = self.full_index_write_lock.lock().await;
+
+        let slice_stats = tantivy_engine::force_merge(&self.index).await?;
+        reload_reader(&self.index_reader, "index")?;
+
+        let full_stats = tantivy_engine::force_merge(&self.full_index).await?;
+        reload_reader(&self.full_index_reader, "full_index")?;
+
+        Ok((slice_stats, full_stats))
+    }
+
     async fn load_query_synonyms(&self, query: &str) -> anyhow::Result<tantivy_engine::SynonymMap> {
         let cfg = config::get();
         if !cfg.search.synonym_enabled {

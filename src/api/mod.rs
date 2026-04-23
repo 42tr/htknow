@@ -71,6 +71,7 @@ use crate::search::SearchEngine;
         system::heap_profile,
         system::heap_profile_pdf,
         system::lancedb_compact,
+        system::index_force_merge,
         system::index_rebuild_status,
     ),
     components(
@@ -124,6 +125,8 @@ use crate::search::SearchEngine;
             system::MemoryUsage,
             system::HeapProfileStatus,
             system::LanceDbCompactStats,
+            system::TantivyForceMergeIndexStats,
+            system::TantivyForceMergeResponse,
             system::IndexRebuildStatus,
         )
     ),
@@ -187,6 +190,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/heap", get(system::heap_profile))
         .route("/heap/pdf", get(system::heap_profile_pdf))
         .route("/lancedb/compact", post(system::lancedb_compact))
+        .route("/index/force-merge", post(system::index_force_merge))
         .route("/index/rebuild/status", get(system::index_rebuild_status));
 
     Router::new()

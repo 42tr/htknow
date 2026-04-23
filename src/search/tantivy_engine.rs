@@ -52,6 +52,18 @@ pub struct FullSearchResultItem {
     pub score: f32,         // 搜索得分
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct ForceMergeStats {
+    pub before_segments: usize,
+    pub after_segments: usize,
+    pub before_docs: u64,
+    pub after_docs: u64,
+    pub before_deleted_docs: u64,
+    pub after_deleted_docs: u64,
+    pub skipped: bool,
+    pub duration_ms: u128,
+}
+
 impl Document {
     pub fn new(id: i64, file_id: i64, kb_id: Option<i64>, content: String) -> Self {
         Document { id, file_id, kb_id, content }
@@ -279,6 +291,13 @@ pub async fn delete_by_kbs(index: &Index, schema: &Schema, kb_ids: &[i64]) -> an
     delete_by_i64_terms(index, schema, "kb_id", kb_ids, "delete_by_kbs").await
 }
 
+pub async fn force_merge(index: &Index) -> anyhow::Result<ForceMergeStats> {
+    let index = index.clone();
+    tokio::task::spawn_blocking(move || force_merge_blocking(&index))
+        .await
+        .map_err(|err| anyhow::anyhow!("tantivy force merge task failed: {}", err))?
+}
+
 async fn delete_by_i64_terms(
     index: &Index, schema: &Schema, field_name: &'static str, ids: &[i64], writer_label: &'static str,
 ) -> anyhow::Result<()> {
@@ -319,6 +338,52 @@ fn delete_by_i64_terms_blocking(
         commit_start.elapsed().as_millis()
     );
     Ok(())
+}
+
+fn force_merge_blocking(index: &Index) -> anyhow::Result<ForceMergeStats> {
+    let start = Instant::now();
+    let before_metas = index.searchable_segment_metas()?;
+    let before_segments = before_metas.len();
+    let before_docs = segment_docs(&before_metas);
+    let before_deleted_docs = segment_deleted_docs(&before_metas);
+
+    if before_segments < 2 {
+        return Ok(ForceMergeStats {
+            before_segments,
+            after_segments: before_segments,
+            before_docs,
+            after_docs: before_docs,
+            before_deleted_docs,
+            after_deleted_docs: before_deleted_docs,
+            skipped: true,
+            duration_ms: start.elapsed().as_millis(),
+        });
+    }
+
+    let segment_ids = before_metas.iter().map(|meta| meta.id()).collect::<Vec<_>>();
+    let mut writer = create_writer_with_timing_blocking(index, "force_merge")?;
+    writer.merge(&segment_ids).wait()?;
+    writer.wait_merging_threads()?;
+
+    let after_metas = index.searchable_segment_metas()?;
+    Ok(ForceMergeStats {
+        before_segments,
+        after_segments: after_metas.len(),
+        before_docs,
+        after_docs: segment_docs(&after_metas),
+        before_deleted_docs,
+        after_deleted_docs: segment_deleted_docs(&after_metas),
+        skipped: false,
+        duration_ms: start.elapsed().as_millis(),
+    })
+}
+
+fn segment_docs(metas: &[tantivy::SegmentMeta]) -> u64 {
+    metas.iter().map(|meta| u64::from(meta.num_docs())).sum()
+}
+
+fn segment_deleted_docs(metas: &[tantivy::SegmentMeta]) -> u64 {
+    metas.iter().map(|meta| u64::from(meta.num_deleted_docs())).sum()
 }
 
 fn build_query(

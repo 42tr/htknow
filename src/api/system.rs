@@ -5,7 +5,7 @@ use sqlx::SqlitePool;
 use utoipa::ToSchema;
 
 use crate::{
-    AuthUser, api::error::{ApiError, ApiResult}, search::SearchEngine
+    AuthUser, api::error::{ApiError, ApiResult}, search::{SearchEngine, tantivy_engine::ForceMergeStats}
 };
 
 /// 进程内存占用
@@ -81,6 +81,40 @@ pub struct IndexRebuildStatus {
     pub finished_at: Option<i64>,
     /// 失败时错误信息
     pub error: Option<String>,
+}
+
+/// 单个 Tantivy 索引 force merge 统计信息
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TantivyForceMergeIndexStats {
+    /// 索引名称：index/full_index
+    pub index: String,
+    /// merge 前 segment 数
+    pub before_segments: usize,
+    /// merge 后 segment 数
+    pub after_segments: usize,
+    /// merge 前存活文档数
+    pub before_docs: u64,
+    /// merge 后存活文档数
+    pub after_docs: u64,
+    /// merge 前已删除文档数
+    pub before_deleted_docs: u64,
+    /// merge 后已删除文档数
+    pub after_deleted_docs: u64,
+    /// 是否因为 segment 少于 2 个而跳过
+    pub skipped: bool,
+    /// 单个索引耗时（毫秒）
+    pub duration_ms: u128,
+}
+
+/// Tantivy force merge 响应
+#[derive(Debug, Serialize, ToSchema)]
+pub struct TantivyForceMergeResponse {
+    /// 普通切片索引统计
+    pub index: TantivyForceMergeIndexStats,
+    /// 全文索引统计
+    pub full_index: TantivyForceMergeIndexStats,
+    /// 总耗时（毫秒）
+    pub total_duration_ms: u128,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -159,6 +193,40 @@ pub async fn lancedb_compact(
         total_rows_after: stats.total_rows_after,
         size_before_bytes: stats.size_before_bytes,
         size_after_bytes: stats.size_after_bytes,
+    }))
+}
+
+/// 强制合并 Tantivy segment，减少索引碎片
+#[utoipa::path(
+    post,
+    path = "/api/v1/knowledge/system/index/force-merge",
+    operation_id = "system_index_force_merge",
+    tag = "system",
+    responses(
+        (status = 200, description = "Tantivy force merge 成功", body = TantivyForceMergeResponse),
+        (status = 400, description = "权限不足"),
+        (status = 500, description = "Tantivy force merge 失败")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn index_force_merge(
+    Extension(search_engine): Extension<SearchEngine>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<TantivyForceMergeResponse>> {
+    ensure_admin(&auth_user)?;
+
+    let start = std::time::Instant::now();
+    let (index_stats, full_index_stats) = search_engine
+        .force_merge_tantivy_indexes()
+        .await
+        .map_err(|e| ApiError::internal(format!("Tantivy force merge failed: {}", e)))?;
+
+    Ok(Json(TantivyForceMergeResponse {
+        index: force_merge_index_stats("index", index_stats),
+        full_index: force_merge_index_stats("full_index", full_index_stats),
+        total_duration_ms: start.elapsed().as_millis(),
     }))
 }
 
@@ -262,6 +330,20 @@ pub async fn index_rebuild_status(
 
 fn ensure_admin(auth_user: &AuthUser) -> ApiResult<()> {
     if auth_user.is_admin() { Ok(()) } else { Err(ApiError::BadRequest("admin role required".to_string())) }
+}
+
+fn force_merge_index_stats(index: &str, stats: ForceMergeStats) -> TantivyForceMergeIndexStats {
+    TantivyForceMergeIndexStats {
+        index: index.to_string(),
+        before_segments: stats.before_segments,
+        after_segments: stats.after_segments,
+        before_docs: stats.before_docs,
+        after_docs: stats.after_docs,
+        before_deleted_docs: stats.before_deleted_docs,
+        after_deleted_docs: stats.after_deleted_docs,
+        skipped: stats.skipped,
+        duration_ms: stats.duration_ms,
+    }
 }
 
 #[cfg(feature = "profiling")]
