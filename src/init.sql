@@ -12,6 +12,7 @@ CREATE TABLE IF NOT EXISTS files (
     log TEXT DEFAULT '', -- 日志
     slice_type TEXT DEFAULT '', -- 切片类型
     kb_id INTEGER DEFAULT NULL, -- 知识库ID
+    parse_priority INTEGER NOT NULL DEFAULT 50, -- 解析队列优先级快照，避免领取待解析文件时跨表排序
     is_public INTEGER NOT NULL DEFAULT 0, -- 是否公开: 0-私有, 1-公开
     meta TEXT DEFAULT NULL, -- 元数据，存储任意JSON数据
     created_at INTEGER DEFAULT (strftime('%s','now')),

@@ -61,6 +61,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     create_tables(&pool).await?;
     ensure_kb_type_column(&pool).await?;
     ensure_parse_priority_column(&pool).await?;
+    ensure_file_parse_priority_column(&pool).await?;
     ensure_user_name_columns(&pool).await?;
     ensure_file_size_column(&pool).await?;
     ensure_pdf_contents_bbox_column(&pool).await?;
@@ -178,6 +179,120 @@ async fn ensure_parse_priority_column(pool: &SqlitePool) -> anyhow::Result<()> {
             .execute(pool)
             .await?;
     }
+
+    Ok(())
+}
+
+async fn ensure_file_parse_priority_column(pool: &SqlitePool) -> anyhow::Result<()> {
+    let columns = sqlx::query("PRAGMA table_info(files);").fetch_all(pool).await?;
+    let has_parse_priority = columns.iter().any(|row| row.get::<String, _>("name") == "parse_priority");
+
+    if !has_parse_priority {
+        sqlx::query("ALTER TABLE files ADD COLUMN parse_priority INTEGER NOT NULL DEFAULT 50")
+            .execute(pool)
+            .await?;
+    }
+
+    sqlx::query(
+        "UPDATE files
+         SET parse_priority = COALESCE(
+             (SELECT kb.parse_priority FROM knowledge_bases kb WHERE kb.id = files.kb_id),
+             50
+         )
+         WHERE status = 0
+           AND parse_priority != COALESCE(
+               (SELECT kb.parse_priority FROM knowledge_bases kb WHERE kb.id = files.kb_id),
+               50
+           )",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_files_pending_status_priority_created_at_id
+         ON files(status, parse_priority DESC, created_at ASC, id ASC)
+         WHERE status = 0",
+    )
+    .execute(pool)
+    .await?;
+
+    ensure_file_parse_priority_triggers(pool).await?;
+
+    Ok(())
+}
+
+async fn ensure_file_parse_priority_triggers(pool: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        "CREATE TRIGGER IF NOT EXISTS trg_files_parse_priority_after_insert
+         AFTER INSERT ON files
+         BEGIN
+             UPDATE files
+             SET parse_priority = COALESCE(
+                 (SELECT kb.parse_priority FROM knowledge_bases kb WHERE kb.id = NEW.kb_id),
+                 50
+             )
+             WHERE id = NEW.id
+               AND parse_priority != COALESCE(
+                   (SELECT kb.parse_priority FROM knowledge_bases kb WHERE kb.id = NEW.kb_id),
+                   50
+               );
+         END",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TRIGGER IF NOT EXISTS trg_files_parse_priority_after_kb_change
+         AFTER UPDATE OF kb_id ON files
+         BEGIN
+             UPDATE files
+             SET parse_priority = COALESCE(
+                 (SELECT kb.parse_priority FROM knowledge_bases kb WHERE kb.id = NEW.kb_id),
+                 50
+             )
+             WHERE id = NEW.id
+               AND parse_priority != COALESCE(
+                   (SELECT kb.parse_priority FROM knowledge_bases kb WHERE kb.id = NEW.kb_id),
+                   50
+               );
+         END",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TRIGGER IF NOT EXISTS trg_files_parse_priority_after_pending
+         AFTER UPDATE OF status ON files
+         WHEN NEW.status = 0
+         BEGIN
+             UPDATE files
+             SET parse_priority = COALESCE(
+                 (SELECT kb.parse_priority FROM knowledge_bases kb WHERE kb.id = NEW.kb_id),
+                 50
+             )
+             WHERE id = NEW.id
+               AND parse_priority != COALESCE(
+                   (SELECT kb.parse_priority FROM knowledge_bases kb WHERE kb.id = NEW.kb_id),
+                   50
+               );
+         END",
+    )
+    .execute(pool)
+    .await?;
+
+    sqlx::query(
+        "CREATE TRIGGER IF NOT EXISTS trg_kbs_parse_priority_update_pending_files
+         AFTER UPDATE OF parse_priority ON knowledge_bases
+         BEGIN
+             UPDATE files
+             SET parse_priority = NEW.parse_priority
+             WHERE kb_id = NEW.id
+               AND status = 0
+               AND parse_priority != NEW.parse_priority;
+         END",
+    )
+    .execute(pool)
+    .await?;
 
     Ok(())
 }

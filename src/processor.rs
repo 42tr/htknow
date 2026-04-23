@@ -656,24 +656,21 @@ impl FileProcessor {
 
     /// 原子领取一个待处理文件，按知识库解析优先级排序
     async fn claim_next_pending_file(&self) -> anyhow::Result<Option<File>> {
-        let mut tx = self.pool.begin().await?;
         let file = sqlx::query_as::<_, File>(
-            "WITH candidate AS (
-                SELECT f.id
-                FROM files f
-                LEFT JOIN knowledge_bases kb ON kb.id = f.kb_id
-                WHERE f.status = 0
-                ORDER BY COALESCE(kb.parse_priority, 50) DESC, f.created_at ASC
-                LIMIT 1
-             )
-             UPDATE files
+            "UPDATE files
              SET status = 2, updated_at = strftime('%s','now')
-             WHERE id = (SELECT id FROM candidate)
+             WHERE id = (
+                 SELECT id
+                 FROM files
+                 WHERE status = 0
+                 ORDER BY parse_priority DESC, created_at ASC, id ASC
+                 LIMIT 1
+             )
+             AND status = 0
              RETURNING *",
         )
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&self.pool)
         .await?;
-        tx.commit().await?;
         Ok(file)
     }
 
