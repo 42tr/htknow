@@ -151,3 +151,21 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 RUST_LOG=debug ./htknow
 RUST_LOG=warn,htknow::search=debug ./htknow
 ```
+
+## 问题处理
+1. 全文索引 tantivy 异常
+可能是异常停止导致的，报错
+thread 'main' (1) panicked at src/search/mod.rs:903:29:failed to create tantivy index reader: Failed to open file for read: 'FileDoestiotExist("/app/data/tantivy index/eafseaef4f2340...
+run with 'RuST_BAcKTRAcE=l environment variable to display a backtrace
+
+**方案一**：在 `meta.json` 中去掉报错的索引，注意 `meta.json` 中记录的名称有 `-`
+
+**方案二**：
+
+先去掉原本的索引使应用正常启动
+```shell
+mv tantivy_index tantivy_index_bak0423
+mv tantivy_full_index tantivy_full_index_bak0423
+docker start htknow
+```
+然后在词典可以重建全文检索的索引
