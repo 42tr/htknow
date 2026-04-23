@@ -7,7 +7,7 @@ use log::{debug, info, warn};
 use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, SqlitePool};
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tantivy::{Index, IndexReader, ReloadPolicy, schema::Schema};
 use tokio::sync::Mutex;
 
@@ -23,7 +23,7 @@ pub use tantivy_engine::{FullSearchResultItem, SearchResultItem};
 
 const FULL_SNIPPET_MAX_CHARS: usize = 400;
 const MAX_QUERY_TERMS_FOR_SYNONYM_LOOKUP: usize = 100;
-const REBUILD_BATCH_SIZE: i64 = 500;
+const DEFAULT_REBUILD_BATCH_SIZE: i64 = 100;
 static RERANK_HTTP_CLIENT: Lazy<Client> = Lazy::new(Client::new);
 
 #[derive(Debug, Serialize)]
@@ -68,11 +68,10 @@ struct RebuildSliceRow {
 }
 
 #[derive(Debug, sqlx::FromRow)]
-struct RebuildFullRow {
+struct RebuildFullMetaRow {
     id: i64,
     kb_id: Option<i64>,
     filename: String,
-    content: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -161,6 +160,10 @@ impl SearchEngine {
         on_progress(RebuildProgress { phase: "prepare".to_string(), total_docs, processed_docs }).await;
 
         let cfg = config::get();
+        let rebuild_batch_size = i64::try_from(cfg.search.tantivy_rebuild_batch_size)
+            .ok()
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_REBUILD_BATCH_SIZE);
         let tag = sanitize_job_tag(job_tag);
         let slice_live_path = cfg.search.tantivy_index_path.clone();
         let full_live_path = cfg.search.tantivy_full_index_path.clone();
@@ -192,7 +195,7 @@ impl SearchEngine {
                      LIMIT ?",
                 )
                 .bind(last_slice_id)
-                .bind(REBUILD_BATCH_SIZE)
+                .bind(rebuild_batch_size)
                 .fetch_all(pool)
                 .await?;
                 if rows.is_empty() {
@@ -212,26 +215,30 @@ impl SearchEngine {
             on_progress(RebuildProgress { phase: "build_full".to_string(), total_docs, processed_docs }).await;
             let mut last_file_id = 0_i64;
             loop {
-                let rows: Vec<RebuildFullRow> = sqlx::query_as(
-                    "SELECT id, kb_id, filename, content \
+                let meta_rows: Vec<RebuildFullMetaRow> = sqlx::query_as(
+                    "SELECT id, kb_id, filename \
                      FROM files \
                      WHERE status = 1 AND id > ? \
                      ORDER BY id ASC \
                      LIMIT ?",
                 )
                 .bind(last_file_id)
-                .bind(REBUILD_BATCH_SIZE)
+                .bind(rebuild_batch_size)
                 .fetch_all(pool)
                 .await?;
-                if rows.is_empty() {
+                if meta_rows.is_empty() {
                     break;
                 }
-                last_file_id = rows.last().map(|row| row.id).unwrap_or(last_file_id);
-                let batch_size = rows.len() as i64;
-                let docs: Vec<tantivy_engine::Document> = rows
+                last_file_id = meta_rows.last().map(|row| row.id).unwrap_or(last_file_id);
+                let batch_size = meta_rows.len() as i64;
+
+                let ids: Vec<i64> = meta_rows.iter().map(|row| row.id).collect();
+                let content_by_id = fetch_file_contents_by_ids(pool, &ids).await?;
+
+                let docs: Vec<tantivy_engine::Document> = meta_rows
                     .into_iter()
                     .map(|row| {
-                        let full_content = row.content.unwrap_or_default();
+                        let full_content = content_by_id.get(&row.id).cloned().unwrap_or_default();
                         let index_content = if full_content.trim().is_empty() {
                             row.filename
                         } else {
@@ -958,6 +965,23 @@ impl SearchEngine {
         info!("Graph-expanded search returned {} results", merged_results.len());
         Ok(merged_results)
     }
+}
+
+async fn fetch_file_contents_by_ids(pool: &SqlitePool, ids: &[i64]) -> anyhow::Result<HashMap<i64, String>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut query_builder: QueryBuilder<'_, Sqlite> =
+        QueryBuilder::new("SELECT id, content FROM files WHERE id IN (");
+    let mut separated = query_builder.separated(", ");
+    for id in ids {
+        separated.push_bind(id);
+    }
+    separated.push_unseparated(")");
+
+    let rows: Vec<(i64, Option<String>)> = query_builder.build_query_as().fetch_all(pool).await?;
+    Ok(rows.into_iter().map(|(id, content)| (id, content.unwrap_or_default())).collect())
 }
 
 fn sanitize_job_tag(input: &str) -> String {

@@ -122,6 +122,7 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | `HTKNOW_TANTIVY_INDEX_PATH` | `data/tantivy_index` | Tantivy 索引路径 |
 | `HTKNOW_TANTIVY_FULL_INDEX_PATH` | `data/tantivy_full_index` | Tantivy 全文索引 |
 | `HTKNOW_TANTIVY_MEMORY_MB` | `50` | Tantivy 内存（MB） |
+| `HTKNOW_SEARCH_TANTIVY_REBUILD_BATCH_SIZE` | `100` | Tantivy 索引重建批次大小 |
 | `HTKNOW_SEARCH_EMBEDDING_TIMEOUT_SECS` | `30` | embedding / 图片 embedding 请求超时（秒） |
 | `HTKNOW_SEARCH_RERANK_TIMEOUT_SECS` | `20` | rerank 请求超时（秒） |
 | `HTKNOW_SEARCH_SYNONYM_ENABLED` | `true` | 是否启用同义词查询扩展 |
