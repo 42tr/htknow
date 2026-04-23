@@ -60,6 +60,8 @@ pub struct ForceMergeStats {
     pub after_docs: u64,
     pub before_deleted_docs: u64,
     pub after_deleted_docs: u64,
+    pub gc_deleted_files: usize,
+    pub gc_failed_files: usize,
     pub skipped: bool,
     pub duration_ms: u128,
 }
@@ -348,6 +350,8 @@ fn force_merge_blocking(index: &Index) -> anyhow::Result<ForceMergeStats> {
     let before_deleted_docs = segment_deleted_docs(&before_metas);
 
     if before_segments < 2 {
+        let writer = create_writer_with_timing_blocking(index, "force_merge_gc")?;
+        let (gc_deleted_files, gc_failed_files) = garbage_collect_index_files(&writer, "force_merge_skipped")?;
         return Ok(ForceMergeStats {
             before_segments,
             after_segments: before_segments,
@@ -355,6 +359,8 @@ fn force_merge_blocking(index: &Index) -> anyhow::Result<ForceMergeStats> {
             after_docs: before_docs,
             before_deleted_docs,
             after_deleted_docs: before_deleted_docs,
+            gc_deleted_files,
+            gc_failed_files,
             skipped: true,
             duration_ms: start.elapsed().as_millis(),
         });
@@ -364,6 +370,8 @@ fn force_merge_blocking(index: &Index) -> anyhow::Result<ForceMergeStats> {
     let mut writer = create_writer_with_timing_blocking(index, "force_merge")?;
     writer.merge(&segment_ids).wait()?;
     writer.wait_merging_threads()?;
+    let writer = create_writer_with_timing_blocking(index, "force_merge_gc")?;
+    let (gc_deleted_files, gc_failed_files) = garbage_collect_index_files(&writer, "force_merge")?;
 
     let after_metas = index.searchable_segment_metas()?;
     Ok(ForceMergeStats {
@@ -373,9 +381,36 @@ fn force_merge_blocking(index: &Index) -> anyhow::Result<ForceMergeStats> {
         after_docs: segment_docs(&after_metas),
         before_deleted_docs,
         after_deleted_docs: segment_deleted_docs(&after_metas),
+        gc_deleted_files,
+        gc_failed_files,
         skipped: false,
         duration_ms: start.elapsed().as_millis(),
     })
+}
+
+fn garbage_collect_index_files(writer: &tantivy::IndexWriter, label: &str) -> anyhow::Result<(usize, usize)> {
+    let start = Instant::now();
+    let gc_result = writer.garbage_collect_files().wait()?;
+    let deleted_files = gc_result.deleted_files.len();
+    let failed_files = gc_result.failed_to_delete_files.len();
+    if failed_files > 0 {
+        warn!(
+            "tantivy_gc label={} deleted_files={} failed_files={} duration_ms={}",
+            label,
+            deleted_files,
+            failed_files,
+            start.elapsed().as_millis()
+        );
+    } else {
+        debug!(
+            "tantivy_gc label={} deleted_files={} failed_files={} duration_ms={}",
+            label,
+            deleted_files,
+            failed_files,
+            start.elapsed().as_millis()
+        );
+    }
+    Ok((deleted_files, failed_files))
 }
 
 fn segment_docs(metas: &[tantivy::SegmentMeta]) -> u64 {

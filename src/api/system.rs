@@ -100,6 +100,10 @@ pub struct TantivyForceMergeIndexStats {
     pub before_deleted_docs: u64,
     /// merge 后已删除文档数
     pub after_deleted_docs: u64,
+    /// GC 删除的不再被索引引用的文件数
+    pub gc_deleted_files: usize,
+    /// GC 删除失败的文件数
+    pub gc_failed_files: usize,
     /// 是否因为 segment 少于 2 个而跳过
     pub skipped: bool,
     /// 单个索引耗时（毫秒）
@@ -341,6 +345,8 @@ fn force_merge_index_stats(index: &str, stats: ForceMergeStats) -> TantivyForceM
         after_docs: stats.after_docs,
         before_deleted_docs: stats.before_deleted_docs,
         after_deleted_docs: stats.after_deleted_docs,
+        gc_deleted_files: stats.gc_deleted_files,
+        gc_failed_files: stats.gc_failed_files,
         skipped: stats.skipped,
         duration_ms: stats.duration_ms,
     }
