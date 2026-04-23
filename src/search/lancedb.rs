@@ -1,4 +1,10 @@
-use std::{path::Path, sync::Arc};
+use std::{
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 use anyhow::Result;
 use arrow_array::{
@@ -7,18 +13,22 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::stream::StreamExt;
 use lancedb::{
-    Connection, connect, query::{ExecutableQuery, QueryBase, Select}, table::{CompactionOptions, Duration, NewColumnTransform, OptimizeAction, OptimizeOptions}
+    Connection, Table, connect, index::Index, query::{ExecutableQuery, QueryBase, Select}, table::{
+        CompactionOptions, Duration, NewColumnTransform, OptimizeAction, OptimizeOptions
+    }
 };
-use log::debug;
+use log::{debug, info, warn};
 use once_cell::sync::OnceCell;
 
 use super::{embedding, tantivy_engine::SearchResultItem};
 use crate::config;
 
 static LANCEDB: OnceCell<Arc<Connection>> = OnceCell::new();
+static LANCEDB_TABLE: OnceCell<Arc<Table>> = OnceCell::new();
 static TABLE_NAME: &str = "documents";
 static IS_DELETED_COLUMN: &str = "is_deleted";
 static SEARCH_SELECT_COLUMNS: &[&str] = &["id", "file_id", "kb_id", "content", "_distance"];
+static VECTOR_FAST_SEARCH_ENABLED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 pub struct CompactStats {
@@ -76,21 +86,30 @@ pub async fn init() -> Result<()> {
         // 表不存在，创建新表
         let empty_batch = create_empty_batch(&schema)?;
         conn.create_table(TABLE_NAME, empty_batch).execute().await?;
-    } else {
-        let table = conn.open_table(TABLE_NAME).execute().await?;
-        ensure_is_deleted_column(&table).await?;
     }
-    // 如果表已存在，直接使用现有的表
+
+    let table = conn.open_table(TABLE_NAME).execute().await?;
+    ensure_is_deleted_column(&table).await?;
+
+    if let Err(err) = ensure_search_indices(&table).await {
+        warn!("LanceDB ensure indices failed: {}", err);
+    }
+    if let Err(err) = refresh_vector_fast_search_state(&table).await {
+        warn!("LanceDB refresh fast-search state failed: {}", err);
+        VECTOR_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
+    }
+
+    LANCEDB_TABLE.set(Arc::new(table)).map_err(|_| anyhow::anyhow!("Failed to cache LanceDB table"))?;
 
     Ok(())
 }
 
 pub async fn write_documents(doc: Document) -> Result<()> {
-    let conn = get_connection()?;
-    let table = conn.open_table(TABLE_NAME).execute().await?;
+    let table = get_table()?;
     let schema = create_schema();
     let batch = create_record_batch(vec![doc], &schema).await?;
     table.add(batch).execute().await?;
+    invalidate_vector_fast_search();
     Ok(())
 }
 
@@ -99,11 +118,11 @@ pub async fn write_documents_batch(docs: Vec<Document>) -> Result<()> {
     if docs.is_empty() {
         return Ok(());
     }
-    let conn = get_connection()?;
-    let table = conn.open_table(TABLE_NAME).execute().await?;
+    let table = get_table()?;
     let schema = create_schema();
     let batch = create_record_batch(docs, &schema).await?;
     table.add(batch).execute().await?;
+    invalidate_vector_fast_search();
     Ok(())
 }
 
@@ -115,8 +134,7 @@ pub async fn search(
     }
 
     let cfg = config::get();
-    let conn = get_connection()?;
-    let table = conn.open_table(TABLE_NAME).execute().await?;
+    let table = get_table()?;
 
     // 获取查询文本的 embedding
     let embedding_start = std::time::Instant::now();
@@ -124,8 +142,12 @@ pub async fn search(
     debug!("LanceDB embedding {}ms", embedding_start.elapsed().as_millis());
 
     // 使用向量搜索
+    let fast_search = vector_fast_search_enabled();
     let mut query_builder =
         table.query().nearest_to(query_vector)?.column("vector").select(Select::columns(SEARCH_SELECT_COLUMNS));
+    if fast_search {
+        query_builder = query_builder.fast_search();
+    }
 
     // 应用过滤条件
     let filter_conditions = build_filter_conditions(false, file_ids, kb_ids);
@@ -136,20 +158,42 @@ pub async fn search(
 
     let execute_start = std::time::Instant::now();
     let mut result_stream = query_builder.limit(cfg.search.limit).execute().await?;
-    debug!("LanceDB execute {}ms", execute_start.elapsed().as_millis());
+    debug!(
+        "LanceDB execute {}ms fast_search={}",
+        execute_start.elapsed().as_millis(),
+        fast_search
+    );
 
     let mut search_results = Vec::with_capacity(cfg.search.limit);
 
     // 从 stream 中读取数据
-    let read_start = std::time::Instant::now();
+    let stream_start = std::time::Instant::now();
+    let mut first_batch_ms = None;
+    let mut batch_count = 0usize;
+    let mut row_count = 0usize;
+    let mut decode_ms = 0u128;
     while let Some(batch_result) = result_stream.next().await {
+        if first_batch_ms.is_none() {
+            first_batch_ms = Some(stream_start.elapsed().as_millis());
+        }
         let batch = batch_result?;
+        row_count += batch.num_rows();
+        let decode_start = std::time::Instant::now();
         decode_search_batch(&batch, &mut search_results)?;
+        decode_ms += decode_start.elapsed().as_millis();
+        batch_count += 1;
     }
 
     // 按分数排序
     search_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-    debug!("LanceDB read+decode {}ms", read_start.elapsed().as_millis());
+    debug!(
+        "LanceDB stream total={}ms first_batch={}ms decode={}ms batches={} rows={}",
+        stream_start.elapsed().as_millis(),
+        first_batch_ms.unwrap_or(0),
+        decode_ms,
+        batch_count,
+        row_count
+    );
 
     Ok(search_results)
 }
@@ -162,8 +206,7 @@ pub async fn search_image(
     }
 
     let cfg = config::get();
-    let conn = get_connection()?;
-    let table = conn.open_table(TABLE_NAME).execute().await?;
+    let table = get_table()?;
 
     let image_vector_dim = config::get().ai.image_embedding_dim;
     if query_vector.len() != image_vector_dim as usize {
@@ -204,8 +247,7 @@ pub async fn delete_by_files(file_ids: &[i64]) -> Result<()> {
         return Ok(());
     }
 
-    let conn = get_connection()?;
-    let table = conn.open_table(TABLE_NAME).execute().await?;
+    let table = get_table()?;
     let predicate = if file_ids.len() == 1 {
         format!("file_id = {}", file_ids[0])
     } else {
@@ -213,6 +255,7 @@ pub async fn delete_by_files(file_ids: &[i64]) -> Result<()> {
         format!("file_id IN ({})", ids)
     };
     table.update().only_if(predicate).column(IS_DELETED_COLUMN, "true").execute().await?;
+    invalidate_vector_fast_search();
     Ok(())
 }
 
@@ -225,8 +268,7 @@ pub async fn delete_by_kbs(kb_ids: &[i64]) -> Result<()> {
         return Ok(());
     }
 
-    let conn = get_connection()?;
-    let table = conn.open_table(TABLE_NAME).execute().await?;
+    let table = get_table()?;
     let predicate = if kb_ids.len() == 1 {
         format!("kb_id = {}", kb_ids[0])
     } else {
@@ -234,13 +276,13 @@ pub async fn delete_by_kbs(kb_ids: &[i64]) -> Result<()> {
         format!("kb_id IN ({})", ids)
     };
     table.update().only_if(predicate).column(IS_DELETED_COLUMN, "true").execute().await?;
+    invalidate_vector_fast_search();
     Ok(())
 }
 
 /// 清理已删除的记录，释放磁盘和内存空间
 pub async fn compact() -> Result<CompactStats> {
-    let conn = get_connection()?;
-    let table = conn.open_table(TABLE_NAME).execute().await?;
+    let table = get_table()?;
     let storage_path = &config::get().storage.lancedb_path;
 
     let size_before_bytes = dir_size_bytes(Path::new(storage_path))?;
@@ -262,6 +304,8 @@ pub async fn compact() -> Result<CompactStats> {
         })
         .await?;
 
+    refresh_vector_fast_search_state(&table).await?;
+
     let total_rows_after = table.count_rows(None).await? as u64;
     let deleted_rows_after = table.count_rows(Some(format!("{} = true", IS_DELETED_COLUMN))).await? as u64;
     let size_after_bytes = dir_size_bytes(Path::new(storage_path))?;
@@ -279,6 +323,18 @@ pub async fn compact() -> Result<CompactStats> {
 
 fn get_connection() -> Result<Arc<Connection>> {
     LANCEDB.get().cloned().ok_or_else(|| anyhow::anyhow!("LanceDB not initialized"))
+}
+
+fn get_table() -> Result<Arc<Table>> {
+    LANCEDB_TABLE.get().cloned().ok_or_else(|| anyhow::anyhow!("LanceDB table not initialized"))
+}
+
+fn vector_fast_search_enabled() -> bool {
+    VECTOR_FAST_SEARCH_ENABLED.load(Ordering::Relaxed)
+}
+
+fn invalidate_vector_fast_search() {
+    VECTOR_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
 }
 
 fn has_empty_scope(file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>) -> bool {
@@ -498,5 +554,61 @@ async fn ensure_is_deleted_column(table: &lancedb::Table) -> Result<()> {
             )
             .await?;
     }
+    Ok(())
+}
+
+async fn ensure_search_indices(table: &Table) -> Result<()> {
+    let existing_indices = table.list_indices().await?;
+
+    if !has_index_on_column(&existing_indices, "vector") {
+        info!("Creating LanceDB vector index on column=vector");
+        table.create_index(&["vector"], Index::Auto).replace(false).execute().await?;
+    }
+
+    let refreshed_indices = table.list_indices().await?;
+    debug!(
+        "LanceDB indices: {}",
+        refreshed_indices
+            .iter()
+            .map(|idx| format!("{}:{:?}:{:?}", idx.name, idx.index_type, idx.columns))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    Ok(())
+}
+
+fn has_index_on_column(indices: &[lancedb::index::IndexConfig], column: &str) -> bool {
+    indices.iter().any(|idx| idx.columns.iter().any(|candidate| candidate == column))
+}
+
+async fn refresh_vector_fast_search_state(table: &Table) -> Result<()> {
+    let indices = table.list_indices().await?;
+    let Some(vector_index) = indices.iter().find(|idx| idx.columns.iter().any(|column| column == "vector")) else {
+        VECTOR_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
+        warn!("LanceDB vector index missing on column=vector; fast_search disabled");
+        return Ok(());
+    };
+
+    let Some(stats) = table.index_stats(&vector_index.name).await? else {
+        VECTOR_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
+        warn!(
+            "LanceDB vector index stats missing for index={}; fast_search disabled",
+            vector_index.name
+        );
+        return Ok(());
+    };
+
+    let fast_search = stats.num_unindexed_rows == 0 && stats.num_indexed_rows > 0;
+    VECTOR_FAST_SEARCH_ENABLED.store(fast_search, Ordering::Relaxed);
+    info!(
+        "LanceDB vector index ready: name={} type={:?} indexed_rows={} unindexed_rows={} fast_search={}",
+        vector_index.name,
+        stats.index_type,
+        stats.num_indexed_rows,
+        stats.num_unindexed_rows,
+        fast_search
+    );
+
     Ok(())
 }
