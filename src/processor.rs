@@ -1906,17 +1906,30 @@ impl FileProcessor {
             let mut tx = self.pool.begin().await?;
             let mut chunk_persisted: Vec<(i64, String)> = Vec::with_capacity(slice_chunk.len());
             let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
-            for slice in slice_chunk {
-                let id = sqlx::query("INSERT INTO slices (file_id, content) VALUES (?, ?)")
-                    .bind(file_id)
-                    .bind(&slice.content)
-                    .execute(&mut *tx)
-                    .await?
-                    .last_insert_rowid();
-                for position in &slice.positions {
-                    position_rows.push((id, position.clone()));
+            let binds_per_row = 2_usize;
+            let max_vars = 999_usize;
+            let batch_size = std::cmp::max(1, max_vars / binds_per_row);
+            for insert_chunk in slice_chunk.chunks(batch_size) {
+                let mut slice_sql = QueryBuilder::<Sqlite>::new("INSERT INTO slices (file_id, content) ");
+                slice_sql.push_values(insert_chunk.iter(), |mut b, slice| {
+                    b.push_bind(file_id).push_bind(&slice.content);
+                });
+                slice_sql.push(" RETURNING id");
+
+                let inserted_ids: Vec<(i64,)> = slice_sql.build_query_as().fetch_all(&mut *tx).await?;
+                anyhow::ensure!(
+                    inserted_ids.len() == insert_chunk.len(),
+                    "inserted slice row count mismatch: expected {}, got {}",
+                    insert_chunk.len(),
+                    inserted_ids.len()
+                );
+
+                for (slice, (id,)) in insert_chunk.iter().zip(inserted_ids.into_iter()) {
+                    for position in &slice.positions {
+                        position_rows.push((id, position.clone()));
+                    }
+                    chunk_persisted.push((id, slice.content.clone()));
                 }
-                chunk_persisted.push((id, slice.content.clone()));
             }
             if !position_rows.is_empty() {
                 let binds_per_row = 6_usize;
@@ -2565,16 +2578,34 @@ impl FileProcessor {
     async fn insert_slice_rows(
         &self, tx: &mut sqlx::Transaction<'_, Sqlite>, target_file_id: i64, rows: &[SliceRow],
     ) -> anyhow::Result<Vec<ClonedSlice>> {
-        let mut cloned = Vec::new();
-        for row in rows {
-            let new_id = sqlx::query("INSERT INTO slices (file_id, content) VALUES (?, ?)")
-                .bind(target_file_id)
-                .bind(&row.content)
-                .execute(&mut **tx)
-                .await?
-                .last_insert_rowid();
-            cloned.push(ClonedSlice { old_id: row.id, new_id, content: row.content.clone() });
+        if rows.is_empty() {
+            return Ok(Vec::new());
         }
+
+        let binds_per_row = 2_usize;
+        let max_vars = 999_usize;
+        let batch_size = std::cmp::max(1, max_vars / binds_per_row);
+        let mut cloned = Vec::with_capacity(rows.len());
+        for chunk in rows.chunks(batch_size) {
+            let mut qb = QueryBuilder::<Sqlite>::new("INSERT INTO slices (file_id, content) ");
+            qb.push_values(chunk.iter(), |mut b, row| {
+                b.push_bind(target_file_id).push_bind(&row.content);
+            });
+            qb.push(" RETURNING id");
+
+            let inserted_ids: Vec<(i64,)> = qb.build_query_as().fetch_all(&mut **tx).await?;
+            anyhow::ensure!(
+                inserted_ids.len() == chunk.len(),
+                "inserted cloned slice row count mismatch: expected {}, got {}",
+                chunk.len(),
+                inserted_ids.len()
+            );
+
+            for (row, (new_id,)) in chunk.iter().zip(inserted_ids.into_iter()) {
+                cloned.push(ClonedSlice { old_id: row.id, new_id, content: row.content.clone() });
+            }
+        }
+
         Ok(cloned)
     }
 
