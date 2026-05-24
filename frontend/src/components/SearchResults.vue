@@ -20,6 +20,11 @@ const isOfficeFile = (filename) => {
   return /\.(pdf|doc|docx|xlsx|xls)$/i.test(filename)
 }
 
+const isExcelFile = (filename) => {
+  if (!filename) return false
+  return /\.(xlsx|xls)$/i.test(filename)
+}
+
 const getFileEmoji = (filename) => (isImageFile(filename) ? '🖼️' : '📄')
 
 const canHighlight = (result) =>
@@ -27,6 +32,20 @@ const canHighlight = (result) =>
 
 const openViewer = (result) => {
   if (!canHighlight(result)) return
+
+  // Excel 文件 → 表格预览器
+  if (isExcelFile(result.file?.filename)) {
+    const pos = result.positions?.[0]
+    const params = new URLSearchParams({
+      file_id: String(result.file?.id || ''),
+      sheet_name: pos?.sheet_name || '',
+      row_num: String(pos?.row_num || ''),
+    })
+    window.open(`/excel-viewer.html?${params.toString()}`, '_blank', 'noopener')
+    return
+  }
+
+  // PDF/Word → PDF 高亮
   const params = new URLSearchParams({
     file_id: String(result.file?.id || ''),
     slice_id: String(result.id),

@@ -19,6 +19,22 @@ use crate::{
     AuthUser, api::error::{ApiError, ApiResult}, config, pdf_highlight, processor, search::SearchEngine
 };
 
+/// Excel 单 sheet 数据
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ExcelSheetData {
+    pub name: String,
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub truncated: bool,
+}
+
+/// Excel 文件数据
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ExcelData {
+    pub filename: String,
+    pub sheets: Vec<ExcelSheetData>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
 pub struct File {
     pub id: i64,
@@ -1956,4 +1972,88 @@ pub async fn get_highlighted_pdf(
         [(header::CONTENT_TYPE, "application/pdf".to_string()), (header::CONTENT_DISPOSITION, content_disposition)],
         Body::from(highlighted_pdf),
     ))
+}
+
+const EXCEL_MAX_ROWS_PER_SHEET: usize = 10000;
+
+/// 获取 Excel 文件的结构化数据
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/files/{id}/excel-data",
+    operation_id = "file_get_excel_data",
+    tag = "file",
+    params(
+        ("id" = i64, Path, description = "文件 ID"),
+    ),
+    responses(
+        (status = 200, description = "成功返回 Excel 数据", body = ExcelData),
+        (status = 400, description = "文件不是 Excel"),
+        (status = 404, description = "文件不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn excel_data(
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<ExcelData>> {
+    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+
+    if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
+        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
+    }
+
+    let filename_lower = file.filename.to_lowercase();
+    let is_excel = filename_lower.ends_with(".xls") || filename_lower.ends_with(".xlsx");
+    if !is_excel {
+        return Err(ApiError::BadRequest("File is not an Excel document".to_string()));
+    }
+
+    let data = tokio::task::spawn_blocking(move || {
+        use calamine::{Reader, open_workbook_auto};
+
+        let path = std::path::Path::new(&file.path);
+        let mut workbook: calamine::Sheets<std::io::BufReader<std::fs::File>> =
+            open_workbook_auto(path).map_err(|e| ApiError::Internal(format!("Failed to open Excel: {}", e)))?;
+
+        let mut sheets = Vec::new();
+        let sheet_names = workbook.sheet_names().to_vec();
+
+        for sheet_name in &sheet_names {
+            let range = match workbook.worksheet_range(sheet_name) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+
+            let all_rows: Vec<_> = range.rows().collect();
+            if all_rows.is_empty() {
+                continue;
+            }
+
+            let headers: Vec<String> = all_rows[0]
+                .iter()
+                .enumerate()
+                .map(|(idx, cell)| {
+                    let s = cell.to_string().trim().to_string();
+                    if s.is_empty() { format!("列{}", idx + 1) } else { s }
+                })
+                .collect();
+
+            let data_rows = &all_rows[1..];
+            let truncated = data_rows.len() > EXCEL_MAX_ROWS_PER_SHEET;
+            let limit = data_rows.len().min(EXCEL_MAX_ROWS_PER_SHEET);
+
+            let rows: Vec<Vec<String>> =
+                data_rows[..limit].iter().map(|row| row.iter().map(|cell| cell.to_string()).collect()).collect();
+
+            sheets.push(ExcelSheetData { name: sheet_name.clone(), headers, rows, truncated });
+        }
+
+        Ok::<_, ApiError>(ExcelData { filename: file.filename, sheets })
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("Excel parsing task failed: {}", e)))??;
+
+    Ok(Json(data))
 }

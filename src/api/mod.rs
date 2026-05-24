@@ -45,6 +45,7 @@ use crate::search::SearchEngine;
         file::get_image_by_filename,
         file::download,
         file::get_highlighted_pdf,
+        file::excel_data,
         // Search
         search::search,
         search::search_full,
@@ -96,6 +97,8 @@ use crate::search::SearchEngine;
             file::Slice,
             file::SlicePosition,
             file::FileStatusBreakdown,
+            file::ExcelData,
+            file::ExcelSheetData,
             search::SearchResult,
             search::SearchResultItem,
             search::SlicePosition,
@@ -167,7 +170,8 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/{id}/move", put(file::move_to_kb))
         .route("/{id}/slices", get(file::get_slices))
         .route("/{id}/download", get(file::download))
-        .route("/{id}/highlighted-pdf", get(file::get_highlighted_pdf));
+        .route("/{id}/highlighted-pdf", get(file::get_highlighted_pdf))
+        .route("/{id}/excel-data", get(file::excel_data));
     let search_router = Router::new()
         .route("/", get(search::search))
         .route("/full", get(search::search_full))

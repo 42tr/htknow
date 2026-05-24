@@ -37,11 +37,30 @@ const isOfficeFile = (filename) => {
   return /\.(pdf|doc|docx|xlsx|xls)$/i.test(filename)
 }
 
+const isExcelFile = (filename) => {
+  if (!filename) return false
+  return /\.(xlsx|xls)$/i.test(filename)
+}
+
 const canHighlight = (slice) =>
   isOfficeFile(props.file?.filename) && Array.isArray(slice?.positions) && slice.positions.length > 0
 
 const openViewer = (slice) => {
   if (!canHighlight(slice)) return
+
+  // Excel 文件 → 表格预览器
+  if (isExcelFile(props.file?.filename)) {
+    const pos = slice.positions?.[0]
+    const params = new URLSearchParams({
+      file_id: String(props.file.id),
+      sheet_name: pos?.sheet_name || '',
+      row_num: String(pos?.row_num || ''),
+    })
+    window.open(`/excel-viewer.html?${params.toString()}`, '_blank', 'noopener')
+    return
+  }
+
+  // PDF/Word → PDF 高亮
   const params = new URLSearchParams({
     file_id: String(props.file.id),
     slice_id: String(slice.id),
