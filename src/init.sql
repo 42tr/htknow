@@ -58,11 +58,13 @@ CREATE TABLE IF NOT EXISTS pdf_contents (
 CREATE TABLE IF NOT EXISTS slice_positions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     slice_id INTEGER NOT NULL, -- 切片ID
-    page_idx INTEGER NOT NULL, -- 所在页码
+    page_idx INTEGER NOT NULL, -- 所在页码（Excel 中表示 sheet 索引）
     x1 INTEGER NOT NULL,
     y1 INTEGER NOT NULL,
     x2 INTEGER NOT NULL,
     y2 INTEGER NOT NULL,
+    sheet_name TEXT DEFAULT NULL, -- Excel 中所在 sheet 名称
+    row_num INTEGER DEFAULT NULL, -- Excel 中所在行号（1-based）
     created_at INTEGER DEFAULT (strftime('%s','now')),
     FOREIGN KEY (slice_id) REFERENCES slices(id) ON DELETE CASCADE
 );

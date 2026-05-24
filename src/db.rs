@@ -65,6 +65,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     ensure_user_name_columns(&pool).await?;
     ensure_file_size_column(&pool).await?;
     ensure_pdf_contents_bbox_column(&pool).await?;
+    ensure_slice_positions_excel_columns(&pool).await?;
     if cfg.database.init_default_kbs {
         ensure_default_knowledge_bases(&pool).await?;
     } else {
@@ -188,9 +189,7 @@ async fn ensure_file_parse_priority_column(pool: &SqlitePool) -> anyhow::Result<
     let has_parse_priority = columns.iter().any(|row| row.get::<String, _>("name") == "parse_priority");
 
     if !has_parse_priority {
-        sqlx::query("ALTER TABLE files ADD COLUMN parse_priority INTEGER NOT NULL DEFAULT 50")
-            .execute(pool)
-            .await?;
+        sqlx::query("ALTER TABLE files ADD COLUMN parse_priority INTEGER NOT NULL DEFAULT 50").execute(pool).await?;
     }
 
     sqlx::query(
@@ -336,6 +335,22 @@ async fn ensure_pdf_contents_bbox_column(pool: &SqlitePool) -> anyhow::Result<()
 
     if !has_bbox {
         sqlx::query("ALTER TABLE pdf_contents ADD COLUMN bbox TEXT DEFAULT NULL").execute(pool).await?;
+    }
+
+    Ok(())
+}
+
+async fn ensure_slice_positions_excel_columns(pool: &SqlitePool) -> anyhow::Result<()> {
+    let columns = sqlx::query("PRAGMA table_info(slice_positions);").fetch_all(pool).await?;
+
+    let has_sheet_name = columns.iter().any(|row| row.get::<String, _>("name") == "sheet_name");
+    let has_row_num = columns.iter().any(|row| row.get::<String, _>("name") == "row_num");
+
+    if !has_sheet_name {
+        sqlx::query("ALTER TABLE slice_positions ADD COLUMN sheet_name TEXT DEFAULT NULL").execute(pool).await?;
+    }
+    if !has_row_num {
+        sqlx::query("ALTER TABLE slice_positions ADD COLUMN row_num INTEGER DEFAULT NULL").execute(pool).await?;
     }
 
     Ok(())

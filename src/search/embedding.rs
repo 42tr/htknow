@@ -64,8 +64,8 @@ pub async fn get_image_embedding_from_bytes(
         anyhow::bail!("Image embedding API error: {} - {}", status, error_text);
     }
 
-    let embedding_response: EmbeddingResponse = response.json().await
-        .context("image embedding response decode failed")?;
+    let embedding_response: EmbeddingResponse =
+        response.json().await.context("image embedding response decode failed")?;
 
     embedding_response
         .data
@@ -105,8 +105,7 @@ pub async fn get_embedding(text: &str) -> Result<Vec<f32>> {
         anyhow::bail!("Embedding API error: {} - {}, input_chars={}", status, error_text, text.chars().count());
     }
 
-    let embedding_response: EmbeddingResponse = response.json().await
-        .context("embedding response decode failed")?;
+    let embedding_response: EmbeddingResponse = response.json().await.context("embedding response decode failed")?;
 
     let embedding = embedding_response
         .data
@@ -165,8 +164,8 @@ async fn get_embeddings_single_batch(texts: &[String]) -> Result<Vec<Vec<f32>>> 
         );
     }
 
-    let embedding_response: EmbeddingResponse = response.json().await
-        .context("batch embedding response decode failed")?;
+    let embedding_response: EmbeddingResponse =
+        response.json().await.context("batch embedding response decode failed")?;
 
     Ok(embedding_response.data.into_iter().map(|data| data.embedding).collect())
 }

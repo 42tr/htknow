@@ -160,6 +160,8 @@ pub struct SearchResult {
 pub struct SlicePosition {
     pub page_idx: i32,
     pub bbox: [i32; 4],
+    pub sheet_name: Option<String>,
+    pub row_num: Option<i32>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -170,6 +172,8 @@ struct SlicePositionRow {
     y1: i32,
     x2: i32,
     y2: i32,
+    sheet_name: Option<String>,
+    row_num: Option<i32>,
 }
 
 /// 全文搜索结果项
@@ -2555,7 +2559,7 @@ async fn get_slice_positions(
     }
 
     let mut qb = QueryBuilder::<Sqlite>::new(
-        "SELECT slice_id, page_idx, x1, y1, x2, y2 FROM slice_positions WHERE slice_id IN (",
+        "SELECT slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num FROM slice_positions WHERE slice_id IN (",
     );
     let mut separated = qb.separated(", ");
     for slice_id in slice_ids {
@@ -2566,10 +2570,12 @@ async fn get_slice_positions(
 
     let mut slice_positions: HashMap<i64, Vec<SlicePosition>> = HashMap::new();
     for row in rows {
-        slice_positions
-            .entry(row.slice_id)
-            .or_default()
-            .push(SlicePosition { page_idx: row.page_idx, bbox: [row.x1, row.y1, row.x2, row.y2] });
+        slice_positions.entry(row.slice_id).or_default().push(SlicePosition {
+            page_idx: row.page_idx,
+            bbox: [row.x1, row.y1, row.x2, row.y2],
+            sheet_name: row.sheet_name,
+            row_num: row.row_num,
+        });
     }
 
     Ok(slice_positions)

@@ -987,8 +987,7 @@ async fn fetch_file_contents_by_ids(pool: &SqlitePool, ids: &[i64]) -> anyhow::R
         return Ok(HashMap::new());
     }
 
-    let mut query_builder: QueryBuilder<'_, Sqlite> =
-        QueryBuilder::new("SELECT id, content FROM files WHERE id IN (");
+    let mut query_builder: QueryBuilder<'_, Sqlite> = QueryBuilder::new("SELECT id, content FROM files WHERE id IN (");
     let mut separated = query_builder.separated(", ");
     for id in ids {
         separated.push_bind(id);

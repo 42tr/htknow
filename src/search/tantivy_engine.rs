@@ -191,12 +191,7 @@ pub fn add_documents(
 pub fn commit_writer(index_writer: &mut tantivy::IndexWriter, label: &str, doc_count: usize) -> tantivy::Result<()> {
     let commit_start = Instant::now();
     index_writer.commit()?;
-    debug!(
-        "tantivy_commit label={} docs={} duration_ms={}",
-        label,
-        doc_count,
-        commit_start.elapsed().as_millis()
-    );
+    debug!("tantivy_commit label={} docs={} duration_ms={}", label, doc_count, commit_start.elapsed().as_millis());
     Ok(())
 }
 

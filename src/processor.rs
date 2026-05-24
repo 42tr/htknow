@@ -162,6 +162,10 @@ struct ContentItem {
 struct SlicePosition {
     page_idx: i32,
     bbox: [i32; 4],
+    #[serde(default)]
+    sheet_name: Option<String>,
+    #[serde(default)]
+    row_num: Option<i32>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -169,6 +173,10 @@ struct RawSlicePosition {
     page_idx: i32,
     #[serde(default)]
     bbox: Vec<i32>,
+    #[serde(default)]
+    sheet_name: Option<String>,
+    #[serde(default)]
+    row_num: Option<i32>,
 }
 
 fn deserialize_slice_positions<'de, D>(deserializer: D) -> std::result::Result<Vec<SlicePosition>, D::Error>
@@ -182,6 +190,8 @@ where
                 positions.push(SlicePosition {
                     page_idx: raw.page_idx,
                     bbox: [raw.bbox[0], raw.bbox[1], raw.bbox[2], raw.bbox[3]],
+                    sheet_name: raw.sheet_name,
+                    row_num: raw.row_num,
                 });
             } else {
                 debug!("Dropping custom slice position on page {} due to invalid bbox {:?}", raw.page_idx, raw.bbox);
@@ -228,6 +238,8 @@ struct SlicePositionRecord {
     y1: i32,
     x2: i32,
     y2: i32,
+    sheet_name: Option<String>,
+    row_num: Option<i32>,
 }
 
 #[derive(Debug, Clone)]
@@ -801,14 +813,22 @@ impl FileProcessor {
                 }
             }
 
-            if is_word || is_excel {
+            if is_excel {
+                timing.set_pipeline("excel");
+                if !self.ensure_file_exists(file.id, "before excel processing").await? {
+                    return Ok(());
+                }
+                info!("Detected Excel document, parsing directly: {}", file.filename);
+                self.process_excel_file(file, Some(&mut timing)).await?;
+                return Ok(());
+            }
+
+            if is_word {
                 timing.set_pipeline("office_pdf");
                 if !self.ensure_file_exists(file.id, "before office conversion").await? {
                     return Ok(());
                 }
-                // Word/Excel 文档：先转换为 PDF，再按需要处理
-                let doc_kind = if is_word { "Word" } else { "Excel" };
-                info!("Detected {} document, converting to PDF: {}", doc_kind, file.filename);
+                info!("Detected Word document, converting to PDF: {}", file.filename);
 
                 if let Some(custom_url) = custom_url {
                     let stored_pdf_path =
@@ -817,16 +837,9 @@ impl FileProcessor {
                     temp_file.path = stored_pdf_path.to_string_lossy().to_string();
                     temp_file.filename = format!("{}.pdf", file.id);
 
-                    if is_word {
-                        timing.set_pipeline("custom_parser");
-                        info!("Custom parse enabled, routing converted PDF for file {} to {}", file.id, custom_url);
-                        self.process_file_with_custom_parser(&temp_file, custom_url, Some(&mut timing)).await?;
-                        return Ok(());
-                    }
-
-                    timing.set_pipeline("pdf");
-                    self.process_pdf_file(&temp_file, None, false, Some(file.filename.as_str()), Some(&mut timing))
-                        .await?;
+                    timing.set_pipeline("custom_parser");
+                    info!("Custom parse enabled, routing converted PDF for file {} to {}", file.id, custom_url);
+                    self.process_file_with_custom_parser(&temp_file, custom_url, Some(&mut timing)).await?;
                     return Ok(());
                 }
 
@@ -1048,10 +1061,7 @@ impl FileProcessor {
         let search_docs = timed_step_opt(timing.as_deref_mut(), "custom_insert_slices", async {
             let owned_slices: Vec<SliceWithPositions> = slices
                 .iter()
-                .map(|slice| SliceWithPositions {
-                    content: slice.content.clone(),
-                    positions: slice.positions.clone(),
-                })
+                .map(|slice| SliceWithPositions { content: slice.content.clone(), positions: slice.positions.clone() })
                 .collect();
             let persisted = self.insert_slices_and_positions(file.id, owned_slices).await?;
             let mut search_docs = Vec::with_capacity(persisted.len());
@@ -1237,6 +1247,166 @@ impl FileProcessor {
 
         // 使用 process_pdf_file 处理转换后的 PDF
         self.process_pdf_file(&temp_file, None, false, Some(file.filename.as_str()), timing.as_deref_mut()).await
+    }
+
+    /// 处理 Excel 文件，按 sheet+行 生成切片
+    async fn process_excel_file(&self, file: &File, mut timing: Option<&mut ParseTimingCtx>) -> anyhow::Result<()> {
+        if !self.ensure_file_exists(file.id, "excel processing start").await? {
+            return Ok(());
+        }
+        info!("Processing Excel file: {}", file.filename);
+
+        let slices =
+            timed_step_opt(timing.as_deref_mut(), "parse_excel", async { self.parse_excel_to_slices(file).await })
+                .await?;
+
+        if slices.is_empty() {
+            timed_step_opt(timing.as_deref_mut(), "finalize_empty_excel", async {
+                let sql =
+                    "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
+                sqlx::query(sql)
+                    .bind("")
+                    .bind("Excel processed successfully (empty)")
+                    .bind(file.id)
+                    .execute(&self.pool)
+                    .await?;
+                Ok(())
+            })
+            .await?;
+            return Ok(());
+        }
+
+        let slice_count = slices.len();
+        let full_content = slices.iter().map(|s| s.content.as_str()).collect::<Vec<_>>().join("\n\n");
+
+        let (search_docs, search_embeddings) = timed_step_opt(timing.as_deref_mut(), "insert_slices", async {
+            let persisted = self.insert_slices_and_positions(file.id, slices).await?;
+            let mut search_docs = Vec::with_capacity(persisted.len());
+            let mut search_embeddings = Vec::with_capacity(persisted.len());
+            for (id, content) in persisted {
+                search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, content));
+                search_embeddings.push(None);
+            }
+            Ok((search_docs, search_embeddings))
+        })
+        .await?;
+
+        if !search_docs.is_empty() {
+            timed_step_opt(timing.as_deref_mut(), "write_search_batch", async {
+                self.search_engine.write_batch(search_docs, search_embeddings).await?;
+                Ok(())
+            })
+            .await?;
+        }
+
+        timed_step_opt(timing.as_deref_mut(), "build_knowledge_graph", async {
+            self.maybe_build_knowledge_graph(file).await;
+            Ok(())
+        })
+        .await?;
+
+        if !self.ensure_file_exists(file.id, "before writing full index").await? {
+            return Ok(());
+        }
+
+        let index_full_content = format!("{}\n\n{}", file.filename, full_content);
+        timed_step_opt(timing.as_deref_mut(), "write_full_index", async {
+            self.search_engine
+                .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
+                .await?;
+            Ok(())
+        })
+        .await?;
+
+        if !self.ensure_file_exists(file.id, "before updating status").await? {
+            return Ok(());
+        }
+        timed_step_opt(timing.as_deref_mut(), "finalize_file_status", async {
+            let sql =
+                "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
+            sqlx::query(sql)
+                .bind(&full_content)
+                .bind("Excel processed successfully")
+                .bind(file.id)
+                .execute(&self.pool)
+                .await?;
+            Ok(())
+        })
+        .await?;
+
+        info!("Excel file {} processed successfully with {} slices", file.id, slice_count);
+
+        self.search_engine.reload_readers()?;
+
+        Ok(())
+    }
+
+    /// 解析 Excel 文件，按 sheet+行 生成切片
+    async fn parse_excel_to_slices(&self, file: &File) -> anyhow::Result<Vec<SliceWithPositions>> {
+        use calamine::{Reader, open_workbook_auto};
+
+        let path = std::path::Path::new(&file.path);
+        let mut workbook: calamine::Sheets<std::io::BufReader<std::fs::File>> =
+            open_workbook_auto(path).map_err(|e| anyhow::anyhow!("Failed to open Excel file: {}", e))?;
+
+        let mut slices = Vec::new();
+        let sheet_names = workbook.sheet_names().to_vec();
+
+        for (sheet_idx, sheet_name) in sheet_names.iter().enumerate() {
+            let range = match workbook.worksheet_range(sheet_name) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("Failed to read sheet '{}' in file {}: {}", sheet_name, file.id, e);
+                    continue;
+                }
+            };
+
+            let rows: Vec<_> = range.rows().collect();
+            if rows.len() < 2 {
+                continue;
+            }
+
+            let header: Vec<String> = rows[0]
+                .iter()
+                .enumerate()
+                .map(|(col_idx, cell)| {
+                    let s = cell.to_string().trim().to_string();
+                    if s.is_empty() { format!("列{}", col_idx + 1) } else { s }
+                })
+                .collect();
+
+            for (row_idx, row) in rows.iter().enumerate().skip(1) {
+                let mut lines = Vec::new();
+                let mut has_data = false;
+
+                for (col_idx, cell) in row.iter().enumerate() {
+                    let value = cell.to_string().trim().to_string();
+                    if !value.is_empty() {
+                        let header_label = header.get(col_idx).cloned().unwrap_or_else(|| format!("列{}", col_idx + 1));
+                        lines.push(format!("{}: {}", header_label, value));
+                        has_data = true;
+                    }
+                }
+
+                if !has_data {
+                    continue;
+                }
+
+                let mut content = format!("Sheet: {}\n", sheet_name);
+                content.push_str(&lines.join("\n"));
+
+                let positions = vec![SlicePosition {
+                    page_idx: sheet_idx as i32,
+                    bbox: [0, 0, 0, 0],
+                    sheet_name: Some(sheet_name.clone()),
+                    row_num: Some((row_idx + 1) as i32),
+                }];
+
+                slices.push(SliceWithPositions { content, positions });
+            }
+        }
+
+        Ok(slices)
     }
 
     /// 处理 PDF 文件，调用 MinerU API
@@ -1430,18 +1600,17 @@ impl FileProcessor {
         }
 
         let slice_count = slices.len();
-        let (search_docs, search_embeddings) =
-            timed_step_opt(timing.as_deref_mut(), "insert_slices", async {
-                let persisted = self.insert_slices_and_positions(file.id, slices).await?;
-                let mut search_docs = Vec::with_capacity(persisted.len());
-                let mut search_embeddings = Vec::with_capacity(persisted.len());
-                for (id, content) in persisted {
-                    search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, content));
-                    search_embeddings.push(image_embedding.clone());
-                }
-                Ok((search_docs, search_embeddings))
-            })
-            .await?;
+        let (search_docs, search_embeddings) = timed_step_opt(timing.as_deref_mut(), "insert_slices", async {
+            let persisted = self.insert_slices_and_positions(file.id, slices).await?;
+            let mut search_docs = Vec::with_capacity(persisted.len());
+            let mut search_embeddings = Vec::with_capacity(persisted.len());
+            for (id, content) in persisted {
+                search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, content));
+                search_embeddings.push(image_embedding.clone());
+            }
+            Ok((search_docs, search_embeddings))
+        })
+        .await?;
 
         // 批量写入搜索引擎
         if !search_docs.is_empty() {
@@ -1932,12 +2101,12 @@ impl FileProcessor {
                 }
             }
             if !position_rows.is_empty() {
-                let binds_per_row = 6_usize;
+                let binds_per_row = 8_usize;
                 let max_vars = 999_usize;
                 let batch_size = std::cmp::max(1, max_vars / binds_per_row);
                 for chunk in position_rows.chunks(batch_size) {
                     let mut pos_sql = QueryBuilder::<Sqlite>::new(
-                        "insert into slice_positions(slice_id, page_idx, x1, y1, x2, y2) ",
+                        "insert into slice_positions(slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num) ",
                     );
                     pos_sql.push_values(chunk.iter(), |mut b, (slice_id, position)| {
                         b.push_bind(slice_id)
@@ -1945,7 +2114,9 @@ impl FileProcessor {
                             .push_bind(position.bbox[0])
                             .push_bind(position.bbox[1])
                             .push_bind(position.bbox[2])
-                            .push_bind(position.bbox[3]);
+                            .push_bind(position.bbox[3])
+                            .push_bind(&position.sheet_name)
+                            .push_bind(position.row_num);
                     });
                     pos_sql.build().execute(&mut *tx).await?;
                 }
@@ -2420,7 +2591,7 @@ impl FileProcessor {
     fn positions_from_item(item: &ContentItem) -> Vec<SlicePosition> {
         if item.bbox.len() == 4 {
             let bbox = [item.bbox[0], item.bbox[1], item.bbox[2], item.bbox[3]];
-            vec![SlicePosition { page_idx: item.page_idx, bbox }]
+            vec![SlicePosition { page_idx: item.page_idx, bbox, sheet_name: None, row_num: None }]
         } else {
             Vec::new()
         }
@@ -2511,7 +2682,7 @@ impl FileProcessor {
         let chunk_size = 400;
         for chunk in slice_ids.chunks(chunk_size) {
             let mut qb = QueryBuilder::<Sqlite>::new(
-                "SELECT slice_id, page_idx, x1, y1, x2, y2 FROM slice_positions WHERE slice_id IN (",
+                "SELECT slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num FROM slice_positions WHERE slice_id IN (",
             );
             let mut separated = qb.separated(", ");
             for slice_id in chunk {
@@ -2621,11 +2792,12 @@ impl FileProcessor {
         if filtered.is_empty() {
             return Ok(());
         }
-        let binds_per_row = 6;
+        let binds_per_row = 8;
         let batch_size = std::cmp::max(1, 999 / binds_per_row);
         for chunk in filtered.chunks(batch_size) {
-            let mut qb =
-                QueryBuilder::<Sqlite>::new("INSERT INTO slice_positions(slice_id, page_idx, x1, y1, x2, y2) ");
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "INSERT INTO slice_positions(slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num) ",
+            );
             qb.push_values(chunk.iter(), |mut b, row| {
                 let new_id = id_map[&row.slice_id];
                 b.push_bind(new_id)
@@ -2633,7 +2805,9 @@ impl FileProcessor {
                     .push_bind(row.x1)
                     .push_bind(row.y1)
                     .push_bind(row.x2)
-                    .push_bind(row.y2);
+                    .push_bind(row.y2)
+                    .push_bind(&row.sheet_name)
+                    .push_bind(row.row_num);
             });
             qb.build().execute(&mut **tx).await?;
         }

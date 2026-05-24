@@ -1662,6 +1662,8 @@ pub struct Slice {
 pub struct SlicePosition {
     pub page_idx: i32,
     pub bbox: [i32; 4],
+    pub sheet_name: Option<String>,
+    pub row_num: Option<i32>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1672,6 +1674,8 @@ struct SlicePositionRow {
     y1: i32,
     x2: i32,
     y2: i32,
+    sheet_name: Option<String>,
+    row_num: Option<i32>,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -1703,7 +1707,7 @@ pub async fn get_slices(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> 
 
     let slice_ids: Vec<i64> = slices.iter().map(|s| s.id).collect();
     let mut qb = QueryBuilder::<Sqlite>::new(
-        "SELECT slice_id, page_idx, x1, y1, x2, y2 FROM slice_positions WHERE slice_id IN (",
+        "SELECT slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num FROM slice_positions WHERE slice_id IN (",
     );
     let mut separated = qb.separated(", ");
     for slice_id in slice_ids {
@@ -1714,10 +1718,12 @@ pub async fn get_slices(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> 
     let rows: Vec<SlicePositionRow> = qb.build_query_as().fetch_all(&pool).await?;
     let mut position_map: std::collections::HashMap<i64, Vec<SlicePosition>> = std::collections::HashMap::new();
     for row in rows {
-        position_map
-            .entry(row.slice_id)
-            .or_default()
-            .push(SlicePosition { page_idx: row.page_idx, bbox: [row.x1, row.y1, row.x2, row.y2] });
+        position_map.entry(row.slice_id).or_default().push(SlicePosition {
+            page_idx: row.page_idx,
+            bbox: [row.x1, row.y1, row.x2, row.y2],
+            sheet_name: row.sheet_name,
+            row_num: row.row_num,
+        });
     }
 
     for slice in &mut slices {
@@ -1849,7 +1855,7 @@ pub async fn get_highlighted_pdf(
     } else if let Some(slice_id) = params.slice_id {
         // 从数据库查询 slice 的 positions
         let rows: Vec<SlicePositionRow> = sqlx::query_as(
-            "SELECT slice_id, page_idx, x1, y1, x2, y2 FROM slice_positions WHERE slice_id = ? ORDER BY page_idx, id",
+            "SELECT slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num FROM slice_positions WHERE slice_id = ? ORDER BY page_idx, id",
         )
         .bind(slice_id)
         .fetch_all(&pool)

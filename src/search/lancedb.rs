@@ -1,9 +1,7 @@
 use std::{
-    path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, Ordering},
-    },
+    path::Path, sync::{
+        Arc, atomic::{AtomicBool, Ordering}
+    }
 };
 
 use anyhow::Result;
@@ -13,9 +11,7 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::stream::StreamExt;
 use lancedb::{
-    Connection, Table, connect, index::Index, query::{ExecutableQuery, QueryBase, Select}, table::{
-        CompactionOptions, Duration, NewColumnTransform, OptimizeAction, OptimizeOptions
-    }
+    Connection, Table, connect, index::Index, query::{ExecutableQuery, QueryBase, Select}, table::{CompactionOptions, Duration, NewColumnTransform, OptimizeAction, OptimizeOptions}
 };
 use log::{debug, info, warn};
 use once_cell::sync::OnceCell;
@@ -158,11 +154,7 @@ pub async fn search(
 
     let execute_start = std::time::Instant::now();
     let mut result_stream = query_builder.limit(cfg.search.limit).execute().await?;
-    debug!(
-        "LanceDB execute {}ms fast_search={}",
-        execute_start.elapsed().as_millis(),
-        fast_search
-    );
+    debug!("LanceDB execute {}ms fast_search={}", execute_start.elapsed().as_millis(), fast_search);
 
     let mut search_results = Vec::with_capacity(cfg.search.limit);
 
@@ -213,11 +205,8 @@ pub async fn search_image(
         anyhow::bail!("Image embedding dimension mismatch: expected {}, got {}", image_vector_dim, query_vector.len());
     }
 
-    let mut query_builder = table
-        .query()
-        .nearest_to(query_vector)?
-        .column("image_vector")
-        .select(Select::columns(SEARCH_SELECT_COLUMNS));
+    let mut query_builder =
+        table.query().nearest_to(query_vector)?.column("image_vector").select(Select::columns(SEARCH_SELECT_COLUMNS));
 
     let filter_conditions = build_filter_conditions(true, file_ids, kb_ids);
 
@@ -592,10 +581,7 @@ async fn refresh_vector_fast_search_state(table: &Table) -> Result<()> {
 
     let Some(stats) = table.index_stats(&vector_index.name).await? else {
         VECTOR_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
-        warn!(
-            "LanceDB vector index stats missing for index={}; fast_search disabled",
-            vector_index.name
-        );
+        warn!("LanceDB vector index stats missing for index={}; fast_search disabled", vector_index.name);
         return Ok(());
     };
 
@@ -603,11 +589,7 @@ async fn refresh_vector_fast_search_state(table: &Table) -> Result<()> {
     VECTOR_FAST_SEARCH_ENABLED.store(fast_search, Ordering::Relaxed);
     info!(
         "LanceDB vector index ready: name={} type={:?} indexed_rows={} unindexed_rows={} fast_search={}",
-        vector_index.name,
-        stats.index_type,
-        stats.num_indexed_rows,
-        stats.num_unindexed_rows,
-        fast_search
+        vector_index.name, stats.index_type, stats.num_indexed_rows, stats.num_unindexed_rows, fast_search
     );
 
     Ok(())
