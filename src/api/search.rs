@@ -41,6 +41,8 @@ pub struct SearchQuery {
     /// 是否启用高级流程（仅切片搜索接口生效）
     #[serde(default)]
     pub advanced: bool,
+    /// 按文件名称全匹配过滤（仅全文搜索接口生效）
+    pub filename: Option<String>,
 }
 
 fn default_max_sub_queries() -> usize {
@@ -1554,8 +1556,28 @@ pub async fn search_full(
         return Ok(Json(FullSearchResult { results: vec![] }));
     }
 
+    let file_ids = if let Some(filename) = params.filename.as_ref().filter(|f| !f.is_empty()) {
+        let matched_ids = search_file_ids_by_name(&pool, filename, kb_ids_to_search.as_ref(), &user_id, is_admin).await?;
+        if matched_ids.is_empty() {
+            return Ok(Json(FullSearchResult { results: vec![] }));
+        }
+        match params.file_id {
+            Some(ref explicit_ids) if !explicit_ids.is_empty() => {
+                let explicit_set: HashSet<i64> = explicit_ids.iter().copied().collect();
+                let intersected: Vec<i64> = matched_ids.into_iter().filter(|id| explicit_set.contains(id)).collect();
+                if intersected.is_empty() {
+                    return Ok(Json(FullSearchResult { results: vec![] }));
+                }
+                Some(intersected)
+            }
+            _ => Some(matched_ids),
+        }
+    } else {
+        params.file_id.clone()
+    };
+
     let raw_results = search_engine
-        .search_full(&params.query, params.file_id.as_ref(), kb_ids_to_search.as_ref())
+        .search_full(&params.query, file_ids.as_ref(), kb_ids_to_search.as_ref())
         .await
         .map_err(|e| crate::api::error::ApiError::internal(format!("Full search failed: {}", e)))?;
 
@@ -2474,6 +2496,31 @@ fn synonym_row_to_item(row: SynonymItemRow) -> SynonymItem {
         created_at: row.created_at,
         updated_at: row.updated_at,
     }
+}
+
+async fn search_file_ids_by_name(
+    pool: &SqlitePool, filename: &str, kb_ids: Option<&Vec<i64>>, user_id: &str, is_admin: bool,
+) -> Result<Vec<i64>, sqlx::Error> {
+    let mut qb = QueryBuilder::<Sqlite>::new("SELECT id FROM files WHERE filename = ");
+    qb.push_bind(filename);
+    if !is_admin {
+        qb.push(" AND (user_id = ");
+        qb.push_bind(user_id);
+        qb.push(" OR is_public = 1)");
+    }
+    if let Some(ids) = kb_ids {
+        if !ids.is_empty() {
+            qb.push(" AND kb_id IN (");
+            let mut separated = qb.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
+            }
+            qb.push(")");
+        }
+    }
+    qb.push(" AND status = 1");
+    let ids: Vec<i64> = qb.build_query_scalar().fetch_all(pool).await?;
+    Ok(ids)
 }
 
 async fn get_files_by_ids(pool: &SqlitePool, file_ids: &[i64]) -> Result<HashMap<i64, FileInfo>, sqlx::Error> {
