@@ -41,7 +41,23 @@ pub struct SearchQuery {
     /// 是否启用高级流程（仅切片搜索接口生效）
     #[serde(default)]
     pub advanced: bool,
-    /// 按文件名称全匹配过滤（仅全文搜索接口生效）
+}
+
+/// 全文搜索查询参数
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct FullSearchQuery {
+    /// 搜索关键词（当 filename 传入时可不填）
+    #[serde(default)]
+    pub query: String,
+    /// 文件 ID（可选，逗号分隔多个，如 1,2）
+    #[param(value_type = String, example = "1,2")]
+    #[serde(default, deserialize_with = "deserialize_id_list")]
+    pub file_id: Option<Vec<i64>>,
+    /// 知识库 ID（可选，逗号分隔多个，如 1,2）
+    #[param(value_type = String, example = "1,2")]
+    #[serde(default, deserialize_with = "deserialize_id_list")]
+    pub kb_id: Option<Vec<i64>>,
+    /// 按文件名称全匹配过滤
     pub filename: Option<String>,
 }
 
@@ -1536,7 +1552,7 @@ fn preview_text(text: &str, max_chars: usize) -> String {
     path = "/api/v1/knowledge/search/full",
     operation_id = "search_full",
     tag = "search",
-    params(SearchQuery),
+    params(FullSearchQuery),
     responses(
         (status = 200, description = "全文搜索成功", body = FullSearchResult),
         (status = 400, description = "请求参数错误")
@@ -1548,7 +1564,7 @@ fn preview_text(text: &str, max_chars: usize) -> String {
 )]
 pub async fn search_full(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
-    Query(params): Query<SearchQuery>, Extension(auth_user): Extension<AuthUser>,
+    Query(params): Query<FullSearchQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<FullSearchResult>> {
     let (is_admin, user_id, kb_ids_to_search) =
         resolve_scope_for_user(&pool, &auth_user, params.kb_id.as_ref()).await?;
