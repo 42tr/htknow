@@ -1576,44 +1576,69 @@ pub async fn search_full(
         params.file_id.clone()
     };
 
-    let raw_results = search_engine
-        .search_full(&params.query, file_ids.as_ref(), kb_ids_to_search.as_ref())
-        .await
-        .map_err(|e| crate::api::error::ApiError::internal(format!("Full search failed: {}", e)))?;
+    let results = if params.query.trim().is_empty() {
+        if file_ids.is_none() {
+            return Ok(Json(FullSearchResult { results: vec![] }));
+        }
+        let ids = file_ids.unwrap_or_default();
+        if ids.is_empty() {
+            return Ok(Json(FullSearchResult { results: vec![] }));
+        }
+        let file_map = get_full_files_by_ids(&pool, &ids).await?;
+        let kb_ids_in_files: Vec<i64> = file_map.values().filter_map(|f| f.kb_id).collect();
+        let kb_map = if !kb_ids_in_files.is_empty() { get_kbs_by_ids(&pool, &kb_ids_in_files).await? } else { HashMap::new() };
+        file_map
+            .values()
+            .filter_map(|f| {
+                if !has_visibility_permission(
+                    Some((f.is_public, f.user_id.as_str())),
+                    f.kb_id.and_then(|kid| kb_map.get(&kid)).map(|k| (k.is_public, k.user_id.as_str())),
+                    &user_id,
+                    is_admin,
+                ) {
+                    return None;
+                }
+                Some(FullSearchResultItem {
+                    snippet: String::new(),
+                    score: 0.0,
+                    file: Some(f.clone()),
+                    kb: f.kb_id.and_then(|kid| kb_map.get(&kid).cloned()),
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let raw_results = search_engine
+            .search_full(&params.query, file_ids.as_ref(), kb_ids_to_search.as_ref())
+            .await
+            .map_err(|e| crate::api::error::ApiError::internal(format!("Full search failed: {}", e)))?;
 
-    if raw_results.is_empty() {
-        return Ok(Json(FullSearchResult { results: vec![] }));
-    }
+        if raw_results.is_empty() {
+            return Ok(Json(FullSearchResult { results: vec![] }));
+        }
 
-    // 收集所有 file_id 和 kb_id
-    let file_ids: Vec<i64> = raw_results.iter().map(|r| r.file_id).collect();
-    let kb_ids: Vec<i64> = raw_results.iter().filter_map(|r| r.kb_id).collect();
+        let file_ids: Vec<i64> = raw_results.iter().map(|r| r.file_id).collect();
+        let kb_ids: Vec<i64> = raw_results.iter().filter_map(|r| r.kb_id).collect();
+        let file_map = get_full_files_by_ids(&pool, &file_ids).await?;
+        let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(&pool, &kb_ids).await? } else { HashMap::new() };
 
-    // 批量查询文件信息（完整字段）
-    let file_map = get_full_files_by_ids(&pool, &file_ids).await?;
-
-    // 批量查询知识库信息
-    let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(&pool, &kb_ids).await? } else { HashMap::new() };
-
-    // 组装结果并过滤权限
-    let results = raw_results
-        .into_iter()
-        .filter_map(|r| {
-            let file = file_map.get(&r.file_id).cloned();
-            let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
-
-            if has_visibility_permission(
-                file.as_ref().map(|f| (f.is_public, f.user_id.as_str())),
-                kb.as_ref().map(|k| (k.is_public, k.user_id.as_str())),
-                &user_id,
-                is_admin,
-            ) {
-                Some(FullSearchResultItem { snippet: r.snippet, score: r.score, file, kb })
-            } else {
-                None
-            }
-        })
-        .collect();
+        raw_results
+            .into_iter()
+            .filter_map(|r| {
+                let file = file_map.get(&r.file_id).cloned();
+                let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
+                if has_visibility_permission(
+                    file.as_ref().map(|f| (f.is_public, f.user_id.as_str())),
+                    kb.as_ref().map(|k| (k.is_public, k.user_id.as_str())),
+                    &user_id,
+                    is_admin,
+                ) {
+                    Some(FullSearchResultItem { snippet: r.snippet, score: r.score, file, kb })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
 
     Ok(Json(FullSearchResult { results }))
 }
