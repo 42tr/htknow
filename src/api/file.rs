@@ -35,6 +35,12 @@ pub struct ExcelData {
     pub sheets: Vec<ExcelSheetData>,
 }
 
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct ExcelDataQuery {
+    pub sheet_name: Option<String>,
+    pub row_num: Option<usize>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
 pub struct File {
     pub id: i64,
@@ -1984,6 +1990,8 @@ const EXCEL_MAX_ROWS_PER_SHEET: usize = 10000;
     tag = "file",
     params(
         ("id" = i64, Path, description = "文件 ID"),
+        ("sheet_name" = Option<String>, Query, description = "指定 sheet 名称"),
+        ("row_num" = Option<usize>, Query, description = "指定 Excel 行号（1-based，包含表头行）"),
     ),
     responses(
         (status = 200, description = "成功返回 Excel 数据", body = ExcelData),
@@ -1997,6 +2005,7 @@ const EXCEL_MAX_ROWS_PER_SHEET: usize = 10000;
 )]
 pub async fn excel_data(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
+    Query(query): Query<ExcelDataQuery>,
 ) -> ApiResult<Json<ExcelData>> {
     let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
 
@@ -2010,6 +2019,9 @@ pub async fn excel_data(
         return Err(ApiError::BadRequest("File is not an Excel document".to_string()));
     }
 
+    let filter_sheet = query.sheet_name.clone();
+    let filter_row = query.row_num;
+
     let data = tokio::task::spawn_blocking(move || {
         use calamine::{Reader, open_workbook_auto};
 
@@ -2021,6 +2033,12 @@ pub async fn excel_data(
         let sheet_names = workbook.sheet_names().to_vec();
 
         for sheet_name in &sheet_names {
+            if let Some(ref target) = filter_sheet {
+                if sheet_name != target {
+                    continue;
+                }
+            }
+
             let range = match workbook.worksheet_range(sheet_name) {
                 Ok(r) => r,
                 Err(_) => continue,
@@ -2044,10 +2062,26 @@ pub async fn excel_data(
             let truncated = data_rows.len() > EXCEL_MAX_ROWS_PER_SHEET;
             let limit = data_rows.len().min(EXCEL_MAX_ROWS_PER_SHEET);
 
-            let rows: Vec<Vec<String>> =
-                data_rows[..limit].iter().map(|row| row.iter().map(|cell| cell.to_string()).collect()).collect();
+            let rows: Vec<Vec<String>> = if let Some(row_num) = filter_row {
+                if row_num == 0 || row_num > all_rows.len() {
+                    return Err(ApiError::BadRequest(format!(
+                        "Row number {} out of range for sheet '{}', valid range: 1-{}",
+                        row_num,
+                        sheet_name,
+                        all_rows.len()
+                    )));
+                }
+                vec![all_rows[row_num - 1].iter().map(|cell| cell.to_string()).collect()]
+            } else {
+                data_rows[..limit].iter().map(|row| row.iter().map(|cell| cell.to_string()).collect()).collect()
+            };
 
-            sheets.push(ExcelSheetData { name: sheet_name.clone(), headers, rows, truncated });
+            sheets.push(ExcelSheetData {
+                name: sheet_name.clone(),
+                headers,
+                rows,
+                truncated: truncated && filter_row.is_none(),
+            });
         }
 
         Ok::<_, ApiError>(ExcelData { filename: file.filename, sheets })
