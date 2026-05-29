@@ -57,6 +57,7 @@ pub struct File {
     pub slice_type: String,
     pub kb_id: Option<i64>,
     pub is_public: bool,
+    pub content_id: Option<i64>,
     pub meta: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
@@ -751,6 +752,7 @@ pub async fn update(
         separated.push("status = ").push_bind_unseparated(0);
         separated.push("log = ").push_bind_unseparated("");
         separated.push("content = NULL");
+        separated.push("content_id = NULL");
         has_updates = true;
     }
 
@@ -896,7 +898,7 @@ pub async fn move_to_kb(
 
     let mut tx = pool.begin().await?;
     let update_result = sqlx::query(
-        "UPDATE files SET kb_id = ?, status = ?, log = ?, content = NULL, updated_at = strftime('%s','now') WHERE id = ? AND status != 2 AND updated_at = ?",
+        "UPDATE files SET kb_id = ?, status = ?, log = ?, content = NULL, content_id = NULL, updated_at = strftime('%s','now') WHERE id = ? AND status != 2 AND updated_at = ?",
     )
     .bind(req.target_kb_id)
     .bind(next_status)
@@ -1060,35 +1062,10 @@ async fn clear_file_parse_rows_for_ids_in_tx(
     }
 
     for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
-        let mut mentions_qb = QueryBuilder::<Sqlite>::new(
-            "DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id IN (",
-        );
-        push_i64_list(&mut mentions_qb, chunk);
-        mentions_qb.push("))");
-        mentions_qb.build().execute(&mut **tx).await?;
-    }
-
-    for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
-        let mut positions_qb = QueryBuilder::<Sqlite>::new(
-            "DELETE FROM slice_positions WHERE slice_id IN (SELECT id FROM slices WHERE file_id IN (",
-        );
-        push_i64_list(&mut positions_qb, chunk);
-        positions_qb.push("))");
-        positions_qb.build().execute(&mut **tx).await?;
-    }
-
-    for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
-        let mut slices_qb = QueryBuilder::<Sqlite>::new("DELETE FROM slices WHERE file_id IN (");
-        push_i64_list(&mut slices_qb, chunk);
-        slices_qb.push(")");
-        slices_qb.build().execute(&mut **tx).await?;
-    }
-
-    for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
-        let mut pdf_qb = QueryBuilder::<Sqlite>::new("DELETE FROM pdf_contents WHERE file_id IN (");
-        push_i64_list(&mut pdf_qb, chunk);
-        pdf_qb.push(")");
-        pdf_qb.build().execute(&mut **tx).await?;
+        let mut qb = QueryBuilder::<Sqlite>::new("UPDATE files SET content_id = NULL WHERE id IN (");
+        push_i64_list(&mut qb, chunk);
+        qb.push(")");
+        qb.build().execute(&mut **tx).await?;
     }
 
     Ok(())
@@ -1097,8 +1074,6 @@ async fn clear_file_parse_rows_for_ids_in_tx(
 pub(crate) async fn delete_file_rows_in_tx(
     tx: &mut sqlx::Transaction<'_, Sqlite>, file_ids: &[i64],
 ) -> Result<(), sqlx::Error> {
-    clear_file_parse_rows_for_ids_in_tx(tx, file_ids).await?;
-
     for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
         let mut files_qb = QueryBuilder::<Sqlite>::new("DELETE FROM files WHERE id IN (");
         push_i64_list(&mut files_qb, chunk);
@@ -1106,6 +1081,24 @@ pub(crate) async fn delete_file_rows_in_tx(
         files_qb.build().execute(&mut **tx).await?;
     }
 
+    Ok(())
+}
+
+async fn cleanup_content_data(pool: &SqlitePool, content_id: i64) -> Result<(), sqlx::Error> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM slices WHERE content_id = ?")
+        .bind(content_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM pdf_contents WHERE content_id = ?")
+        .bind(content_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM file_contents WHERE id = ?")
+        .bind(content_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
     Ok(())
 }
 
@@ -1240,7 +1233,7 @@ async fn execute_reparse_failed(
     clear_file_parse_rows_for_ids_in_tx(&mut tx, &file_ids).await?;
 
     let mut qb = QueryBuilder::<Sqlite>::new(
-        "UPDATE files SET status = 0, log = '', content = NULL, updated_at = strftime('%s','now') WHERE status = -1 AND id IN (",
+        "UPDATE files SET status = 0, log = '', content = NULL, content_id = NULL, updated_at = strftime('%s','now') WHERE status = -1 AND id IN (",
     );
     push_i64_list(&mut qb, &file_ids);
     qb.push(")");
@@ -1350,6 +1343,17 @@ async fn execute_batch_delete(
     let image_paths = collect_image_paths_for_files(pool, &file_ids).await?;
     debug!("file_batch_delete collect_image_paths ids={} {}ms", file_ids.len(), step_start.elapsed().as_millis());
 
+    let mut file_content_map: HashMap<i64, Option<i64>> = HashMap::new();
+    for file in &files_to_delete {
+        let content_id: Option<i64> =
+            sqlx::query_as::<_, (Option<i64>,)>("SELECT content_id FROM files WHERE id = ?")
+                .bind(file.id)
+                .fetch_optional(pool)
+                .await?
+                .and_then(|r| r.0);
+        file_content_map.insert(file.id, content_id);
+    }
+
     let step_start = Instant::now();
     let mut tx = pool.begin().await?;
     delete_file_rows_in_tx(&mut tx, &file_ids).await?;
@@ -1364,6 +1368,31 @@ async fn execute_batch_delete(
         cleanup_failed.len(),
         step_start.elapsed().as_millis()
     );
+
+    let mut checked_contents = std::collections::HashSet::new();
+    for (_, content_id) in file_content_map {
+        if let Some(cid) = content_id {
+            if !checked_contents.insert(cid) {
+                continue;
+            }
+            let remaining: i64 = match sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE content_id = ?")
+                .bind(cid)
+                .fetch_one(pool)
+                .await
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!("Failed to check content ref count for content_id {}: {}", cid, e);
+                    continue;
+                }
+            };
+            if remaining == 0 {
+                if let Err(e) = cleanup_content_data(pool, cid).await {
+                    warn!("Failed to cleanup orphaned content {}: {}", cid, e);
+                }
+            }
+        }
+    }
 
     debug!(
         "file_batch_delete total requested={} accepted={} deleted={} {}ms",
@@ -1390,12 +1419,16 @@ pub(crate) async fn collect_image_paths_for_files(
         return Ok(Vec::new());
     }
 
-    let mut qb = QueryBuilder::<Sqlite>::new("SELECT img_path FROM pdf_contents WHERE file_id IN (");
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "SELECT DISTINCT p.img_path FROM pdf_contents p \
+         JOIN files f ON p.content_id = f.content_id \
+         WHERE f.id IN (",
+    );
     let mut separated = qb.separated(", ");
     for file_id in file_ids {
         separated.push_bind(file_id);
     }
-    qb.push(") AND img_path IS NOT NULL AND img_path != ''");
+    qb.push(") AND p.img_path IS NOT NULL AND p.img_path != ''");
     let rows: Vec<Option<String>> = qb.build_query_scalar().fetch_all(pool).await?;
     let mut resolved = Vec::new();
     for raw in rows.into_iter().flatten() {
@@ -1721,8 +1754,24 @@ struct PageBBoxRow {
     )
 )]
 pub async fn get_slices(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> ApiResult<Json<Vec<Slice>>> {
-    let mut slices: Vec<Slice> =
-        sqlx::query_as("SELECT * FROM slices WHERE file_id = ? ORDER BY id").bind(id).fetch_all(&pool).await?;
+    let content_id: Option<i64> =
+        sqlx::query_as::<_, (Option<i64>,)>("SELECT content_id FROM files WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&pool)
+            .await?
+            .and_then(|r| r.0);
+
+    let mut slices: Vec<Slice> = if let Some(cid) = content_id {
+        sqlx::query_as("SELECT * FROM slices WHERE content_id = ? ORDER BY id")
+            .bind(cid)
+            .fetch_all(&pool)
+            .await?
+    } else {
+        sqlx::query_as("SELECT * FROM slices WHERE file_id = ? ORDER BY id")
+            .bind(id)
+            .fetch_all(&pool)
+            .await?
+    };
     if slices.is_empty() {
         return Ok(Json(slices));
     }
@@ -1896,12 +1945,21 @@ pub async fn get_highlighted_pdf(
     let coord_bounds_by_page = if positions.is_empty() {
         None
     } else {
-        let rows: Vec<PageBBoxRow> = sqlx::query_as(
-            "SELECT page_idx, bbox FROM pdf_contents WHERE file_id = ? AND bbox IS NOT NULL AND bbox != ''",
-        )
-        .bind(file.id)
-        .fetch_all(&pool)
-        .await?;
+        let rows: Vec<PageBBoxRow> = if let Some(cid) = file.content_id {
+            sqlx::query_as(
+                "SELECT page_idx, bbox FROM pdf_contents WHERE content_id = ? AND bbox IS NOT NULL AND bbox != ''",
+            )
+            .bind(cid)
+            .fetch_all(&pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT page_idx, bbox FROM pdf_contents WHERE file_id = ? AND bbox IS NOT NULL AND bbox != ''",
+            )
+            .bind(file.id)
+            .fetch_all(&pool)
+            .await?
+        };
 
         let mut bounds: HashMap<i32, pdf_highlight::PageCoordBounds> = HashMap::new();
         for row in rows {

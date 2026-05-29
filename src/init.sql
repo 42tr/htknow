@@ -154,6 +154,17 @@ CREATE INDEX IF NOT EXISTS idx_mentions_slice ON entity_mentions(slice_id);
 CREATE INDEX IF NOT EXISTS idx_slice_positions_slice ON slice_positions(slice_id);
 CREATE INDEX IF NOT EXISTS idx_files_meta ON files(meta);
 
+-- 文件内容解耦表
+CREATE TABLE IF NOT EXISTS file_contents (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    hash TEXT NOT NULL,
+    full_content TEXT,
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    updated_at INTEGER DEFAULT (strftime('%s','now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_file_contents_hash ON file_contents(hash);
+
 -- 搜索词表（分词增强）
 CREATE TABLE IF NOT EXISTS search_lexicon (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
