@@ -590,26 +590,16 @@ impl FileProcessor {
     async fn delete_processing_file_data(
         &self, tx: &mut sqlx::Transaction<'_, Sqlite>, file_id: i64,
     ) -> anyhow::Result<()> {
-        sqlx::query(
-            "DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ? AND content_id IS NULL)",
-        )
-        .bind(file_id)
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query(
-            "DELETE FROM slice_positions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ? AND content_id IS NULL)",
-        )
-        .bind(file_id)
-        .execute(&mut **tx)
-        .await?;
-        sqlx::query("DELETE FROM slices WHERE file_id = ? AND content_id IS NULL")
+        sqlx::query("DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
             .bind(file_id)
             .execute(&mut **tx)
             .await?;
-        sqlx::query("DELETE FROM pdf_contents WHERE file_id = ? AND content_id IS NULL")
+        sqlx::query("DELETE FROM slice_positions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
             .bind(file_id)
             .execute(&mut **tx)
             .await?;
+        sqlx::query("DELETE FROM slices WHERE file_id = ?").bind(file_id).execute(&mut **tx).await?;
+        sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(file_id).execute(&mut **tx).await?;
         Ok(())
     }
 
@@ -708,10 +698,10 @@ impl FileProcessor {
 
         info!("Found reusable parsed file {} for new file {} (hash={})", source_file.id, file.id, file.hash);
 
-        match self.reuse_content_data(&source_file, file).await {
+        match self.clone_file_data(&source_file, file).await {
             Ok(_) => Ok(true),
             Err(err) => {
-                error!("Failed to reuse content from file {} for file {}: {}", source_file.id, file.id, err);
+                error!("Failed to reuse parsed data from file {} for file {}: {}", source_file.id, file.id, err);
                 if let Err(clean_err) = self.cleanup_processing_file_data_with_retry(file.id, 3).await {
                     warn!("Failed to cleanup file {} after reuse error: {}", file.id, clean_err);
                 }
@@ -904,55 +894,7 @@ impl FileProcessor {
         }
         .await;
         timing.finish(&result);
-        if result.is_ok() {
-            if let Err(e) = self.finalize_file_content(file).await {
-                error!("Failed to finalize file content for file {}: {}", file.id, e);
-            }
-        }
         result
-    }
-
-    /// 文件解析成功后，创建 file_contents 记录并关联到文件
-    async fn finalize_file_content(&self, file: &File) -> anyhow::Result<()> {
-        let status: Option<i32> = sqlx::query_scalar("SELECT status FROM files WHERE id = ?")
-            .bind(file.id)
-            .fetch_optional(&self.pool)
-            .await?;
-        if status != Some(1) {
-            return Ok(());
-        }
-        let content: Option<String> = sqlx::query_scalar("SELECT content FROM files WHERE id = ?")
-            .bind(file.id)
-            .fetch_optional(&self.pool)
-            .await?;
-        let full_content = content.unwrap_or_default();
-
-        let content_id = sqlx::query_scalar::<_, i64>(
-            "INSERT INTO file_contents (hash, full_content) VALUES (?, ?) RETURNING id",
-        )
-        .bind(&file.hash)
-        .bind(&full_content)
-        .fetch_one(&self.pool)
-        .await?;
-
-        sqlx::query("UPDATE slices SET content_id = ? WHERE file_id = ?")
-            .bind(content_id)
-            .bind(file.id)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("UPDATE pdf_contents SET content_id = ? WHERE file_id = ?")
-            .bind(content_id)
-            .bind(file.id)
-            .execute(&self.pool)
-            .await?;
-        sqlx::query("UPDATE files SET content_id = ? WHERE id = ?")
-            .bind(content_id)
-            .bind(file.id)
-            .execute(&self.pool)
-            .await?;
-
-        info!("Created file_content {} for file {}", content_id, file.id);
-        Ok(())
     }
 
     async fn process_file_with_custom_parser(
@@ -1477,22 +1419,14 @@ impl FileProcessor {
         }
         info!("Processing PDF file: {}", file.filename);
 
-        // 先检查 pdf_contents 表中是否已有该文件的数据（通过 content_id 或 file_id）
-        let content_id: Option<i64> = sqlx::query_as::<_, (Option<i64>,)>("SELECT content_id FROM files WHERE id = ?")
-            .bind(file.id)
-            .fetch_one(&self.pool)
-            .await?
-            .0;
-
-        let effective_id = content_id.unwrap_or(file.id);
-
+        // 先检查 pdf_contents 表中是否已有该文件的数据
         let (count, bbox_count): ((i64,), (i64,)) =
             timed_step_opt(timing.as_deref_mut(), "pdf_existing_content_check", async {
-                let check_sql = "SELECT COUNT(*) as count FROM pdf_contents WHERE content_id = ?";
-                let count: (i64,) = sqlx::query_as(check_sql).bind(effective_id).fetch_one(&self.pool).await?;
+                let check_sql = "SELECT COUNT(*) as count FROM pdf_contents WHERE file_id = ?";
+                let count: (i64,) = sqlx::query_as(check_sql).bind(file.id).fetch_one(&self.pool).await?;
                 let bbox_sql =
-                    "SELECT COUNT(*) as count FROM pdf_contents WHERE content_id = ? AND bbox IS NOT NULL AND bbox != ''";
-                let bbox_count: (i64,) = sqlx::query_as(bbox_sql).bind(effective_id).fetch_one(&self.pool).await?;
+                    "SELECT COUNT(*) as count FROM pdf_contents WHERE file_id = ? AND bbox IS NOT NULL AND bbox != ''";
+                let bbox_count: (i64,) = sqlx::query_as(bbox_sql).bind(file.id).fetch_one(&self.pool).await?;
                 Ok((count, bbox_count))
             })
             .await?;
@@ -1501,12 +1435,12 @@ impl FileProcessor {
 
         if count.0 > 0 && bbox_count.0 > 0 {
             // 已有数据，直接从数据库读取
-            info!("Found existing PDF contents in database for file {} (content_id={}), skipping MinerU API call", file.id, effective_id);
+            info!("Found existing PDF contents in database for file {}, skipping MinerU API call", file.id);
 
             content_list = timed_step_opt(timing.as_deref_mut(), "load_existing_pdf_content", async {
-                let fetch_sql = "SELECT page_idx, bbox, text, text_level, img_path, table_body FROM pdf_contents WHERE content_id = ? ORDER BY page_idx, id";
+                let fetch_sql = "SELECT page_idx, bbox, text, text_level, img_path, table_body FROM pdf_contents WHERE file_id = ? ORDER BY page_idx, id";
                 let rows: Vec<(i32, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>)> =
-                    sqlx::query_as(fetch_sql).bind(effective_id).fetch_all(&self.pool).await?;
+                    sqlx::query_as(fetch_sql).bind(file.id).fetch_all(&self.pool).await?;
 
                 // 将数据库记录转换为 ContentItem
                 let content_list = rows
@@ -2675,51 +2609,6 @@ impl FileProcessor {
         set.into_iter().collect()
     }
 
-    async fn reuse_content_data(&self, source: &File, target: &File) -> anyhow::Result<()> {
-        if source.id == target.id {
-            anyhow::bail!("Source and target file ids are identical");
-        }
-        if source.status != 1 {
-            anyhow::bail!("Source file {} is not processed", source.id);
-        }
-
-        let content_id = match source.content_id {
-            Some(id) => id,
-            None => {
-                return self.clone_file_data(source, target).await;
-            }
-        };
-
-        let reuse_log = format!("Reusing content {} from file {}", content_id, source.id);
-        sqlx::query("UPDATE files SET status = 2, log = ?, updated_at = strftime('%s','now') WHERE id = ?")
-            .bind(&reuse_log)
-            .bind(target.id)
-            .execute(&self.pool)
-            .await?;
-
-        self.cleanup_processing_file_data_with_retry(target.id, 3).await?;
-
-        self.hardlink_images_for_file(source.id, target.id).await?;
-        self.hardlink_converted_pdf(source.id, target.id).await?;
-
-        let full_content = self.reindex_content_for_file(target, content_id).await?;
-
-        let final_log = format!("Reused content {} from file {}", content_id, source.id);
-        sqlx::query(
-            "UPDATE files SET content_id = ?, status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?",
-        )
-        .bind(content_id)
-        .bind(&full_content)
-        .bind(&final_log)
-        .bind(target.id)
-        .execute(&self.pool)
-        .await?;
-
-        self.maybe_build_knowledge_graph_from_content(target, content_id).await;
-
-        Ok(())
-    }
-
     async fn clone_file_data(&self, source: &File, target: &File) -> anyhow::Result<()> {
         if source.id == target.id {
             anyhow::bail!("Source and target file ids are identical");
@@ -3027,175 +2916,6 @@ impl FileProcessor {
         if let Some(parent) = path.parent() { parent.join(new_name).to_string_lossy().to_string() } else { new_name }
     }
 
-    async fn hardlink_images_for_file(&self, source_id: i64, target_id: i64) -> anyhow::Result<()> {
-        let image_paths = collect_image_paths_for_files(&self.pool, &[source_id]).await?;
-        for img_path in image_paths {
-            let src_abs = match resolve_image_storage_path(&img_path) {
-                Some(p) => p,
-                None => continue,
-            };
-            let new_img_name = Self::remap_image_name(&img_path, source_id, target_id);
-            let dst_abs = match resolve_image_storage_path(&new_img_name) {
-                Some(p) => p,
-                None => continue,
-            };
-            if let Some(parent) = std::path::Path::new(&dst_abs).parent() {
-                fs::create_dir_all(parent).await?;
-            }
-            match std::fs::hard_link(&src_abs, &dst_abs) {
-                Ok(()) => {}
-                Err(e) if e.raw_os_error() == Some(18) => {
-                    fs::copy(&src_abs, &dst_abs).await?;
-                }
-                Err(e) => return Err(e.into()),
-            }
-        }
-        Ok(())
-    }
-
-    async fn hardlink_converted_pdf(&self, source_id: i64, target_id: i64) -> anyhow::Result<()> {
-        let cfg = config::get();
-        let pdf_dir = std::path::Path::new(&cfg.storage.pdf_path);
-        let src_pdf = pdf_dir.join(format!("{}.pdf", source_id));
-        match fs::try_exists(&src_pdf).await {
-            Ok(true) => {}
-            Ok(false) => return Ok(()),
-            Err(err) => {
-                warn!("Failed to check converted PDF existence for file {}: {}, skipping hardlink", source_id, err);
-                return Ok(());
-            }
-        }
-        fs::create_dir_all(pdf_dir).await?;
-        let dst_pdf = pdf_dir.join(format!("{}.pdf", target_id));
-        match std::fs::hard_link(&src_pdf, &dst_pdf) {
-            Ok(()) => {}
-            Err(e) if e.raw_os_error() == Some(18) => {
-                fs::copy(&src_pdf, &dst_pdf).await?;
-            }
-            Err(e) => return Err(e.into()),
-        }
-        Ok(())
-    }
-
-    async fn reindex_content_for_file(&self, file: &File, content_id: i64) -> anyhow::Result<String> {
-        let slices: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT id, content FROM slices WHERE content_id = ? ORDER BY id"
-        )
-        .bind(content_id)
-        .fetch_all(&self.pool)
-        .await?;
-
-        let mut search_docs = Vec::new();
-        let mut embeddings = Vec::new();
-        for (slice_id, content) in &slices {
-            search_docs.push(tantivy_engine::Document::new(*slice_id, file.id, file.kb_id, content.clone()));
-            embeddings.push(None);
-        }
-
-        if !search_docs.is_empty() {
-            let filename_lower = file.filename.to_lowercase();
-            let is_image = Self::is_image_file(&filename_lower);
-            if is_image {
-                let embedding =
-                    search::embedding::get_image_embedding_from_path(&file.path, Some(&file.filename)).await?;
-                for e in &mut embeddings {
-                    *e = Some(embedding.clone());
-                }
-            }
-            self.search_engine.write_batch(search_docs, embeddings).await?;
-        }
-
-        let full_content = slices.iter().map(|(_, c)| c.as_str()).collect::<Vec<_>>().join("\n\n");
-        let index_full_content = if full_content.is_empty() {
-            file.filename.clone()
-        } else {
-            format!("{}\n\n{}", file.filename, full_content)
-        };
-        self.search_engine
-            .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
-            .await?;
-        self.search_engine.reload_readers()?;
-
-        Ok(full_content)
-    }
-
-    async fn maybe_build_knowledge_graph_from_content(&self, file: &File, content_id: i64) {
-        if !config::get().server.build_knowledge_graph {
-            return;
-        }
-
-        let slices = match sqlx::query_as::<_, (i64, String)>(
-            "SELECT id, content FROM slices WHERE content_id = ? ORDER BY id"
-        )
-        .bind(content_id)
-        .fetch_all(&self.pool)
-        .await
-        {
-            Ok(s) => s,
-            Err(e) => {
-                error!("Failed to fetch slices for knowledge graph from content {}: {}", content_id, e);
-                return;
-            }
-        };
-
-        if slices.is_empty() {
-            return;
-        }
-
-        let mut combined_content = String::new();
-        for (_, content) in &slices {
-            if combined_content.len() + content.len() > 8000 {
-                break;
-            }
-            combined_content.push_str(content);
-            combined_content.push_str("\n\n");
-        }
-
-        if combined_content.trim().is_empty() {
-            return;
-        }
-
-        let llm_extractor = LLMGraphExtractor::from_env();
-        if !llm_extractor.is_enabled() {
-            return;
-        }
-
-        let context = format!("文件名: {}", file.filename);
-        let (mut entities, mut relations) = match llm_extractor.extract_knowledge_graph(&combined_content, &context).await
-        {
-            Ok(result) => result,
-            Err(e) => {
-                error!("LLM knowledge graph extraction failed for file {} from content {}: {}", file.id, content_id, e);
-                return;
-            }
-        };
-
-        for entity in &mut entities {
-            entity.file_id = Some(file.id);
-            entity.kb_id = file.kb_id;
-        }
-        for relation in &mut relations {
-            relation.file_id = Some(file.id);
-        }
-
-        let mut graph = match KnowledgeGraph::load_from_db(self.pool.clone(), file.kb_id).await {
-            Ok(g) => g,
-            Err(e) => {
-                error!("Failed to load knowledge graph for file {}: {}", file.id, e);
-                return;
-            }
-        };
-
-        if let Err(e) = graph.incremental_update(entities, relations).await {
-            error!("Failed to update knowledge graph for file {}: {}", file.id, e);
-            return;
-        }
-
-        if let Err(e) = graph.save_snapshot().await {
-            error!("Failed to save graph snapshot for file {}: {}", file.id, e);
-        }
-    }
-
     async fn maybe_build_knowledge_graph(&self, file: &File) {
         if !config::get().server.build_knowledge_graph {
             debug!("Knowledge graph building disabled by config, skipping file {}", file.id);
@@ -3222,15 +2942,9 @@ impl FileProcessor {
 
         info!("Using LLM to generate knowledge graph for file {}", file.id);
 
-        // 2. 获取文件的所有切片（通过 content_id）
-        let slices: Vec<(i64, String)> = sqlx::query_as(
-            "SELECT s.id, s.content FROM slices s \
-             JOIN files f ON f.id = ? AND s.content_id = f.content_id \
-             ORDER BY s.id"
-        )
-        .bind(file.id)
-        .fetch_all(&self.pool)
-        .await?;
+        // 2. 获取文件的所有切片
+        let slices_sql = "SELECT id, content FROM slices WHERE file_id = ? ORDER BY id";
+        let slices: Vec<(i64, String)> = sqlx::query_as(slices_sql).bind(file.id).fetch_all(&self.pool).await?;
 
         if slices.is_empty() {
             debug!("No slices found for file {}, skipping graph building", file.id);

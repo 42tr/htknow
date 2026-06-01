@@ -164,10 +164,9 @@ async fn insert_file(
 }
 
 async fn insert_slice(pool: &SqlitePool, file_id: i64, content: &str) -> i64 {
-    sqlx::query("INSERT INTO slices (file_id, content, content_id) VALUES (?, ?, ?)")
+    sqlx::query("INSERT INTO slices (file_id, content) VALUES (?, ?)")
         .bind(file_id)
         .bind(content)
-        .bind(file_id)
         .execute(pool)
         .await
         .unwrap()

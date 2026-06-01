@@ -873,8 +873,13 @@ async fn reset_reparse_scope(
     }
 
     if !file_ids.is_empty() {
+        let mut del_slices_qb = QueryBuilder::<Sqlite>::new("DELETE FROM slices WHERE file_id IN (");
+        push_i64_list(&mut del_slices_qb, file_ids);
+        del_slices_qb.push(")");
+        del_slices_qb.build().execute(pool).await?;
+
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-        let mut update_qb = QueryBuilder::<Sqlite>::new("UPDATE files SET status = 0, log = '', content_id = NULL, updated_at = ");
+        let mut update_qb = QueryBuilder::<Sqlite>::new("UPDATE files SET status = 0, log = '', updated_at = ");
         update_qb.push_bind(now);
         update_qb.push(" WHERE id IN (");
         push_i64_list(&mut update_qb, file_ids);

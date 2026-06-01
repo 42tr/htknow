@@ -334,9 +334,7 @@ fn take_with_limit(items: Vec<SliceRow>, char_limit: usize, reverse_after: bool)
 
 async fn fetch_before_slices(pool: &SqlitePool, file_id: i64, center_id: i64) -> Result<Vec<SliceRow>> {
     let sql = format!(
-        "SELECT s.id, s.content FROM slices s \
-         JOIN files f ON f.id = ? AND s.content_id = f.content_id \
-         WHERE s.id < ? ORDER BY s.id DESC LIMIT {}",
+        "SELECT id, content FROM slices WHERE file_id = ? AND id < ? ORDER BY id DESC LIMIT {}",
         MAX_NEIGHBOR_SLICES
     );
     let rows = sqlx::query_as::<_, SliceRow>(&sql).bind(file_id).bind(center_id).fetch_all(pool).await?;
@@ -345,9 +343,7 @@ async fn fetch_before_slices(pool: &SqlitePool, file_id: i64, center_id: i64) ->
 
 async fn fetch_after_slices(pool: &SqlitePool, file_id: i64, center_id: i64) -> Result<Vec<SliceRow>> {
     let sql = format!(
-        "SELECT s.id, s.content FROM slices s \
-         JOIN files f ON f.id = ? AND s.content_id = f.content_id \
-         WHERE s.id > ? ORDER BY s.id ASC LIMIT {}",
+        "SELECT id, content FROM slices WHERE file_id = ? AND id > ? ORDER BY id ASC LIMIT {}",
         MAX_NEIGHBOR_SLICES
     );
     let rows = sqlx::query_as::<_, SliceRow>(&sql).bind(file_id).bind(center_id).fetch_all(pool).await?;
