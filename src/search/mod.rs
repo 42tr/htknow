@@ -26,6 +26,7 @@ const MAX_QUERY_TERMS_FOR_SYNONYM_LOOKUP: usize = 100;
 const DEFAULT_REBUILD_BATCH_SIZE: i64 = 100;
 static RERANK_HTTP_CLIENT: Lazy<Client> = Lazy::new(Client::new);
 
+/// /v1/rerank 格式的请求体
 #[derive(Debug, Serialize)]
 struct RerankRequest {
     model: String,
@@ -33,6 +34,7 @@ struct RerankRequest {
     documents: Vec<String>,
 }
 
+/// /v1/rerank 格式的响应体
 #[derive(Debug, Deserialize)]
 struct RerankResponse {
     results: Vec<RerankResult>,
@@ -42,6 +44,20 @@ struct RerankResponse {
 struct RerankResult {
     index: usize,
     relevance_score: f32,
+}
+
+/// /rerank 格式的请求体
+#[derive(Debug, Serialize)]
+struct SimpleRerankRequest {
+    query: String,
+    texts: Vec<String>,
+}
+
+/// /rerank 格式的响应体（数组）
+#[derive(Debug, Deserialize)]
+struct SimpleRerankResult {
+    index: usize,
+    score: f32,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -711,17 +727,35 @@ impl SearchEngine {
             document_index_map.push(idx);
         }
 
-        // 构造请求
-        let rerank_request = RerankRequest { model: cfg.ai.rerank_model.clone(), query: query.to_string(), documents };
+        // 根据 URL 后缀判断使用哪种 rerank 接口格式
+        let use_v1_format = cfg.services.rerank_url.ends_with("/v1/rerank");
 
         // 调用 BGE-Rerank API
         let rerank_http_start = Instant::now();
-        let response = RERANK_HTTP_CLIENT
-            .post(&cfg.services.rerank_url)
-            .timeout(Duration::from_secs(cfg.search.rerank_timeout_secs))
-            .json(&rerank_request)
-            .send()
-            .await?;
+        let response = if use_v1_format {
+            let rerank_request = RerankRequest {
+                model: cfg.ai.rerank_model.clone(),
+                query: query.to_string(),
+                documents: documents.clone(),
+            };
+            RERANK_HTTP_CLIENT
+                .post(&cfg.services.rerank_url)
+                .timeout(Duration::from_secs(cfg.search.rerank_timeout_secs))
+                .json(&rerank_request)
+                .send()
+                .await?
+        } else {
+            let rerank_request = SimpleRerankRequest {
+                query: query.to_string(),
+                texts: documents.clone(),
+            };
+            RERANK_HTTP_CLIENT
+                .post(&cfg.services.rerank_url)
+                .timeout(Duration::from_secs(cfg.search.rerank_timeout_secs))
+                .json(&rerank_request)
+                .send()
+                .await?
+        };
         debug!("Rerank HTTP request {}ms", rerank_http_start.elapsed().as_millis());
 
         if !response.status().is_success() {
@@ -731,7 +765,7 @@ impl SearchEngine {
                 "Rerank API failed with status {}: {}; documents={}",
                 status,
                 error_text,
-                rerank_request.documents.len()
+                documents.len()
             );
         }
 
@@ -742,22 +776,36 @@ impl SearchEngine {
 
         // 解析 JSON 响应
         let rerank_parse_start = Instant::now();
-        let rerank_response: RerankResponse = serde_json::from_str(&response_text)?;
-        debug!("Rerank response parse {}ms", rerank_parse_start.elapsed().as_millis());
-
-        // 检查返回的结果数量是否匹配
-        if rerank_response.results.len() != rerank_request.documents.len() {
-            anyhow::bail!(
-                "Rerank results count mismatch: expected {}, got {}",
-                rerank_request.documents.len(),
-                rerank_response.results.len()
-            );
-        }
-
-        let mut rerank_scores: Vec<Option<f32>> = vec![None; rerank_request.documents.len()];
-        for rerank_result in &rerank_response.results {
-            if let Some(score) = rerank_scores.get_mut(rerank_result.index) {
-                *score = Some(rerank_result.relevance_score);
+        let mut rerank_scores: Vec<Option<f32>> = vec![None; documents.len()];
+        if use_v1_format {
+            let rerank_response: RerankResponse = serde_json::from_str(&response_text)?;
+            debug!("Rerank response parse {}ms", rerank_parse_start.elapsed().as_millis());
+            if rerank_response.results.len() != documents.len() {
+                anyhow::bail!(
+                    "Rerank results count mismatch: expected {}, got {}",
+                    documents.len(),
+                    rerank_response.results.len()
+                );
+            }
+            for rerank_result in &rerank_response.results {
+                if let Some(score) = rerank_scores.get_mut(rerank_result.index) {
+                    *score = Some(rerank_result.relevance_score);
+                }
+            }
+        } else {
+            let simple_results: Vec<SimpleRerankResult> = serde_json::from_str(&response_text)?;
+            debug!("Rerank response parse {}ms", rerank_parse_start.elapsed().as_millis());
+            if simple_results.len() != documents.len() {
+                anyhow::bail!(
+                    "Rerank results count mismatch: expected {}, got {}",
+                    documents.len(),
+                    simple_results.len()
+                );
+            }
+            for result in &simple_results {
+                if let Some(score) = rerank_scores.get_mut(result.index) {
+                    *score = Some(result.score);
+                }
             }
         }
 
