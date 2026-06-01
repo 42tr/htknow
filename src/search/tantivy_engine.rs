@@ -89,7 +89,19 @@ pub fn init_with_path(path: &str) -> Result<(Schema, Index)> {
     let schema = build_schema();
     let path = Path::new(path);
     let index = if path.exists() {
-        Index::open_in_dir(path)?
+        match Index::open_in_dir(path) {
+            Ok(idx) => idx,
+            Err(e) => {
+                warn!(
+                    "Tantivy index at '{}' is corrupted or unreadable: {}. Removing and creating fresh index.",
+                    path.display(),
+                    e
+                );
+                std::fs::remove_dir_all(path)?;
+                std::fs::create_dir_all(path)?;
+                Index::create_in_dir(path, schema.clone())?
+            }
+        }
     } else {
         std::fs::create_dir_all(path)?;
         Index::create_in_dir(path, schema.clone())?

@@ -321,10 +321,12 @@ impl SearchEngine {
         .await;
 
         if rebuild_result.is_err() {
+            // 清理临时重建目录（重建过程中的中间产物）
             let _ = cleanup_dir_if_exists(&slice_temp_path);
             let _ = cleanup_dir_if_exists(&full_temp_path);
-            let _ = cleanup_dir_if_exists(&slice_backup_path);
-            let _ = cleanup_dir_if_exists(&full_backup_path);
+            // 保留 backup 目录不删除——如果 swap 后 reload 失败且 restore 也失败，
+            // backup 是恢复到上一次可用索引的唯一手段。
+            // 这些 backup 会在下次成功重建后被覆盖，或通过手动清理。
         }
 
         rebuild_result
@@ -334,6 +336,7 @@ impl SearchEngine {
         {
             let _guard = self.index_write_lock.lock().await;
             tantivy_engine::write_documents(&self.index, &self.schema, doc.clone()).await?;
+            reload_reader(&self.index_reader, "index")?;
         }
 
         let mut lancedb_doc = lancedb::Document::new(doc.id, doc.file_id, doc.kb_id, doc.content);
@@ -354,6 +357,7 @@ impl SearchEngine {
         {
             let _guard = self.index_write_lock.lock().await;
             tantivy_engine::write_documents_batch(&self.index, &self.schema, docs.clone()).await?;
+            reload_reader(&self.index_reader, "index")?;
         }
 
         let lancedb_docs: Vec<lancedb::Document> = docs
@@ -376,6 +380,7 @@ impl SearchEngine {
         {
             let _guard = self.full_index_write_lock.lock().await;
             tantivy_engine::write_documents(&self.full_index, &self.full_schema, doc).await?;
+            reload_reader(&self.full_index_reader, "full_index")?;
         }
         Ok(())
     }
@@ -898,13 +903,15 @@ impl SearchEngine {
         &self,
     ) -> anyhow::Result<(tantivy_engine::ForceMergeStats, tantivy_engine::ForceMergeStats)> {
         let _rebuild_guard = self.rebuild_lock.lock().await;
-        let _slice_write_guard = self.index_write_lock.lock().await;
-        let _full_write_guard = self.full_index_write_lock.lock().await;
+        let (slice_stats, full_stats) = {
+            let _slice_write_guard = self.index_write_lock.lock().await;
+            let _full_write_guard = self.full_index_write_lock.lock().await;
+            let slice_stats = tantivy_engine::force_merge(&self.index).await?;
+            let full_stats = tantivy_engine::force_merge(&self.full_index).await?;
+            (slice_stats, full_stats)
+        };
 
-        let slice_stats = tantivy_engine::force_merge(&self.index).await?;
         reload_reader(&self.index_reader, "index")?;
-
-        let full_stats = tantivy_engine::force_merge(&self.full_index).await?;
         reload_reader(&self.full_index_reader, "full_index")?;
 
         Ok((slice_stats, full_stats))
