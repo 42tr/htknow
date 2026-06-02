@@ -10,7 +10,13 @@ use futures::stream::StreamExt;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, sqlite::SqlitePoolOptions};
-use tantivy::{TantivyDocument, collector::TopDocs, doc, query::AllQuery, schema::Value as _};
+use tantivy::{
+    TantivyDocument, Term,
+    collector::TopDocs,
+    doc,
+    query::{BooleanQuery, Occur, Query, TermQuery},
+    schema::{IndexRecordOption, Value as _},
+};
 use utoipa::ToSchema;
 
 use crate::{config, search::tantivy_engine};
@@ -1183,46 +1189,54 @@ async fn copy_files(
     let copied_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let skipped_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    // Copy original files concurrently
-    let mut copy_tasks = tokio::task::JoinSet::new();
-    for (file_id, src_path) in file_paths {
-        let files_dir = files_dir.to_path_buf();
-        let copied = copied_count.clone();
-        let skipped = skipped_count.clone();
-        copy_tasks.spawn(async move {
-            let src = Path::new(&src_path);
-            if !src.exists() {
-                warn!("Source file not found: {}", src_path);
-                skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                return;
-            }
-            let filename = src.file_name().unwrap_or(std::ffi::OsStr::new("unknown"));
-            let dst = files_dir.join(filename);
-            if let Err(e) = tokio::fs::copy(src, &dst).await {
-                warn!("Failed to copy file {} to {}: {}", src_path, dst.display(), e);
-                skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            } else {
-                debug!("Copied file {} to {}", src_path, dst.display());
-                copied.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        });
-
-        // Also copy PDF concurrently
-        let pdfs_dir = pdfs_dir.to_path_buf();
-        let cfg_pdf_path = cfg.storage.pdf_path.clone();
-        copy_tasks.spawn(async move {
-            let src_pdf = Path::new(&cfg_pdf_path).join(format!("{}.pdf", file_id));
-            if src_pdf.exists() {
-                let dst_pdf = pdfs_dir.join(format!("{}.pdf", file_id));
-                if let Err(e) = tokio::fs::copy(&src_pdf, &dst_pdf).await {
-                    warn!("Failed to copy PDF {} to {}: {}", src_pdf.display(), dst_pdf.display(), e);
+    // Copy original files concurrently via spawn_blocking
+    let file_handles: Vec<_> = file_paths
+        .iter()
+        .cloned()
+        .map(|(_file_id, src_path)| {
+            let files_dir = files_dir.to_path_buf();
+            let copied = copied_count.clone();
+            let skipped = skipped_count.clone();
+            tokio::task::spawn_blocking(move || {
+                let src = Path::new(&src_path);
+                if !src.exists() {
+                    warn!("Source file not found: {}", src_path);
+                    skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    return;
                 }
-            }
-        });
-    }
+                let filename = src.file_name().unwrap_or(std::ffi::OsStr::new("unknown"));
+                let dst = files_dir.join(filename);
+                if let Err(e) = std::fs::copy(src, &dst) {
+                    warn!("Failed to copy file {} to {}: {}", src_path, dst.display(), e);
+                    skipped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                } else {
+                    debug!("Copied file {} to {}", src_path, dst.display());
+                    copied.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            })
+        })
+        .collect();
+    futures::future::join_all(file_handles).await;
 
-    // Wait for all file copy tasks to complete
-    while copy_tasks.join_next().await.is_some() {}
+    // Copy PDFs concurrently via spawn_blocking
+    let pdf_handles: Vec<_> = file_paths
+        .iter()
+        .cloned()
+        .map(|(file_id, _src_path)| {
+            let pdfs_dir = pdfs_dir.to_path_buf();
+            let cfg_pdf_path = cfg.storage.pdf_path.clone();
+            tokio::task::spawn_blocking(move || {
+                let src_pdf = Path::new(&cfg_pdf_path).join(format!("{}.pdf", file_id));
+                if src_pdf.exists() {
+                    let dst_pdf = pdfs_dir.join(format!("{}.pdf", file_id));
+                    if let Err(e) = std::fs::copy(&src_pdf, &dst_pdf) {
+                        warn!("Failed to copy PDF {} to {}: {}", src_pdf.display(), dst_pdf.display(), e);
+                    }
+                }
+            })
+        })
+        .collect();
+    futures::future::join_all(pdf_handles).await;
 
     let copied = copied_count.load(std::sync::atomic::Ordering::Relaxed);
     let skipped = skipped_count.load(std::sync::atomic::Ordering::Relaxed);
@@ -1271,61 +1285,57 @@ async fn copy_images(pool: &SqlitePool, images_dir: &Path, file_ids: &[i64]) -> 
         return Ok(());
     }
 
-    // Copy images concurrently
-    let mut copy_tasks = tokio::task::JoinSet::new();
-    for trimmed in all_img_paths {
-        let images_dir = images_dir.to_path_buf();
-        let cfg_images_path = cfg.storage.images_path.clone();
-        let data_root = data_root.map(|p| p.to_path_buf());
+    // Copy images concurrently via spawn_blocking
+    let img_handles: Vec<_> = all_img_paths
+        .into_iter()
+        .map(|trimmed| {
+            let images_dir = images_dir.to_path_buf();
+            let cfg_images_path = cfg.storage.images_path.clone();
+            let data_root = data_root.map(|p| p.to_path_buf());
 
-        copy_tasks.spawn(async move {
-            // Resolve to absolute path (same logic as resolve_image_storage_path)
-            let use_data_root = trimmed.contains('/') || trimmed.contains('\\');
-            let src = if use_data_root {
-                if let Some(root) = data_root {
-                    root.join(&trimmed)
+            tokio::task::spawn_blocking(move || {
+                // Resolve to absolute path (same logic as resolve_image_storage_path)
+                let use_data_root = trimmed.contains('/') || trimmed.contains('\\');
+                let src = if use_data_root {
+                    if let Some(root) = data_root {
+                        root.join(&trimmed)
+                    } else {
+                        Path::new(&cfg_images_path).join(&trimmed)
+                    }
                 } else {
                     Path::new(&cfg_images_path).join(&trimmed)
+                };
+
+                if !src.exists() {
+                    warn!("Source image not found: {}", src.display());
+                    return false;
                 }
-            } else {
-                Path::new(&cfg_images_path).join(&trimmed)
-            };
 
-            if !src.exists() {
-                warn!("Source image not found: {}", src.display());
-                return;
-            }
+                // Compute destination path
+                let dst = if use_data_root {
+                    images_dir.parent().unwrap_or(&images_dir).join(&trimmed)
+                } else {
+                    images_dir.join(&trimmed)
+                };
 
-            // Compute destination path
-            let dst = if use_data_root {
-                images_dir.parent().unwrap_or(&images_dir).join(&trimmed)
-            } else {
-                images_dir.join(&trimmed)
-            };
+                if let Some(parent) = dst.parent() {
+                    std::fs::create_dir_all(parent).ok();
+                }
 
-            if let Some(parent) = dst.parent() {
-                tokio::fs::create_dir_all(parent).await.ok();
-            }
+                if let Err(e) = std::fs::copy(&src, &dst) {
+                    warn!("Failed to copy image {} to {}: {}", src.display(), dst.display(), e);
+                    false
+                } else {
+                    debug!("Copied image {} to {}", src.display(), dst.display());
+                    true
+                }
+            })
+        })
+        .collect();
 
-            if let Err(e) = tokio::fs::copy(&src, &dst).await {
-                warn!("Failed to copy image {} to {}: {}", src.display(), dst.display(), e);
-            } else {
-                debug!("Copied image {} to {}", src.display(), dst.display());
-            }
-        });
-    }
-
-    let mut copied = 0usize;
-    let mut failed = 0usize;
-    while let Some(result) = copy_tasks.join_next().await {
-        match result {
-            Ok(_) => copied += 1,
-            Err(e) => {
-                warn!("Image copy task failed: {}", e);
-                failed += 1;
-            }
-        }
-    }
+    let results = futures::future::join_all(img_handles).await;
+    let copied = results.iter().filter(|r| r.as_ref().map_or(false, |v| *v)).count();
+    let failed = results.len() - copied;
     info!("Copied {} images, {} failed", copied, failed);
 
     Ok(())
@@ -1336,47 +1346,64 @@ async fn export_tantivy_index(src_path: &str, dst_path: &str, kb_ids: &[i64]) ->
         return Ok(0);
     }
 
-    let step_start = std::time::Instant::now();
-    let src_index = tantivy::Index::open_in_dir(src_path)
-        .with_context(|| format!("Failed to open source Tantivy index: {}", src_path))?;
-    let src_schema = src_index.schema();
-    let kb_id_field = src_schema.get_field("kb_id")?;
+    let src_path = src_path.to_string();
+    let dst_path = dst_path.to_string();
+    let kb_ids = kb_ids.to_vec();
 
-    let reader = src_index.reader()?;
-    let searcher = reader.searcher();
+    tokio::task::spawn_blocking(move || {
+        let step_start = std::time::Instant::now();
+        let src_index = tantivy::Index::open_in_dir(&src_path)
+            .with_context(|| format!("Failed to open source Tantivy index: {}", src_path))?;
+        let src_schema = src_index.schema();
+        let kb_id_field = src_schema.get_field("kb_id")?;
 
-    // Collect all matching documents
-    let all_query = AllQuery;
-    let doc_limit = 10_000_000;
-    let top_docs = searcher.search(&all_query, &TopDocs::with_limit(doc_limit))?;
+        let reader = src_index.reader()?;
+        let searcher = reader.searcher();
 
-    if top_docs.len() == doc_limit {
-        warn!("Tantivy export hit document limit of {}", doc_limit);
-    }
-    let scan_ms = step_start.elapsed().as_millis();
+        // Build a BooleanQuery with TermQuery for each kb_id — directly hits the inverted index
+        let kb_queries: Vec<(Occur, Box<dyn Query>)> = kb_ids
+            .iter()
+            .map(|kb_id| {
+                (
+                    Occur::Should,
+                    Box::new(TermQuery::new(
+                        Term::from_field_i64(kb_id_field, *kb_id),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn Query>,
+                )
+            })
+            .collect();
+        let kb_query = BooleanQuery::new(kb_queries);
+        let doc_limit = 10_000_000;
+        let top_docs = searcher.search(&kb_query, &TopDocs::with_limit(doc_limit))?;
 
-    // Create destination index
-    let s = std::time::Instant::now();
-    let (dst_schema, dst_index) = tantivy_engine::init_with_path(dst_path)?;
-    let writer_memory = config::get().search.tantivy_memory_mb * 1_000_000;
-    let mut writer = dst_index.writer(writer_memory)?;
-    writer.set_merge_policy(Box::new(tantivy::merge_policy::LogMergePolicy::default()));
+        if top_docs.len() == doc_limit {
+            warn!("Tantivy export hit document limit of {}", doc_limit);
+        }
+        let scan_ms = step_start.elapsed().as_millis();
+        info!("  [tantivy] Matched {} docs (scan {}ms)", top_docs.len(), scan_ms);
 
-    let id_field = src_schema.get_field("id")?;
-    let file_id_field = src_schema.get_field("file_id")?;
-    let content_field = src_schema.get_field("content")?;
+        // Create destination index
+        let s = std::time::Instant::now();
+        let (dst_schema, dst_index) = tantivy_engine::init_with_path(&dst_path)?;
+        let writer_memory = config::get().search.tantivy_memory_mb * 1_000_000;
+        let mut writer = dst_index.writer(writer_memory)?;
+        writer.set_merge_policy(Box::new(tantivy::merge_policy::LogMergePolicy::default()));
 
-    let dst_id_field = dst_schema.get_field("id")?;
-    let dst_file_id_field = dst_schema.get_field("file_id")?;
-    let dst_content_field = dst_schema.get_field("content")?;
-    let dst_kb_id_field = dst_schema.get_field("kb_id")?;
+        let id_field = src_schema.get_field("id")?;
+        let file_id_field = src_schema.get_field("file_id")?;
+        let content_field = src_schema.get_field("content")?;
 
-    let mut count = 0;
-    for (_, doc_address) in top_docs {
-        let doc: TantivyDocument = searcher.doc(doc_address)?;
-        let doc_kb_id = doc.get_first(kb_id_field).and_then(|v| v.as_i64());
+        let dst_id_field = dst_schema.get_field("id")?;
+        let dst_file_id_field = dst_schema.get_field("file_id")?;
+        let dst_content_field = dst_schema.get_field("content")?;
+        let dst_kb_id_field = dst_schema.get_field("kb_id")?;
 
-        if doc_kb_id.map_or(false, |id| kb_ids.contains(&id)) {
+        let mut count = 0;
+        for (_, doc_address) in top_docs {
+            let doc: TantivyDocument = searcher.doc(doc_address)?;
+            let doc_kb_id = doc.get_first(kb_id_field).and_then(|v| v.as_i64());
+
             let id = doc.get_first(id_field).and_then(|v| v.as_i64()).unwrap_or(0);
             let file_id = doc.get_first(file_id_field).and_then(|v| v.as_i64()).unwrap_or(0);
             let content = doc.get_first(content_field).and_then(|v| v.as_str()).unwrap_or("");
@@ -1392,18 +1419,20 @@ async fn export_tantivy_index(src_path: &str, dst_path: &str, kb_ids: &[i64]) ->
             writer.add_document(new_doc)?;
             count += 1;
         }
-    }
 
-    writer.commit()?;
-    info!(
-        "Exported {} Tantivy documents to {} (scan {}ms, write {}ms, total {}ms)",
-        count,
-        dst_path,
-        scan_ms,
-        s.elapsed().as_millis(),
-        step_start.elapsed().as_millis()
-    );
-    Ok(count)
+        writer.commit()?;
+        info!(
+            "Exported {} Tantivy documents to {} (scan {}ms, write {}ms, total {}ms)",
+            count,
+            dst_path,
+            scan_ms,
+            s.elapsed().as_millis(),
+            step_start.elapsed().as_millis()
+        );
+        anyhow::Ok(count)
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("Tantivy export task panicked: {}", e))?
 }
 
 async fn export_lancedb(src_path: &str, dst_path: &str, kb_ids: &[i64]) -> anyhow::Result<usize> {
