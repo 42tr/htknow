@@ -31,6 +31,7 @@ use crate::search::SearchEngine;
         knowledge_base::reparse_by_id,
         knowledge_base::delete,
         knowledge_base::tree,
+        knowledge_base::batch_export_kb,
         // File
         file::upload,
         file::list,
@@ -85,6 +86,9 @@ use crate::search::SearchEngine;
             knowledge_base::KnowledgeCreateReq,
             knowledge_base::KnowledgeUpdateReq,
             knowledge_base::ReparseKnowledgeBaseResponse,
+            knowledge_base::ExportKbResponse,
+            knowledge_base::BatchExportKbRequest,
+            crate::export::ExportManifest,
             file::File,
             file::UpdateFileReq,
             file::MoveFileReq,
@@ -158,6 +162,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/", get(knowledge_base::list).post(knowledge_base::create))
         .route("/reparse", post(knowledge_base::reparse))
         .route("/{id}/reparse", post(knowledge_base::reparse_by_id))
+        .route("/export", post(knowledge_base::batch_export_kb))
         .route("/tree", get(knowledge_base::tree))
         .route("/{id}", get(knowledge_base::get).put(knowledge_base::update).delete(knowledge_base::delete));
     let file_router = Router::new()

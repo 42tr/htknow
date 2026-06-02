@@ -4,6 +4,7 @@ import { api } from '../api'
 import FileCard from './FileCard.vue'
 import CreateKnowledgeBase from './CreateKnowledgeBase.vue'
 import FileStatusSummary from './FileStatusSummary.vue'
+import ExportRecordPanel from './ExportRecordPanel.vue'
 import { setCurrentKb } from '../store'
 
 // Reactive state for the current view
@@ -19,6 +20,96 @@ const currentKbReparseLoading = ref(false)
 const childKbReparseLoading = ref({})
 const priorityDrafts = ref({})
 const prioritySaving = ref({})
+
+// Export state
+const selectedKbIds = ref(new Set())
+const exportLoading = ref(false)
+const exportIncludeChildren = ref(false)
+const exportRecords = ref([])
+const EXPORT_RECORDS_KEY = 'htknow_export_records'
+
+const loadExportRecords = () => {
+  try {
+    const raw = localStorage.getItem(EXPORT_RECORDS_KEY)
+    if (raw) exportRecords.value = JSON.parse(raw)
+  } catch {
+    exportRecords.value = []
+  }
+}
+
+const saveExportRecords = () => {
+  localStorage.setItem(EXPORT_RECORDS_KEY, JSON.stringify(exportRecords.value))
+}
+
+const addExportRecord = (result) => {
+  const manifest = result.manifest || {}
+  const record = {
+    id: Date.now(),
+    timestamp: new Date().toISOString(),
+    exportPath: result.export_path || '',
+    kbNames: manifest.kb_names || [],
+    kbCount: manifest.kb_ids?.length || 0,
+    kb_ids: manifest.kb_ids || [],
+    fileCount: manifest.file_count || 0,
+    sliceCount: manifest.slice_count || 0,
+    tantivyDocCount: manifest.tantivy_doc_count || 0,
+    lancedbRowCount: manifest.lancedb_row_count || 0,
+  }
+  exportRecords.value.unshift(record)
+  if (exportRecords.value.length > 50) {
+    exportRecords.value = exportRecords.value.slice(0, 50)
+  }
+  saveExportRecords()
+}
+
+const clearExportRecords = () => {
+  exportRecords.value = []
+  localStorage.removeItem(EXPORT_RECORDS_KEY)
+}
+
+const hasSelectedKbs = computed(() => selectedKbIds.value.size > 0)
+const selectedKbNames = computed(() => {
+  return childrenKbs.value
+    .filter(kb => selectedKbIds.value.has(kb.id))
+    .map(kb => kb.name)
+})
+
+const toggleKbSelection = (kbId) => {
+  if (selectedKbIds.value.has(kbId)) {
+    selectedKbIds.value.delete(kbId)
+  } else {
+    selectedKbIds.value.add(kbId)
+  }
+}
+
+const selectAllKbs = () => {
+  if (selectedKbIds.value.size === childrenKbs.value.length) {
+    selectedKbIds.value.clear()
+  } else {
+    childrenKbs.value.forEach(kb => selectedKbIds.value.add(kb.id))
+  }
+}
+
+const handleExport = async () => {
+  if (selectedKbIds.value.size === 0) return
+  const ids = Array.from(selectedKbIds.value)
+  const names = selectedKbNames.value
+  const label = names.length <= 2 ? names.join('、') : `${names[0]} 等 ${names.length} 个`
+  if (!confirm(`确定要导出「${label}」${exportIncludeChildren.value ? '（含子知识库）' : ''}吗？`)) return
+
+  exportLoading.value = true
+  try {
+    const result = await api.exportKnowledgeBases(ids, exportIncludeChildren.value)
+    addExportRecord(result)
+    alert(`导出成功！\n路径：${result.export_path}`)
+    selectedKbIds.value.clear()
+  } catch (e) {
+    alert('导出失败：' + e.message)
+  } finally {
+    exportLoading.value = false
+  }
+}
+
 const createEmptyStats = () => ({
   total: 0,
   pending: 0,
@@ -93,6 +184,7 @@ const loadKbContent = async (kbId) => {
     priorityDrafts.value = nextPriorityDrafts
     currentKb.value = newCurrentKb;
     setCurrentKb(newCurrentKb); // Update global store
+    selectedKbIds.value.clear()
     await fetchStats(targetId)
   } catch (e) {
     error.value = e.message
@@ -269,6 +361,7 @@ defineExpose({
 // Initial load
 onMounted(() => {
   loadKbContent(null)
+  loadExportRecords()
 })
 </script>
 
@@ -322,6 +415,38 @@ onMounted(() => {
           </svg>
           {{ currentKbReparseLoading ? '解析中...' : '重新解析当前知识库' }}
         </button>
+
+        <!-- Export Controls -->
+        <div v-if="childrenKbs.length > 0" class="flex items-center gap-2"
+          :class="hasSelectedKbs ? 'opacity-100' : 'opacity-60'"
+        >
+          <label class="flex items-center gap-1.5 text-sm text-slate-600 cursor-pointer select-none"
+            @click.stop
+          >
+            <input
+              v-model="exportIncludeChildren"
+              type="checkbox"
+              class="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
+            />
+            含子知识库
+          </label>
+          <button
+            @click="handleExport"
+            :disabled="!hasSelectedKbs || exportLoading"
+            :class="[
+              'px-4 py-2.5 rounded-xl font-medium transition-all duration-200 border flex items-center gap-2',
+              !hasSelectedKbs || exportLoading
+                ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
+                : 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100 hover:border-blue-300'
+            ]"
+          >
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" />
+            </svg>
+            {{ exportLoading ? '导出中...' : `导出选中 (${selectedKbIds.size})` }}
+          </button>
+        </div>
+
         <CreateKnowledgeBase :parent-id="currentKb?.id" @created="handleKbCreated" />
       </div>
     </div>
@@ -365,13 +490,22 @@ onMounted(() => {
           v-for="kb in childrenKbs"
           :key="`kb-${kb.id}`"
           @click="navigateToKb(kb.id)"
-          class="bg-white rounded-xl p-5 border border-slate-200 hover:border-blue-300 hover:shadow-md transition-all duration-200 group cursor-pointer"
+          class="bg-white rounded-xl p-5 border border-slate-200 hover:border-blue-300 hover:shadow-md transition-all duration-200 group cursor-pointer relative"
         >
-           <div class="flex items-start justify-between mb-3">
-             <div class="w-12 h-12 bg-linear-to-br from-blue-100 to-indigo-100 rounded-xl flex items-center justify-center">
-               <span class="text-2xl">📚</span>
-             </div>
-             <div class="flex items-center gap-1">
+          <!-- Selection checkbox -->
+          <div class="absolute top-3 left-3 z-10" @click.stop>
+            <input
+              type="checkbox"
+              :checked="selectedKbIds.has(kb.id)"
+              @change="toggleKbSelection(kb.id)"
+              class="w-5 h-5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
+            />
+          </div>
+          <div class="flex items-start justify-between mb-3 pl-8">
+            <div class="w-12 h-12 bg-linear-to-br from-blue-100 to-indigo-100 rounded-xl flex items-center justify-center">
+              <span class="text-2xl">📚</span>
+            </div>
+            <div class="flex items-center gap-1">
                 <button
                   @click="(e) => handleTogglePublic(e, kb.id, kb.is_public)"
                   :class="[
@@ -469,5 +603,11 @@ onMounted(() => {
         />
       </div>
     </div>
+
+    <!-- Export Records -->
+    <ExportRecordPanel
+      :records="exportRecords"
+      @clear="clearExportRecords"
+    />
   </div>
 </template>

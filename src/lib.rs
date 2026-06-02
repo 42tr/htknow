@@ -6,6 +6,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 pub mod api;
 pub mod config;
 pub mod db;
+pub mod export;
 pub mod frontend;
 pub mod graph;
 pub mod log4rs;

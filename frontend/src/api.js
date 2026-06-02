@@ -416,6 +416,16 @@ export const api = {
     return response.json()
   },
 
+  async exportKnowledgeBases(kbIds, includeChildren = false) {
+    const response = await fetch(`${API_BASE}/knowledge_base/export`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ kb_ids: kbIds, include_children: includeChildren }),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '导出知识库失败'))
+    return response.json()
+  },
+
   // 文件
   async uploadFiles(knowledgeBaseId, files, tags = [], isPublic = false, sliceType = 'smart') {
     const formData = new FormData()

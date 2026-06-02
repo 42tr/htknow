@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use axum::{
     Extension, extract::{Path, Query, State}, response::Json
 };
+use log::warn;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use utoipa::{IntoParams, ToSchema};
@@ -1222,4 +1223,83 @@ pub async fn tree(
     let files_by_kb = load_tree_files_by_kb(&pool, &kb_ids, &auth_user.user_id, is_admin).await?;
     let tree = assemble_tree(knowledges, files_by_kb, params.kb_id);
     Ok(Json(tree))
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct ExportKbResponse {
+    pub export_path: String,
+    pub manifest: crate::export::ExportManifest,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub struct BatchExportKbRequest {
+    pub kb_ids: Vec<i64>,
+    #[serde(default)]
+    pub include_children: bool,
+}
+
+/// 批量导出多个知识库
+#[utoipa::path(
+    post,
+    path = "/api/v1/knowledge/knowledge_base/export",
+    operation_id = "knowledge_base_batch_export",
+    tag = "knowledge_base",
+    request_body = BatchExportKbRequest,
+    responses(
+        (status = 200, description = "成功导出知识库", body = ExportKbResponse),
+        (status = 400, description = "请求参数错误"),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn batch_export_kb(
+    State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
+    Json(req): Json<BatchExportKbRequest>,
+) -> ApiResult<Json<ExportKbResponse>> {
+    let is_admin = auth_user.is_admin();
+
+    if req.kb_ids.is_empty() {
+        return Err(ApiError::BadRequest("kb_ids cannot be empty".to_string()));
+    }
+
+    // Verify all knowledge bases exist and user has access
+    let mut qb = QueryBuilder::<Sqlite>::new(
+        "SELECT id FROM knowledge_bases WHERE id IN ("
+    );
+    let mut separated = qb.separated(", ");
+    for id in &req.kb_ids {
+        separated.push_bind(id);
+    }
+    qb.push(")");
+    if !is_admin {
+        qb.push(" AND (user_id = ").push_bind(&auth_user.user_id).push(" OR is_public = 1)");
+    }
+
+    let allowed_ids: Vec<i64> = qb.build_query_scalar().fetch_all(&pool).await?;
+    if allowed_ids.is_empty() {
+        return Err(ApiError::NotFound("No knowledge bases found or permission denied.".to_string()));
+    }
+
+    if allowed_ids.len() != req.kb_ids.len() {
+        let missing: Vec<i64> = req.kb_ids.iter().filter(|id| !allowed_ids.contains(id)).copied().collect();
+        warn!("User {} tried to export inaccessible KBs: {:?}", auth_user.user_id, missing);
+    }
+
+    let export_path = crate::export::export_knowledge_bases(&pool, &allowed_ids, req.include_children,
+    )
+    .await
+    .map_err(|e| ApiError::Internal(format!("Export failed: {}", e)))?;
+
+    // Read manifest
+    let manifest_path = std::path::Path::new(&export_path).join("manifest.json");
+    let manifest_json = tokio::fs::read_to_string(&manifest_path)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to read manifest: {}", e)))?;
+    let manifest: crate::export::ExportManifest = serde_json::from_str(&manifest_json)
+        .map_err(|e| ApiError::Internal(format!("Failed to parse manifest: {}", e)))?;
+
+    Ok(Json(ExportKbResponse { export_path, manifest }))
 }
