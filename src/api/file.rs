@@ -1,22 +1,35 @@
 use std::{
-    collections::{HashMap, HashSet}, path::Component, sync::{Arc, OnceLock}, time::Instant
+    collections::{HashMap, HashSet},
+    path::Component,
+    sync::{Arc, OnceLock},
+    time::Instant,
 };
 
 use anyhow::Result as AnyResult;
 use axum::{
-    Extension, body::Body, extract::{Multipart, Path, Query, State}, http::{StatusCode, header}, response::Json
+    Extension,
+    body::Body,
+    extract::{Multipart, Path, Query, State},
+    http::{StatusCode, header},
+    response::Json,
 };
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use tokio::{
-    fs, io::AsyncWriteExt as _, spawn, sync::{OwnedSemaphorePermit, Semaphore}
+    fs,
+    io::AsyncWriteExt as _,
+    spawn,
+    sync::{OwnedSemaphorePermit, Semaphore},
 };
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    AuthUser, api::error::{ApiError, ApiResult}, config, pdf_highlight, processor, search::SearchEngine
+    AuthUser,
+    api::error::{ApiError, ApiResult},
+    config, pdf_highlight, processor,
+    search::SearchEngine,
 };
 
 /// Excel 单 sheet 数据

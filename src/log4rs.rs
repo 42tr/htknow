@@ -1,7 +1,9 @@
 use std::{env, str::FromStr};
 
 use log4rs::{
-    append::console::ConsoleAppender, config::{Appender, Config, Logger, Root}, encode::pattern::PatternEncoder
+    append::console::ConsoleAppender,
+    config::{Appender, Config, Logger, Root},
+    encode::pattern::PatternEncoder,
 };
 
 fn parse_rust_log(rust_log: &str) -> (Option<log::LevelFilter>, Vec<Logger>) {

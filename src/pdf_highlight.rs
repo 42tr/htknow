@@ -5,7 +5,9 @@
 use anyhow::Result;
 use log::info;
 use lopdf::{
-    Document, Object, ObjectId, Stream, content::{Content, Operation}, dictionary
+    Document, Object, ObjectId, Stream,
+    content::{Content, Operation},
+    dictionary,
 };
 use serde::{Deserialize, Serialize};
 

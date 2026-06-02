@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use axum::{
-    extract::{Path, Query, State}, response::Json
+    extract::{Path, Query, State},
+    response::Json,
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;

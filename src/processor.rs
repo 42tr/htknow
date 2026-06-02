@@ -1,7 +1,11 @@
 use std::{
-    collections::{HashMap, HashSet}, future::Future, sync::{
-        Arc, atomic::{AtomicBool, AtomicU64, Ordering}
-    }, time::{Duration, Instant, SystemTime, UNIX_EPOCH}
+    collections::{HashMap, HashSet},
+    future::Future,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -14,8 +18,11 @@ use tokio::{fs, time};
 
 use crate::{
     api::{
-        File, collect_image_paths_for_files, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path
-    }, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, SearchEngine, tantivy_engine}
+        File, collect_image_paths_for_files, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path,
+    },
+    config,
+    graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor},
+    search::{self, SearchEngine, tantivy_engine},
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -181,7 +188,8 @@ struct RawSlicePosition {
 
 fn deserialize_slice_positions<'de, D>(deserializer: D) -> std::result::Result<Vec<SlicePosition>, D::Error>
 where
-    D: Deserializer<'de>, {
+    D: Deserializer<'de>,
+{
     let raw_positions: Option<Vec<RawSlicePosition>> = Option::deserialize(deserializer)?;
     let mut positions = Vec::new();
     if let Some(raw_positions) = raw_positions {
@@ -382,7 +390,8 @@ impl ParseTimingCtx {
 
     async fn step<T, Fut>(&mut self, step: &'static str, fut: Fut) -> anyhow::Result<T>
     where
-        Fut: Future<Output=anyhow::Result<T>>, {
+        Fut: Future<Output = anyhow::Result<T>>,
+    {
         let (seq, started_at) = self.step_start(step);
         match fut.await {
             Ok(value) => {
@@ -397,11 +406,10 @@ impl ParseTimingCtx {
     }
 }
 
-async fn timed_step_opt<T, Fut>(
-    timing: Option<&mut ParseTimingCtx>, step: &'static str, fut: Fut,
-) -> anyhow::Result<T>
+async fn timed_step_opt<T, Fut>(timing: Option<&mut ParseTimingCtx>, step: &'static str, fut: Fut) -> anyhow::Result<T>
 where
-    Fut: Future<Output=anyhow::Result<T>>, {
+    Fut: Future<Output = anyhow::Result<T>>,
+{
     match timing {
         Some(ctx) => ctx.step(step, fut).await,
         None => fut.await,

@@ -1,12 +1,21 @@
 use std::{
-    collections::{HashMap, HashSet}, path::Path, thread, time::{Duration, Instant}
+    collections::{HashMap, HashSet},
+    path::Path,
+    thread,
+    time::{Duration, Instant},
 };
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use log::{debug, warn};
 use serde::Serialize;
 use tantivy::{
-    Index, IndexReader, Result, TantivyDocument, TantivyError, Term, collector::TopDocs, directory::error::LockError, doc, merge_policy::LogMergePolicy, query::{BooleanQuery, BoostQuery, Occur, Query, TermQuery}, schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _}
+    Index, IndexReader, Result, TantivyDocument, TantivyError, Term,
+    collector::TopDocs,
+    directory::error::LockError,
+    doc,
+    merge_policy::LogMergePolicy,
+    query::{BooleanQuery, BoostQuery, Occur, Query, TermQuery},
+    schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _},
 };
 use tokio::time::sleep;
 
@@ -190,7 +199,7 @@ pub async fn create_rebuild_writer(index: &Index, label: &str) -> tantivy::Resul
 }
 
 pub fn add_documents(
-    index_writer: &mut tantivy::IndexWriter, schema: &Schema, docs: impl IntoIterator<Item=Document>,
+    index_writer: &mut tantivy::IndexWriter, schema: &Schema, docs: impl IntoIterator<Item = Document>,
 ) -> tantivy::Result<usize> {
     let mut count = 0_usize;
     for doc in docs {

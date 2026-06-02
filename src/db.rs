@@ -1,11 +1,15 @@
 use std::{
-    collections::HashSet, fs::OpenOptions, path::{Path, PathBuf}, time::Duration
+    collections::HashSet,
+    fs::OpenOptions,
+    path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::Context;
 use log::info;
 use sqlx::{
-    Row, SqlitePool, sqlite::{SqliteConnectOptions, SqlitePoolOptions}
+    Row, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
 use crate::config;

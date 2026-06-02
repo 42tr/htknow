@@ -1,5 +1,9 @@
 use std::{
-    collections::{HashMap, HashSet}, fs, path::Path, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, anyhow};
@@ -161,8 +165,9 @@ impl SearchEngine {
 
     pub async fn rebuild_tantivy_indexes<F, Fut>(&self, job_tag: &str, mut on_progress: F) -> anyhow::Result<()>
     where
-        F: FnMut(RebuildProgress) -> Fut+Send,
-        Fut: std::future::Future<Output=()>+Send, {
+        F: FnMut(RebuildProgress) -> Fut + Send,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
         let Some(pool) = &self.pool else {
             return Err(anyhow!("search engine db pool not set"));
         };
@@ -750,10 +755,7 @@ impl SearchEngine {
                 .send()
                 .await?
         } else {
-            let rerank_request = SimpleRerankRequest {
-                query: query.to_string(),
-                texts: documents.clone(),
-            };
+            let rerank_request = SimpleRerankRequest { query: query.to_string(), texts: documents.clone() };
             RERANK_HTTP_CLIENT
                 .post(&cfg.services.rerank_url)
                 .timeout(Duration::from_secs(cfg.search.rerank_timeout_secs))
@@ -766,12 +768,7 @@ impl SearchEngine {
         if !response.status().is_success() {
             let status = response.status();
             let error_text = response.text().await.unwrap_or_default();
-            anyhow::bail!(
-                "Rerank API failed with status {}: {}; documents={}",
-                status,
-                error_text,
-                documents.len()
-            );
+            anyhow::bail!("Rerank API failed with status {}: {}; documents={}", status, error_text, documents.len());
         }
 
         // 先获取响应文本用于调试

@@ -1,12 +1,18 @@
 use std::{
-    cmp::Ordering, collections::{HashMap, HashSet}, convert::Infallible, time::Instant
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    time::Instant,
 };
 
 use anyhow::anyhow;
 use axum::{
-    Extension, extract::{Multipart, Path, Query, State}, response::{
-        Json, sse::{Event, KeepAlive, KeepAliveStream, Sse}
-    }
+    Extension,
+    extract::{Multipart, Path, Query, State},
+    response::{
+        Json,
+        sse::{Event, KeepAlive, KeepAliveStream, Sse},
+    },
 };
 use chrono::Utc;
 use log::{error, info, warn};
@@ -19,11 +25,16 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::File;
 use crate::{
-    AuthUser, api::error::{ApiError, ApiResult}, processor, search::{
-        RebuildProgress, SearchEngine, SearchResultItem as EngineSearchResultItem, advanced::{
-            ChunkRefiner, ChunkSegment, LlmClient, PlanAction, PlanStep, QueryPlanner, RefineOutcome, RelevanceJudge, assemble_context_chunk
-        }
-    }
+    AuthUser,
+    api::error::{ApiError, ApiResult},
+    processor,
+    search::{
+        RebuildProgress, SearchEngine, SearchResultItem as EngineSearchResultItem,
+        advanced::{
+            ChunkRefiner, ChunkSegment, LlmClient, PlanAction, PlanStep, QueryPlanner, RefineOutcome, RelevanceJudge,
+            assemble_context_chunk,
+        },
+    },
 };
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -107,7 +118,8 @@ pub struct AdvancedSearchQuery {
 
 fn deserialize_id_list<'de, D>(deserializer: D) -> Result<Option<Vec<i64>>, D::Error>
 where
-    D: serde::Deserializer<'de>, {
+    D: serde::Deserializer<'de>,
+{
     let raw = Option::<String>::deserialize(deserializer)?;
     let Some(raw) = raw else {
         return Ok(None);
@@ -1573,7 +1585,8 @@ pub async fn search_full(
     }
 
     let file_ids = if let Some(filename) = params.filename.as_ref().filter(|f| !f.is_empty()) {
-        let matched_ids = search_file_ids_by_name(&pool, filename, kb_ids_to_search.as_ref(), &user_id, is_admin).await?;
+        let matched_ids =
+            search_file_ids_by_name(&pool, filename, kb_ids_to_search.as_ref(), &user_id, is_admin).await?;
         if matched_ids.is_empty() {
             return Ok(Json(FullSearchResult { results: vec![] }));
         }
@@ -1602,7 +1615,8 @@ pub async fn search_full(
         }
         let file_map = get_full_files_by_ids(&pool, &ids).await?;
         let kb_ids_in_files: Vec<i64> = file_map.values().filter_map(|f| f.kb_id).collect();
-        let kb_map = if !kb_ids_in_files.is_empty() { get_kbs_by_ids(&pool, &kb_ids_in_files).await? } else { HashMap::new() };
+        let kb_map =
+            if !kb_ids_in_files.is_empty() { get_kbs_by_ids(&pool, &kb_ids_in_files).await? } else { HashMap::new() };
         file_map
             .values()
             .filter_map(|f| {

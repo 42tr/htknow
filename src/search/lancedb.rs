@@ -1,17 +1,23 @@
 use std::{
-    path::Path, sync::{
-        Arc, atomic::{AtomicBool, Ordering}
-    }
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 use anyhow::Result;
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Int64Array, RecordBatch, StringArray, builder::{FixedSizeListBuilder, Float32Builder}
+    Array, ArrayRef, BooleanArray, Float32Array, Int64Array, RecordBatch, StringArray,
+    builder::{FixedSizeListBuilder, Float32Builder},
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::stream::StreamExt;
 use lancedb::{
-    Connection, Table, connect, index::Index, query::{ExecutableQuery, QueryBase, Select}, table::{CompactionOptions, Duration, NewColumnTransform, OptimizeAction, OptimizeOptions}
+    Connection, Table, connect,
+    index::Index,
+    query::{ExecutableQuery, QueryBase, Select},
+    table::{CompactionOptions, Duration, NewColumnTransform, OptimizeAction, OptimizeOptions},
 };
 use log::{debug, info, warn};
 use once_cell::sync::OnceCell;
@@ -447,16 +453,19 @@ fn create_empty_batch(schema: &Arc<ArrowSchema>) -> Result<RecordBatch> {
     let mut image_list_builder = FixedSizeListBuilder::new(image_value_builder, image_vector_dim);
     let image_vector_array: ArrayRef = Arc::new(image_list_builder.finish());
 
-    Ok(RecordBatch::try_new(schema.clone(), vec![
-        id_array,
-        file_id_array,
-        kb_id_array,
-        content_array,
-        is_image_array,
-        is_deleted_array,
-        vector_array,
-        image_vector_array,
-    ])?)
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            id_array,
+            file_id_array,
+            kb_id_array,
+            content_array,
+            is_image_array,
+            is_deleted_array,
+            vector_array,
+            image_vector_array,
+        ],
+    )?)
 }
 
 async fn create_record_batch(docs: Vec<Document>, schema: &Arc<ArrowSchema>) -> Result<RecordBatch> {
@@ -521,16 +530,19 @@ async fn create_record_batch(docs: Vec<Document>, schema: &Arc<ArrowSchema>) -> 
     }
     let image_vector_array: ArrayRef = Arc::new(image_list_builder.finish());
 
-    Ok(RecordBatch::try_new(schema.clone(), vec![
-        id_array,
-        file_id_array,
-        kb_id_array,
-        content_array,
-        is_image_array,
-        is_deleted_array,
-        vector_array,
-        image_vector_array,
-    ])?)
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            id_array,
+            file_id_array,
+            kb_id_array,
+            content_array,
+            is_image_array,
+            is_deleted_array,
+            vector_array,
+            image_vector_array,
+        ],
+    )?)
 }
 
 async fn ensure_is_deleted_column(table: &lancedb::Table) -> Result<()> {

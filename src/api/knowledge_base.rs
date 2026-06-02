@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use axum::{
-    Extension, extract::{Path, Query, State}, response::Json
+    Extension,
+    extract::{Path, Query, State},
+    response::Json,
 };
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -10,7 +12,9 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::file::{self, FileStatusBreakdown};
 use crate::{
-    AuthUser, api::error::{ApiError, ApiResult}, search::SearchEngine
+    AuthUser,
+    api::error::{ApiError, ApiResult},
+    search::SearchEngine,
 };
 
 const KB_TYPE_ANALYSIS: &str = "analysis";
@@ -1256,8 +1260,7 @@ pub struct BatchExportKbRequest {
     )
 )]
 pub async fn batch_export_kb(
-    State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
-    Json(req): Json<BatchExportKbRequest>,
+    State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Json(req): Json<BatchExportKbRequest>,
 ) -> ApiResult<Json<ExportKbResponse>> {
     let is_admin = auth_user.is_admin();
 
@@ -1266,9 +1269,7 @@ pub async fn batch_export_kb(
     }
 
     // Verify all knowledge bases exist and user has access
-    let mut qb = QueryBuilder::<Sqlite>::new(
-        "SELECT id FROM knowledge_bases WHERE id IN ("
-    );
+    let mut qb = QueryBuilder::<Sqlite>::new("SELECT id FROM knowledge_bases WHERE id IN (");
     let mut separated = qb.separated(", ");
     for id in &req.kb_ids {
         separated.push_bind(id);
@@ -1288,10 +1289,9 @@ pub async fn batch_export_kb(
         warn!("User {} tried to export inaccessible KBs: {:?}", auth_user.user_id, missing);
     }
 
-    let export_path = crate::export::export_knowledge_bases(&pool, &allowed_ids, req.include_children,
-    )
-    .await
-    .map_err(|e| ApiError::Internal(format!("Export failed: {}", e)))?;
+    let export_path = crate::export::export_knowledge_bases(&pool, &allowed_ids, req.include_children)
+        .await
+        .map_err(|e| ApiError::Internal(format!("Export failed: {}", e)))?;
 
     // Read manifest
     let manifest_path = std::path::Path::new(&export_path).join("manifest.json");
