@@ -578,9 +578,9 @@ async fn export_files(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i6
                     let id: i64 = row.get("id");
                     let path: String = row.get("path");
                     let relative_path = if path.starts_with(&files_path_prefix) {
-                        format!("files/{}", &path[files_path_prefix.len()..])
+                        format!("data/files/{}", &path[files_path_prefix.len()..])
                     } else if let Some(filename) = Path::new(&path).file_name() {
-                        format!("files/{}", filename.to_string_lossy())
+                        format!("data/files/{}", filename.to_string_lossy())
                     } else {
                         path.clone()
                     };
