@@ -83,34 +83,44 @@ const formatSize = (bytes) => {
 }
 
 const loadEntries = async () => {
+  console.log('[ArchiveViewer] loadEntries start, file_id=' + props.file.id)
   loading.value = true
   error.value = ''
   try {
     const data = await api.getArchiveEntries(props.file.id)
+    console.log('[ArchiveViewer] getArchiveEntries returned', data.length, 'entries')
     entries.value = data
     needsPassword.value = false
     // 如果数据库中没有记录（还没解压过），自动解压
     if (entries.value.length === 0) {
+      console.log('[ArchiveViewer] entries empty, triggering extractArchive')
       await extractArchive()
+    } else {
+      console.log('[ArchiveViewer] entries loaded from db:', entries.value.map(e => e.entry_path))
     }
   } catch (e) {
+    console.error('[ArchiveViewer] getArchiveEntries failed:', e)
     error.value = e.message || '加载失败'
   } finally {
     loading.value = false
+    console.log('[ArchiveViewer] loadEntries done, final entries.length=', entries.value.length)
   }
 }
 
 const extractArchive = async () => {
+  console.log('[ArchiveViewer] extractArchive start, password_provided=' + !!password.value)
   loading.value = true
   error.value = ''
   try {
     const result = await api.extractArchive(props.file.id, password.value || null)
+    console.log('[ArchiveViewer] extractArchive response:', result)
     if (result.needs_password) {
       needsPassword.value = true
       entries.value = []
     } else {
       needsPassword.value = false
       entries.value = result.entries || []
+      console.log('[ArchiveViewer] extracted', entries.value.length, 'entries:', entries.value.map(e => e.entry_path))
       // 默认展开第一层目录
       for (const entry of entries.value) {
         const parts = entry.entry_path.split('/')
@@ -120,9 +130,11 @@ const extractArchive = async () => {
       }
     }
   } catch (e) {
+    console.error('[ArchiveViewer] extractArchive failed:', e)
     error.value = e.message || '解压失败'
   } finally {
     loading.value = false
+    console.log('[ArchiveViewer] extractArchive done')
   }
 }
 
