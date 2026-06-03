@@ -219,14 +219,16 @@ fn extract_zip(
             archive.by_index(i).map_err(|e| ArchiveError::Zip(e.to_string()))?
         };
 
+        let raw_name = file_entry.name().to_string();
         // 统一路径分隔符为 /，并处理连续分隔符和首尾分隔符
-        let name: String = file_entry.name()
+        let name: String = raw_name
             .replace('\\', "/")
             .split('/')
             .filter(|s| !s.is_empty())
             .collect::<Vec<_>>()
             .join("/");
         if name.is_empty() {
+            log::info!("ZIP entry {}: raw_name={:?} -> skipped (empty after normalization)", i, raw_name);
             continue;
         }
         // zip crate 的 is_dir 只认 / 结尾；统一分隔符后重新判断
@@ -238,7 +240,7 @@ fn extract_zip(
         };
         let size = file_entry.size();
 
-        log::debug!("ZIP entry: name={}, is_dir={}, size={}", name, is_dir, size);
+        log::info!("ZIP entry {}: raw_name={:?} -> normalized={}, is_dir={}, size={}", i, raw_name, name, is_dir, size);
 
         // 安全检查：路径遍历
         if name.contains("..") {

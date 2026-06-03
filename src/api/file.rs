@@ -13,7 +13,7 @@ use axum::{
     http::{StatusCode, header},
     response::Json,
 };
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
@@ -2226,17 +2226,28 @@ pub async fn archive_extract(
     // 执行解压
     let password = req.password.clone();
     let file_path = file.path.clone();
+    info!("archive_extract: starting extraction for file_id={}, path={:?}, password_provided={}", id, file_path, password.is_some());
     let entries = match tokio::task::spawn_blocking(move || {
         archive::extract_archive(&file_path, dest_dir.to_string_lossy().as_ref(), password.as_deref(), id)
     })
     .await
     {
-        Ok(Ok(entries)) => entries,
+        Ok(Ok(entries)) => {
+            info!("archive_extract: extraction succeeded for file_id={}, entries={}", id, entries.len());
+            entries
+        }
         Ok(Err(archive::ArchiveError::PasswordRequired)) => {
+            info!("archive_extract: password required for file_id={}", id);
             return Ok(Json(ExtractResult { entries: vec![], needs_password: true }));
         }
-        Ok(Err(e)) => return Err(ApiError::BadRequest(e.to_string())),
-        Err(e) => return Err(ApiError::Internal(format!("Archive extraction task failed: {}", e))),
+        Ok(Err(e)) => {
+            warn!("archive_extract: extraction failed for file_id={}: {}", id, e);
+            return Err(ApiError::BadRequest(e.to_string()));
+        }
+        Err(e) => {
+            error!("archive_extract: spawn_blocking failed for file_id={}: {}", id, e);
+            return Err(ApiError::Internal(format!("Archive extraction task failed: {}", e)));
+        }
     };
 
     // 写入数据库
