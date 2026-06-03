@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
 import { api } from '../api'
+import ArchiveTreeNode from './ArchiveTreeNode.vue'
 
 const props = defineProps({
   file: {
@@ -56,14 +57,6 @@ const fileTree = computed(() => {
   return root
 })
 
-const sortedChildren = (node) => {
-  const children = Object.values(node.children || {})
-  return children.sort((a, b) => {
-    if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
-    return a.name.localeCompare(b.name)
-  })
-}
-
 const isExpanded = (path) => expandedDirs.value.has(path)
 
 const toggleDir = (path) => {
@@ -72,14 +65,6 @@ const toggleDir = (path) => {
   } else {
     expandedDirs.value.add(path)
   }
-}
-
-const formatSize = (bytes) => {
-  if (bytes == null) return '-'
-  if (bytes < 1024) return bytes + ' B'
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
-  if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
-  return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB'
 }
 
 const loadEntries = async () => {
@@ -91,7 +76,6 @@ const loadEntries = async () => {
     console.log('[ArchiveViewer] getArchiveEntries returned', data.length, 'entries')
     entries.value = data
     needsPassword.value = false
-    // 如果数据库中没有记录（还没解压过），自动解压
     if (entries.value.length === 0) {
       console.log('[ArchiveViewer] entries empty, triggering extractArchive')
       await extractArchive()
@@ -121,7 +105,6 @@ const extractArchive = async () => {
       needsPassword.value = false
       entries.value = result.entries || []
       console.log('[ArchiveViewer] extracted', entries.value.length, 'entries:', entries.value.map(e => e.entry_path))
-      // 默认展开第一层目录
       for (const entry of entries.value) {
         const parts = entry.entry_path.split('/')
         if (parts.length > 1) {
@@ -254,7 +237,6 @@ watch(() => props.file, () => {
               </button>
             </div>
             <div class="border border-slate-100 rounded-xl overflow-hidden">
-              <!-- 递归渲染树 -->
               <ArchiveTreeNode
                 :node="fileTree"
                 :level="0"
@@ -276,83 +258,3 @@ watch(() => props.file, () => {
     </div>
   </Teleport>
 </template>
-
-<script>
-// 递归树节点组件（必须在同一文件中定义，因为前端没有单独注册）
-export default {
-  components: {
-    ArchiveTreeNode: {
-      name: 'ArchiveTreeNode',
-      props: {
-        node: { type: Object, required: true },
-        level: { type: Number, default: 0 },
-        expandedDirs: { type: Set, required: true },
-        downloading: { type: Set, required: true }
-      },
-      emits: ['toggle', 'download'],
-      setup(props, { emit, slots }) {
-        const isExpanded = (path) => props.expandedDirs.has(path)
-
-        const sortedChildren = (node) => {
-          const children = Object.values(node.children || {})
-          return children.sort((a, b) => {
-            if (a.isDir !== b.isDir) return a.isDir ? -1 : 1
-            return a.name.localeCompare(b.name)
-          })
-        }
-
-        const formatSize = (bytes) => {
-          if (bytes == null) return '-'
-          if (bytes < 1024) return bytes + ' B'
-          if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
-          if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
-          return (bytes / (1024 * 1024 * 1024)).toFixed(1) + ' GB'
-        }
-
-        return { isExpanded, sortedChildren, formatSize, emit }
-      },
-      template: `
-        <div>
-          <div v-for="child in sortedChildren(node)" :key="child.path">
-            <div
-              v-if="child.isDir"
-              class="flex items-center gap-2 py-1.5 px-2 hover:bg-slate-50 rounded cursor-pointer select-none"
-              :style="{ paddingLeft: (level * 16 + 8) + 'px' }"
-              @click="$emit('toggle', child.path)"
-            >
-              <span class="text-amber-500 text-sm">{{ isExpanded(child.path) ? '📂' : '📁' }}</span>
-              <span class="text-sm text-slate-700">{{ child.name }}</span>
-            </div>
-            <div
-              v-else
-              class="flex items-center gap-2 py-1.5 px-2 hover:bg-slate-50 rounded cursor-pointer group"
-              :style="{ paddingLeft: (level * 16 + 8) + 'px' }"
-            >
-              <span class="text-slate-400 text-sm">📄</span>
-              <span class="text-sm text-slate-700 flex-1 truncate">{{ child.name }}</span>
-              <span class="text-xs text-slate-400 mr-2">{{ formatSize(child.size) }}</span>
-              <button
-                @click.stop="$emit('download', child.path)"
-                :disabled="downloading.has(child.path)"
-                class="opacity-0 group-hover:opacity-100 p-1 text-slate-400 hover:text-emerald-500 hover:bg-emerald-50 rounded transition-all text-xs"
-                title="下载"
-              >
-                {{ downloading.has(child.path) ? '⏳' : '⬇️' }}
-              </button>
-            </div>
-            <ArchiveTreeNode
-              v-if="child.isDir && isExpanded(child.path)"
-              :node="child"
-              :level="level + 1"
-              :expanded-dirs="expandedDirs"
-              :downloading="downloading"
-              @toggle="$emit('toggle', $event)"
-              @download="$emit('download', $event)"
-            />
-          </div>
-        </div>
-      `
-    }
-  }
-}
-</script>

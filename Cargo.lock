@@ -2427,6 +2427,7 @@ dependencies = [
  "bzip2 0.4.4",
  "calamine",
  "chrono",
+ "encoding_rs",
  "etcd-client",
  "flate2",
  "futures",

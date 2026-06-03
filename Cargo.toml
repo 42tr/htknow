@@ -63,6 +63,9 @@ xz2 = "0.1"
 # 错误处理
 thiserror = "1"
 
+# 编码处理（ZIP 中文文件名 GBK/GB18030 解码）
+encoding_rs = "0.8"
+
 # etcd 配置中心（可选）
 etcd-client = { version = "0.14", optional = true }
 serde_with = "3.16.1"

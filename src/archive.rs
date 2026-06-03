@@ -6,8 +6,34 @@
 use std::io::Read;
 use std::path::Path;
 
+use encoding_rs::GB18030;
 use serde::Serialize;
 use utoipa::ToSchema;
+
+/// 智能解码文件名：先尝试 UTF-8，发现乱码时回退到 GB18030（兼容 GBK/GB2312）
+fn decode_filename(raw: &[u8]) -> String {
+    // 先尝试 UTF-8
+    if let Ok(utf8) = std::str::from_utf8(raw) {
+        // 如果 UTF-8 解码成功且不包含替换字符，直接使用
+        if !utf8.contains('\u{FFFD}') {
+            return utf8.to_string();
+        }
+    }
+
+    // 尝试 GB18030（兼容 GBK/GB2312）
+    let (decoded, _, had_errors) = GB18030.decode(raw);
+    if !had_errors {
+        return decoded.to_string();
+    }
+
+    // 回退：UTF-8 lossy
+    String::from_utf8_lossy(raw).to_string()
+}
+
+/// 判断原始文件名是否表示目录（以 / 或 \ 结尾）
+fn is_dir_from_raw(raw: &[u8]) -> bool {
+    raw.ends_with(b"/") || raw.ends_with(b"\\")
+}
 
 /// 压缩包内单个文件条目
 #[derive(Debug, Clone, Serialize, sqlx::FromRow, ToSchema)]
@@ -213,7 +239,8 @@ fn extract_zip(
             archive.by_index(i).map_err(|e| ArchiveError::Zip(e.to_string()))?
         };
 
-        let raw_name = file_entry.name().to_string();
+        let raw_bytes = file_entry.name_raw();
+        let raw_name = decode_filename(raw_bytes);
         // 统一路径分隔符为 /，并处理连续分隔符和首尾分隔符
         let name: String = raw_name
             .replace('\\', "/")
@@ -222,11 +249,10 @@ fn extract_zip(
             .collect::<Vec<_>>()
             .join("/");
         if name.is_empty() {
-            log::info!("ZIP entry {}: raw_name={:?} -> skipped (empty after normalization)", i, raw_name);
+            log::info!("ZIP entry {}: raw={:?} utf8={:?} -> skipped (empty after normalization)", i, raw_bytes, raw_name);
             continue;
         }
-        // zip crate 的 is_dir 只认 / 结尾；统一分隔符后重新判断
-        let is_dir = file_entry.name().ends_with('/') || file_entry.name().ends_with('\\');
+        let is_dir = is_dir_from_raw(raw_bytes);
         let name = if is_dir && name.ends_with('/') {
             name.trim_end_matches('/').to_string()
         } else {
@@ -234,7 +260,7 @@ fn extract_zip(
         };
         let size = file_entry.size();
 
-        log::info!("ZIP entry {}: raw_name={:?} -> normalized={}, is_dir={}, size={}", i, raw_name, name, is_dir, size);
+        log::info!("ZIP entry {}: raw={:?} decoded={:?} -> normalized={}, is_dir={}, size={}", i, raw_bytes, raw_name, name, is_dir, size);
 
         // 安全检查：路径遍历
         if name.contains("..") {
@@ -304,43 +330,39 @@ fn read_zip_entry(
     };
 
     let password_bytes = password.map(|p| p.as_bytes());
-    // ZIP 内部路径统一使用 /，但传入的 entry_path 可能已经统一
-    let normalized_entry = entry_path.replace('\\', "/");
+    let normalized_target = entry_path.replace('\\', "/").trim_start_matches('/').trim_end_matches('/').to_string();
 
-    // 先检查文件是否加密
-    let is_encrypted = {
-        let file = archive.by_name(&normalized_entry).map_err(|e| match e {
-            zip::result::ZipError::FileNotFound => {
-                ArchiveError::Other(format!("文件不存在: {}", entry_path))
-            }
-            _ => ArchiveError::Zip(e.to_string()),
-        })?;
-        file.encrypted()
-    };
+    // 遍历所有条目，用解码后的文件名匹配（处理 GBK 编码中文文件名）
+    for i in 0..archive.len() {
+        let file_ref = archive.by_index(i).map_err(|e| ArchiveError::Zip(e.to_string()))?;
+        let decoded_name = decode_filename(file_ref.name_raw());
+        let normalized_name = decoded_name
+            .replace('\\', "/")
+            .trim_start_matches('/')
+            .trim_end_matches('/')
+            .to_string();
 
-    let mut file_entry = if is_encrypted {
-        if let Some(pw) = password_bytes {
-            archive.by_name_decrypt(&normalized_entry, pw).map_err(|e| match e {
-                zip::result::ZipError::FileNotFound => {
-                    ArchiveError::Other(format!("文件不存在: {}", entry_path))
+        if normalized_name == normalized_target {
+            let is_encrypted = file_ref.encrypted();
+            drop(file_ref);
+
+            let mut file_entry = if is_encrypted {
+                if let Some(pw) = password_bytes {
+                    archive.by_index_decrypt(i, pw).map_err(|e| ArchiveError::Zip(e.to_string()))?
+                } else {
+                    return Err(ArchiveError::PasswordRequired);
                 }
-                _ => ArchiveError::Zip(e.to_string()),
-            })?
-        } else {
-            return Err(ArchiveError::PasswordRequired);
-        }
-    } else {
-        archive.by_name(&normalized_entry).map_err(|e| match e {
-            zip::result::ZipError::FileNotFound => {
-                ArchiveError::Other(format!("文件不存在: {}", entry_path))
-            }
-            _ => ArchiveError::Zip(e.to_string()),
-        })?
-    };
+            } else {
+                archive.by_index(i).map_err(|e| ArchiveError::Zip(e.to_string()))?
+            };
 
-    let mut buf = Vec::new();
-    file_entry.read_to_end(&mut buf)?;
-    Ok(buf)
+            let mut buf = Vec::new();
+            file_entry.read_to_end(&mut buf)?;
+            return Ok(buf);
+        }
+    }
+
+    Err(ArchiveError::Other(format!("文件不存在: {}", entry_path)))
 }
 
 // ============================================================================
@@ -378,14 +400,14 @@ fn extract_tar(
 
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
-        let path = entry.path()?;
-        let name = path.to_string_lossy().replace('\\', "/");
-        let name = name.trim_start_matches('/').trim_end_matches('/').to_string();
+        let raw_path = entry.path_bytes();
+        let decoded = decode_filename(&raw_path);
+        let name = decoded.replace('\\', "/").trim_start_matches('/').trim_end_matches('/').to_string();
         if name.is_empty() {
             continue;
         }
-        let is_dir = entry.header().entry_type().is_dir() || name.ends_with('/');
-        let name = if is_dir { name.trim_end_matches('/').to_string() } else { name };
+        let is_dir = entry.header().entry_type().is_dir() || decoded.ends_with('/') || decoded.ends_with('\\');
+        let name = if is_dir && name.ends_with('/') { name.trim_end_matches('/').to_string() } else { name };
         let size = entry.size();
 
         // 安全检查
@@ -450,8 +472,9 @@ fn read_tar_entry(src_path: &str, entry_path: &str) -> Result<Vec<u8>, ArchiveEr
 
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
-        let path = entry.path()?;
-        let name = path.to_string_lossy().replace('\\', "/").trim_start_matches('/').trim_end_matches('/').to_string();
+        let raw_path = entry.path_bytes();
+        let decoded = decode_filename(&raw_path);
+        let name = decoded.replace('\\', "/").trim_start_matches('/').trim_end_matches('/').to_string();
 
         if name == normalized_target {
             let mut buf = Vec::new();
