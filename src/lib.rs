@@ -7,6 +7,7 @@ use axum::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 
 pub mod api;
+pub mod archive;
 pub mod config;
 pub mod db;
 pub mod export;

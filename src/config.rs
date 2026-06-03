@@ -133,6 +133,8 @@ pub struct StorageConfig {
     pub pdf_path: String,
     /// 上传文件保存路径
     pub files_path: String,
+    /// 压缩文件解压后保存路径
+    pub archives_path: String,
 }
 
 /// 搜索配置
@@ -268,6 +270,7 @@ impl StorageConfig {
             images_path: env_or("HTKNOW_IMAGES_PATH", &format!("{}/images", data_dir)),
             pdf_path: env_or("HTKNOW_PDF_PATH", &format!("{}/pdfs", data_dir)),
             files_path: env_or("HTKNOW_FILES_PATH", &format!("{}/files", data_dir)),
+            archives_path: env_or("HTKNOW_ARCHIVES_PATH", &format!("{}/archives", data_dir)),
         }
     }
 }

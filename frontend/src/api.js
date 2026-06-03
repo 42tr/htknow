@@ -600,6 +600,34 @@ export const api = {
     return response.json()
   },
 
+  // 压缩文件
+  async getArchiveEntries(id) {
+    const response = await fetch(`${API_BASE}/files/${id}/archive-entries`, {
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error('获取压缩文件列表失败')
+    return response.json()
+  },
+
+  async extractArchive(id, password = null) {
+    const response = await fetch(`${API_BASE}/files/${id}/archive-extract`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ password }),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '解压失败'))
+    return response.json()
+  },
+
+  async downloadArchiveEntry(id, path) {
+    const encodedPath = encodeURIComponent(path)
+    const response = await fetch(`${API_BASE}/files/${id}/archive-download?path=${encodedPath}`, {
+      headers: getHeaders(false),
+    })
+    if (!response.ok) throw new Error('下载文件失败')
+    return response.blob()
+  },
+
   // 知识图谱
   async searchEntities(query = null, entityType = null, kbId = null, limit = 100, fileId = null) {
     let url = `${API_BASE}/graph/entities?limit=${limit}`

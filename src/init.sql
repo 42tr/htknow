@@ -183,6 +183,18 @@ CREATE TABLE IF NOT EXISTS search_synonyms (
 CREATE INDEX IF NOT EXISTS idx_search_synonyms_term ON search_synonyms(term);
 CREATE INDEX IF NOT EXISTS idx_search_synonyms_synonym ON search_synonyms(synonym);
 
+-- 压缩文件条目表
+CREATE TABLE IF NOT EXISTS archive_entries (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL,
+    entry_path TEXT NOT NULL,
+    size INTEGER,
+    is_directory INTEGER DEFAULT 0,
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    FOREIGN KEY (file_id) REFERENCES files(id) ON DELETE CASCADE
+);
+CREATE INDEX IF NOT EXISTS idx_archive_entries_file_id ON archive_entries(file_id);
+
 -- 索引重建任务状态
 CREATE TABLE IF NOT EXISTS index_rebuild_jobs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

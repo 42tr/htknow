@@ -4,6 +4,7 @@ import { api } from '../api'
 import FileSlices from './FileSlices.vue'
 import FileGraph from './FileGraph.vue'
 import KnowledgeBaseSelector from './KnowledgeBaseSelector.vue'
+import ArchiveViewer from './ArchiveViewer.vue'
 
 const props = defineProps({
   file: {
@@ -23,6 +24,7 @@ const showSettings = ref(false)
 const showGraph = ref(false)
 const showTagsEditor = ref(false)
 const showMoveKbSelector = ref(false)
+const showArchive = ref(false)
 const selectedSliceType = ref(props.file.slice_type || 'paragraph')
 const updating = ref(false)
 const downloading = ref(false)
@@ -37,6 +39,12 @@ const sliceTypes = [
 
 const isStorageKb = computed(() => props.kbType === 'storage')
 
+const isArchive = computed(() => {
+  if (!props.file?.filename) return false
+  const lower = props.file.filename.toLowerCase()
+  return /\.(zip|7z|tar|tgz|tar\.gz|tar\.bz2|tar\.xz)$/i.test(lower)
+})
+
 const statusInfo = computed(() => {
   switch (props.file.status) {
     case 0:
@@ -46,7 +54,9 @@ const statusInfo = computed(() => {
     case 1:
       return { text: '已完成', color: 'bg-green-100 text-green-700', icon: '✓' }
     case 3:
-      return { text: '不解析', color: 'bg-amber-100 text-amber-700', icon: '🗄️' }
+      return isArchive.value
+        ? { text: '压缩文件', color: 'bg-purple-100 text-purple-700', icon: '📦' }
+        : { text: '不解析', color: 'bg-amber-100 text-amber-700', icon: '🗄️' }
     case -1:
       return { text: '处理失败', color: 'bg-red-100 text-red-700', icon: '✗' }
     default:
@@ -217,7 +227,7 @@ const handleMoveToKb = async (kb) => {
       <div class="flex items-start gap-4">
         <!-- File Icon -->
         <div class="w-10 h-10 bg-linear-to-br from-amber-100 to-orange-100 rounded-lg flex items-center justify-center shrink-0">
-          <span class="text-lg">📄</span>
+          <span class="text-lg">{{ isArchive ? '📦' : '📄' }}</span>
         </div>
 
         <!-- File Details -->
@@ -278,7 +288,7 @@ const handleMoveToKb = async (kb) => {
             </svg>
           </button>
           <button
-            v-if="file.status === 1 && !isStorageKb"
+            v-if="file.status === 1 && !isStorageKb && !isArchive"
             @click="showGraph = true"
             class="p-2 text-slate-400 hover:text-purple-500 hover:bg-purple-50 rounded-lg transition-all"
             title="查看知识图谱"
@@ -296,7 +306,7 @@ const handleMoveToKb = async (kb) => {
             </svg>
           </button>
           <button
-            v-if="file.status === 1 && !isStorageKb"
+            v-if="file.status === 1 && !isStorageKb && !isArchive"
             @click="showSlices = true"
             class="p-2 text-slate-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all"
             title="查看切片"
@@ -306,7 +316,17 @@ const handleMoveToKb = async (kb) => {
             </svg>
           </button>
           <button
-            v-if="!isStorageKb"
+            v-if="isArchive"
+            @click="showArchive = true"
+            class="p-2 text-slate-400 hover:text-purple-500 hover:bg-purple-50 rounded-lg transition-all"
+            title="查看内容"
+          >
+            <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 19a2 2 0 01-2-2V7a2 2 0 012-2h4l2 2h4a2 2 0 012 2v1M5 19h14a2 2 0 002-2v-5a2 2 0 00-2-2H9a2 2 0 00-2 2v5a2 2 0 01-2 2z" />
+            </svg>
+          </button>
+          <button
+            v-if="!isStorageKb && !isArchive"
             @click="showSettings = true; selectedSliceType = file.slice_type || 'smart'"
             class="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-all"
             title="修改切片方式"
@@ -511,6 +531,13 @@ const handleMoveToKb = async (kb) => {
       :show="showMoveKbSelector"
       @close="showMoveKbSelector = false"
       @select="handleMoveToKb"
+    />
+
+    <!-- Archive Viewer Modal -->
+    <ArchiveViewer
+      v-if="showArchive"
+      :file="file"
+      @close="showArchive = false"
     />
   </div>
 </template>

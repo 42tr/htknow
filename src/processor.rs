@@ -22,6 +22,7 @@ use crate::{
     },
     config,
     graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor},
+    archive,
     search::{self, SearchEngine, tantivy_engine},
 };
 
@@ -852,6 +853,21 @@ impl FileProcessor {
                 }
 
                 self.convert_office_to_pdf_and_process(file, Some(&mut timing)).await?;
+                return Ok(());
+            }
+
+            // 压缩文件：不解析，直接标记为跳过
+            if archive::is_archive_file(&filename_lower) {
+                timing.set_pipeline("archive");
+                info!("Detected archive file, skipping parsing: {}", file.filename);
+                timing
+                    .step("mark_archive_skipped", async {
+                        let sql =
+                            "UPDATE files SET status = 3, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
+                        sqlx::query(sql).bind("Archive file: not parsed").bind(file.id).execute(&self.pool).await?;
+                        Ok(())
+                    })
+                    .await?;
                 return Ok(());
             }
 
