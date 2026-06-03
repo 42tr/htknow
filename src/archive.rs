@@ -111,31 +111,28 @@ fn archive_format_desc(filename: &str) -> &'static str {
 
 /// 将压缩文件解压到指定目录
 ///
+/// `filename` 为原始文件名（含扩展名），用于判断压缩格式。
 /// 返回解压后的文件列表
 pub fn extract_archive(
     src_path: &str,
     dest_dir: &str,
+    filename: &str,
     password: Option<&str>,
     file_id: i64,
 ) -> Result<Vec<ArchiveEntry>, ArchiveError> {
     let limits = ExtractLimits::default();
-    extract_archive_with_limits(src_path, dest_dir, password, file_id, &limits)
+    extract_archive_with_limits(src_path, dest_dir, filename, password, file_id, &limits)
 }
 
 /// 带限制的解压
 pub fn extract_archive_with_limits(
     src_path: &str,
     dest_dir: &str,
+    filename: &str,
     password: Option<&str>,
     file_id: i64,
     limits: &ExtractLimits,
 ) -> Result<Vec<ArchiveEntry>, ArchiveError> {
-    let path = Path::new(src_path);
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(src_path);
-
     if !is_archive_file(filename) {
         return Err(ArchiveError::UnsupportedFormat(archive_format_desc(filename).to_string()));
     }
@@ -156,17 +153,14 @@ pub fn extract_archive_with_limits(
 }
 
 /// 读取压缩包内单个文件内容到内存
+///
+/// `filename` 为原始文件名（含扩展名），用于判断压缩格式。
 pub fn read_archive_entry(
     src_path: &str,
+    filename: &str,
     entry_path: &str,
     password: Option<&str>,
 ) -> Result<Vec<u8>, ArchiveError> {
-    let path = Path::new(src_path);
-    let filename = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(src_path);
-
     let lower = filename.to_lowercase();
     if lower.ends_with(".zip") {
         read_zip_entry(src_path, entry_path, password)
@@ -546,7 +540,7 @@ mod tests {
             zip.finish().unwrap();
         }
 
-        let entries = extract_archive(zip_path, extract_dir, None, 1).unwrap();
+        let entries = extract_archive(zip_path, extract_dir, "test.zip", None, 1).unwrap();
 
         // 应该解压出 3 个文件条目（目录条目会自动从路径推断）
         assert!(
@@ -598,7 +592,7 @@ mod tests {
             zip.finish().unwrap();
         }
 
-        let entries = extract_archive(zip_path, extract_dir, None, 2).unwrap();
+        let entries = extract_archive(zip_path, extract_dir, "test.zip", None, 2).unwrap();
         assert!(entries.len() >= 2, "Expected at least 2 entries, got {}", entries.len());
 
         let paths: Vec<String> = entries.iter().map(|e| e.entry_path.clone()).collect();

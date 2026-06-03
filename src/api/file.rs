@@ -2226,9 +2226,16 @@ pub async fn archive_extract(
     // 执行解压
     let password = req.password.clone();
     let file_path = file.path.clone();
-    info!("archive_extract: starting extraction for file_id={}, path={:?}, password_provided={}", id, file_path, password.is_some());
+    let filename = file.filename.clone();
+    info!("archive_extract: starting extraction for file_id={}, path={:?}, filename={:?}, password_provided={}", id, file_path, filename, password.is_some());
     let entries = match tokio::task::spawn_blocking(move || {
-        archive::extract_archive(&file_path, dest_dir.to_string_lossy().as_ref(), password.as_deref(), id)
+        archive::extract_archive(
+            &file_path,
+            dest_dir.to_string_lossy().as_ref(),
+            &filename,
+            password.as_deref(),
+            id,
+        )
     })
     .await
     {
@@ -2354,9 +2361,10 @@ pub async fn archive_download(
 
     // 如果解压目录没有，尝试直接从压缩包读取（ZIP/TAR 支持）
     let src_path = file.path.clone();
+    let filename = file.filename.clone();
     let entry_path_owned = entry_path.to_string();
     let buf = match tokio::task::spawn_blocking(move || {
-        archive::read_archive_entry(&src_path, &entry_path_owned, None)
+        archive::read_archive_entry(&src_path, &filename, &entry_path_owned, None)
     })
     .await
     {
