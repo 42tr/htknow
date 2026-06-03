@@ -200,6 +200,8 @@ fn extract_zip(
     let mut total_size: u64 = 0;
     let password_bytes = password.map(|p| p.as_bytes());
 
+    log::info!("ZIP archive has {} entries, file_id={}", archive.len(), file_id);
+
     for i in 0..archive.len() {
         // 先检查文件是否加密
         let is_encrypted = {
@@ -217,12 +219,30 @@ fn extract_zip(
             archive.by_index(i).map_err(|e| ArchiveError::Zip(e.to_string()))?
         };
 
-        let name = file_entry.name().to_string();
-        let is_dir = file_entry.is_dir();
+        // 统一路径分隔符为 /，并处理连续分隔符和首尾分隔符
+        let name: String = file_entry.name()
+            .replace('\\', "/")
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("/");
+        if name.is_empty() {
+            continue;
+        }
+        // zip crate 的 is_dir 只认 / 结尾；统一分隔符后重新判断
+        let is_dir = file_entry.name().ends_with('/') || file_entry.name().ends_with('\\');
+        let name = if is_dir && name.ends_with('/') {
+            name.trim_end_matches('/').to_string()
+        } else {
+            name
+        };
         let size = file_entry.size();
 
+        log::debug!("ZIP entry: name={}, is_dir={}, size={}", name, is_dir, size);
+
         // 安全检查：路径遍历
-        if name.contains("..") || name.starts_with('/') || name.starts_with('\\') {
+        if name.contains("..") {
+            log::warn!("Skipping ZIP entry with path traversal: {}", name);
             continue;
         }
 
@@ -272,6 +292,7 @@ fn extract_zip(
         });
     }
 
+    log::info!("ZIP extraction completed: {} entries, file_id={}", entries.len(), file_id);
     Ok(entries)
 }
 
@@ -287,10 +308,12 @@ fn read_zip_entry(
     };
 
     let password_bytes = password.map(|p| p.as_bytes());
+    // ZIP 内部路径统一使用 /，但传入的 entry_path 可能已经统一
+    let normalized_entry = entry_path.replace('\\', "/");
 
     // 先检查文件是否加密
     let is_encrypted = {
-        let file = archive.by_name(entry_path).map_err(|e| match e {
+        let file = archive.by_name(&normalized_entry).map_err(|e| match e {
             zip::result::ZipError::FileNotFound => {
                 ArchiveError::Other(format!("文件不存在: {}", entry_path))
             }
@@ -301,7 +324,7 @@ fn read_zip_entry(
 
     let mut file_entry = if is_encrypted {
         if let Some(pw) = password_bytes {
-            archive.by_name_decrypt(entry_path, pw).map_err(|e| match e {
+            archive.by_name_decrypt(&normalized_entry, pw).map_err(|e| match e {
                 zip::result::ZipError::FileNotFound => {
                     ArchiveError::Other(format!("文件不存在: {}", entry_path))
                 }
@@ -311,7 +334,7 @@ fn read_zip_entry(
             return Err(ArchiveError::PasswordRequired);
         }
     } else {
-        archive.by_name(entry_path).map_err(|e| match e {
+        archive.by_name(&normalized_entry).map_err(|e| match e {
             zip::result::ZipError::FileNotFound => {
                 ArchiveError::Other(format!("文件不存在: {}", entry_path))
             }
@@ -360,12 +383,18 @@ fn extract_tar(
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
         let path = entry.path()?;
-        let name = path.to_string_lossy().to_string();
-        let is_dir = entry.header().entry_type().is_dir();
+        let name = path.to_string_lossy().replace('\\', "/");
+        let name = name.trim_start_matches('/').trim_end_matches('/').to_string();
+        if name.is_empty() {
+            continue;
+        }
+        let is_dir = entry.header().entry_type().is_dir() || name.ends_with('/');
+        let name = if is_dir { name.trim_end_matches('/').to_string() } else { name };
         let size = entry.size();
 
         // 安全检查
-        if name.contains("..") || name.starts_with('/') || name.starts_with('\\') {
+        if name.contains("..") {
+            log::warn!("Skipping TAR entry with path traversal: {}", name);
             continue;
         }
 
@@ -421,12 +450,14 @@ fn read_tar_entry(src_path: &str, entry_path: &str) -> Result<Vec<u8>, ArchiveEr
     let reader = open_tar_reader(src_path)?;
     let mut archive = tar::Archive::new(reader);
 
+    let normalized_target = entry_path.replace('\\', "/").trim_start_matches('/').trim_end_matches('/').to_string();
+
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
         let path = entry.path()?;
-        let name = path.to_string_lossy().to_string();
+        let name = path.to_string_lossy().replace('\\', "/").trim_start_matches('/').trim_end_matches('/').to_string();
 
-        if name == entry_path {
+        if name == normalized_target {
             let mut buf = Vec::new();
             entry.read_to_end(&mut buf)?;
             return Ok(buf);
@@ -470,4 +501,109 @@ pub fn resolve_archive_entry_path(
     }
 
     Some(resolved)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn test_is_archive_file() {
+        assert!(is_archive_file("test.zip"));
+        assert!(is_archive_file("test.ZIP"));
+        assert!(is_archive_file("test.tar.gz"));
+        assert!(is_archive_file("test.tgz"));
+        assert!(is_archive_file("test.tar.bz2"));
+        assert!(is_archive_file("test.tar.xz"));
+        assert!(is_archive_file("test.7z"));
+        assert!(!is_archive_file("test.pdf"));
+        assert!(!is_archive_file("test.txt"));
+    }
+
+    #[test]
+    fn test_extract_zip_with_backslash_paths() {
+        // 创建测试 ZIP（Windows 风格路径）
+        let zip_path = "/tmp/test_htknow_zip.zip";
+        let extract_dir = "/tmp/test_htknow_extract";
+
+        // 清理
+        let _ = std::fs::remove_file(zip_path);
+        let _ = std::fs::remove_dir_all(extract_dir);
+
+        {
+            let file = std::fs::File::create(zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("folder\\file1.txt", options).unwrap();
+            zip.write_all(b"hello world 1").unwrap();
+            zip.start_file("folder\\sub\\file2.txt", options).unwrap();
+            zip.write_all(b"hello world 2").unwrap();
+            zip.start_file("root.txt", options).unwrap();
+            zip.write_all(b"hello root").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let entries = extract_archive(zip_path, extract_dir, None, 1).unwrap();
+
+        // 应该解压出 3 个文件条目（目录条目会自动从路径推断）
+        assert!(
+            entries.len() >= 3,
+            "Expected at least 3 entries, got {}: {:?}",
+            entries.len(),
+            entries.iter().map(|e| &e.entry_path).collect::<Vec<_>>()
+        );
+
+        // 检查路径统一使用了 /
+        let paths: Vec<String> = entries.iter().map(|e| e.entry_path.clone()).collect();
+        assert!(paths.iter().any(|p| p == "folder/file1.txt"), "Missing folder/file1.txt in {:?}", paths);
+        assert!(paths.iter().any(|p| p == "folder/sub/file2.txt"), "Missing folder/sub/file2.txt in {:?}", paths);
+        assert!(paths.iter().any(|p| p == "root.txt"), "Missing root.txt in {:?}", paths);
+
+        // 没有路径应该包含反斜杠
+        for p in &paths {
+            assert!(!p.contains('\\'), "Path should not contain backslash: {}", p);
+        }
+
+        // 检查文件内容
+        let content1 = std::fs::read_to_string(format!("{}/folder/file1.txt", extract_dir)).unwrap();
+        assert_eq!(content1, "hello world 1");
+
+        let content2 = std::fs::read_to_string(format!("{}/folder/sub/file2.txt", extract_dir)).unwrap();
+        assert_eq!(content2, "hello world 2");
+
+        // 清理
+        let _ = std::fs::remove_file(zip_path);
+        let _ = std::fs::remove_dir_all(extract_dir);
+    }
+
+    #[test]
+    fn test_extract_zip_with_forward_slash_paths() {
+        let zip_path = "/tmp/test_htknow_zip2.zip";
+        let extract_dir = "/tmp/test_htknow_extract2";
+
+        let _ = std::fs::remove_file(zip_path);
+        let _ = std::fs::remove_dir_all(extract_dir);
+
+        {
+            let file = std::fs::File::create(zip_path).unwrap();
+            let mut zip = zip::ZipWriter::new(file);
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("docs/report.pdf", options).unwrap();
+            zip.write_all(b"fake pdf").unwrap();
+            zip.start_file("data/info.txt", options).unwrap();
+            zip.write_all(b"info").unwrap();
+            zip.finish().unwrap();
+        }
+
+        let entries = extract_archive(zip_path, extract_dir, None, 2).unwrap();
+        assert!(entries.len() >= 2, "Expected at least 2 entries, got {}", entries.len());
+
+        let paths: Vec<String> = entries.iter().map(|e| e.entry_path.clone()).collect();
+        assert!(paths.iter().any(|p| p == "docs/report.pdf"));
+        assert!(paths.iter().any(|p| p == "data/info.txt"));
+
+        let _ = std::fs::remove_file(zip_path);
+        let _ = std::fs::remove_dir_all(extract_dir);
+    }
 }
