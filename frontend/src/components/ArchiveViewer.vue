@@ -89,13 +89,12 @@ const loadEntries = async () => {
     const data = await api.getArchiveEntries(props.file.id)
     entries.value = data
     needsPassword.value = false
-  } catch (e) {
-    // 如果没有解压过，尝试自动解压
+    // 如果数据库中没有记录（还没解压过），自动解压
     if (entries.value.length === 0) {
       await extractArchive()
-    } else {
-      error.value = e.message || '加载失败'
     }
+  } catch (e) {
+    error.value = e.message || '加载失败'
   } finally {
     loading.value = false
   }
