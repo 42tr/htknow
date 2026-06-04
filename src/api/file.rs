@@ -140,6 +140,10 @@ enum FileStatsScope {
     UnassignedOnly,
 }
 
+const PARSE_ASSETS_META_KEY: &str = "_htknow_parse_assets";
+const CUSTOM_IMAGES_META_KEY: &str = "custom_images";
+const CUSTOM_IMAGES_META_VERSION: i64 = 1;
+
 async fn query_file_status_breakdown(
     pool: &SqlitePool, scope: FileStatsScope, user_id: &str, is_admin: bool,
 ) -> AnyResult<FileStatusBreakdown> {
@@ -1424,27 +1428,274 @@ async fn execute_batch_delete(
     })
 }
 
-pub(crate) async fn collect_image_paths_for_files(
+#[derive(Default)]
+struct FileImagePathState {
+    has_pdf_contents: bool,
+    meta_checked: bool,
+    paths: Vec<String>,
+}
+
+pub(crate) async fn collect_image_raw_paths_for_files(
     pool: &SqlitePool, file_ids: &[i64],
 ) -> Result<Vec<String>, sqlx::Error> {
     if file_ids.is_empty() {
         return Ok(Vec::new());
     }
 
-    let mut qb = QueryBuilder::<Sqlite>::new("SELECT img_path FROM pdf_contents WHERE file_id IN (");
-    let mut separated = qb.separated(", ");
-    for file_id in file_ids {
-        separated.push_bind(file_id);
+    let mut states: HashMap<i64, FileImagePathState> =
+        file_ids.iter().copied().map(|file_id| (file_id, FileImagePathState::default())).collect();
+
+    for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
+        let mut qb = QueryBuilder::<Sqlite>::new("SELECT file_id, img_path FROM pdf_contents WHERE file_id IN (");
+        push_i64_list(&mut qb, chunk);
+        qb.push(")");
+        let rows: Vec<(i64, Option<String>)> = qb.build_query_as().fetch_all(pool).await?;
+        for (file_id, img_path) in rows {
+            if let Some(state) = states.get_mut(&file_id) {
+                state.has_pdf_contents = true;
+                if let Some(path) = img_path {
+                    let trimmed = path.trim();
+                    if !trimmed.is_empty() {
+                        state.paths.push(trimmed.to_string());
+                    }
+                }
+            }
+        }
     }
-    qb.push(") AND img_path IS NOT NULL AND img_path != ''");
-    let rows: Vec<Option<String>> = qb.build_query_scalar().fetch_all(pool).await?;
+
+    let meta_candidate_ids: Vec<i64> =
+        file_ids.iter().copied().filter(|id| !states.get(id).is_some_and(|state| state.has_pdf_contents)).collect();
+    for chunk in meta_candidate_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
+        let mut qb = QueryBuilder::<Sqlite>::new("SELECT id, meta FROM files WHERE id IN (");
+        push_i64_list(&mut qb, chunk);
+        qb.push(")");
+        let rows: Vec<(i64, Option<String>)> = qb.build_query_as().fetch_all(pool).await?;
+        for (file_id, meta) in rows {
+            if let Some(paths) = extract_custom_image_paths_from_meta(meta.as_deref()) {
+                if let Some(state) = states.get_mut(&file_id) {
+                    state.meta_checked = true;
+                    state.paths.extend(paths);
+                }
+            }
+        }
+    }
+
+    let regex_candidate_ids: Vec<i64> = file_ids
+        .iter()
+        .copied()
+        .filter(|id| {
+            states
+                .get(id)
+                .is_some_and(|state| !state.has_pdf_contents && !state.meta_checked)
+        })
+        .collect();
+    let mut regex_paths = extract_slice_image_paths_by_file(pool, &regex_candidate_ids).await?;
+    for file_id in regex_candidate_ids {
+        if let Some(paths) = regex_paths.remove(&file_id) {
+            if let Some(state) = states.get_mut(&file_id) {
+                state.paths.extend(paths);
+            }
+        }
+    }
+
+    let mut raw_paths = Vec::new();
+    let mut seen = HashSet::new();
+    for file_id in file_ids {
+        let Some(state) = states.get(file_id) else { continue };
+        for path in &state.paths {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                raw_paths.push(trimmed.to_string());
+            }
+        }
+    }
+    Ok(raw_paths)
+}
+
+pub(crate) async fn collect_image_paths_for_files(
+    pool: &SqlitePool, file_ids: &[i64],
+) -> Result<Vec<String>, sqlx::Error> {
+    let raw_paths = collect_image_raw_paths_for_files(pool, file_ids).await?;
     let mut resolved = Vec::new();
-    for raw in rows.into_iter().flatten() {
+    for raw in raw_paths {
         if let Some(path) = resolve_image_storage_path(&raw) {
             resolved.push(path);
         }
     }
     Ok(resolved)
+}
+
+pub(crate) async fn update_file_custom_image_meta(
+    pool: &SqlitePool, file_id: i64, image_paths: &[String], source: &str,
+) -> AnyResult<()> {
+    let current_meta: Option<String> =
+        sqlx::query_scalar("SELECT meta FROM files WHERE id = ?").bind(file_id).fetch_optional(pool).await?;
+    let merged_meta = merge_custom_image_meta(current_meta.as_deref(), image_paths, source);
+    sqlx::query("UPDATE files SET meta = ? WHERE id = ?")
+        .bind(merged_meta)
+        .bind(file_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub(crate) async fn backfill_missing_image_meta_for_files(
+    pool: &SqlitePool, file_ids: &[i64], source: &str,
+) -> AnyResult<usize> {
+    if file_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut candidate_ids = Vec::new();
+    for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
+        let mut qb = QueryBuilder::<Sqlite>::new("SELECT f.id, f.meta FROM files f WHERE f.id IN (");
+        push_i64_list(&mut qb, chunk);
+        qb.push(") AND NOT EXISTS (SELECT 1 FROM pdf_contents pc WHERE pc.file_id = f.id)");
+        let rows: Vec<(i64, Option<String>)> = qb.build_query_as().fetch_all(pool).await?;
+        for (file_id, meta) in rows {
+            if extract_custom_image_paths_from_meta(meta.as_deref()).is_none() {
+                candidate_ids.push(file_id);
+            }
+        }
+    }
+
+    if candidate_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let mut extracted = extract_slice_image_paths_by_file(pool, &candidate_ids).await?;
+    let mut updated = 0usize;
+    for file_id in candidate_ids {
+        let paths = extracted.remove(&file_id).unwrap_or_default();
+        update_file_custom_image_meta(pool, file_id, &paths, source).await?;
+        updated += 1;
+    }
+    Ok(updated)
+}
+
+fn extract_custom_image_paths_from_meta(meta: Option<&str>) -> Option<Vec<String>> {
+    let raw = meta?.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let value: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let custom_images = value.get(PARSE_ASSETS_META_KEY)?.get(CUSTOM_IMAGES_META_KEY)?;
+    if !custom_images.get("checked").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return None;
+    }
+
+    let mut paths = Vec::new();
+    if let Some(raw_paths) = custom_images.get("paths").and_then(|v| v.as_array()) {
+        for path in raw_paths {
+            if let Some(path) = path.as_str() {
+                let trimmed = path.trim();
+                if !trimmed.is_empty() {
+                    paths.push(trimmed.to_string());
+                }
+            }
+        }
+    }
+    Some(paths)
+}
+
+fn merge_custom_image_meta(meta: Option<&str>, image_paths: &[String], source: &str) -> String {
+    let mut root = parse_meta_object(meta);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs() as i64)
+        .unwrap_or_default();
+
+    let mut unique_paths = Vec::new();
+    let mut seen = HashSet::new();
+    for path in image_paths {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+            unique_paths.push(trimmed.to_string());
+        }
+    }
+
+    let parse_assets = root
+        .entry(PARSE_ASSETS_META_KEY.to_string())
+        .or_insert_with(|| serde_json::json!({}));
+    if !parse_assets.is_object() {
+        *parse_assets = serde_json::json!({});
+    }
+    let parse_assets_obj = parse_assets.as_object_mut().expect("parse assets meta is object");
+    parse_assets_obj.insert("version".to_string(), serde_json::json!(CUSTOM_IMAGES_META_VERSION));
+    parse_assets_obj.insert(
+        CUSTOM_IMAGES_META_KEY.to_string(),
+        serde_json::json!({
+            "source": source,
+            "paths": unique_paths,
+            "checked": true,
+            "updated_at": now
+        }),
+    );
+
+    serde_json::Value::Object(root).to_string()
+}
+
+fn parse_meta_object(meta: Option<&str>) -> serde_json::Map<String, serde_json::Value> {
+    let Some(raw) = meta.map(str::trim).filter(|raw| !raw.is_empty()) else {
+        return serde_json::Map::new();
+    };
+
+    match serde_json::from_str::<serde_json::Value>(raw) {
+        Ok(serde_json::Value::Object(map)) => map,
+        Ok(value) => {
+            let mut map = serde_json::Map::new();
+            map.insert("_legacy_meta".to_string(), value);
+            map
+        }
+        Err(_) => {
+            let mut map = serde_json::Map::new();
+            map.insert("_legacy_meta".to_string(), serde_json::Value::String(raw.to_string()));
+            map
+        }
+    }
+}
+
+async fn extract_slice_image_paths_by_file(
+    pool: &SqlitePool, file_ids: &[i64],
+) -> Result<HashMap<i64, Vec<String>>, sqlx::Error> {
+    let mut result: HashMap<i64, Vec<String>> = HashMap::new();
+    if file_ids.is_empty() {
+        return Ok(result);
+    }
+
+    for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
+        let mut qb = QueryBuilder::<Sqlite>::new("SELECT file_id, content FROM slices WHERE file_id IN (");
+        push_i64_list(&mut qb, chunk);
+        qb.push(")");
+        let rows: Vec<(i64, String)> = qb.build_query_as().fetch_all(pool).await?;
+        for (file_id, content) in rows {
+            let paths = result.entry(file_id).or_default();
+            for path in extract_image_paths_from_text(&content) {
+                if !paths.iter().any(|existing| existing == &path) {
+                    paths.push(path);
+                }
+            }
+        }
+    }
+
+    Ok(result)
+}
+
+fn extract_image_paths_from_text(content: &str) -> Vec<String> {
+    static IMAGE_REF_RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = IMAGE_REF_RE.get_or_init(|| {
+        regex::Regex::new(r"/api/v1/knowledge/files/([^\s'\)>]+)").expect("valid image reference regex")
+    });
+
+    let mut paths = Vec::new();
+    for cap in re.captures_iter(content) {
+        let Some(matched) = cap.get(1) else { continue };
+        let path = matched.as_str().trim();
+        if !path.is_empty() && !paths.iter().any(|existing| existing == path) {
+            paths.push(path.to_string());
+        }
+    }
+    paths
 }
 
 fn is_safe_relative_path(path: &str) -> bool {

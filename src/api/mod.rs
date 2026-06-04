@@ -14,7 +14,8 @@ mod system;
 // 重新导出 File 类型供其他模块使用
 pub use file::File;
 pub(crate) use file::{
-    collect_image_paths_for_files, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path,
+    backfill_missing_image_meta_for_files, collect_image_paths_for_files, collect_image_raw_paths_for_files,
+    find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta,
 };
 
 use crate::search::SearchEngine;

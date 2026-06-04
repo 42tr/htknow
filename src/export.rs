@@ -19,7 +19,11 @@ use tantivy::{
 };
 use utoipa::ToSchema;
 
-use crate::{config, search::tantivy_engine};
+use crate::{
+    api::{backfill_missing_image_meta_for_files, collect_image_raw_paths_for_files},
+    config,
+    search::tantivy_engine,
+};
 
 const EXPORT_MANIFEST_FILENAME: &str = "manifest.json";
 const EXPORT_DB_FILENAME: &str = "app.sqlite";
@@ -144,6 +148,12 @@ pub async fn export_knowledge_bases(
 
     // Disable foreign keys for faster parallel inserts (will re-enable before close)
     sqlx::query("PRAGMA foreign_keys = OFF").execute(&export_pool).await?;
+
+    let export_file_ids = collect_file_ids_for_kbs(pool, &target_kb_ids).await?;
+    let meta_backfilled = backfill_missing_image_meta_for_files(pool, &export_file_ids, "export_regex").await?;
+    if meta_backfilled > 0 {
+        info!("Backfilled image meta for {} files before export", meta_backfilled);
+    }
 
     let file_ids = export_sqlite_data(pool, &export_pool, &target_kb_ids, &all_kb_ids).await?;
     info!("Exported {} files to SQLite in {}ms", file_ids.len(), step_start.elapsed().as_millis());
@@ -365,6 +375,27 @@ async fn fetch_kb_names(pool: &SqlitePool, kb_ids: &[i64]) -> anyhow::Result<Vec
         names.extend(chunk_names);
     }
     Ok(names)
+}
+
+async fn collect_file_ids_for_kbs(pool: &SqlitePool, kb_ids: &[i64]) -> anyhow::Result<Vec<i64>> {
+    if kb_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut file_ids = Vec::new();
+    for chunk in kb_ids.chunks(SQLITE_BATCH_SIZE) {
+        let mut qb = QueryBuilder::<Sqlite>::new("SELECT id FROM files WHERE kb_id IN (");
+        let mut separated = qb.separated(", ");
+        for id in chunk {
+            separated.push_bind(id);
+        }
+        qb.push(")");
+        let ids: Vec<i64> = qb.build_query_scalar().fetch_all(pool).await?;
+        file_ids.extend(ids);
+    }
+    file_ids.sort_unstable();
+    file_ids.dedup();
+    Ok(file_ids)
 }
 
 async fn create_export_db_pool(db_path: &Path) -> anyhow::Result<SqlitePool> {
@@ -1258,42 +1289,13 @@ async fn copy_images(pool: &SqlitePool, images_dir: &Path, file_ids: &[i64]) -> 
     let cfg = config::get();
     let data_root = Path::new(&cfg.storage.images_path).parent();
 
-    // 1. Collect image paths from pdf_contents (MinerU flow)
-    let mut all_img_paths = Vec::new();
-    for chunk in file_ids.chunks(SQLITE_BATCH_SIZE) {
-        let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT DISTINCT img_path FROM pdf_contents WHERE img_path IS NOT NULL AND img_path != '' AND file_id IN ("
-        );
-        let mut separated = qb.separated(", ");
-        for id in chunk {
-            separated.push_bind(id);
-        }
-        qb.push(")");
-        let rows: Vec<(Option<String>,)> = qb.build_query_as().fetch_all(pool).await?;
-
-        for (img_path_opt,) in rows {
-            if let Some(img_path) = img_path_opt {
-                let trimmed = img_path.trim();
-                if !trimmed.is_empty() {
-                    all_img_paths.push(trimmed.to_string());
-                }
-            }
-        }
-    }
-
-    // 2. Extract image paths from slices of files without pdf_contents (custom parser flow)
-    let custom_img_paths = extract_custom_image_paths(pool, file_ids).await?;
-    all_img_paths.extend(custom_img_paths);
+    let all_img_paths = collect_image_raw_paths_for_files(pool, file_ids).await?;
 
     if all_img_paths.is_empty() {
         return Ok(());
     }
 
-    // Deduplicate
-    let mut seen = std::collections::HashSet::new();
-    all_img_paths.retain(|p| seen.insert(p.clone()));
-
-    // 3. Copy all images concurrently via spawn_blocking
+    // Copy all images concurrently via spawn_blocking
     let img_handles: Vec<_> = all_img_paths
         .into_iter()
         .map(|trimmed| {
@@ -1348,67 +1350,6 @@ async fn copy_images(pool: &SqlitePool, images_dir: &Path, file_ids: &[i64]) -> 
     info!("Copied {} images, {} failed", copied, failed);
 
     Ok(())
-}
-
-/// Extract image paths from slices of files that have no pdf_contents records.
-/// Custom parser images are not recorded in pdf_contents; their references may be
-/// embedded in slice.content (e.g. markdown `![alt](/api/v1/knowledge/files/xxx.jpg)`).
-async fn extract_custom_image_paths(pool: &SqlitePool, file_ids: &[i64]) -> anyhow::Result<Vec<String>> {
-    let mut custom_file_ids = Vec::new();
-
-    // Find files without pdf_contents records, in batches
-    for chunk in file_ids.chunks(SQLITE_BATCH_SIZE) {
-        let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT DISTINCT id FROM files WHERE id IN ("
-        );
-        let mut separated = qb.separated(", ");
-        for id in chunk {
-            separated.push_bind(id);
-        }
-        qb.push(") AND id NOT IN (SELECT DISTINCT file_id FROM pdf_contents WHERE file_id IN (");
-        let mut separated = qb.separated(", ");
-        for id in chunk {
-            separated.push_bind(id);
-        }
-        qb.push("))");
-        let ids: Vec<i64> = qb.build_query_scalar().fetch_all(pool).await?;
-        custom_file_ids.extend(ids);
-    }
-
-    if custom_file_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // Extract image references from slice content, in batches
-    let re = regex::Regex::new(r"/api/v1/knowledge/files/([^\s'\)>]+)")?;
-    let mut img_paths = Vec::new();
-    let mut seen = std::collections::HashSet::new();
-
-    for chunk in custom_file_ids.chunks(SQLITE_BATCH_SIZE) {
-        let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT content FROM slices WHERE file_id IN ("
-        );
-        let mut separated = qb.separated(", ");
-        for id in chunk {
-            separated.push_bind(id);
-        }
-        qb.push(")");
-        let rows: Vec<(String,)> = qb.build_query_as().fetch_all(pool).await?;
-
-        for (content,) in rows {
-            for cap in re.captures_iter(&content) {
-                if let Some(m) = cap.get(1) {
-                    let img_name = m.as_str().trim();
-                    if img_name.is_empty() || !seen.insert(img_name.to_string()) {
-                        continue;
-                    }
-                    img_paths.push(img_name.to_string());
-                }
-            }
-        }
-    }
-
-    Ok(img_paths)
 }
 
 async fn export_tantivy_index(src_path: &str, dst_path: &str, kb_ids: &[i64]) -> anyhow::Result<usize> {

@@ -18,7 +18,8 @@ use tokio::{fs, time};
 
 use crate::{
     api::{
-        File, collect_image_paths_for_files, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path,
+        File, collect_image_paths_for_files, collect_image_raw_paths_for_files, find_reusable_parsed_file,
+        remove_image_files, resolve_image_storage_path, update_file_custom_image_meta,
     },
     config,
     graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor},
@@ -100,6 +101,17 @@ struct CustomParseData {
     full_content: Option<String>,
     #[serde(default)]
     images: Option<HashMap<String, String>>,
+    #[serde(default)]
+    content_list: Option<Vec<ContentItem>>,
+}
+
+#[derive(Debug)]
+struct NormalizedCustomParseData {
+    slices: Vec<CustomSlice>,
+    full_content: Option<String>,
+    images: HashMap<String, String>,
+    content_list: Option<Vec<ContentItem>>,
+    image_paths: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -931,14 +943,24 @@ impl FileProcessor {
         let parse_data =
             timed_step_opt(timing.as_deref_mut(), "custom_parse_api", self.call_custom_parse_api(file, custom_url))
                 .await?;
+        let normalized = Self::normalize_custom_parse_data(file.id, parse_data)?;
 
-        if let Some(images) = parse_data.images.as_ref() {
-            if !images.is_empty() {
-                self.save_custom_images(images, timing.as_deref_mut()).await?;
-            }
+        if let Some(content_list) = normalized.content_list.as_ref() {
+            self.insert_custom_pdf_contents(file.id, content_list, timing.as_deref_mut()).await?;
+        } else {
+            timed_step_opt(timing.as_deref_mut(), "custom_update_image_meta", async {
+                update_file_custom_image_meta(&self.pool, file.id, &normalized.image_paths, "custom_parse_images")
+                    .await?;
+                Ok(())
+            })
+            .await?;
         }
 
-        self.save_custom_slices(file, &parse_data.slices, parse_data.full_content.as_deref(), timing.as_deref_mut())
+        if !normalized.images.is_empty() {
+            self.save_custom_images(&normalized.images, timing.as_deref_mut()).await?;
+        }
+
+        self.save_custom_slices(file, &normalized.slices, normalized.full_content.as_deref(), timing.as_deref_mut())
             .await?;
 
         Ok(())
@@ -1006,6 +1028,179 @@ impl FileProcessor {
         self.save_custom_slices(file, &data.slices, data.full_content.as_deref(), timing.as_deref_mut()).await?;
 
         Ok(true)
+    }
+
+    fn normalize_custom_parse_data(file_id: i64, data: CustomParseData) -> anyhow::Result<NormalizedCustomParseData> {
+        let mut image_mapping: HashMap<String, String> = HashMap::new();
+        let prefix = format!("f{}_", file_id);
+        let images = data.images.unwrap_or_default();
+
+        for image_name in images.keys() {
+            Self::ensure_safe_image_name(image_name)?;
+            image_mapping.entry(image_name.clone()).or_insert_with(|| Self::prefix_image_path(image_name, &prefix));
+        }
+
+        if let Some(content_list) = data.content_list.as_ref() {
+            for item in content_list {
+                if let Some(img_path) = item.img_path.as_deref() {
+                    Self::ensure_safe_image_name(img_path)?;
+                    let mapped_path = image_mapping.get(img_path).cloned().or_else(|| {
+                        Self::basename_for_path(img_path).and_then(|basename| image_mapping.get(&basename).cloned())
+                    });
+                    let mapped_path = mapped_path.unwrap_or_else(|| Self::prefix_image_path(img_path, &prefix));
+                    image_mapping.entry(img_path.to_string()).or_insert(mapped_path);
+                }
+            }
+        }
+
+        let image_mapping = Self::expand_image_mapping_aliases(image_mapping);
+        let mut referenced_image_paths = Vec::new();
+        for slice in &data.slices {
+            for image_path in Self::extract_custom_image_refs(&slice.content) {
+                if Self::lookup_image_mapping(&image_mapping, &image_path).is_none()
+                    && resolve_image_storage_path(&image_path).is_some()
+                    && !referenced_image_paths.iter().any(|existing| existing == &image_path)
+                {
+                    referenced_image_paths.push(image_path);
+                }
+            }
+        }
+        if let Some(full_content) = data.full_content.as_deref() {
+            for image_path in Self::extract_custom_image_refs(full_content) {
+                if Self::lookup_image_mapping(&image_mapping, &image_path).is_none()
+                    && resolve_image_storage_path(&image_path).is_some()
+                    && !referenced_image_paths.iter().any(|existing| existing == &image_path)
+                {
+                    referenced_image_paths.push(image_path);
+                }
+            }
+        }
+
+        let mut normalized_images = HashMap::new();
+        for (image_name, image_base64) in images {
+            let new_name = image_mapping
+                .get(&image_name)
+                .cloned()
+                .or_else(|| Self::basename_for_path(&image_name).and_then(|name| image_mapping.get(&name).cloned()))
+                .unwrap_or_else(|| Self::prefix_image_path(&image_name, &prefix));
+            normalized_images.insert(new_name, image_base64);
+        }
+
+        let mut content_list = data.content_list;
+        if let Some(items) = content_list.as_mut() {
+            for item in items {
+                if let Some(img_path) = item.img_path.as_deref() {
+                    if let Some(new_path) = Self::lookup_image_mapping(&image_mapping, img_path) {
+                        item.img_path = Some(new_path);
+                    }
+                }
+            }
+        }
+
+        let slices = data
+            .slices
+            .into_iter()
+            .map(|mut slice| {
+                slice.content = Self::rewrite_custom_image_refs(&slice.content, &image_mapping);
+                slice
+            })
+            .collect();
+        let full_content = data.full_content.map(|content| Self::rewrite_custom_image_refs(&content, &image_mapping));
+
+        let mut image_paths = Vec::new();
+        let mut seen = HashSet::new();
+        for new_path in image_mapping.values() {
+            let trimmed = new_path.trim();
+            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                image_paths.push(trimmed.to_string());
+            }
+        }
+        for path in referenced_image_paths {
+            let trimmed = path.trim();
+            if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
+                image_paths.push(trimmed.to_string());
+            }
+        }
+
+        Ok(NormalizedCustomParseData { slices, full_content, images: normalized_images, content_list, image_paths })
+    }
+
+    fn ensure_safe_image_name(image_name: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            resolve_image_storage_path(image_name).is_some(),
+            "Custom parse returned unsafe image path: {}",
+            image_name
+        );
+        Ok(())
+    }
+
+    fn lookup_image_mapping(mapping: &HashMap<String, String>, image_path: &str) -> Option<String> {
+        mapping
+            .get(image_path)
+            .cloned()
+            .or_else(|| Self::basename_for_path(image_path).and_then(|basename| mapping.get(&basename).cloned()))
+    }
+
+    fn basename_for_path(path: &str) -> Option<String> {
+        std::path::Path::new(path).file_name().and_then(|name| name.to_str()).map(|name| name.to_string())
+    }
+
+    fn expand_image_mapping_aliases(mut mapping: HashMap<String, String>) -> HashMap<String, String> {
+        let aliases: Vec<(String, String)> = mapping
+            .iter()
+            .filter_map(|(old_path, new_path)| {
+                let basename = Self::basename_for_path(old_path)?;
+                if basename == *old_path { None } else { Some((basename, new_path.clone())) }
+            })
+            .collect();
+        for (alias, new_path) in aliases {
+            mapping.entry(alias).or_insert(new_path);
+        }
+        mapping
+    }
+
+    fn extract_custom_image_refs(content: &str) -> Vec<String> {
+        let api_re = regex::Regex::new(r"/api/v1/knowledge/files/([^\s'\)>]+)").expect("valid image reference regex");
+        let markdown_re = regex::Regex::new(r"!\[[^\]]*\]\(([^)]+)\)").expect("valid markdown image regex");
+        let mut refs = Vec::new();
+        for cap in api_re.captures_iter(content) {
+            if let Some(path) = cap.get(1).map(|m| m.as_str().trim()).filter(|path| !path.is_empty()) {
+                if !refs.iter().any(|existing| existing == path) {
+                    refs.push(path.to_string());
+                }
+            }
+        }
+        for cap in markdown_re.captures_iter(content) {
+            let Some(path) = cap.get(1).map(|m| m.as_str().trim()).filter(|path| !path.is_empty()) else {
+                continue;
+            };
+            if path.starts_with("http://") || path.starts_with("https://") || path.starts_with("data:") {
+                continue;
+            }
+            let normalized = path.strip_prefix("/api/v1/knowledge/files/").unwrap_or(path).trim();
+            if !normalized.is_empty() && !refs.iter().any(|existing| existing == normalized) {
+                refs.push(normalized.to_string());
+            }
+        }
+        refs
+    }
+
+    fn rewrite_custom_image_refs(content: &str, mapping: &HashMap<String, String>) -> String {
+        if mapping.is_empty() || content.is_empty() {
+            return content.to_string();
+        }
+
+        let mut rewritten = content.to_string();
+        let mut pairs: Vec<(&String, &String)> = mapping.iter().collect();
+        pairs.sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()));
+        for (old_path, new_path) in pairs {
+            rewritten = rewritten.replace(
+                &format!("/api/v1/knowledge/files/{}", old_path),
+                &format!("/api/v1/knowledge/files/{}", new_path),
+            );
+            rewritten = rewritten.replace(&format!("]({})", old_path), &format!("]({})", new_path));
+        }
+        rewritten
     }
 
     async fn call_custom_parse_api(&self, file: &File, custom_url: &str) -> anyhow::Result<CustomParseData> {
@@ -1146,6 +1341,45 @@ impl FileProcessor {
         Ok(())
     }
 
+    async fn insert_custom_pdf_contents(
+        &self, file_id: i64, content_list: &[ContentItem], timing: Option<&mut ParseTimingCtx>,
+    ) -> anyhow::Result<()> {
+        let valid_content_items: Vec<ContentItem> =
+            content_list.iter().filter(|item| item.typ != "discarded").cloned().collect();
+        timed_step_opt(timing, "custom_write_pdf_contents", async {
+            sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(file_id).execute(&self.pool).await?;
+            if valid_content_items.is_empty() {
+                return Ok(());
+            }
+
+            let binds_per_row = 7_usize;
+            let max_vars = 999_usize;
+            let batch_size = std::cmp::max(1, max_vars / binds_per_row);
+            for chunk in valid_content_items.chunks(batch_size) {
+                let mut pdf_sql = QueryBuilder::<Sqlite>::new(
+                    "insert into pdf_contents(file_id, page_idx, bbox, text, text_level, img_path, table_body) ",
+                );
+                pdf_sql.push_values(chunk.iter(), |mut b, item| {
+                    let bbox = if item.bbox.is_empty() {
+                        None
+                    } else {
+                        Some(serde_json::to_string(&item.bbox).unwrap_or_default())
+                    };
+                    b.push_bind(file_id)
+                        .push_bind(item.page_idx)
+                        .push_bind(bbox)
+                        .push_bind(&item.text)
+                        .push_bind(item.text_level)
+                        .push_bind(&item.img_path)
+                        .push_bind(&item.table_body);
+                });
+                pdf_sql.build().execute(&self.pool).await?;
+            }
+            Ok(())
+        })
+        .await
+    }
+
     async fn save_custom_images(
         &self, images: &HashMap<String, String>, timing: Option<&mut ParseTimingCtx>,
     ) -> anyhow::Result<()> {
@@ -1170,7 +1404,13 @@ impl FileProcessor {
                     );
                     anyhow::anyhow!(err)
                 })?;
-                fs::write(format!("{}/{}", cfg.storage.images_path, img_name), bytes).await?;
+                let Some(image_path) = resolve_image_storage_path(img_name) else {
+                    anyhow::bail!("Custom parse returned unsafe image path: {}", img_name);
+                };
+                if let Some(parent) = std::path::Path::new(&image_path).parent() {
+                    fs::create_dir_all(parent).await?;
+                }
+                fs::write(image_path, bytes).await?;
             }
             Ok(())
         })
@@ -2651,10 +2891,25 @@ impl FileProcessor {
         self.cleanup_processing_file_data_with_retry(target.id, 3).await?;
 
         let pdf_rows = self.fetch_pdf_content_rows(source.id).await?;
-        let slice_rows = self.fetch_slice_rows(source.id).await?;
+        let mut slice_rows = self.fetch_slice_rows(source.id).await?;
         let slice_ids: Vec<i64> = slice_rows.iter().map(|row| row.id).collect();
         let slice_positions = self.fetch_slice_position_rows(&slice_ids).await?;
         let (image_jobs, image_mapping) = self.prepare_image_jobs(&pdf_rows, source.id, target.id);
+        let meta_image_paths =
+            if pdf_rows.is_empty() { collect_image_raw_paths_for_files(&self.pool, &[source.id]).await? } else { Vec::new() };
+        let (meta_image_jobs, meta_image_mapping, target_meta_image_paths) =
+            Self::prepare_raw_image_jobs(&meta_image_paths, source.id, target.id);
+        if !meta_image_mapping.is_empty() {
+            for row in &mut slice_rows {
+                row.content = Self::rewrite_custom_image_refs(&row.content, &meta_image_mapping);
+            }
+        }
+        let mut source_for_reindex = source.clone();
+        if !meta_image_mapping.is_empty() {
+            if let Some(content) = source_for_reindex.content.clone() {
+                source_for_reindex.content = Some(Self::rewrite_custom_image_refs(&content, &meta_image_mapping));
+            }
+        }
 
         let mut tx = self.pool.begin().await?;
         self.insert_pdf_rows(&mut tx, target.id, &pdf_rows, &image_mapping).await?;
@@ -2663,9 +2918,14 @@ impl FileProcessor {
         tx.commit().await?;
 
         self.copy_image_files(&image_jobs).await?;
+        self.copy_image_files(&meta_image_jobs).await?;
         self.copy_converted_pdf(source.id, target.id).await?;
 
-        let full_content = self.reindex_cloned_slices(target, &cloned_slices, source).await?;
+        if pdf_rows.is_empty() {
+            update_file_custom_image_meta(&self.pool, target.id, &target_meta_image_paths, "reuse_custom_images").await?;
+        }
+
+        let full_content = self.reindex_cloned_slices(target, &cloned_slices, &source_for_reindex).await?;
 
         self.search_engine.reload_readers()?;
 
@@ -2735,6 +2995,26 @@ impl FileProcessor {
             }
         }
         (jobs, mapping)
+    }
+
+    fn prepare_raw_image_jobs(
+        paths: &[String], source_id: i64, target_id: i64,
+    ) -> (Vec<(String, String)>, HashMap<String, String>, Vec<String>) {
+        let mut jobs = Vec::new();
+        let mut mapping = HashMap::new();
+        let mut target_paths = Vec::new();
+        let mut seen = HashSet::new();
+        for path in paths {
+            let trimmed = path.trim();
+            if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
+                continue;
+            }
+            let new_path = Self::remap_image_name(trimmed, source_id, target_id);
+            mapping.insert(trimmed.to_string(), new_path.clone());
+            jobs.push((trimmed.to_string(), new_path.clone()));
+            target_paths.push(new_path);
+        }
+        (jobs, mapping, target_paths)
     }
 
     async fn insert_pdf_rows(
@@ -3063,4 +3343,68 @@ pub async fn try_reuse_file_with_file(
     }
     let processor = FileProcessor::new(pool, search_engine, 0);
     processor.try_reuse_existing_data(&file).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn image_content_item(img_path: &str) -> ContentItem {
+        ContentItem {
+            typ: "image".to_string(),
+            bbox: vec![1, 2, 3, 4],
+            page_idx: 0,
+            text: None,
+            text_level: None,
+            text_format: None,
+            img_path: Some(img_path.to_string()),
+            image_caption: None,
+            table_body: None,
+            table_caption: None,
+        }
+    }
+
+    #[test]
+    fn custom_parse_normalization_rewrites_known_image_refs() -> anyhow::Result<()> {
+        let mut images = HashMap::new();
+        images.insert("img.png".to_string(), "raw-base64".to_string());
+        let data = CustomParseData {
+            slices: vec![CustomSlice {
+                content: "see ![x](/api/v1/knowledge/files/img.png)".to_string(),
+                positions: Vec::new(),
+            }],
+            full_content: Some("full /api/v1/knowledge/files/img.png".to_string()),
+            images: Some(images),
+            content_list: Some(vec![image_content_item("images/img.png")]),
+        };
+
+        let normalized = FileProcessor::normalize_custom_parse_data(42, data)?;
+
+        assert!(normalized.images.contains_key("f42_img.png"));
+        assert_eq!(normalized.content_list.as_ref().unwrap()[0].img_path.as_deref(), Some("f42_img.png"));
+        assert!(normalized.slices[0].content.contains("/api/v1/knowledge/files/f42_img.png"));
+        assert!(normalized.full_content.as_ref().unwrap().contains("/api/v1/knowledge/files/f42_img.png"));
+        assert_eq!(normalized.image_paths, vec!["f42_img.png".to_string()]);
+        Ok(())
+    }
+
+    #[test]
+    fn custom_parse_normalization_preserves_unmapped_slice_refs() -> anyhow::Result<()> {
+        let data = CustomParseData {
+            slices: vec![CustomSlice {
+                content: "legacy ![x](/api/v1/knowledge/files/legacy.png)".to_string(),
+                positions: Vec::new(),
+            }],
+            full_content: None,
+            images: None,
+            content_list: None,
+        };
+
+        let normalized = FileProcessor::normalize_custom_parse_data(7, data)?;
+
+        assert!(normalized.images.is_empty());
+        assert!(normalized.slices[0].content.contains("/api/v1/knowledge/files/legacy.png"));
+        assert_eq!(normalized.image_paths, vec!["legacy.png".to_string()]);
+        Ok(())
+    }
 }
