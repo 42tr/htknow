@@ -1258,7 +1258,7 @@ async fn copy_images(pool: &SqlitePool, images_dir: &Path, file_ids: &[i64]) -> 
     let cfg = config::get();
     let data_root = Path::new(&cfg.storage.images_path).parent();
 
-    // Collect all image paths first
+    // 1. Collect image paths from pdf_contents (MinerU flow)
     let mut all_img_paths = Vec::new();
     for chunk in file_ids.chunks(SQLITE_BATCH_SIZE) {
         let mut qb = QueryBuilder::<Sqlite>::new(
@@ -1281,11 +1281,19 @@ async fn copy_images(pool: &SqlitePool, images_dir: &Path, file_ids: &[i64]) -> 
         }
     }
 
+    // 2. Extract image paths from slices of files without pdf_contents (custom parser flow)
+    let custom_img_paths = extract_custom_image_paths(pool, file_ids).await?;
+    all_img_paths.extend(custom_img_paths);
+
     if all_img_paths.is_empty() {
         return Ok(());
     }
 
-    // Copy images concurrently via spawn_blocking
+    // Deduplicate
+    let mut seen = std::collections::HashSet::new();
+    all_img_paths.retain(|p| seen.insert(p.clone()));
+
+    // 3. Copy all images concurrently via spawn_blocking
     let img_handles: Vec<_> = all_img_paths
         .into_iter()
         .map(|trimmed| {
@@ -1294,16 +1302,12 @@ async fn copy_images(pool: &SqlitePool, images_dir: &Path, file_ids: &[i64]) -> 
             let data_root = data_root.map(|p| p.to_path_buf());
 
             tokio::task::spawn_blocking(move || {
-                // Resolve to absolute path (same logic as resolve_image_storage_path)
                 let use_data_root = trimmed.contains('/') || trimmed.contains('\\');
                 let src = if use_data_root {
-                    // 新版端点：img_name 如 images/f{file_id}_xxx.jpg，
-                    // 实际保存在 images_path/images/f{file_id}_xxx.jpg
                     let via_images_path = Path::new(&cfg_images_path).join(&trimmed);
                     if via_images_path.exists() {
                         via_images_path
                     } else if let Some(root) = data_root {
-                        // 回退到 data_root 拼接（兼容旧逻辑或历史数据）
                         root.join(&trimmed)
                     } else {
                         via_images_path
@@ -1317,7 +1321,6 @@ async fn copy_images(pool: &SqlitePool, images_dir: &Path, file_ids: &[i64]) -> 
                     return false;
                 }
 
-                // Compute destination path
                 let dst = if use_data_root {
                     images_dir.parent().unwrap_or(&images_dir).join(&trimmed)
                 } else {
@@ -1345,6 +1348,67 @@ async fn copy_images(pool: &SqlitePool, images_dir: &Path, file_ids: &[i64]) -> 
     info!("Copied {} images, {} failed", copied, failed);
 
     Ok(())
+}
+
+/// Extract image paths from slices of files that have no pdf_contents records.
+/// Custom parser images are not recorded in pdf_contents; their references may be
+/// embedded in slice.content (e.g. markdown `![alt](/api/v1/knowledge/files/xxx.jpg)`).
+async fn extract_custom_image_paths(pool: &SqlitePool, file_ids: &[i64]) -> anyhow::Result<Vec<String>> {
+    let mut custom_file_ids = Vec::new();
+
+    // Find files without pdf_contents records, in batches
+    for chunk in file_ids.chunks(SQLITE_BATCH_SIZE) {
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT DISTINCT id FROM files WHERE id IN ("
+        );
+        let mut separated = qb.separated(", ");
+        for id in chunk {
+            separated.push_bind(id);
+        }
+        qb.push(") AND id NOT IN (SELECT DISTINCT file_id FROM pdf_contents WHERE file_id IN (");
+        let mut separated = qb.separated(", ");
+        for id in chunk {
+            separated.push_bind(id);
+        }
+        qb.push("))");
+        let ids: Vec<i64> = qb.build_query_scalar().fetch_all(pool).await?;
+        custom_file_ids.extend(ids);
+    }
+
+    if custom_file_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // Extract image references from slice content, in batches
+    let re = regex::Regex::new(r"/api/v1/knowledge/files/([^\s'\)>]+)")?;
+    let mut img_paths = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    for chunk in custom_file_ids.chunks(SQLITE_BATCH_SIZE) {
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT content FROM slices WHERE file_id IN ("
+        );
+        let mut separated = qb.separated(", ");
+        for id in chunk {
+            separated.push_bind(id);
+        }
+        qb.push(")");
+        let rows: Vec<(String,)> = qb.build_query_as().fetch_all(pool).await?;
+
+        for (content,) in rows {
+            for cap in re.captures_iter(&content) {
+                if let Some(m) = cap.get(1) {
+                    let img_name = m.as_str().trim();
+                    if img_name.is_empty() || !seen.insert(img_name.to_string()) {
+                        continue;
+                    }
+                    img_paths.push(img_name.to_string());
+                }
+            }
+        }
+    }
+
+    Ok(img_paths)
 }
 
 async fn export_tantivy_index(src_path: &str, dst_path: &str, kb_ids: &[i64]) -> anyhow::Result<usize> {
