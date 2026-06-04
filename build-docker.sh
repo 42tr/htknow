@@ -40,12 +40,14 @@ fi
 
 # Build Docker image
 echo "Building Docker image with ${DOCKERFILE}..."
-docker build -f ${DOCKERFILE} -t htknow:${IMAGE_TAG} .
+docker build -f "${DOCKERFILE}" -t "htknow:${IMAGE_TAG}" -t htknow:latest .
 
 echo "Build complete!"
 echo ""
 echo "Image tag: htknow:${IMAGE_TAG}"
+echo "Latest tag: htknow:latest"
 echo "BUILT_IMAGE=htknow:${IMAGE_TAG}"
+echo "BUILT_LATEST_IMAGE=htknow:latest"
 echo "Build mode: ${BUILD_MODE}"
 echo ""
 echo "To run the container:"
