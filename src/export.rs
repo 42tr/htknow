@@ -1297,10 +1297,16 @@ async fn copy_images(pool: &SqlitePool, images_dir: &Path, file_ids: &[i64]) -> 
                 // Resolve to absolute path (same logic as resolve_image_storage_path)
                 let use_data_root = trimmed.contains('/') || trimmed.contains('\\');
                 let src = if use_data_root {
-                    if let Some(root) = data_root {
+                    // 新版端点：img_name 如 images/f{file_id}_xxx.jpg，
+                    // 实际保存在 images_path/images/f{file_id}_xxx.jpg
+                    let via_images_path = Path::new(&cfg_images_path).join(&trimmed);
+                    if via_images_path.exists() {
+                        via_images_path
+                    } else if let Some(root) = data_root {
+                        // 回退到 data_root 拼接（兼容旧逻辑或历史数据）
                         root.join(&trimmed)
                     } else {
-                        Path::new(&cfg_images_path).join(&trimmed)
+                        via_images_path
                     }
                 } else {
                     Path::new(&cfg_images_path).join(&trimmed)

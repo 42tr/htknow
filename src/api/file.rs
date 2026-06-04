@@ -1473,14 +1473,10 @@ pub(crate) fn resolve_image_storage_path(raw: &str) -> Option<String> {
 
     let cfg = config::get();
     let images_root = std::path::Path::new(&cfg.storage.images_path);
-    let data_root = images_root.parent();
-    let use_data_root = trimmed.contains('/') || trimmed.contains('\\');
 
-    let resolved = if use_data_root {
-        if let Some(root) = data_root { root.join(trimmed) } else { images_root.join(trimmed) }
-    } else {
-        images_root.join(trimmed)
-    };
+    // 图片实际存储路径为 images_path/trimmed
+    // （与 save_mineru_images 的 "{images_path}/{img_name}" 一致）
+    let resolved = images_root.join(trimmed);
 
     Some(resolved.to_string_lossy().to_string())
 }
