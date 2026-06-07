@@ -19,6 +19,12 @@ pub struct LlmClient {
     model: String,
 }
 
+impl Default for LlmClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl LlmClient {
     pub fn new() -> Self {
         let cfg = config::get();

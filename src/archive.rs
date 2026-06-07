@@ -3,8 +3,7 @@
 //! 支持 ZIP、TAR（及其 GZ/BZ2/XZ 变体）格式的解压。
 //! 7Z 和 RAR 格式暂不支持。
 
-use std::io::Read;
-use std::path::Path;
+use std::{io::Read, path::Path};
 
 use encoding_rs::GB18030;
 use serde::Serialize;
@@ -140,11 +139,7 @@ fn archive_format_desc(filename: &str) -> &'static str {
 /// `filename` 为原始文件名（含扩展名），用于判断压缩格式。
 /// 返回解压后的文件列表
 pub fn extract_archive(
-    src_path: &str,
-    dest_dir: &str,
-    filename: &str,
-    password: Option<&str>,
-    file_id: i64,
+    src_path: &str, dest_dir: &str, filename: &str, password: Option<&str>, file_id: i64,
 ) -> Result<Vec<ArchiveEntry>, ArchiveError> {
     let limits = ExtractLimits::default();
     extract_archive_with_limits(src_path, dest_dir, filename, password, file_id, &limits)
@@ -152,12 +147,7 @@ pub fn extract_archive(
 
 /// 带限制的解压
 pub fn extract_archive_with_limits(
-    src_path: &str,
-    dest_dir: &str,
-    filename: &str,
-    password: Option<&str>,
-    file_id: i64,
-    limits: &ExtractLimits,
+    src_path: &str, dest_dir: &str, filename: &str, password: Option<&str>, file_id: i64, limits: &ExtractLimits,
 ) -> Result<Vec<ArchiveEntry>, ArchiveError> {
     if !is_archive_file(filename) {
         return Err(ArchiveError::UnsupportedFormat(archive_format_desc(filename).to_string()));
@@ -182,10 +172,7 @@ pub fn extract_archive_with_limits(
 ///
 /// `filename` 为原始文件名（含扩展名），用于判断压缩格式。
 pub fn read_archive_entry(
-    src_path: &str,
-    filename: &str,
-    entry_path: &str,
-    password: Option<&str>,
+    src_path: &str, filename: &str, entry_path: &str, password: Option<&str>,
 ) -> Result<Vec<u8>, ArchiveError> {
     let lower = filename.to_lowercase();
     if lower.ends_with(".zip") {
@@ -204,11 +191,7 @@ pub fn read_archive_entry(
 // ============================================================================
 
 fn extract_zip(
-    src_path: &str,
-    dest_dir: &str,
-    password: Option<&str>,
-    file_id: i64,
-    limits: &ExtractLimits,
+    src_path: &str, dest_dir: &str, password: Option<&str>, file_id: i64, limits: &ExtractLimits,
 ) -> Result<Vec<ArchiveEntry>, ArchiveError> {
     let file = std::fs::File::open(src_path)?;
     let mut archive = match zip::ZipArchive::new(file) {
@@ -242,25 +225,30 @@ fn extract_zip(
         let raw_bytes = file_entry.name_raw();
         let raw_name = decode_filename(raw_bytes);
         // 统一路径分隔符为 /，并处理连续分隔符和首尾分隔符
-        let name: String = raw_name
-            .replace('\\', "/")
-            .split('/')
-            .filter(|s| !s.is_empty())
-            .collect::<Vec<_>>()
-            .join("/");
+        let name: String =
+            raw_name.replace('\\', "/").split('/').filter(|s| !s.is_empty()).collect::<Vec<_>>().join("/");
         if name.is_empty() {
-            log::info!("ZIP entry {}: raw={:?} utf8={:?} -> skipped (empty after normalization)", i, raw_bytes, raw_name);
+            log::info!(
+                "ZIP entry {}: raw={:?} utf8={:?} -> skipped (empty after normalization)",
+                i,
+                raw_bytes,
+                raw_name
+            );
             continue;
         }
         let is_dir = is_dir_from_raw(raw_bytes);
-        let name = if is_dir && name.ends_with('/') {
-            name.trim_end_matches('/').to_string()
-        } else {
-            name
-        };
+        let name = if is_dir && name.ends_with('/') { name.trim_end_matches('/').to_string() } else { name };
         let size = file_entry.size();
 
-        log::info!("ZIP entry {}: raw={:?} decoded={:?} -> normalized={}, is_dir={}, size={}", i, raw_bytes, raw_name, name, is_dir, size);
+        log::info!(
+            "ZIP entry {}: raw={:?} decoded={:?} -> normalized={}, is_dir={}, size={}",
+            i,
+            raw_bytes,
+            raw_name,
+            name,
+            is_dir,
+            size
+        );
 
         // 安全检查：路径遍历
         if name.contains("..") {
@@ -287,10 +275,7 @@ fn extract_zip(
 
         // 数量限制检查
         if entries.len() >= limits.max_file_count {
-            return Err(ArchiveError::FileCountExceeded {
-                max: limits.max_file_count,
-                actual: entries.len(),
-            });
+            return Err(ArchiveError::FileCountExceeded { max: limits.max_file_count, actual: entries.len() });
         }
 
         let out_path = Path::new(dest_dir).join(&name);
@@ -318,11 +303,7 @@ fn extract_zip(
     Ok(entries)
 }
 
-fn read_zip_entry(
-    src_path: &str,
-    entry_path: &str,
-    password: Option<&str>,
-) -> Result<Vec<u8>, ArchiveError> {
+fn read_zip_entry(src_path: &str, entry_path: &str, password: Option<&str>) -> Result<Vec<u8>, ArchiveError> {
     let file = std::fs::File::open(src_path)?;
     let mut archive = match zip::ZipArchive::new(file) {
         Ok(a) => a,
@@ -336,11 +317,7 @@ fn read_zip_entry(
     for i in 0..archive.len() {
         let file_ref = archive.by_index(i).map_err(|e| ArchiveError::Zip(e.to_string()))?;
         let decoded_name = decode_filename(file_ref.name_raw());
-        let normalized_name = decoded_name
-            .replace('\\', "/")
-            .trim_start_matches('/')
-            .trim_end_matches('/')
-            .to_string();
+        let normalized_name = decoded_name.replace('\\', "/").trim_start_matches('/').trim_end_matches('/').to_string();
 
         if normalized_name == normalized_target {
             let is_encrypted = file_ref.encrypted();
@@ -387,10 +364,7 @@ fn open_tar_reader(src_path: &str) -> Result<Box<dyn Read>, ArchiveError> {
 }
 
 fn extract_tar(
-    src_path: &str,
-    dest_dir: &str,
-    file_id: i64,
-    limits: &ExtractLimits,
+    src_path: &str, dest_dir: &str, file_id: i64, limits: &ExtractLimits,
 ) -> Result<Vec<ArchiveEntry>, ArchiveError> {
     let reader = open_tar_reader(src_path)?;
     let mut archive = tar::Archive::new(reader);
@@ -434,10 +408,7 @@ fn extract_tar(
         }
 
         if entries.len() >= limits.max_file_count {
-            return Err(ArchiveError::FileCountExceeded {
-                max: limits.max_file_count,
-                actual: entries.len(),
-            });
+            return Err(ArchiveError::FileCountExceeded { max: limits.max_file_count, actual: entries.len() });
         }
 
         let out_path = Path::new(dest_dir).join(&name);
@@ -500,11 +471,7 @@ pub fn cleanup_archive_dir(archives_path: &str, file_id: i64) -> std::io::Result
 }
 
 /// 获取压缩文件条目的本地文件系统路径
-pub fn resolve_archive_entry_path(
-    archives_path: &str,
-    file_id: i64,
-    entry_path: &str,
-) -> Option<std::path::PathBuf> {
+pub fn resolve_archive_entry_path(archives_path: &str, file_id: i64, entry_path: &str) -> Option<std::path::PathBuf> {
     let base = Path::new(archives_path).join(file_id.to_string());
     let resolved = base.join(entry_path);
 
@@ -524,8 +491,9 @@ pub fn resolve_archive_entry_path(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write;
+
+    use super::*;
 
     #[test]
     fn test_is_archive_file() {

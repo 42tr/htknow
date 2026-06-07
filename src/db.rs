@@ -1,15 +1,11 @@
 use std::{
-    collections::HashSet,
-    fs::OpenOptions,
-    path::{Path, PathBuf},
-    time::Duration,
+    collections::HashSet, fs::OpenOptions, path::{Path, PathBuf}, time::Duration
 };
 
 use anyhow::Context;
 use log::info;
 use sqlx::{
-    Row, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+    Row, SqlitePool, sqlite::{SqliteConnectOptions, SqlitePoolOptions}
 };
 
 use crate::config;
@@ -431,18 +427,18 @@ fn strip_uri_suffix(value: &str) -> &str {
 
 /// 确保数据库文件以及其父目录存在。如果父目录不存在会创建，数据库文件不存在会创建空文件。
 fn ensure_db_file(path: &Path) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        if !parent.exists() {
+    if let Some(parent) = path.parent()
+        && !parent.exists() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("failed to create parent directory {}", parent.display()))?;
             info!("Created parent directory for sqlite DB: {}", parent.display());
         }
-    }
 
     // 创建空文件（若已存在则不修改）
     if !path.exists() {
         OpenOptions::new()
             .create(true)
+            .truncate(false)
             .write(true)
             .open(path)
             .with_context(|| format!("failed to create sqlite db file {}", path.display()))?;

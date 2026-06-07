@@ -55,18 +55,15 @@ pub fn reload_custom_words(entries: &[LexiconEntry]) -> anyhow::Result<usize> {
 
 /// 分词模式
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Default)]
 pub enum SegmentationMode {
     /// 搜索模式：适合搜索引擎（召回率高但较慢）
+    #[default]
     Search,
     /// 全模式：速度较慢，但能识别更多的词汇
     All,
 }
 
-impl Default for SegmentationMode {
-    fn default() -> Self {
-        SegmentationMode::Search
-    }
-}
 
 /// 快速中文分词器 - 针对性能优化
 #[derive(Clone)]

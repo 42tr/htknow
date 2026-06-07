@@ -8,7 +8,7 @@ use tokio::fs;
 
 use crate::config;
 
-static HTTP_CLIENT: Lazy<Client> = Lazy::new(|| Client::new());
+static HTTP_CLIENT: Lazy<Client> = Lazy::new(Client::new);
 
 #[derive(Debug, Serialize)]
 struct EmbeddingRequest {

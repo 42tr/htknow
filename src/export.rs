@@ -2,8 +2,7 @@ use std::{path::Path, sync::Arc};
 
 use anyhow::Context;
 use arrow_array::{
-    ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray,
-    builder::{FixedSizeListBuilder, Float32Builder},
+    ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray, builder::{FixedSizeListBuilder, Float32Builder}
 };
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use futures::stream::StreamExt;
@@ -11,22 +10,35 @@ use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, sqlite::SqlitePoolOptions};
 use tantivy::{
-    TantivyDocument, Term,
-    collector::TopDocs,
-    doc,
-    query::{BooleanQuery, Occur, Query, TermQuery},
-    schema::{IndexRecordOption, Value as _},
+    TantivyDocument, Term, collector::TopDocs, doc, query::{BooleanQuery, Occur, Query, TermQuery}, schema::{IndexRecordOption, Value as _}
 };
 use utoipa::ToSchema;
 
 use crate::{
-    api::{backfill_missing_image_meta_for_files, collect_image_raw_paths_for_files},
-    config,
-    search::tantivy_engine,
+    api::{backfill_missing_image_meta_for_files, collect_image_raw_paths_for_files}, config, search::tantivy_engine
 };
 
 const EXPORT_MANIFEST_FILENAME: &str = "manifest.json";
 const EXPORT_DB_FILENAME: &str = "app.sqlite";
+
+// Type aliases for complex SQL row types used in bulk export operations
+#[allow(clippy::type_complexity)]
+type KbRow = (i64, String, String, String, String, String, Option<i64>, i32, i32, i64, i64);
+#[allow(clippy::type_complexity)]
+type FileRow =
+    (i64, String, String, String, String, String, i64, Option<String>, String, i32, String, String, Option<i64>, i32, i32, Option<String>, i64, i64);
+#[allow(clippy::type_complexity)]
+type SlicePosRow = (i64, i64, i32, i32, i32, i32, i32, Option<String>, Option<i32>, i64);
+#[allow(clippy::type_complexity)]
+type PdfContentRow = (i64, i64, i32, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>, i64, i64);
+#[allow(clippy::type_complexity)]
+type EntityRow = (i64, String, String, Option<String>, Option<Vec<u8>>, Option<i64>, Option<i64>, i32, i64, i64);
+#[allow(clippy::type_complexity)]
+type RelationRow = (i64, i64, i64, String, Option<String>, Option<f64>, Option<i64>, i64);
+#[allow(clippy::type_complexity)]
+type MentionRow = (i64, i64, i64, Option<i64>, Option<i64>, Option<String>, i64);
+#[allow(clippy::type_complexity)]
+type GraphSnapshotRow = (i64, Option<i64>, Vec<u8>, Option<i32>, Option<i32>, Option<i32>, i64);
 
 /// Export manifest metadata
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
@@ -234,20 +246,12 @@ pub async fn export_knowledge_bases(
         (slice_count, node_count, edge_count, mention_count, snapshot_count)
     };
 
-    let (copy_result, tantivy_doc_count, tantivy_full_doc_count, lancedb_row_count, stats) = tokio::join!(
-        copy_files_future,
-        tantivy_future,
-        tantivy_full_future,
-        lancedb_future,
-        stats_future,
-    );
+    let (copy_result, tantivy_doc_count, tantivy_full_doc_count, lancedb_row_count, stats) =
+        tokio::join!(copy_files_future, tantivy_future, tantivy_full_future, lancedb_future, stats_future,);
 
     copy_result?;
     let (slice_count, node_count, edge_count, mention_count, snapshot_count) = stats;
-    info!(
-        "[step] Parallel export (files + tantivy + lancedb + stats) total: {}ms",
-        step_start.elapsed().as_millis()
-    );
+    info!("[step] Parallel export (files + tantivy + lancedb + stats) total: {}ms", step_start.elapsed().as_millis());
 
     // 5. Write manifest
     let step_start = std::time::Instant::now();
@@ -337,7 +341,7 @@ async fn collect_ancestor_kb_ids(pool: &SqlitePool, kb_ids: &[i64]) -> anyhow::R
         let mut next_batch = Vec::new();
         for chunk in current_batch.chunks(SQLITE_BATCH_SIZE) {
             let mut qb = QueryBuilder::<Sqlite>::new(
-                "SELECT DISTINCT parent_id FROM knowledge_bases WHERE parent_id IS NOT NULL AND id IN ("
+                "SELECT DISTINCT parent_id FROM knowledge_bases WHERE parent_id IS NOT NULL AND id IN (",
             );
             let mut separated = qb.separated(", ");
             for id in chunk {
@@ -517,9 +521,7 @@ async fn export_sqlite_data(
     Ok(file_ids)
 }
 
-async fn do_export_knowledge_bases(
-    src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i64],
-) -> anyhow::Result<()> {
+async fn do_export_knowledge_bases(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i64]) -> anyhow::Result<()> {
     if kb_ids.is_empty() {
         return Ok(());
     }
@@ -538,43 +540,46 @@ async fn do_export_knowledge_bases(
             continue;
         }
 
-        let values: Vec<(i64, String, String, String, String, String, Option<i64>, i32, i32, i64, i64)> =
-            rows.iter()
-                .map(|row| {
-                    (
-                        row.get::<i64, _>("id"),
-                        row.get::<String, _>("user_id"),
-                        row.get::<String, _>("user_name"),
-                        row.get::<String, _>("name"),
-                        row.get::<String, _>("description"),
-                        row.get::<String, _>("kb_type"),
-                        row.get::<Option<i64>, _>("parent_id"),
-                        row.get::<i32, _>("is_public"),
-                        row.get::<i32, _>("parse_priority"),
-                        row.get::<i64, _>("created_at"),
-                        row.get::<i64, _>("updated_at"),
-                    )
-                })
-                .collect();
+        let values: Vec<KbRow> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<i64, _>("id"),
+                    row.get::<String, _>("user_id"),
+                    row.get::<String, _>("user_name"),
+                    row.get::<String, _>("name"),
+                    row.get::<String, _>("description"),
+                    row.get::<String, _>("kb_type"),
+                    row.get::<Option<i64>, _>("parent_id"),
+                    row.get::<i32, _>("is_public"),
+                    row.get::<i32, _>("parse_priority"),
+                    row.get::<i64, _>("created_at"),
+                    row.get::<i64, _>("updated_at"),
+                )
+            })
+            .collect();
 
         for values_chunk in values.chunks(INSERT_BATCH_SIZE) {
             let mut qb = QueryBuilder::<Sqlite>::new(
                 "INSERT INTO knowledge_bases \
                  (id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority, created_at, updated_at) ",
             );
-            qb.push_values(values_chunk, |mut b, (id, uid, uname, name, desc, kb_type, pid, is_pub, prio, cat, uat)| {
-                b.push_bind(id)
-                    .push_bind(uid)
-                    .push_bind(uname)
-                    .push_bind(name)
-                    .push_bind(desc)
-                    .push_bind(kb_type)
-                    .push_bind(pid)
-                    .push_bind(is_pub)
-                    .push_bind(prio)
-                    .push_bind(cat)
-                    .push_bind(uat);
-            });
+            qb.push_values(
+                values_chunk,
+                |mut b, (id, uid, uname, name, desc, kb_type, pid, is_pub, prio, cat, uat)| {
+                    b.push_bind(id)
+                        .push_bind(uid)
+                        .push_bind(uname)
+                        .push_bind(name)
+                        .push_bind(desc)
+                        .push_bind(kb_type)
+                        .push_bind(pid)
+                        .push_bind(is_pub)
+                        .push_bind(prio)
+                        .push_bind(cat)
+                        .push_bind(uat);
+                },
+            );
             qb.build().execute(dst_pool).await?;
         }
     }
@@ -603,41 +608,41 @@ async fn export_files(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i6
             continue;
         }
 
-        let values: Vec<(i64, String, String, String, String, String, i64, Option<String>, String, i32, String, String, Option<i64>, i32, i32, Option<String>, i64, i64)> =
-            rows.iter()
-                .map(|row| {
-                    let id: i64 = row.get("id");
-                    let path: String = row.get("path");
-                    let relative_path = if path.starts_with(&files_path_prefix) {
-                        format!("data/files/{}", &path[files_path_prefix.len()..])
-                    } else if let Some(filename) = Path::new(&path).file_name() {
-                        format!("data/files/{}", filename.to_string_lossy())
-                    } else {
-                        path.clone()
-                    };
-                    file_ids.push(id);
-                    (
-                        id,
-                        row.get::<String, _>("user_id"),
-                        row.get::<String, _>("user_name"),
-                        row.get::<String, _>("hash"),
-                        row.get::<String, _>("filename"),
-                        relative_path,
-                        row.get::<i64, _>("size"),
-                        row.get::<Option<String>, _>("content"),
-                        row.get::<String, _>("tags"),
-                        row.get::<i32, _>("status"),
-                        row.get::<String, _>("log"),
-                        row.get::<String, _>("slice_type"),
-                        row.get::<Option<i64>, _>("kb_id"),
-                        row.get::<i32, _>("parse_priority"),
-                        row.get::<i32, _>("is_public"),
-                        row.get::<Option<String>, _>("meta"),
-                        row.get::<i64, _>("created_at"),
-                        row.get::<i64, _>("updated_at"),
-                    )
-                })
-                .collect();
+        let values: Vec<FileRow> = rows
+            .iter()
+            .map(|row| {
+                let id: i64 = row.get("id");
+                let path: String = row.get("path");
+                let relative_path = if path.starts_with(&files_path_prefix) {
+                    format!("data/files/{}", &path[files_path_prefix.len()..])
+                } else if let Some(filename) = Path::new(&path).file_name() {
+                    format!("data/files/{}", filename.to_string_lossy())
+                } else {
+                    path.clone()
+                };
+                file_ids.push(id);
+                (
+                    id,
+                    row.get::<String, _>("user_id"),
+                    row.get::<String, _>("user_name"),
+                    row.get::<String, _>("hash"),
+                    row.get::<String, _>("filename"),
+                    relative_path,
+                    row.get::<i64, _>("size"),
+                    row.get::<Option<String>, _>("content"),
+                    row.get::<String, _>("tags"),
+                    row.get::<i32, _>("status"),
+                    row.get::<String, _>("log"),
+                    row.get::<String, _>("slice_type"),
+                    row.get::<Option<i64>, _>("kb_id"),
+                    row.get::<i32, _>("parse_priority"),
+                    row.get::<i32, _>("is_public"),
+                    row.get::<Option<String>, _>("meta"),
+                    row.get::<i64, _>("created_at"),
+                    row.get::<i64, _>("updated_at"),
+                )
+            })
+            .collect();
 
         for values_chunk in values.chunks(INSERT_BATCH_SIZE) {
             let mut qb = QueryBuilder::<Sqlite>::new(
@@ -647,7 +652,27 @@ async fn export_files(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i6
             );
             qb.push_values(
                 values_chunk,
-                |mut b, (id, uid, uname, hash, filename, path, size, content, tags, status, log, stype, kb_id, prio, is_pub, meta, cat, uat)| {
+                |mut b,
+                 (
+                    id,
+                    uid,
+                    uname,
+                    hash,
+                    filename,
+                    path,
+                    size,
+                    content,
+                    tags,
+                    status,
+                    log,
+                    stype,
+                    kb_id,
+                    prio,
+                    is_pub,
+                    meta,
+                    cat,
+                    uat,
+                )| {
                     b.push_bind(id)
                         .push_bind(uid)
                         .push_bind(uname)
@@ -712,7 +737,8 @@ async fn export_slices(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &
             .collect();
 
         for values_chunk in values.chunks(INSERT_BATCH_SIZE) {
-            let mut qb = QueryBuilder::<Sqlite>::new("INSERT INTO slices (id, file_id, content, created_at, updated_at) ");
+            let mut qb =
+                QueryBuilder::<Sqlite>::new("INSERT INTO slices (id, file_id, content, created_at, updated_at) ");
             qb.push_values(values_chunk, |mut b, (id, file_id, content, created_at, updated_at)| {
                 b.push_bind(id).push_bind(file_id).push_bind(content).push_bind(created_at).push_bind(updated_at);
             });
@@ -722,9 +748,7 @@ async fn export_slices(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &
     Ok(())
 }
 
-async fn export_slice_positions(
-    src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &[i64],
-) -> anyhow::Result<()> {
+async fn export_slice_positions(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &[i64]) -> anyhow::Result<()> {
     if file_ids.is_empty() {
         return Ok(());
     }
@@ -745,7 +769,7 @@ async fn export_slice_positions(
             continue;
         }
 
-        let values: Vec<(i64, i64, i32, i32, i32, i32, i32, Option<String>, Option<i32>, i64)> = rows
+        let values: Vec<SlicePosRow> = rows
             .iter()
             .map(|row| {
                 (
@@ -788,9 +812,7 @@ async fn export_slice_positions(
     Ok(())
 }
 
-async fn export_pdf_contents(
-    src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &[i64],
-) -> anyhow::Result<()> {
+async fn export_pdf_contents(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &[i64]) -> anyhow::Result<()> {
     if file_ids.is_empty() {
         return Ok(());
     }
@@ -810,27 +832,27 @@ async fn export_pdf_contents(
             continue;
         }
 
-        let values: Vec<(i64, i64, i32, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>, i64, i64)> =
-            rows.iter()
-                .map(|row| {
-                    let img_path: Option<String> = row.get("img_path");
-                    let relative_img_path = img_path.map(|p| {
-                        if p.starts_with(&images_path_prefix) { p[images_path_prefix.len()..].to_string() } else { p }
-                    });
-                    (
-                        row.get::<i64, _>("id"),
-                        row.get::<i64, _>("file_id"),
-                        row.get::<i32, _>("page_idx"),
-                        row.get::<Option<String>, _>("bbox"),
-                        row.get::<Option<String>, _>("text"),
-                        row.get::<Option<i32>, _>("text_level"),
-                        relative_img_path,
-                        row.get::<Option<String>, _>("table_body"),
-                        row.get::<i64, _>("created_at"),
-                        row.get::<i64, _>("updated_at"),
-                    )
-                })
-                .collect();
+        let values: Vec<PdfContentRow> = rows
+            .iter()
+            .map(|row| {
+                let img_path: Option<String> = row.get("img_path");
+                let relative_img_path = img_path.map(|p| {
+                    if p.starts_with(&images_path_prefix) { p[images_path_prefix.len()..].to_string() } else { p }
+                });
+                (
+                    row.get::<i64, _>("id"),
+                    row.get::<i64, _>("file_id"),
+                    row.get::<i32, _>("page_idx"),
+                    row.get::<Option<String>, _>("bbox"),
+                    row.get::<Option<String>, _>("text"),
+                    row.get::<Option<i32>, _>("text_level"),
+                    relative_img_path,
+                    row.get::<Option<String>, _>("table_body"),
+                    row.get::<i64, _>("created_at"),
+                    row.get::<i64, _>("updated_at"),
+                )
+            })
+            .collect();
 
         for values_chunk in values.chunks(INSERT_BATCH_SIZE) {
             let mut qb = QueryBuilder::<Sqlite>::new(
@@ -882,23 +904,23 @@ async fn export_graph_nodes(
                 continue;
             }
 
-            let values: Vec<(i64, String, String, Option<String>, Option<Vec<u8>>, Option<i64>, Option<i64>, i32, i64, i64)> =
-                rows.iter()
-                    .map(|row| {
-                        (
-                            row.get::<i64, _>("id"),
-                            row.get::<String, _>("name"),
-                            row.get::<String, _>("entity_type"),
-                            row.get::<Option<String>, _>("properties"),
-                            row.get::<Option<Vec<u8>>, _>("embedding"),
-                            row.get::<Option<i64>, _>("file_id"),
-                            row.get::<Option<i64>, _>("kb_id"),
-                            row.get::<i32, _>("is_public"),
-                            row.get::<i64, _>("created_at"),
-                            row.get::<i64, _>("updated_at"),
-                        )
-                    })
-                    .collect();
+            let values: Vec<EntityRow> = rows
+                .iter()
+                .map(|row| {
+                    (
+                        row.get::<i64, _>("id"),
+                        row.get::<String, _>("name"),
+                        row.get::<String, _>("entity_type"),
+                        row.get::<Option<String>, _>("properties"),
+                        row.get::<Option<Vec<u8>>, _>("embedding"),
+                        row.get::<Option<i64>, _>("file_id"),
+                        row.get::<Option<i64>, _>("kb_id"),
+                        row.get::<i32, _>("is_public"),
+                        row.get::<i64, _>("created_at"),
+                        row.get::<i64, _>("updated_at"),
+                    )
+                })
+                .collect();
 
             for values_chunk in values.chunks(INSERT_BATCH_SIZE) {
                 let mut qb = QueryBuilder::<Sqlite>::new(
@@ -907,7 +929,19 @@ async fn export_graph_nodes(
                 );
                 qb.push_values(
                     values_chunk,
-                    |mut b, (id, name, entity_type, properties, embedding, file_id, kb_id, is_public, created_at, updated_at)| {
+                    |mut b,
+                     (
+                        id,
+                        name,
+                        entity_type,
+                        properties,
+                        embedding,
+                        file_id,
+                        kb_id,
+                        is_public,
+                        created_at,
+                        updated_at,
+                    )| {
                         b.push_bind(id)
                             .push_bind(name)
                             .push_bind(entity_type)
@@ -948,23 +982,23 @@ async fn export_graph_nodes_by_kb_id(
             continue;
         }
 
-        let values: Vec<(i64, String, String, Option<String>, Option<Vec<u8>>, Option<i64>, Option<i64>, i32, i64, i64)> =
-            rows.iter()
-                .map(|row| {
-                    (
-                        row.get::<i64, _>("id"),
-                        row.get::<String, _>("name"),
-                        row.get::<String, _>("entity_type"),
-                        row.get::<Option<String>, _>("properties"),
-                        row.get::<Option<Vec<u8>>, _>("embedding"),
-                        row.get::<Option<i64>, _>("file_id"),
-                        row.get::<Option<i64>, _>("kb_id"),
-                        row.get::<i32, _>("is_public"),
-                        row.get::<i64, _>("created_at"),
-                        row.get::<i64, _>("updated_at"),
-                    )
-                })
-                .collect();
+        let values: Vec<EntityRow> = rows
+            .iter()
+            .map(|row| {
+                (
+                    row.get::<i64, _>("id"),
+                    row.get::<String, _>("name"),
+                    row.get::<String, _>("entity_type"),
+                    row.get::<Option<String>, _>("properties"),
+                    row.get::<Option<Vec<u8>>, _>("embedding"),
+                    row.get::<Option<i64>, _>("file_id"),
+                    row.get::<Option<i64>, _>("kb_id"),
+                    row.get::<i32, _>("is_public"),
+                    row.get::<i64, _>("created_at"),
+                    row.get::<i64, _>("updated_at"),
+                )
+            })
+            .collect();
 
         for values_chunk in values.chunks(INSERT_BATCH_SIZE) {
             let mut qb = QueryBuilder::<Sqlite>::new(
@@ -1015,7 +1049,7 @@ async fn export_graph_edges(src_pool: &SqlitePool, dst_pool: &SqlitePool) -> any
             continue;
         }
 
-        let values: Vec<(i64, i64, i64, String, Option<String>, Option<f64>, Option<i64>, i64)> = rows
+        let values: Vec<RelationRow> = rows
             .iter()
             .filter_map(|row| {
                 let target_id: i64 = row.get("target_node_id");
@@ -1088,7 +1122,7 @@ async fn export_entity_mentions(src_pool: &SqlitePool, dst_pool: &SqlitePool) ->
             continue;
         }
 
-        let values: Vec<(i64, i64, i64, Option<i64>, Option<i64>, Option<String>, i64)> = rows
+        let values: Vec<MentionRow> = rows
             .iter()
             .filter_map(|row| {
                 let slice_id: i64 = row.get("slice_id");
@@ -1135,9 +1169,7 @@ async fn export_entity_mentions(src_pool: &SqlitePool, dst_pool: &SqlitePool) ->
     Ok(())
 }
 
-async fn export_graph_snapshots(
-    src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i64],
-) -> anyhow::Result<()> {
+async fn export_graph_snapshots(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i64]) -> anyhow::Result<()> {
     if kb_ids.is_empty() {
         return Ok(());
     }
@@ -1156,7 +1188,7 @@ async fn export_graph_snapshots(
             continue;
         }
 
-        let values: Vec<(i64, Option<i64>, Vec<u8>, Option<i32>, Option<i32>, Option<i32>, i64)> = rows
+        let values: Vec<GraphSnapshotRow> = rows
             .iter()
             .map(|row| {
                 (
@@ -1345,7 +1377,7 @@ async fn copy_images(pool: &SqlitePool, images_dir: &Path, file_ids: &[i64]) -> 
         .collect();
 
     let results = futures::future::join_all(img_handles).await;
-    let copied = results.iter().filter(|r| r.as_ref().map_or(false, |v| *v)).count();
+    let copied = results.iter().filter(|r| r.as_ref().is_ok_and(|v| *v)).count();
     let failed = results.len() - copied;
     info!("Copied {} images, {} failed", copied, failed);
 
@@ -1377,10 +1409,8 @@ async fn export_tantivy_index(src_path: &str, dst_path: &str, kb_ids: &[i64]) ->
             .map(|kb_id| {
                 (
                     Occur::Should,
-                    Box::new(TermQuery::new(
-                        Term::from_field_i64(kb_id_field, *kb_id),
-                        IndexRecordOption::Basic,
-                    )) as Box<dyn Query>,
+                    Box::new(TermQuery::new(Term::from_field_i64(kb_id_field, *kb_id), IndexRecordOption::Basic))
+                        as Box<dyn Query>,
                 )
             })
             .collect();
@@ -1553,7 +1583,9 @@ async fn count_graph_data(pool: &SqlitePool, kb_ids: &[i64]) -> anyhow::Result<(
     for chunk in kb_ids.chunks(SQLITE_BATCH_SIZE) {
         let mut qb = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM graph_nodes WHERE kb_id IN (");
         let mut separated = qb.separated(", ");
-        for id in chunk { separated.push_bind(id); }
+        for id in chunk {
+            separated.push_bind(id);
+        }
         qb.push(")");
         let cnt: i64 = qb.build_query_scalar().fetch_one(pool).await?;
         node_count += cnt;
@@ -1562,10 +1594,12 @@ async fn count_graph_data(pool: &SqlitePool, kb_ids: &[i64]) -> anyhow::Result<(
     let mut edge_count = 0_i64;
     for chunk in kb_ids.chunks(SQLITE_BATCH_SIZE) {
         let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT COUNT(*) FROM graph_edges e WHERE EXISTS (SELECT 1 FROM graph_nodes n WHERE n.id = e.source_node_id AND n.kb_id IN ("
+            "SELECT COUNT(*) FROM graph_edges e WHERE EXISTS (SELECT 1 FROM graph_nodes n WHERE n.id = e.source_node_id AND n.kb_id IN (",
         );
         let mut separated = qb.separated(", ");
-        for id in chunk { separated.push_bind(id); }
+        for id in chunk {
+            separated.push_bind(id);
+        }
         qb.push("))");
         let cnt: i64 = qb.build_query_scalar().fetch_one(pool).await?;
         edge_count += cnt;
@@ -1574,10 +1608,12 @@ async fn count_graph_data(pool: &SqlitePool, kb_ids: &[i64]) -> anyhow::Result<(
     let mut mention_count = 0_i64;
     for chunk in kb_ids.chunks(SQLITE_BATCH_SIZE) {
         let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT COUNT(*) FROM entity_mentions m WHERE EXISTS (SELECT 1 FROM graph_nodes n WHERE n.id = m.node_id AND n.kb_id IN ("
+            "SELECT COUNT(*) FROM entity_mentions m WHERE EXISTS (SELECT 1 FROM graph_nodes n WHERE n.id = m.node_id AND n.kb_id IN (",
         );
         let mut separated = qb.separated(", ");
-        for id in chunk { separated.push_bind(id); }
+        for id in chunk {
+            separated.push_bind(id);
+        }
         qb.push("))");
         let cnt: i64 = qb.build_query_scalar().fetch_one(pool).await?;
         mention_count += cnt;
@@ -1587,7 +1623,9 @@ async fn count_graph_data(pool: &SqlitePool, kb_ids: &[i64]) -> anyhow::Result<(
     for chunk in kb_ids.chunks(SQLITE_BATCH_SIZE) {
         let mut qb = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM graph_snapshots WHERE kb_id IN (");
         let mut separated = qb.separated(", ");
-        for id in chunk { separated.push_bind(id); }
+        for id in chunk {
+            separated.push_bind(id);
+        }
         qb.push(")");
         let cnt: i64 = qb.build_query_scalar().fetch_one(pool).await?;
         snapshot_count += cnt;

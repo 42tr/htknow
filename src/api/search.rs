@@ -1,18 +1,12 @@
 use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet},
-    convert::Infallible,
-    time::Instant,
+    cmp::Ordering, collections::{HashMap, HashSet}, convert::Infallible, time::Instant
 };
 
 use anyhow::anyhow;
 use axum::{
-    Extension,
-    extract::{Multipart, Path, Query, State},
-    response::{
-        Json,
-        sse::{Event, KeepAlive, KeepAliveStream, Sse},
-    },
+    Extension, extract::{Multipart, Path, Query, State}, response::{
+        Json, sse::{Event, KeepAlive, KeepAliveStream, Sse}
+    }
 };
 use chrono::Utc;
 use log::{error, info, warn};
@@ -25,16 +19,11 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::File;
 use crate::{
-    AuthUser,
-    api::error::{ApiError, ApiResult},
-    processor,
-    search::{
-        RebuildProgress, SearchEngine, SearchResultItem as EngineSearchResultItem,
-        advanced::{
-            ChunkRefiner, ChunkSegment, LlmClient, PlanAction, PlanStep, QueryPlanner, RefineOutcome, RelevanceJudge,
-            assemble_context_chunk,
-        },
-    },
+    AuthUser, api::error::{ApiError, ApiResult}, processor, search::{
+        RebuildProgress, SearchEngine, SearchResultItem as EngineSearchResultItem, advanced::{
+            ChunkRefiner, ChunkSegment, LlmClient, PlanAction, PlanStep, QueryPlanner, RefineOutcome, RelevanceJudge, assemble_context_chunk
+        }
+    }
 };
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -118,8 +107,7 @@ pub struct AdvancedSearchQuery {
 
 fn deserialize_id_list<'de, D>(deserializer: D) -> Result<Option<Vec<i64>>, D::Error>
 where
-    D: serde::Deserializer<'de>,
-{
+    D: serde::Deserializer<'de>, {
     let raw = Option::<String>::deserialize(deserializer)?;
     let Some(raw) = raw else {
         return Ok(None);
@@ -786,11 +774,10 @@ async fn send_step_event(
         "comment": step.comment,
         "status": status,
     });
-    if let Value::Object(ref mut map) = payload {
-        if let Some(details) = details {
+    if let Value::Object(ref mut map) = payload
+        && let Some(details) = details {
             map.insert("details".to_string(), details);
         }
-    }
     send_event_json(tx, "step", &payload).await
 }
 
@@ -841,16 +828,14 @@ fn has_visibility_permission(
     if is_admin {
         return true;
     }
-    if let Some((is_public, owner_id)) = file {
-        if !is_public && owner_id != user_id {
+    if let Some((is_public, owner_id)) = file
+        && !is_public && owner_id != user_id {
             return false;
         }
-    }
-    if let Some((is_public, owner_id)) = kb {
-        if !is_public && owner_id != user_id {
+    if let Some((is_public, owner_id)) = kb
+        && !is_public && owner_id != user_id {
             return false;
         }
-    }
     true
 }
 
@@ -918,6 +903,7 @@ async fn build_slice_results_from_raw(
     Ok(results)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn collect_relevant_slices(
     pool: &SqlitePool, search_engine: &SearchEngine, query: &str, file_filter: Option<&Vec<i64>>,
     kb_filter: Option<&Vec<i64>>, slice_limit: usize, user_id: &str, is_admin: bool, request_id: &str,
@@ -1288,6 +1274,7 @@ async fn run_advanced_slice_search_non_stream(
     }])
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn execute_page_content_step_core(
     pool: &SqlitePool, candidates: &[SliceCandidate], max_slices: usize, context_chars: usize, judge: &RelevanceJudge,
     chunk_refiner: &ChunkRefiner, query: &str, request_id: &str, log_prefix: &str,
@@ -1322,8 +1309,8 @@ async fn execute_page_content_step_core(
                     "{} context assemble failed: request_id={}, file_id={}, base_slice_id={}, error={}",
                     log_prefix, request_id, candidate.file.id, base_slice.id, err
                 );
-                if debug_events {
-                    if let Some(tx) = tx {
+                if debug_events
+                    && let Some(tx) = tx {
                         let _ = send_event_json(
                             tx,
                             "candidate",
@@ -1336,13 +1323,12 @@ async fn execute_page_content_step_core(
                         )
                         .await;
                     }
-                }
                 continue;
             }
         };
 
-        if debug_events {
-            if let Some(tx) = tx {
+        if debug_events
+            && let Some(tx) = tx {
                 let preview = preview_text(&context_chunk.content, 160);
                 let _ = send_event_json(
                     tx,
@@ -1359,7 +1345,6 @@ async fn execute_page_content_step_core(
                 )
                 .await;
             }
-        }
 
         let judge_outcome = judge.judge(query, &context_chunk.content).await;
         if !judge_outcome.is_relevant {
@@ -1376,8 +1361,8 @@ async fn execute_page_content_step_core(
                     preview_for_log(&judge_outcome.reason, 120)
                 );
             }
-            if debug_events {
-                if let Some(tx) = tx {
+            if debug_events
+                && let Some(tx) = tx {
                     let _ = send_event_json(
                         tx,
                         "filtered",
@@ -1391,7 +1376,6 @@ async fn execute_page_content_step_core(
                     )
                     .await;
                 }
-            }
             continue;
         }
 
@@ -1423,7 +1407,7 @@ async fn execute_page_content_step_core(
             break;
         }
 
-        let should_replace_best = best_candidate.as_ref().map_or(true, |best| {
+        let should_replace_best = best_candidate.as_ref().is_none_or(|best| {
             current_candidate.judge_score > best.judge_score
                 || ((current_candidate.judge_score - best.judge_score).abs() < f32::EPSILON
                     && current_candidate.base_score > best.base_score)
@@ -2563,8 +2547,8 @@ async fn search_file_ids_by_name(
         qb.push_bind(user_id);
         qb.push(" OR is_public = 1)");
     }
-    if let Some(ids) = kb_ids {
-        if !ids.is_empty() {
+    if let Some(ids) = kb_ids
+        && !ids.is_empty() {
             qb.push(" AND kb_id IN (");
             let mut separated = qb.separated(", ");
             for id in ids {
@@ -2572,7 +2556,6 @@ async fn search_file_ids_by_name(
             }
             qb.push(")");
         }
-    }
     qb.push(" AND status = 1");
     let ids: Vec<i64> = qb.build_query_scalar().fetch_all(pool).await?;
     Ok(ids)

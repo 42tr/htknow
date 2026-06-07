@@ -1,11 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet},
-    future::Future,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    collections::{HashMap, HashSet}, future::Future, sync::{
+        Arc, atomic::{AtomicBool, AtomicU64, Ordering}
+    }, time::{Duration, Instant, SystemTime, UNIX_EPOCH}
 };
 
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -18,13 +14,8 @@ use tokio::{fs, time};
 
 use crate::{
     api::{
-        File, collect_image_paths_for_files, collect_image_raw_paths_for_files, find_reusable_parsed_file,
-        remove_image_files, resolve_image_storage_path, update_file_custom_image_meta,
-    },
-    config,
-    graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor},
-    archive,
-    search::{self, SearchEngine, tantivy_engine},
+        File, collect_image_paths_for_files, collect_image_raw_paths_for_files, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta
+    }, archive, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, SearchEngine, tantivy_engine}
 };
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -34,6 +25,12 @@ struct Result {
     #[serde(default)]
     images: HashMap<String, String>,
 }
+
+// Type aliases for complex SQL / return types
+#[allow(clippy::type_complexity)]
+type PdfContentDbRow = (i32, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>);
+#[allow(clippy::type_complexity)]
+type RawImageJobs = (Vec<(String, String)>, HashMap<String, String>, Vec<String>);
 
 /// MinerU API 返回的结果结构
 #[derive(Debug, Deserialize)]
@@ -201,8 +198,7 @@ struct RawSlicePosition {
 
 fn deserialize_slice_positions<'de, D>(deserializer: D) -> std::result::Result<Vec<SlicePosition>, D::Error>
 where
-    D: Deserializer<'de>,
-{
+    D: Deserializer<'de>, {
     let raw_positions: Option<Vec<RawSlicePosition>> = Option::deserialize(deserializer)?;
     let mut positions = Vec::new();
     if let Some(raw_positions) = raw_positions {
@@ -403,8 +399,7 @@ impl ParseTimingCtx {
 
     async fn step<T, Fut>(&mut self, step: &'static str, fut: Fut) -> anyhow::Result<T>
     where
-        Fut: Future<Output = anyhow::Result<T>>,
-    {
+        Fut: Future<Output=anyhow::Result<T>>, {
         let (seq, started_at) = self.step_start(step);
         match fut.await {
             Ok(value) => {
@@ -419,10 +414,11 @@ impl ParseTimingCtx {
     }
 }
 
-async fn timed_step_opt<T, Fut>(timing: Option<&mut ParseTimingCtx>, step: &'static str, fut: Fut) -> anyhow::Result<T>
+async fn timed_step_opt<T, Fut>(
+    timing: Option<&mut ParseTimingCtx>, step: &'static str, fut: Fut,
+) -> anyhow::Result<T>
 where
-    Fut: Future<Output = anyhow::Result<T>>,
-{
+    Fut: Future<Output=anyhow::Result<T>>, {
     match timing {
         Some(ctx) => ctx.step(step, fut).await,
         None => fut.await,
@@ -786,13 +782,12 @@ impl FileProcessor {
                 return Ok(());
             }
 
-            if !skip_reuse {
-                if timing.step("reuse_check", self.try_reuse_existing_data(file)).await? {
+            if !skip_reuse
+                && timing.step("reuse_check", self.try_reuse_existing_data(file)).await? {
                     timing.set_pipeline("reuse");
                     info!("File {} reused existing parsed data, skipping processing pipeline", file.id);
                     return Ok(());
                 }
-            }
 
             timing
                 .step("set_processing_status", async {
@@ -883,14 +878,13 @@ impl FileProcessor {
                 return Ok(());
             }
 
-            if let Some(custom_url) = custom_url {
-                if is_pdf {
+            if let Some(custom_url) = custom_url
+                && is_pdf {
                     timing.set_pipeline("custom_parser");
                     info!("Custom parse enabled, routing file {} to {}", file.id, custom_url);
                     self.process_file_with_custom_parser(file, custom_url, Some(&mut timing)).await?;
                     return Ok(());
                 }
-            }
 
             if is_pdf {
                 timing.set_pipeline("pdf");
@@ -960,7 +954,7 @@ impl FileProcessor {
             self.save_custom_images(&normalized.images, timing.as_deref_mut()).await?;
         }
 
-        self.save_custom_slices(file, &normalized.slices, normalized.full_content.as_deref(), timing.as_deref_mut())
+        self.save_custom_slices(file, &normalized.slices, normalized.full_content.as_deref(), timing)
             .await?;
 
         Ok(())
@@ -1025,7 +1019,7 @@ impl FileProcessor {
             return Err(anyhow::anyhow!("Custom parse reuse API returned empty slices"));
         }
 
-        self.save_custom_slices(file, &data.slices, data.full_content.as_deref(), timing.as_deref_mut()).await?;
+        self.save_custom_slices(file, &data.slices, data.full_content.as_deref(), timing).await?;
 
         Ok(true)
     }
@@ -1089,11 +1083,10 @@ impl FileProcessor {
         let mut content_list = data.content_list;
         if let Some(items) = content_list.as_mut() {
             for item in items {
-                if let Some(img_path) = item.img_path.as_deref() {
-                    if let Some(new_path) = Self::lookup_image_mapping(&image_mapping, img_path) {
+                if let Some(img_path) = item.img_path.as_deref()
+                    && let Some(new_path) = Self::lookup_image_mapping(&image_mapping, img_path) {
                         item.img_path = Some(new_path);
                     }
-                }
             }
         }
 
@@ -1164,11 +1157,10 @@ impl FileProcessor {
         let markdown_re = regex::Regex::new(r"!\[[^\]]*\]\(([^)]+)\)").expect("valid markdown image regex");
         let mut refs = Vec::new();
         for cap in api_re.captures_iter(content) {
-            if let Some(path) = cap.get(1).map(|m| m.as_str().trim()).filter(|path| !path.is_empty()) {
-                if !refs.iter().any(|existing| existing == path) {
+            if let Some(path) = cap.get(1).map(|m| m.as_str().trim()).filter(|path| !path.is_empty())
+                && !refs.iter().any(|existing| existing == path) {
                     refs.push(path.to_string());
                 }
-            }
         }
         for cap in markdown_re.captures_iter(content) {
             let Some(path) = cap.get(1).map(|m| m.as_str().trim()).filter(|path| !path.is_empty()) else {
@@ -1192,7 +1184,7 @@ impl FileProcessor {
 
         let mut rewritten = content.to_string();
         let mut pairs: Vec<(&String, &String)> = mapping.iter().collect();
-        pairs.sort_by(|(left, _), (right, _)| right.len().cmp(&left.len()));
+        pairs.sort_by_key(|(right, _)| std::cmp::Reverse(right.len()));
         for (old_path, new_path) in pairs {
             rewritten = rewritten.replace(
                 &format!("/api/v1/knowledge/files/{}", old_path),
@@ -1332,7 +1324,7 @@ impl FileProcessor {
 
         self.search_engine.reload_readers()?;
 
-        timed_step_opt(timing.as_deref_mut(), "build_knowledge_graph", async {
+        timed_step_opt(timing, "build_knowledge_graph", async {
             self.maybe_build_knowledge_graph(file).await;
             Ok(())
         })
@@ -1510,7 +1502,7 @@ impl FileProcessor {
         temp_file.filename = format!("{}.pdf", file.id);
 
         // 使用 process_pdf_file 处理转换后的 PDF
-        self.process_pdf_file(&temp_file, None, false, Some(file.filename.as_str()), timing.as_deref_mut()).await
+        self.process_pdf_file(&temp_file, None, false, Some(file.filename.as_str()), timing).await
     }
 
     /// 处理 Excel 文件，按 sheet+行 生成切片
@@ -1585,7 +1577,7 @@ impl FileProcessor {
         if !self.ensure_file_exists(file.id, "before updating status").await? {
             return Ok(());
         }
-        timed_step_opt(timing.as_deref_mut(), "finalize_file_status", async {
+        timed_step_opt(timing, "finalize_file_status", async {
             let sql =
                 "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
             sqlx::query(sql)
@@ -1703,7 +1695,7 @@ impl FileProcessor {
 
             content_list = timed_step_opt(timing.as_deref_mut(), "load_existing_pdf_content", async {
                 let fetch_sql = "SELECT page_idx, bbox, text, text_level, img_path, table_body FROM pdf_contents WHERE file_id = ? ORDER BY page_idx, id";
-                let rows: Vec<(i32, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>)> =
+                let rows: Vec<PdfContentDbRow> =
                     sqlx::query_as(fetch_sql).bind(file.id).fetch_all(&self.pool).await?;
 
                 // 将数据库记录转换为 ContentItem
@@ -1911,7 +1903,7 @@ impl FileProcessor {
         if !self.ensure_file_exists(file.id, "before updating status").await? {
             return Ok(());
         }
-        timed_step_opt(timing.as_deref_mut(), "finalize_file_status", async {
+        timed_step_opt(timing, "finalize_file_status", async {
             let sql =
                 "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
             sqlx::query(sql)
@@ -1956,7 +1948,7 @@ impl FileProcessor {
             }
         }
 
-        timed_step_opt(timing.as_deref_mut(), "mineru_api", async {
+        timed_step_opt(timing, "mineru_api", async {
             self.call_mineru_api_with_path(&file.path, &file.filename, is_image, None, None).await
         })
         .await
@@ -1965,7 +1957,7 @@ impl FileProcessor {
     async fn call_mineru_api_in_ranges(
         &self, file: &File, total_pages: usize, max_pages: usize,
     ) -> anyhow::Result<Result> {
-        let total_parts = (total_pages + max_pages - 1) / max_pages;
+        let total_parts = total_pages.div_ceil(max_pages);
         info!(
             "PDF {} has {} pages, calling MinerU in {} ranges (max {} pages per range)",
             file.filename, total_pages, total_parts, max_pages
@@ -1985,7 +1977,7 @@ impl FileProcessor {
 
             let image_prefix = format!("part{}_", part_index + 1);
             let min_page_idx = chunk_items.iter().map(|item| item.page_idx).min();
-            let needs_offset = min_page_idx.map_or(false, |min| min < range_start as i32);
+            let needs_offset = min_page_idx.is_some_and(|min| min < range_start as i32);
             for item in &mut chunk_items {
                 if needs_offset {
                     item.page_idx += range_start as i32;
@@ -2192,7 +2184,7 @@ impl FileProcessor {
             Ok(tokio::fs::read_to_string(file.path.as_str()).await?)
         })
         .await?;
-        self.process_plain_text_content(file, &content, "Processing completed successfully", timing.as_deref_mut())
+        self.process_plain_text_content(file, &content, "Processing completed successfully", timing)
             .await
     }
 
@@ -2213,11 +2205,10 @@ impl FileProcessor {
         let client = self.services_http_client()?;
         let cfg = config::get();
         let mut req_builder = client.post(&cfg.services.audio_transcription_url).multipart(form);
-        if let Some(key) = &cfg.services.audio_transcription_key {
-            if !key.is_empty() {
+        if let Some(key) = &cfg.services.audio_transcription_key
+            && !key.is_empty() {
                 req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
             }
-        }
 
         let response =
             timed_step_opt(timing.as_deref_mut(), "audio_transcription_api", async { Ok(req_builder.send().await?) })
@@ -2234,7 +2225,7 @@ impl FileProcessor {
             format!("Audio processed successfully (language: {})", language)
         };
 
-        self.process_plain_text_content(file, &text, &log_message, timing.as_deref_mut()).await
+        self.process_plain_text_content(file, &text, &log_message, timing).await
     }
 
     async fn process_plain_text_content(
@@ -2245,7 +2236,7 @@ impl FileProcessor {
         }
         // 示例：根据 slice_type 进行分片处理
         let slices = timed_step_opt(timing.as_deref_mut(), "slice_build", async {
-            Ok(self.slice_content(content, &file.slice_type)?)
+            self.slice_content(content, &file.slice_type)
         })
         .await?;
         let slice_count = slices.len();
@@ -2302,7 +2293,7 @@ impl FileProcessor {
         self.search_engine.reload_readers()?;
 
         // 构建知识图谱
-        timed_step_opt(timing.as_deref_mut(), "build_knowledge_graph", async {
+        timed_step_opt(timing, "build_knowledge_graph", async {
             self.maybe_build_knowledge_graph(file).await;
             Ok(())
         })
@@ -2357,7 +2348,7 @@ impl FileProcessor {
                     inserted_ids.len()
                 );
 
-                for (slice, (id,)) in insert_chunk.iter().zip(inserted_ids.into_iter()) {
+                for (slice, (id,)) in insert_chunk.iter().zip(inserted_ids) {
                     for position in &slice.positions {
                         position_rows.push((id, position.clone()));
                     }
@@ -2453,7 +2444,7 @@ impl FileProcessor {
             "sentence" => {
                 // 按句子分片（简单实现：以句号、问号、感叹号分隔）
                 Ok(content
-                    .split(|c| c == '。' || c == '.' || c == '?' || c == '!' || c == '？' || c == '！')
+                    .split(['。', '.', '?', '!', '？', '！'])
                     .map(|s| s.trim())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string())
@@ -2504,7 +2495,7 @@ impl FileProcessor {
                 if let Some(text) = &pdf_content.text {
                     if let Some(lv) = pdf_content.text_level {
                         item_content.push_str("#".repeat(lv as usize).as_str());
-                        item_content.push_str(" ");
+                        item_content.push(' ');
                     }
                     item_content.push_str(text);
                 }
@@ -2514,13 +2505,13 @@ impl FileProcessor {
                 }
                 if let Some(captions) = &pdf_content.image_caption {
                     for caption in captions {
-                        item_content.push_str(&format!("{}", caption));
+                        item_content.push_str(&caption.to_string());
                     }
                 }
             } else if pdf_content.typ == "table" {
                 if let Some(table_caption) = &pdf_content.table_caption {
                     for caption in table_caption {
-                        item_content.push_str(&format!("{}", caption));
+                        item_content.push_str(&caption.to_string());
                     }
                 }
                 if let Some(table_body) = &pdf_content.table_body {
@@ -2645,13 +2636,13 @@ impl FileProcessor {
                 }
                 if let Some(captions) = &item.image_caption {
                     for caption in captions {
-                        item_content.push_str(&format!("{}", caption));
+                        item_content.push_str(&caption.to_string());
                     }
                 }
             } else if item.typ == "table" {
                 if let Some(table_caption) = &item.table_caption {
                     for caption in table_caption {
-                        item_content.push_str(&format!("{}", caption));
+                        item_content.push_str(&caption.to_string());
                     }
                 }
                 if let Some(table_body) = &item.table_body {
@@ -2895,8 +2886,11 @@ impl FileProcessor {
         let slice_ids: Vec<i64> = slice_rows.iter().map(|row| row.id).collect();
         let slice_positions = self.fetch_slice_position_rows(&slice_ids).await?;
         let (image_jobs, image_mapping) = self.prepare_image_jobs(&pdf_rows, source.id, target.id);
-        let meta_image_paths =
-            if pdf_rows.is_empty() { collect_image_raw_paths_for_files(&self.pool, &[source.id]).await? } else { Vec::new() };
+        let meta_image_paths = if pdf_rows.is_empty() {
+            collect_image_raw_paths_for_files(&self.pool, &[source.id]).await?
+        } else {
+            Vec::new()
+        };
         let (meta_image_jobs, meta_image_mapping, target_meta_image_paths) =
             Self::prepare_raw_image_jobs(&meta_image_paths, source.id, target.id);
         if !meta_image_mapping.is_empty() {
@@ -2905,11 +2899,10 @@ impl FileProcessor {
             }
         }
         let mut source_for_reindex = source.clone();
-        if !meta_image_mapping.is_empty() {
-            if let Some(content) = source_for_reindex.content.clone() {
+        if !meta_image_mapping.is_empty()
+            && let Some(content) = source_for_reindex.content.clone() {
                 source_for_reindex.content = Some(Self::rewrite_custom_image_refs(&content, &meta_image_mapping));
             }
-        }
 
         let mut tx = self.pool.begin().await?;
         self.insert_pdf_rows(&mut tx, target.id, &pdf_rows, &image_mapping).await?;
@@ -2922,7 +2915,8 @@ impl FileProcessor {
         self.copy_converted_pdf(source.id, target.id).await?;
 
         if pdf_rows.is_empty() {
-            update_file_custom_image_meta(&self.pool, target.id, &target_meta_image_paths, "reuse_custom_images").await?;
+            update_file_custom_image_meta(&self.pool, target.id, &target_meta_image_paths, "reuse_custom_images")
+                .await?;
         }
 
         let full_content = self.reindex_cloned_slices(target, &cloned_slices, &source_for_reindex).await?;
@@ -2999,7 +2993,7 @@ impl FileProcessor {
 
     fn prepare_raw_image_jobs(
         paths: &[String], source_id: i64, target_id: i64,
-    ) -> (Vec<(String, String)>, HashMap<String, String>, Vec<String>) {
+    ) -> RawImageJobs {
         let mut jobs = Vec::new();
         let mut mapping = HashMap::new();
         let mut target_paths = Vec::new();
@@ -3076,7 +3070,7 @@ impl FileProcessor {
                 inserted_ids.len()
             );
 
-            for (row, (new_id,)) in chunk.iter().zip(inserted_ids.into_iter()) {
+            for (row, (new_id,)) in chunk.iter().zip(inserted_ids) {
                 cloned.push(ClonedSlice { old_id: row.id, new_id, content: row.content.clone() });
             }
         }

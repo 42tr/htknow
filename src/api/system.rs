@@ -5,9 +5,7 @@ use sqlx::SqlitePool;
 use utoipa::ToSchema;
 
 use crate::{
-    AuthUser,
-    api::error::{ApiError, ApiResult},
-    search::{SearchEngine, tantivy_engine::ForceMergeStats},
+    AuthUser, api::error::{ApiError, ApiResult}, search::{SearchEngine, tantivy_engine::ForceMergeStats}
 };
 
 /// 进程内存占用
@@ -357,13 +355,11 @@ fn force_merge_index_stats(index: &str, stats: ForceMergeStats) -> TantivyForceM
 #[cfg(feature = "profiling")]
 async fn heap_profile_impl() -> ApiResult<Response> {
     use std::{
-        ffi::CString,
-        time::{SystemTime, UNIX_EPOCH},
+        ffi::CString, time::{SystemTime, UNIX_EPOCH}
     };
 
     use axum::{
-        body::Body,
-        http::{HeaderValue, header},
+        body::Body, http::{HeaderValue, header}
     };
     use tikv_jemalloc_ctl::raw;
     use tokio::fs;
@@ -410,13 +406,11 @@ async fn heap_profile_impl() -> ApiResult<Response> {
 #[cfg(feature = "profiling")]
 async fn heap_profile_pdf_impl() -> ApiResult<Response> {
     use std::{
-        ffi::CString,
-        time::{SystemTime, UNIX_EPOCH},
+        ffi::CString, time::{SystemTime, UNIX_EPOCH}
     };
 
     use axum::{
-        body::Body,
-        http::{HeaderValue, header},
+        body::Body, http::{HeaderValue, header}
     };
     use tikv_jemalloc_ctl::raw;
     use tokio::{fs, process::Command};

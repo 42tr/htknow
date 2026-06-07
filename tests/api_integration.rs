@@ -1,20 +1,11 @@
 use std::{
-    fs,
-    path::PathBuf,
-    sync::{
-        OnceLock,
-        atomic::{AtomicUsize, Ordering},
-    },
-    time::{SystemTime, UNIX_EPOCH},
+    fs, path::PathBuf, sync::{
+        OnceLock, atomic::{AtomicUsize, Ordering}
+    }, time::{SystemTime, UNIX_EPOCH}
 };
 
 use axum::{
-    Router,
-    body::Body,
-    extract::DefaultBodyLimit,
-    http::{Request, StatusCode, header},
-    middleware,
-    response::Response,
+    Router, body::Body, extract::DefaultBodyLimit, http::{Request, StatusCode, header}, middleware, response::Response
 };
 use htknow::{api, auth, db, search::SearchEngine};
 use http_body_util::BodyExt;

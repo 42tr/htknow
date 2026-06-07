@@ -1,9 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    path::Path,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    collections::{HashMap, HashSet}, fs, path::Path, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}
 };
 
 use anyhow::{Context, anyhow};
@@ -165,9 +161,8 @@ impl SearchEngine {
 
     pub async fn rebuild_tantivy_indexes<F, Fut>(&self, job_tag: &str, mut on_progress: F) -> anyhow::Result<()>
     where
-        F: FnMut(RebuildProgress) -> Fut + Send,
-        Fut: std::future::Future<Output = ()> + Send,
-    {
+        F: FnMut(RebuildProgress) -> Fut+Send,
+        Fut: std::future::Future<Output=()>+Send, {
         let Some(pool) = &self.pool else {
             return Err(anyhow!("search engine db pool not set"));
         };
@@ -817,11 +812,10 @@ impl SearchEngine {
             .enumerate()
             .map(|(i, mut result)| {
                 // 根据去重后的 index 找到对应的重排序结果
-                if let Some(doc_index) = document_index_map.get(i) {
-                    if let Some(score) = rerank_scores.get(*doc_index).and_then(|s| *s) {
+                if let Some(doc_index) = document_index_map.get(i)
+                    && let Some(score) = rerank_scores.get(*doc_index).and_then(|s| *s) {
                         result.score = score;
                     }
-                }
                 result
             })
             .collect();
@@ -848,8 +842,8 @@ impl SearchEngine {
         let mut qb = QueryBuilder::new("SELECT DISTINCT name, entity_type FROM graph_nodes WHERE name LIKE ");
         qb.push_bind(format!("%{}%", query));
 
-        if let Some(ids) = kb_ids {
-            if !ids.is_empty() {
+        if let Some(ids) = kb_ids
+            && !ids.is_empty() {
                 qb.push(" AND kb_id IN (");
                 let mut separated = qb.separated(", ");
                 for id in ids {
@@ -857,7 +851,6 @@ impl SearchEngine {
                 }
                 qb.push(")");
             }
-        }
         qb.push(" LIMIT 10");
         let entities: Vec<(String, String)> = qb.build_query_as().fetch_all(pool).await?;
 

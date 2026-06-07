@@ -14,7 +14,7 @@ pub fn get() -> AppConfig {
     CONFIG.read().unwrap().clone()
 }
 
-/// 重新加载配置（用于热更新）
+// 重新加载配置（用于热更新）
 // pub fn reload() {
 //     let new_config = AppConfig::from_env();
 //     let mut config = CONFIG.write().unwrap();
@@ -22,7 +22,7 @@ pub fn get() -> AppConfig {
 //     info!("Configuration reloaded");
 // }
 
-/// 使用新配置更新（用于 etcd watch 等场景）
+// 使用新配置更新（用于 etcd watch 等场景）
 // pub fn update(new_config: AppConfig) {
 //     let mut config = CONFIG.write().unwrap();
 //     *config = new_config;
@@ -345,7 +345,7 @@ fn env_or_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
 
 /// 配置加载器 trait
 #[allow(dead_code)]
-pub trait ConfigLoader: Send + Sync {
+pub trait ConfigLoader: Send+Sync {
     /// 加载配置
     fn load(&self) -> anyhow::Result<AppConfig>;
 }
@@ -378,8 +378,7 @@ impl EtcdConfigLoader {
     /// 启动 watch 监听配置变化
     pub async fn watch<F>(&self, _callback: F) -> anyhow::Result<()>
     where
-        F: Fn(AppConfig) + Send + Sync + 'static,
-    {
+        F: Fn(AppConfig)+Send+Sync+'static, {
         // TODO: 实现 etcd watch 逻辑
         // 1. 连接 etcd
         // 2. 监听 prefix 下的 key 变化

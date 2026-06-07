@@ -1,36 +1,22 @@
 use std::{
-    collections::{HashMap, HashSet},
-    path::Component,
-    sync::{Arc, OnceLock},
-    time::Instant,
+    collections::{HashMap, HashSet}, path::Component, sync::{Arc, OnceLock}, time::Instant
 };
 
 use anyhow::Result as AnyResult;
 use axum::{
-    Extension,
-    body::Body,
-    extract::{Multipart, Path, Query, State},
-    http::{StatusCode, header},
-    response::Json,
+    Extension, body::Body, extract::{Multipart, Path, Query, State}, http::{StatusCode, header}, response::Json
 };
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use tokio::{
-    fs,
-    io::AsyncWriteExt as _,
-    spawn,
-    sync::{OwnedSemaphorePermit, Semaphore},
+    fs, io::AsyncWriteExt as _, spawn, sync::{OwnedSemaphorePermit, Semaphore}
 };
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    AuthUser,
-    api::error::{ApiError, ApiResult},
-    archive::{self, ArchiveEntry, ExtractResult},
-    config, pdf_highlight, processor,
-    search::SearchEngine,
+    AuthUser, api::error::{ApiError, ApiResult}, archive::{self, ArchiveEntry, ExtractResult}, config, pdf_highlight, processor, search::SearchEngine
 };
 
 /// Excel 单 sheet 数据
@@ -875,11 +861,10 @@ pub async fn move_to_kb(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Extension(auth_user): Extension<AuthUser>, Path(id): Path<i64>, Json(req): Json<MoveFileReq>,
 ) -> ApiResult<Json<File>> {
-    if let Some(target_kb_id) = req.target_kb_id {
-        if target_kb_id <= 0 {
+    if let Some(target_kb_id) = req.target_kb_id
+        && target_kb_id <= 0 {
             return Err(ApiError::BadRequest("Invalid target_kb_id".to_string()));
         }
-    }
 
     let is_admin = auth_user.is_admin();
     let file = if is_admin {
@@ -950,11 +935,10 @@ pub async fn move_to_kb(
     remove_image_files(image_paths).await;
     let cfg = config::get();
     let pdf_path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", id));
-    if let Err(e) = fs::remove_file(&pdf_path).await {
-        if !matches!(e.kind(), std::io::ErrorKind::NotFound) {
+    if let Err(e) = fs::remove_file(&pdf_path).await
+        && !matches!(e.kind(), std::io::ErrorKind::NotFound) {
             warn!("Failed to delete converted pdf {} after file move: {}", pdf_path.display(), e);
         }
-    }
 
     let moved: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
     Ok(Json(moved))
@@ -1249,11 +1233,10 @@ async fn remove_converted_pdfs(file_ids: &[i64]) {
     let pdf_root = std::path::Path::new(&cfg.storage.pdf_path);
     for file_id in file_ids {
         let pdf_path = pdf_root.join(format!("{}.pdf", file_id));
-        if let Err(e) = fs::remove_file(&pdf_path).await {
-            if !matches!(e.kind(), std::io::ErrorKind::NotFound) {
+        if let Err(e) = fs::remove_file(&pdf_path).await
+            && !matches!(e.kind(), std::io::ErrorKind::NotFound) {
                 warn!("Failed to delete converted pdf {}: {}", pdf_path.display(), e);
             }
-        }
     }
 }
 
@@ -1291,8 +1274,8 @@ pub(crate) async fn cleanup_deleted_files(
     let mut cleanup_failed = Vec::new();
     let cfg = config::get();
     for file in files {
-        if let Err(e) = fs::remove_file(&file.path).await {
-            if !matches!(e.kind(), std::io::ErrorKind::NotFound) {
+        if let Err(e) = fs::remove_file(&file.path).await
+            && !matches!(e.kind(), std::io::ErrorKind::NotFound) {
                 warn!("Failed to delete file {}: {}", file.path, e);
                 cleanup_failed.push(BatchDeleteCleanupFailedItem {
                     id: file.id,
@@ -1300,11 +1283,10 @@ pub(crate) async fn cleanup_deleted_files(
                     error: e.to_string(),
                 });
             }
-        }
 
         let pdf_path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", file.id));
-        if let Err(e) = fs::remove_file(&pdf_path).await {
-            if !matches!(e.kind(), std::io::ErrorKind::NotFound) {
+        if let Err(e) = fs::remove_file(&pdf_path).await
+            && !matches!(e.kind(), std::io::ErrorKind::NotFound) {
                 warn!("Failed to delete converted pdf {}: {}", pdf_path.display(), e);
                 cleanup_failed.push(BatchDeleteCleanupFailedItem {
                     id: file.id,
@@ -1312,12 +1294,11 @@ pub(crate) async fn cleanup_deleted_files(
                     error: e.to_string(),
                 });
             }
-        }
 
         // 清理压缩文件解压目录
         let archive_dir = std::path::Path::new(&cfg.storage.archives_path).join(file.id.to_string());
-        if archive_dir.exists() {
-            if let Err(e) = tokio::fs::remove_dir_all(&archive_dir).await {
+        if archive_dir.exists()
+            && let Err(e) = tokio::fs::remove_dir_all(&archive_dir).await {
                 warn!("Failed to delete archive dir {}: {}", archive_dir.display(), e);
                 cleanup_failed.push(BatchDeleteCleanupFailedItem {
                     id: file.id,
@@ -1325,7 +1306,6 @@ pub(crate) async fn cleanup_deleted_files(
                     error: e.to_string(),
                 });
             }
-        }
 
         if let Err(e) = search_engine.delete(Some(file.id), None).await {
             warn!("Failed to delete search index for file {}: {}", file.id, e);
@@ -1471,31 +1451,25 @@ pub(crate) async fn collect_image_raw_paths_for_files(
         qb.push(")");
         let rows: Vec<(i64, Option<String>)> = qb.build_query_as().fetch_all(pool).await?;
         for (file_id, meta) in rows {
-            if let Some(paths) = extract_custom_image_paths_from_meta(meta.as_deref()) {
-                if let Some(state) = states.get_mut(&file_id) {
+            if let Some(paths) = extract_custom_image_paths_from_meta(meta.as_deref())
+                && let Some(state) = states.get_mut(&file_id) {
                     state.meta_checked = true;
                     state.paths.extend(paths);
                 }
-            }
         }
     }
 
     let regex_candidate_ids: Vec<i64> = file_ids
         .iter()
         .copied()
-        .filter(|id| {
-            states
-                .get(id)
-                .is_some_and(|state| !state.has_pdf_contents && !state.meta_checked)
-        })
+        .filter(|id| states.get(id).is_some_and(|state| !state.has_pdf_contents && !state.meta_checked))
         .collect();
     let mut regex_paths = extract_slice_image_paths_by_file(pool, &regex_candidate_ids).await?;
     for file_id in regex_candidate_ids {
-        if let Some(paths) = regex_paths.remove(&file_id) {
-            if let Some(state) = states.get_mut(&file_id) {
+        if let Some(paths) = regex_paths.remove(&file_id)
+            && let Some(state) = states.get_mut(&file_id) {
                 state.paths.extend(paths);
             }
-        }
     }
 
     let mut raw_paths = Vec::new();
@@ -1531,11 +1505,7 @@ pub(crate) async fn update_file_custom_image_meta(
     let current_meta: Option<String> =
         sqlx::query_scalar("SELECT meta FROM files WHERE id = ?").bind(file_id).fetch_optional(pool).await?;
     let merged_meta = merge_custom_image_meta(current_meta.as_deref(), image_paths, source);
-    sqlx::query("UPDATE files SET meta = ? WHERE id = ?")
-        .bind(merged_meta)
-        .bind(file_id)
-        .execute(pool)
-        .await?;
+    sqlx::query("UPDATE files SET meta = ? WHERE id = ?").bind(merged_meta).bind(file_id).execute(pool).await?;
     Ok(())
 }
 
@@ -1614,9 +1584,7 @@ fn merge_custom_image_meta(meta: Option<&str>, image_paths: &[String], source: &
         }
     }
 
-    let parse_assets = root
-        .entry(PARSE_ASSETS_META_KEY.to_string())
-        .or_insert_with(|| serde_json::json!({}));
+    let parse_assets = root.entry(PARSE_ASSETS_META_KEY.to_string()).or_insert_with(|| serde_json::json!({}));
     if !parse_assets.is_object() {
         *parse_assets = serde_json::json!({});
     }
@@ -1769,7 +1737,7 @@ pub(crate) async fn remove_image_files(image_paths: Vec<String>) {
         let candidate = std::path::Path::new(trimmed);
         let full_path = if candidate.is_absolute()
             || candidate.starts_with(images_root)
-            || data_root.map_or(false, |root| candidate.starts_with(root))
+            || data_root.is_some_and(|root| candidate.starts_with(root))
         {
             candidate.to_path_buf()
         } else {
@@ -1778,23 +1746,21 @@ pub(crate) async fn remove_image_files(image_paths: Vec<String>) {
                 None => continue,
             }
         };
-        let allowed = full_path.starts_with(images_root) || data_root.map_or(false, |root| full_path.starts_with(root));
+        let allowed = full_path.starts_with(images_root) || data_root.is_some_and(|root| full_path.starts_with(root));
         if !allowed {
             log::warn!("Skipping unsafe image path: {}", full_path.display());
             continue;
         }
         if let Err(e) = fs::remove_file(&full_path).await {
             if matches!(e.kind(), std::io::ErrorKind::NotFound) {
-                if !candidate.is_absolute() && (trimmed.contains('/') || trimmed.contains('\\')) {
-                    if let Some(file_name) = candidate.file_name() {
+                if !candidate.is_absolute() && (trimmed.contains('/') || trimmed.contains('\\'))
+                    && let Some(file_name) = candidate.file_name() {
                         let fallback_path = images_root.join(file_name);
-                        if let Err(e) = fs::remove_file(&fallback_path).await {
-                            if !matches!(e.kind(), std::io::ErrorKind::NotFound) {
+                        if let Err(e) = fs::remove_file(&fallback_path).await
+                            && !matches!(e.kind(), std::io::ErrorKind::NotFound) {
                                 log::warn!("Failed to delete image {}: {}", fallback_path.display(), e);
                             }
-                        }
                     }
-                }
             } else {
                 log::warn!("Failed to delete image {}: {}", full_path.display(), e);
             }
@@ -2193,8 +2159,8 @@ pub async fn get_highlighted_pdf(
 
         let mut bounds: HashMap<i32, pdf_highlight::PageCoordBounds> = HashMap::new();
         for row in rows {
-            if let Ok(bbox) = serde_json::from_str::<Vec<f32>>(&row.bbox) {
-                if bbox.len() == 4 {
+            if let Ok(bbox) = serde_json::from_str::<Vec<f32>>(&row.bbox)
+                && bbox.len() == 4 {
                     let x1 = bbox[0];
                     let y1 = bbox[1];
                     let x2 = bbox[2];
@@ -2214,7 +2180,6 @@ pub async fn get_highlighted_pdf(
                         })
                         .or_insert(pdf_highlight::PageCoordBounds { min_x, min_y, max_x, max_y });
                 }
-            }
         }
 
         bounds.retain(|_, b| {
@@ -2321,11 +2286,10 @@ pub async fn excel_data(
         let sheet_names = workbook.sheet_names().to_vec();
 
         for sheet_name in &sheet_names {
-            if let Some(ref target) = filter_sheet {
-                if sheet_name != target {
+            if let Some(ref target) = filter_sheet
+                && sheet_name != target {
                     continue;
                 }
-            }
 
             let range = match workbook.worksheet_range(sheet_name) {
                 Ok(r) => r,
@@ -2416,11 +2380,12 @@ pub async fn archive_entries(
         return Err(ApiError::BadRequest("File is not an archive".to_string()));
     }
 
-    let entries: Vec<ArchiveEntry> =
-        sqlx::query_as("SELECT id, file_id, entry_path, size, is_directory FROM archive_entries WHERE file_id = ? ORDER BY entry_path")
-            .bind(id)
-            .fetch_all(&pool)
-            .await?;
+    let entries: Vec<ArchiveEntry> = sqlx::query_as(
+        "SELECT id, file_id, entry_path, size, is_directory FROM archive_entries WHERE file_id = ? ORDER BY entry_path",
+    )
+    .bind(id)
+    .fetch_all(&pool)
+    .await?;
 
     Ok(Json(entries))
 }
@@ -2474,15 +2439,15 @@ pub async fn archive_extract(
     let password = req.password.clone();
     let file_path = file.path.clone();
     let filename = file.filename.clone();
-    info!("archive_extract: starting extraction for file_id={}, path={:?}, filename={:?}, password_provided={}", id, file_path, filename, password.is_some());
+    info!(
+        "archive_extract: starting extraction for file_id={}, path={:?}, filename={:?}, password_provided={}",
+        id,
+        file_path,
+        filename,
+        password.is_some()
+    );
     let entries = match tokio::task::spawn_blocking(move || {
-        archive::extract_archive(
-            &file_path,
-            dest_dir.to_string_lossy().as_ref(),
-            &filename,
-            password.as_deref(),
-            id,
-        )
+        archive::extract_archive(&file_path, dest_dir.to_string_lossy().as_ref(), &filename, password.as_deref(), id)
     })
     .await
     {
@@ -2510,9 +2475,8 @@ pub async fn archive_extract(
         let max_vars = 999_usize;
         let batch_size = std::cmp::max(1, max_vars / binds_per_row);
         for chunk in entries.chunks(batch_size) {
-            let mut chunk_qb = QueryBuilder::<Sqlite>::new(
-                "INSERT INTO archive_entries (file_id, entry_path, size, is_directory) ",
-            );
+            let mut chunk_qb =
+                QueryBuilder::<Sqlite>::new("INSERT INTO archive_entries (file_id, entry_path, size, is_directory) ");
             chunk_qb.push_values(chunk.iter(), |mut b, entry| {
                 b.push_bind(entry.file_id)
                     .push_bind(&entry.entry_path)
@@ -2576,10 +2540,7 @@ pub async fn archive_download(
 
     // 安全检查：防止目录遍历
     let entry_path = query.path.trim();
-    if entry_path.is_empty()
-        || entry_path.contains("..")
-        || entry_path.starts_with('/')
-        || entry_path.starts_with('\\')
+    if entry_path.is_empty() || entry_path.contains("..") || entry_path.starts_with('/') || entry_path.starts_with('\\')
     {
         return Err(ApiError::BadRequest("Invalid entry path".to_string()));
     }
@@ -2587,16 +2548,11 @@ pub async fn archive_download(
     let cfg = config::get();
 
     // 尝试从解压目录读取
-    if let Some(resolved) = archive::resolve_archive_entry_path(
-        &cfg.storage.archives_path, id, entry_path,
-    ) {
-        if resolved.exists() && resolved.is_file() {
+    if let Some(resolved) = archive::resolve_archive_entry_path(&cfg.storage.archives_path, id, entry_path)
+        && resolved.exists() && resolved.is_file() {
             let file_content = fs::read(&resolved).await?;
             let mime_type = mime_guess::from_path(entry_path).first_or_octet_stream().to_string();
-            let filename = std::path::Path::new(entry_path)
-                .file_name()
-                .and_then(|n| n.to_str())
-                .unwrap_or(entry_path);
+            let filename = std::path::Path::new(entry_path).file_name().and_then(|n| n.to_str()).unwrap_or(entry_path);
             let content_disposition = format!("attachment; filename=\"{}\"", filename);
             return Ok((
                 StatusCode::OK,
@@ -2604,7 +2560,6 @@ pub async fn archive_download(
                 Body::from(file_content),
             ));
         }
-    }
 
     // 如果解压目录没有，尝试直接从压缩包读取（ZIP/TAR 支持）
     let src_path = file.path.clone();
@@ -2624,10 +2579,7 @@ pub async fn archive_download(
     };
 
     let mime_type = mime_guess::from_path(entry_path).first_or_octet_stream().to_string();
-    let filename = std::path::Path::new(entry_path)
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or(entry_path);
+    let filename = std::path::Path::new(entry_path).file_name().and_then(|n| n.to_str()).unwrap_or(entry_path);
     let content_disposition = format!("attachment; filename=\"{}\"", filename);
     Ok((
         StatusCode::OK,

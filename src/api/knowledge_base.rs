@@ -1,9 +1,7 @@
 use std::collections::HashMap;
 
 use axum::{
-    Extension,
-    extract::{Path, Query, State},
-    response::Json,
+    Extension, extract::{Path, Query, State}, response::Json
 };
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -12,9 +10,7 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::file::{self, FileStatusBreakdown};
 use crate::{
-    AuthUser,
-    api::error::{ApiError, ApiResult},
-    search::SearchEngine,
+    AuthUser, api::error::{ApiError, ApiResult}, search::SearchEngine
 };
 
 const KB_TYPE_ANALYSIS: &str = "analysis";
@@ -433,15 +429,14 @@ pub async fn update(
 ) -> ApiResult<Json<Knowledge>> {
     let is_admin = auth_user.is_admin();
     // Prevent moving a knowledge base into itself.
-    if let Some(Some(parent_id)) = knowledge.parent_id {
-        if parent_id == id {
+    if let Some(Some(parent_id)) = knowledge.parent_id
+        && parent_id == id {
             return Err(crate::api::error::ApiError::BadRequest(
                 "Cannot move a knowledge base into itself.".to_string(),
             ));
         }
         // A full descendant check would be needed for production to prevent moving a KB into its own child.
         // This requires a recursive query and is omitted for this iteration.
-    }
 
     let mut qb = QueryBuilder::<Sqlite>::new("UPDATE knowledge_bases SET ");
     let mut has_update = false;

@@ -1,9 +1,7 @@
 use std::{fmt, num::ParseIntError, result};
 
 use axum::{
-    Json,
-    http::StatusCode,
-    response::{IntoResponse, Response},
+    Json, http::StatusCode, response::{IntoResponse, Response}
 };
 use serde::Serialize;
 use sqlx;
@@ -115,12 +113,12 @@ impl IntoResponse for ApiError {
 pub type ApiResult<T> = result::Result<T, ApiError>;
 
 impl ApiError {
-    /// Helper to create a `BadRequest` error.
+    // Helper to create a `BadRequest` error.
     // pub fn bad_request<M: Into<String>>(msg: M) -> Self {
     //     ApiError::BadRequest(msg.into())
     // }
 
-    // /// Helper to create a `NotFound` error.
+    // Helper to create a `NotFound` error.
     // pub fn not_found<M: Into<String>>(msg: M) -> Self {
     //     ApiError::NotFound(msg.into())
     // }

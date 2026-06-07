@@ -1,21 +1,12 @@
 use std::{
-    collections::{HashMap, HashSet},
-    path::Path,
-    thread,
-    time::{Duration, Instant},
+    collections::{HashMap, HashSet}, path::Path, thread, time::{Duration, Instant}
 };
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use log::{debug, warn};
 use serde::Serialize;
 use tantivy::{
-    Index, IndexReader, Result, TantivyDocument, TantivyError, Term,
-    collector::TopDocs,
-    directory::error::LockError,
-    doc,
-    merge_policy::LogMergePolicy,
-    query::{BooleanQuery, BoostQuery, Occur, Query, TermQuery},
-    schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _},
+    Index, IndexReader, Result, TantivyDocument, TantivyError, Term, collector::TopDocs, directory::error::LockError, doc, merge_policy::LogMergePolicy, query::{BooleanQuery, BoostQuery, Occur, Query, TermQuery}, schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _}
 };
 use tokio::time::sleep;
 
@@ -199,7 +190,7 @@ pub async fn create_rebuild_writer(index: &Index, label: &str) -> tantivy::Resul
 }
 
 pub fn add_documents(
-    index_writer: &mut tantivy::IndexWriter, schema: &Schema, docs: impl IntoIterator<Item = Document>,
+    index_writer: &mut tantivy::IndexWriter, schema: &Schema, docs: impl IntoIterator<Item=Document>,
 ) -> tantivy::Result<usize> {
     let mut count = 0_usize;
     for doc in docs {
@@ -486,8 +477,8 @@ fn build_query(
     let content_bool = BooleanQuery::new(content_queries);
     subqueries.push((Occur::Must, Box::new(content_bool)));
 
-    if let Some(ids) = file_ids {
-        if !ids.is_empty() {
+    if let Some(ids) = file_ids
+        && !ids.is_empty() {
             let mut file_id_queries = Vec::new();
             let file_id_field = get_field(schema, "file_id");
             for file_id in ids {
@@ -500,10 +491,9 @@ fn build_query(
                 subqueries.push((Occur::Must, Box::new(file_ids_bool_query)));
             }
         }
-    }
 
-    if let Some(ids) = kb_ids {
-        if !ids.is_empty() {
+    if let Some(ids) = kb_ids
+        && !ids.is_empty() {
             let mut kb_id_queries = Vec::new();
             let kb_id_field = get_field(schema, "kb_id");
             for kb_id in ids {
@@ -515,7 +505,6 @@ fn build_query(
                 subqueries.push((Occur::Must, Box::new(kb_ids_bool_query)));
             }
         }
-    }
     Ok(Box::new(BooleanQuery::new(subqueries)))
 }
 
@@ -580,8 +569,8 @@ fn build_snippet_terms(query: &str, synonym_map: Option<&SynonymMap>) -> Vec<Str
         if seen.insert(trimmed.to_string()) {
             terms.push(trimmed.to_string());
         }
-        if let Some(map) = synonym_map {
-            if let Some(synonyms) = map.get(trimmed) {
+        if let Some(map) = synonym_map
+            && let Some(synonyms) = map.get(trimmed) {
                 for synonym in synonyms {
                     let syn = synonym.term.trim();
                     if syn.is_empty() {
@@ -592,9 +581,8 @@ fn build_snippet_terms(query: &str, synonym_map: Option<&SynonymMap>) -> Vec<Str
                     }
                 }
             }
-        }
     }
-    terms.sort_by(|a, b| b.len().cmp(&a.len()));
+    terms.sort_by_key(|b| std::cmp::Reverse(b.len()));
     terms
 }
 
@@ -616,8 +604,8 @@ fn build_query_terms(input: &str, synonym_map: Option<&SynonymMap>) -> Vec<Query
         if seen.insert(trimmed.to_string()) {
             terms.push(QueryTerm { term: trimmed.to_string(), boost: 1.0 });
         }
-        if let Some(map) = synonym_map {
-            if let Some(synonyms) = map.get(trimmed) {
+        if let Some(map) = synonym_map
+            && let Some(synonyms) = map.get(trimmed) {
                 for synonym in synonyms {
                     let syn = synonym.term.trim();
                     if syn.is_empty() || syn == trimmed {
@@ -628,15 +616,14 @@ fn build_query_terms(input: &str, synonym_map: Option<&SynonymMap>) -> Vec<Query
                     }
                 }
             }
-        }
     }
 
     if terms.is_empty() {
         let raw = input.trim();
         if !raw.is_empty() {
             terms.push(QueryTerm { term: raw.to_string(), boost: 1.0 });
-            if let Some(map) = synonym_map {
-                if let Some(synonyms) = map.get(raw) {
+            if let Some(map) = synonym_map
+                && let Some(synonyms) = map.get(raw) {
                     for synonym in synonyms {
                         let syn = synonym.term.trim();
                         if syn.is_empty() || syn == raw {
@@ -647,7 +634,6 @@ fn build_query_terms(input: &str, synonym_map: Option<&SynonymMap>) -> Vec<Query
                         }
                     }
                 }
-            }
         }
     }
 

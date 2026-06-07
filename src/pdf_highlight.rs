@@ -5,9 +5,7 @@
 use anyhow::Result;
 use log::info;
 use lopdf::{
-    Document, Object, ObjectId, Stream,
-    content::{Content, Operation},
-    dictionary,
+    Document, Object, ObjectId, Stream, content::{Content, Operation}, dictionary
 };
 use serde::{Deserialize, Serialize};
 
@@ -136,23 +134,20 @@ fn get_page_box(doc: &Document, page_id: ObjectId) -> Option<PageBox> {
     let page_dict = doc.get_dictionary(page_id).ok()?;
 
     if let Some(page_box) =
-        get_box_from_dict(&page_dict, b"MediaBox").or_else(|| get_box_from_dict(&page_dict, b"CropBox"))
+        get_box_from_dict(page_dict, b"MediaBox").or_else(|| get_box_from_dict(page_dict, b"CropBox"))
     {
         return Some(page_box);
     }
 
     // 如果没有，尝试从父页面获取（可继承）
-    if let Ok(parent_ref) = page_dict.get(b"Parent") {
-        if let Ok(parent_id) = parent_ref.as_reference() {
-            if let Ok(parent_dict) = doc.get_dictionary(parent_id) {
-                if let Some(page_box) =
-                    get_box_from_dict(&parent_dict, b"MediaBox").or_else(|| get_box_from_dict(&parent_dict, b"CropBox"))
+    if let Ok(parent_ref) = page_dict.get(b"Parent")
+        && let Ok(parent_id) = parent_ref.as_reference()
+            && let Ok(parent_dict) = doc.get_dictionary(parent_id)
+                && let Some(page_box) =
+                    get_box_from_dict(parent_dict, b"MediaBox").or_else(|| get_box_from_dict(parent_dict, b"CropBox"))
                 {
                     return Some(page_box);
                 }
-            }
-        }
-    }
 
     None
 }

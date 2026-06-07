@@ -1,8 +1,5 @@
 use axum::{
-    body::Body,
-    http::{Request, StatusCode},
-    middleware::Next,
-    response::{IntoResponse, Response},
+    body::Body, http::{Request, StatusCode}, middleware::Next, response::{IntoResponse, Response}
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 

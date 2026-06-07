@@ -1,14 +1,19 @@
 use std::collections::HashMap;
 
 use axum::{
-    extract::{Path, Query, State},
-    response::Json,
+    extract::{Path, Query, State}, response::Json
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::api::error::ApiError;
+
+// Type aliases for complex SQL row types
+#[allow(clippy::type_complexity)]
+type EntityRow = (i64, String, String, Option<String>, Option<i64>, Option<i64>, i64);
+#[allow(clippy::type_complexity)]
+type NeighborRow = (i64, String, String, Option<String>, Option<i64>, Option<i64>, i64, String);
 
 /// 实体信息
 #[derive(Debug, Serialize, ToSchema)]
@@ -147,7 +152,7 @@ pub async fn get_entity(Path(id): Path<i64>, State(pool): State<SqlitePool>) -> 
     // 查询实体基本信息
     let entity_sql =
         "SELECT id, name, entity_type, properties, file_id, kb_id, created_at FROM graph_nodes WHERE id = ?";
-    let entity_row: Option<(i64, String, String, Option<String>, Option<i64>, Option<i64>, i64)> =
+    let entity_row: Option<EntityRow> =
         sqlx::query_as(entity_sql).bind(id).fetch_optional(&pool).await?;
 
     let entity_row = entity_row.ok_or_else(|| ApiError::Internal("Entity not found".to_string()))?;
@@ -170,7 +175,7 @@ pub async fn get_entity(Path(id): Path<i64>, State(pool): State<SqlitePool>) -> 
                         FROM graph_edges e \
                         INNER JOIN graph_nodes n ON e.target_node_id = n.id \
                         WHERE e.source_node_id = ? LIMIT 50";
-    let outgoing_rows: Vec<(i64, String, String, Option<String>, Option<i64>, Option<i64>, i64, String)> =
+    let outgoing_rows: Vec<NeighborRow> =
         sqlx::query_as(outgoing_sql).bind(id).fetch_all(&pool).await?;
 
     // 查询邻居（入边）
@@ -178,7 +183,7 @@ pub async fn get_entity(Path(id): Path<i64>, State(pool): State<SqlitePool>) -> 
                         FROM graph_edges e \
                         INNER JOIN graph_nodes n ON e.source_node_id = n.id \
                         WHERE e.target_node_id = ? LIMIT 50";
-    let incoming_rows: Vec<(i64, String, String, Option<String>, Option<i64>, Option<i64>, i64, String)> =
+    let incoming_rows: Vec<NeighborRow> =
         sqlx::query_as(incoming_sql).bind(id).fetch_all(&pool).await?;
 
     let mut neighbors = Vec::new();
