@@ -76,7 +76,7 @@ pub struct ServicesConfig {
     pub mineru_max_pages: usize,
     /// Office 文档转 PDF 服务地址
     pub office_convert_url: String,
-    /// 自定义解析服务地址（配置后仅 Word/PDF 走该服务）
+    /// 自定义解析服务地址（配置后仅 Word/PPT/PDF 走该服务）
     pub custom_parse_url: Option<String>,
     /// 自定义解析复用服务地址（仅输入 pdf_contents）
     pub custom_parse_reuse_url: Option<String>,

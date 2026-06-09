@@ -803,8 +803,9 @@ impl FileProcessor {
             let is_image = Self::is_image_file(&filename_lower);
             let is_audio = Self::is_audio_file(&filename_lower);
 
-            // 检查文件是否为 Word 或 Excel 文档
+            // 检查文件是否为 Office 文档
             let is_word = filename_lower.ends_with(".doc") || filename_lower.ends_with(".docx");
+            let is_presentation = filename_lower.ends_with(".ppt") || filename_lower.ends_with(".pptx");
             let is_excel = filename_lower.ends_with(".xls") || filename_lower.ends_with(".xlsx");
 
             let cfg = config::get();
@@ -839,12 +840,12 @@ impl FileProcessor {
                 return Ok(());
             }
 
-            if is_word {
+            if is_word || is_presentation {
                 timing.set_pipeline("office_pdf");
                 if !self.ensure_file_exists(file.id, "before office conversion").await? {
                     return Ok(());
                 }
-                info!("Detected Word document, converting to PDF: {}", file.filename);
+                info!("Detected Office document, converting to PDF: {}", file.filename);
 
                 if let Some(custom_url) = custom_url {
                     let stored_pdf_path =
@@ -1409,7 +1410,7 @@ impl FileProcessor {
         .await
     }
 
-    /// 调用外部服务将 Word/Excel 文档转换为 PDF
+    /// 调用外部服务将 Word/PPT 文档转换为 PDF
     async fn convert_office_to_pdf(&self, file: &File) -> anyhow::Result<std::path::PathBuf> {
         let cfg = config::get();
         let pdf_dir = std::path::Path::new(&cfg.storage.pdf_path);
@@ -1489,7 +1490,7 @@ impl FileProcessor {
         Err(anyhow::anyhow!("Failed to convert office document to PDF: {}", error_msg))
     }
 
-    /// 将 Word/Excel 文档转换为 PDF 并处理
+    /// 将 Word/PPT 文档转换为 PDF 并处理
     async fn convert_office_to_pdf_and_process(
         &self, file: &File, mut timing: Option<&mut ParseTimingCtx>,
     ) -> anyhow::Result<()> {

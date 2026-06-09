@@ -2198,6 +2198,8 @@ pub async fn get_highlighted_pdf(
     let filename_lower = file.filename.to_lowercase();
     let pdf_path = if filename_lower.ends_with(".doc")
         || filename_lower.ends_with(".docx")
+        || filename_lower.ends_with(".ppt")
+        || filename_lower.ends_with(".pptx")
         || filename_lower.ends_with(".xls")
         || filename_lower.ends_with(".xlsx")
     {
@@ -2210,7 +2212,7 @@ pub async fn get_highlighted_pdf(
     } else if filename_lower.ends_with(".pdf") {
         std::path::PathBuf::from(&file.path)
     } else {
-        return Err(ApiError::BadRequest("File is not a PDF, Word, or Excel document".to_string()));
+        return Err(ApiError::BadRequest("File is not a PDF, Word, PowerPoint, or Excel document".to_string()));
     };
 
     // 读取原始 PDF

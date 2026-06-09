@@ -17,7 +17,7 @@ const isImageFile = (filename) => {
 
 const isOfficeFile = (filename) => {
   if (!filename) return false
-  return /\.(pdf|doc|docx|xlsx|xls)$/i.test(filename)
+  return /\.(pdf|doc|docx|ppt|pptx|xlsx|xls)$/i.test(filename)
 }
 
 const isExcelFile = (filename) => {
@@ -45,7 +45,7 @@ const openViewer = (result) => {
     return
   }
 
-  // PDF/Word → PDF 高亮
+  // PDF/Word/PPT → PDF 高亮
   const params = new URLSearchParams({
     file_id: String(result.file?.id || ''),
     slice_id: String(result.id),
