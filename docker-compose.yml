@@ -30,6 +30,7 @@ services:
       # AI 模型配置
       - HTKNOW_EMBEDDING_MODEL=bge-m3
       - HTKNOW_EMBEDDING_DIM=1024
+      - HTKNOW_EMBEDDING_BATCH_SIZE=8
       - HTKNOW_RERANK_MODEL=bge-rerank
       - HTKNOW_RERANK_THRESHOLD=0.1
       # 数据库配置

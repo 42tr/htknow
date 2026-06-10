@@ -105,6 +105,8 @@ pub struct AIConfig {
     pub rerank_model: String,
     /// Rerank 分数阈值
     pub rerank_threshold: f32,
+    /// Embedding 批量请求批次大小
+    pub embedding_batch_size: usize,
 }
 
 /// 数据库配置
@@ -246,6 +248,7 @@ impl AIConfig {
             image_embedding_dim: env_or_parse("HTKNOW_IMAGE_EMBEDDING_DIM", 2048),
             rerank_model: env_or("HTKNOW_RERANK_MODEL", "bge-rerank"),
             rerank_threshold: env_or_parse("HTKNOW_RERANK_THRESHOLD", 0.1),
+            embedding_batch_size: env_or_parse("HTKNOW_EMBEDDING_BATCH_SIZE", 8),
         }
     }
 }

@@ -116,16 +116,15 @@ pub async fn get_embedding(text: &str) -> Result<Vec<f32>> {
     Ok(embedding)
 }
 
-const EMBEDDING_BATCH_SIZE: usize = 256;
-
 /// 批量获取文本的 embedding 向量（自动分批）
 pub async fn get_embeddings(texts: &[String]) -> Result<Vec<Vec<f32>>> {
     if texts.is_empty() {
         return Ok(Vec::new());
     }
 
+    let batch_size = config::get().ai.embedding_batch_size;
     let mut all_embeddings = Vec::with_capacity(texts.len());
-    for chunk in texts.chunks(EMBEDDING_BATCH_SIZE) {
+    for chunk in texts.chunks(batch_size) {
         let batch = get_embeddings_single_batch(chunk).await?;
         all_embeddings.extend(batch);
     }

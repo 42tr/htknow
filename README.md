@@ -94,6 +94,7 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | `HTKNOW_EMBEDDING_MODEL` | `bge-m3` | Embedding 模型 |
 | `HTKNOW_EMBEDDING_DIM` | `1024` | Embedding 维度 |
 | `HTKNOW_IMAGE_EMBEDDING_DIM` | `2048` | 图片 Embedding 维度 |
+| `HTKNOW_EMBEDDING_BATCH_SIZE` | `8` | Embedding 批量请求批次大小 |
 | `HTKNOW_RERANK_MODEL` | `bge-rerank` | Rerank 模型 |
 | `HTKNOW_RERANK_THRESHOLD` | `0.1` | Rerank 阈值 |
 
