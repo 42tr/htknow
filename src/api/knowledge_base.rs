@@ -33,6 +33,96 @@ fn normalize_parse_priority(parse_priority: Option<i64>) -> Result<i64, ApiError
     Ok(value)
 }
 
+// ---------------------------------------------------------------------------
+// KB permission helpers
+// ---------------------------------------------------------------------------
+
+/// Get the highest permission level a user has on a knowledge base.
+/// Priority: global admin > owner > explicit permission > is_public.
+/// Returns None if the user has no access at all.
+pub async fn get_kb_permission(pool: &SqlitePool, kb_id: i64, user_id: &str, is_admin: bool) -> Option<String> {
+    if is_admin {
+        return Some("admin".to_string());
+    }
+
+    // 1. Check if owner
+    let owner: Option<String> = sqlx::query_scalar("SELECT user_id FROM knowledge_bases WHERE id = ?")
+        .bind(kb_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    if owner.as_deref() == Some(user_id) {
+        return Some("admin".to_string());
+    }
+
+    // 2. Check explicit permission
+    let explicit: Option<String> =
+        sqlx::query_scalar("SELECT permission FROM kb_permissions WHERE kb_id = ? AND user_id = ?")
+            .bind(kb_id)
+            .bind(user_id)
+            .fetch_optional(pool)
+            .await
+            .ok()
+            .flatten();
+    if let Some(perm) = explicit {
+        return Some(perm);
+    }
+
+    // 3. Check if public
+    let is_public: Option<i64> = sqlx::query_scalar("SELECT is_public FROM knowledge_bases WHERE id = ?")
+        .bind(kb_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten();
+    if is_public == Some(1) {
+        return Some("viewer".to_string());
+    }
+
+    None
+}
+
+/// Numeric level for comparison: admin=3, editor=2, viewer=1, none=0.
+pub fn perm_level(perm: &str) -> i32 {
+    match perm {
+        "admin" => 3,
+        "editor" => 2,
+        "viewer" => 1,
+        _ => 0,
+    }
+}
+
+/// Check whether `actual` permission meets at least `required` permission.
+pub fn meets_requirement(actual: Option<&str>, required: &str) -> bool {
+    let actual_level = actual.map(perm_level).unwrap_or(0);
+    let required_level = perm_level(required);
+    actual_level >= required_level
+}
+
+/// Get all KB ids that the user has at least viewer access to.
+pub async fn get_user_viewable_kb_ids(pool: &SqlitePool, user_id: &str, is_admin: bool) -> Vec<i64> {
+    if is_admin {
+        return sqlx::query_scalar("SELECT id FROM knowledge_bases")
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
+    }
+    sqlx::query_scalar(
+        "SELECT id FROM knowledge_bases WHERE user_id = ?1 OR is_public = 1 \
+         UNION \
+         SELECT kb_id FROM kb_permissions WHERE user_id = ?1",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
+// ---------------------------------------------------------------------------
+// Data models
+// ---------------------------------------------------------------------------
+
 #[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
 pub struct Knowledge {
     pub id: i64,
@@ -44,6 +134,9 @@ pub struct Knowledge {
     pub parent_id: Option<i64>,
     pub is_public: bool,
     pub parse_priority: i64,
+    #[serde(default)]
+    #[sqlx(default)]
+    pub current_user_permission: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
@@ -59,6 +152,7 @@ pub struct KnowledgeResponse {
     pub parse_priority: i64,
     pub file_count: i64,
     pub children_kb_count: i64,
+    pub current_user_permission: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, ToSchema)]
@@ -78,6 +172,7 @@ pub struct KnowledgeDetailResponse {
     pub files: Vec<FileWithoutContent>,
     pub path: Vec<Knowledge>, // For breadcrumbs
     pub status_breakdown: FileStatusBreakdown,
+    pub current_user_permission: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
@@ -183,7 +278,8 @@ pub async fn list(
         "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE 1=1 ",
     );
     if !is_admin {
-        qb.push(" AND (user_id = ").push_bind(auth_user.user_id.clone()).push(" OR is_public = 1)");
+        let user_id = auth_user.user_id.clone();
+        qb.push(" AND (user_id = ").push_bind(user_id.clone()).push(" OR is_public = 1 OR id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ").push_bind(user_id).push("))");
     }
 
     // Filter by parent_id
@@ -235,10 +331,37 @@ pub async fn list(
             parse_priority: kb.parse_priority,
             file_count: *file_counts.get(&kb.id).unwrap_or(&0),
             children_kb_count: *children_counts.get(&kb.id).unwrap_or(&0),
+            current_user_permission: if kb.user_id == auth_user.user_id || is_admin {
+                "admin".to_string()
+            } else if kb.is_public {
+                "viewer".to_string()
+            } else {
+                // fallback - should not happen since query already filters
+                "viewer".to_string()
+            },
         })
         .collect();
 
     Ok(Json(knowledge_responses))
+}
+
+/// Build the access-filter clause used in CTEs.
+fn push_kb_access_filter<'a>(qb: &mut QueryBuilder<'a, Sqlite>, user_id: &'a str) {
+    qb.push(" AND (user_id = ");
+    qb.push_bind(user_id);
+    qb.push(" OR is_public = 1 OR id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ");
+    qb.push_bind(user_id);
+    qb.push(")");
+    qb.push(")");
+}
+
+fn push_kb_access_filter_where<'a>(qb: &mut QueryBuilder<'a, Sqlite>, user_id: &'a str) {
+    qb.push(" WHERE (kb.user_id = ");
+    qb.push_bind(user_id);
+    qb.push(" OR kb.is_public = 1 OR kb.id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ");
+    qb.push_bind(user_id);
+    qb.push(")");
+    qb.push(")");
 }
 
 async fn get_children_kb_counts(
@@ -257,16 +380,12 @@ async fn get_children_kb_counts(
     }
     qb.push(")");
     if !is_admin {
-        qb.push(" AND (user_id = ");
-        qb.push_bind(user_id);
-        qb.push(" OR is_public = 1)");
+        push_kb_access_filter(&mut qb, user_id);
     }
     qb.push(" UNION ALL SELECT d.root_id, kb.id FROM knowledge_bases kb ");
     qb.push("JOIN descendants d ON kb.parent_id = d.kb_id");
     if !is_admin {
-        qb.push(" WHERE (kb.user_id = ");
-        qb.push_bind(user_id);
-        qb.push(" OR kb.is_public = 1)");
+        push_kb_access_filter_where(&mut qb, user_id);
     }
     qb.push(") ");
     qb.push("SELECT root_id, COUNT(*) - 1 AS cnt FROM descendants GROUP BY root_id");
@@ -301,16 +420,12 @@ async fn get_file_counts(
     }
     qb.push(")");
     if !is_admin {
-        qb.push(" AND (user_id = ");
-        qb.push_bind(user_id);
-        qb.push(" OR is_public = 1)");
+        push_kb_access_filter(&mut qb, user_id);
     }
     qb.push(" UNION ALL SELECT d.root_id, kb.id FROM knowledge_bases kb ");
     qb.push("JOIN descendants d ON kb.parent_id = d.kb_id");
     if !is_admin {
-        qb.push(" WHERE (kb.user_id = ");
-        qb.push_bind(user_id);
-        qb.push(" OR kb.is_public = 1)");
+        push_kb_access_filter_where(&mut qb, user_id);
     }
     qb.push(") ");
     qb.push("SELECT d.root_id, COUNT(f.id) AS cnt FROM descendants d ");
@@ -383,12 +498,13 @@ pub async fn create(
         .execute(&pool)
         .await?
         .last_insert_rowid();
-    let kb = sqlx::query_as(
+    let mut kb: Knowledge = sqlx::query_as(
         "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
     )
     .bind(id)
     .fetch_one(&pool)
     .await?;
+    kb.current_user_permission = "admin".to_string();
     Ok(Json(kb))
 }
 
@@ -428,6 +544,13 @@ pub async fn update(
     Json(knowledge): Json<KnowledgeUpdateReq>,
 ) -> ApiResult<Json<Knowledge>> {
     let is_admin = auth_user.is_admin();
+    let user_perm = get_kb_permission(&pool, id, &auth_user.user_id, is_admin).await;
+    let perm_str = user_perm.as_deref().unwrap_or("");
+
+    if !meets_requirement(user_perm.as_deref(), "editor") {
+        return Err(ApiError::Forbidden("Permission denied. Requires editor or admin.".to_string()));
+    }
+
     // Prevent moving a knowledge base into itself.
     if let Some(Some(parent_id)) = knowledge.parent_id
         && parent_id == id {
@@ -437,6 +560,24 @@ pub async fn update(
         }
         // A full descendant check would be needed for production to prevent moving a KB into its own child.
         // This requires a recursive query and is omitted for this iteration.
+
+    // Only admin-level can change sensitive fields: is_public, parent_id, kb_type
+    let is_kb_admin = meets_requirement(Some(perm_str), "admin");
+    if let Some(ref _kb_type) = knowledge.kb_type {
+        if !is_kb_admin {
+            return Err(ApiError::Forbidden("Only admin can change kb_type.".to_string()));
+        }
+    }
+    if knowledge.parent_id.is_some() {
+        if !is_kb_admin {
+            return Err(ApiError::Forbidden("Only admin can change parent_id.".to_string()));
+        }
+    }
+    if knowledge.is_public.is_some() {
+        if !is_kb_admin {
+            return Err(ApiError::Forbidden("Only admin can change visibility.".to_string()));
+        }
+    }
 
     let mut qb = QueryBuilder::<Sqlite>::new("UPDATE knowledge_bases SET ");
     let mut has_update = false;
@@ -494,32 +635,18 @@ pub async fn update(
     }
 
     if !has_update {
-        // If nothing is being updated, just return the current state of kb, ensuring it exists and belongs to user.
-        let kb = if is_admin {
-            sqlx::query_as(
-                "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
-            )
-            .bind(id)
-            .fetch_one(&pool)
-            .await?
-        } else {
-            sqlx::query_as(
-                "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ? AND user_id = ?",
-            )
-            .bind(id)
-            .bind(auth_user.user_id.clone())
-            .fetch_one(&pool)
-            .await?
-        };
+        let mut kb: Knowledge = sqlx::query_as(
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
+        kb.current_user_permission = "admin".to_string();
         return Ok(Json(kb));
     }
 
     qb.push(" WHERE id = ");
     qb.push_bind(id);
-    if !is_admin {
-        qb.push(" AND user_id = ");
-        qb.push_bind(auth_user.user_id.clone());
-    }
 
     let result = qb.build().execute(&pool).await?;
 
@@ -529,22 +656,13 @@ pub async fn update(
         ));
     }
 
-    let kb = if is_admin {
-        sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await?
-    } else {
-        sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ? AND user_id = ?",
-        )
-        .bind(id)
-        .bind(auth_user.user_id.clone())
-        .fetch_one(&pool)
-        .await?
-    };
+    let mut kb: Knowledge = sqlx::query_as(
+        "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await?;
+    kb.current_user_permission = "admin".to_string();
     Ok(Json(kb))
 }
 
@@ -574,40 +692,35 @@ pub async fn get(
 ) -> ApiResult<Json<KnowledgeDetailResponse>> {
     let is_admin = auth_user.is_admin();
     let user_id = auth_user.user_id.clone();
-    // 1. Fetch the main knowledge base and verify ownership
-    let main_kb: Knowledge = if is_admin {
-        sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_one(&pool)
-        .await?
-    } else {
-        sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
-        )
-        .bind(id)
-        .bind(user_id.clone())
-        .fetch_one(&pool)
-        .await?
-    };
+
+    // 0. Check permission
+    let user_perm = get_kb_permission(&pool, id, &user_id, is_admin).await;
+    if user_perm.is_none() {
+        return Err(ApiError::NotFound("Knowledge base not found or permission denied.".to_string()));
+    }
+    let current_user_permission = user_perm.clone().unwrap();
+
+    // 1. Fetch the main knowledge base (already permission-checked above)
+    let main_kb: Knowledge = sqlx::query_as(
+        "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_one(&pool)
+    .await?;
 
     // 2. Fetch children KBs and files in parallel
-    let children_future = if is_admin {
-        sqlx::query_as(
+    let children_future = async {
+        let mut qb = QueryBuilder::<Sqlite>::new(
             "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority \
-             FROM knowledge_bases WHERE parent_id = ? ORDER BY name",
-        )
-        .bind(id)
-        .fetch_all(&pool)
-    } else {
-        sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority \
-             FROM knowledge_bases WHERE parent_id = ? AND (user_id = ? OR is_public = 1) ORDER BY name",
-        )
-        .bind(id)
-        .bind(user_id.clone())
-        .fetch_all(&pool)
+             FROM knowledge_bases WHERE parent_id = ",
+        );
+        qb.push_bind(id);
+        if !is_admin {
+            let uid = user_id.clone();
+            qb.push(" AND (user_id = ").push_bind(uid.clone()).push(" OR is_public = 1 OR id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ").push_bind(uid).push("))");
+        }
+        qb.push(" ORDER BY name");
+        qb.build_query_as::<Knowledge>().fetch_all(&pool).await
     };
 
     let files_future = async {
@@ -641,6 +754,14 @@ pub async fn get(
     let children_kb_count = *children_counts.get(&id).unwrap_or(&0);
     let status_breakdown =
         file::get_file_status_breakdown_for_kb(&pool, id, true, &auth_user.user_id, is_admin).await?;
+
+    // Compute permission for each child KB
+    let mut child_perms = HashMap::new();
+    for kb in &children_kbs {
+        let cp = get_kb_permission(&pool, kb.id, &user_id, is_admin).await;
+        child_perms.insert(kb.id, cp.unwrap_or_else(|| "viewer".to_string()));
+    }
+
     let children_kbs: Vec<KnowledgeResponse> = children_kbs
         .into_iter()
         .map(|kb| KnowledgeResponse {
@@ -655,6 +776,7 @@ pub async fn get(
             parse_priority: kb.parse_priority,
             file_count: *file_counts.get(&kb.id).unwrap_or(&0),
             children_kb_count: *children_counts.get(&kb.id).unwrap_or(&0),
+            current_user_permission: child_perms.get(&kb.id).cloned().unwrap_or_else(|| "viewer".to_string()),
         })
         .collect();
 
@@ -668,24 +790,12 @@ pub async fn get(
     let mut path = Vec::new();
     let mut current_parent_id = main_kb.parent_id;
     while let Some(parent_id) = current_parent_id {
-        // In a high-depth scenario, this could be slow. A recursive CTE would be faster.
-        // But for typical UI breadcrumbs, this iterative approach is simpler and often sufficient.
-        let parent_kb: Knowledge = if is_admin {
-            sqlx::query_as(
-                "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
-            )
-            .bind(parent_id)
-            .fetch_one(&pool)
-            .await?
-        } else {
-            sqlx::query_as(
-                "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)",
-            )
-            .bind(parent_id)
-            .bind(user_id.clone())
-            .fetch_one(&pool)
-            .await?
-        };
+        let parent_kb: Knowledge = sqlx::query_as(
+            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
+        )
+        .bind(parent_id)
+        .fetch_one(&pool)
+        .await?;
         current_parent_id = parent_kb.parent_id;
         path.push(parent_kb);
     }
@@ -708,6 +818,7 @@ pub async fn get(
         files,
         path,
         status_breakdown,
+        current_user_permission,
     };
 
     Ok(Json(response))
@@ -737,23 +848,25 @@ pub async fn delete(
     Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<()> {
     let is_admin = auth_user.is_admin();
+
+    // Check permission: only admin can delete
+    let user_perm = get_kb_permission(&pool, id, &auth_user.user_id, is_admin).await;
+    if !meets_requirement(user_perm.as_deref(), "admin") {
+        return Err(ApiError::Forbidden("Permission denied. Admin role required.".to_string()));
+    }
+
     let all_kb_ids: Vec<i64> = sqlx::query_scalar(
         r#"
         WITH RECURSIVE kb_hierarchy AS (
-            SELECT id FROM knowledge_bases WHERE id = ? AND (? OR user_id = ?)
+            SELECT id FROM knowledge_bases WHERE id = ?
             UNION ALL
             SELECT kb.id FROM knowledge_bases kb
             INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
-            WHERE ? OR kb.user_id = ?
         )
         SELECT id FROM kb_hierarchy;
         "#,
     )
     .bind(id)
-    .bind(is_admin)
-    .bind(&auth_user.user_id)
-    .bind(is_admin)
-    .bind(&auth_user.user_id)
     .fetch_all(&pool)
     .await?;
 
@@ -769,9 +882,6 @@ pub async fn delete(
         files_separated.push_bind(kb_id);
     }
     files_qb.push(")");
-    if !is_admin {
-        files_qb.push(" AND user_id = ").push_bind(&auth_user.user_id);
-    }
     let files: Vec<super::file::File> = files_qb.build_query_as().fetch_all(&pool).await?;
 
     let file_ids: Vec<i64> = files.iter().map(|f| f.id).collect();
@@ -781,15 +891,10 @@ pub async fn delete(
 
     super::file::delete_file_rows_in_tx(&mut tx, &file_ids).await?;
 
-    let result = if is_admin {
-        sqlx::query("DELETE FROM knowledge_bases WHERE id = ?").bind(id).execute(&mut *tx).await?
-    } else {
-        sqlx::query("DELETE FROM knowledge_bases WHERE id = ? AND user_id = ?")
-            .bind(id)
-            .bind(&auth_user.user_id)
-            .execute(&mut *tx)
-            .await?
-    };
+    let result = sqlx::query("DELETE FROM knowledge_bases WHERE id = ?")
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
 
     if result.rows_affected() == 0 {
         return Err(crate::api::error::ApiError::NotFound(
@@ -909,12 +1014,36 @@ pub async fn reparse(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<ReparseKnowledgeBaseResponse>> {
-    let analysis_kb_ids: Vec<i64> =
+    // Get analysis-type KBs owned by or explicitly editable by the user
+    let mut analysis_kb_ids: Vec<i64> =
         sqlx::query_scalar("SELECT id FROM knowledge_bases WHERE user_id = ? AND kb_type != ?")
             .bind(auth_user.user_id.clone())
             .bind(KB_TYPE_STORAGE)
             .fetch_all(&pool)
             .await?;
+
+    // Also include KBs where user has editor/admin via kb_permissions
+    let perm_kb_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT kb_id FROM kb_permissions WHERE user_id = ? AND permission IN ('editor', 'admin')"
+    )
+    .bind(&auth_user.user_id)
+    .fetch_all(&pool)
+    .await?;
+
+    for kb_id in perm_kb_ids {
+        if !analysis_kb_ids.contains(&kb_id) {
+            let is_analysis: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM knowledge_bases WHERE id = ? AND kb_type != ?"
+            )
+            .bind(kb_id)
+            .bind(KB_TYPE_STORAGE)
+            .fetch_optional(&pool)
+            .await?;
+            if is_analysis.is_some() {
+                analysis_kb_ids.push(kb_id);
+            }
+        }
+    }
 
     let unassigned_file_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM files WHERE user_id = ? AND kb_id IS NULL")
         .bind(auth_user.user_id.clone())
@@ -957,20 +1086,10 @@ pub async fn reparse_by_id(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>, Path(id): Path<i64>,
     Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<ReparseKnowledgeBaseResponse>> {
-    let root_exists = if auth_user.is_admin() {
-        sqlx::query_scalar::<_, i64>("SELECT id FROM knowledge_bases WHERE id = ?")
-            .bind(id)
-            .fetch_optional(&pool)
-            .await?
-    } else {
-        sqlx::query_scalar::<_, i64>("SELECT id FROM knowledge_bases WHERE id = ? AND user_id = ?")
-            .bind(id)
-            .bind(&auth_user.user_id)
-            .fetch_optional(&pool)
-            .await?
-    };
-    if root_exists.is_none() {
-        return Err(ApiError::NotFound("Knowledge base not found or permission denied.".to_string()));
+    let is_admin = auth_user.is_admin();
+    let user_perm = get_kb_permission(&pool, id, &auth_user.user_id, is_admin).await;
+    if !meets_requirement(user_perm.as_deref(), "editor") {
+        return Err(ApiError::Forbidden("Permission denied. Requires editor or admin.".to_string()));
     }
 
     let analysis_kb_ids: Vec<i64> = sqlx::query_scalar(
@@ -1002,6 +1121,9 @@ pub async fn reparse_by_id(
 async fn load_tree_knowledges(
     pool: &SqlitePool, root_kb_id: Option<i64>, user_id: &str, is_admin: bool,
 ) -> anyhow::Result<Vec<TreeKnowledge>> {
+    let access_clause = "(user_id = ? OR is_public = 1 OR id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ?))";
+    let access_where = "WHERE kb.user_id = ? OR kb.is_public = 1 OR kb.id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ?)";
+
     let rows = match (root_kb_id, is_admin) {
         (Some(kb_id), true) => {
             sqlx::query_as(
@@ -1030,19 +1152,24 @@ async fn load_tree_knowledges(
                 WITH RECURSIVE tree AS (
                     SELECT id, name, description, kb_type, parent_id, is_public
                     FROM knowledge_bases
-                    WHERE id = ? AND (user_id = ? OR is_public = 1)
+                    WHERE id = ? AND #ACCESS#
                     UNION ALL
                     SELECT kb.id, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public
                     FROM knowledge_bases kb
                     INNER JOIN tree t ON kb.parent_id = t.id
-                    WHERE kb.user_id = ? OR kb.is_public = 1
+                    #ACCESS_WHERE#
                 )
                 SELECT id, name, description, kb_type, parent_id, is_public
                 FROM tree
                 ORDER BY name
-                "#,
+                "#
+                .replace("#ACCESS#", access_clause)
+                .replace("#ACCESS_WHERE#", access_where)
+                .as_str(),
             )
             .bind(kb_id)
+            .bind(user_id)
+            .bind(user_id)
             .bind(user_id)
             .bind(user_id)
             .fetch_all(pool)
@@ -1074,18 +1201,23 @@ async fn load_tree_knowledges(
                 WITH RECURSIVE tree AS (
                     SELECT id, name, description, kb_type, parent_id, is_public
                     FROM knowledge_bases
-                    WHERE parent_id IS NULL AND (user_id = ? OR is_public = 1)
+                    WHERE parent_id IS NULL AND #ACCESS#
                     UNION ALL
                     SELECT kb.id, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public
                     FROM knowledge_bases kb
                     INNER JOIN tree t ON kb.parent_id = t.id
-                    WHERE kb.user_id = ? OR kb.is_public = 1
+                    #ACCESS_WHERE#
                 )
                 SELECT id, name, description, kb_type, parent_id, is_public
                 FROM tree
                 ORDER BY name
-                "#,
+                "#
+                .replace("#ACCESS#", access_clause)
+                .replace("#ACCESS_WHERE#", access_where)
+                .as_str(),
             )
+            .bind(user_id)
+            .bind(user_id)
             .bind(user_id)
             .bind(user_id)
             .fetch_all(pool)
@@ -1263,18 +1395,14 @@ pub async fn batch_export_kb(
         return Err(ApiError::BadRequest("kb_ids cannot be empty".to_string()));
     }
 
-    // Verify all knowledge bases exist and user has access
-    let mut qb = QueryBuilder::<Sqlite>::new("SELECT id FROM knowledge_bases WHERE id IN (");
-    let mut separated = qb.separated(", ");
-    for id in &req.kb_ids {
-        separated.push_bind(id);
+    // Verify all knowledge bases exist and user has access (viewer or above)
+    let mut allowed_ids = Vec::new();
+    for kb_id in &req.kb_ids {
+        let perm = get_kb_permission(&pool, *kb_id, &auth_user.user_id, is_admin).await;
+        if perm.is_some() {
+            allowed_ids.push(*kb_id);
+        }
     }
-    qb.push(")");
-    if !is_admin {
-        qb.push(" AND (user_id = ").push_bind(&auth_user.user_id).push(" OR is_public = 1)");
-    }
-
-    let allowed_ids: Vec<i64> = qb.build_query_scalar().fetch_all(&pool).await?;
     if allowed_ids.is_empty() {
         return Err(ApiError::NotFound("No knowledge bases found or permission denied.".to_string()));
     }
@@ -1297,4 +1425,175 @@ pub async fn batch_export_kb(
         .map_err(|e| ApiError::Internal(format!("Failed to parse manifest: {}", e)))?;
 
     Ok(Json(ExportKbResponse { export_path, manifest }))
+}
+
+// ---------------------------------------------------------------------------
+// KB Permission management endpoints
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize, Clone, Debug, sqlx::FromRow, ToSchema)]
+pub struct KbPermissionItem {
+    pub user_id: String,
+    pub permission: String,
+    pub created_at: i64,
+}
+
+#[derive(Deserialize, Clone, Debug, ToSchema)]
+pub struct KbPermissionCreateReq {
+    pub user_id: String,
+    pub permission: String,
+}
+
+/// 获取知识库权限列表
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/knowledge_base/{id}/permissions",
+    operation_id = "kb_permission_list",
+    tag = "knowledge_base",
+    params(
+        ("id" = i64, Path, description = "知识库 ID")
+    ),
+    responses(
+        (status = 200, description = "成功返回权限列表", body = Vec<KbPermissionItem>),
+        (status = 403, description = "无权限"),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn list_permissions(
+    Path(id): Path<i64>, State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<Vec<KbPermissionItem>>> {
+    let is_admin = auth_user.is_admin();
+    let user_perm = get_kb_permission(&pool, id, &auth_user.user_id, is_admin).await;
+    if !meets_requirement(user_perm.as_deref(), "admin") {
+        return Err(ApiError::Forbidden("Permission denied. Admin role required.".to_string()));
+    }
+
+    let rows: Vec<KbPermissionItem> = sqlx::query_as(
+        "SELECT user_id, permission, created_at FROM kb_permissions WHERE kb_id = ? ORDER BY created_at",
+    )
+    .bind(id)
+    .fetch_all(&pool)
+    .await?;
+
+    Ok(Json(rows))
+}
+
+/// 添加或更新知识库权限
+#[utoipa::path(
+    post,
+    path = "/api/v1/knowledge/knowledge_base/{id}/permissions",
+    operation_id = "kb_permission_add",
+    tag = "knowledge_base",
+    params(
+        ("id" = i64, Path, description = "知识库 ID")
+    ),
+    request_body = KbPermissionCreateReq,
+    responses(
+        (status = 200, description = "成功添加/更新权限", body = KbPermissionItem),
+        (status = 400, description = "请求参数错误"),
+        (status = 403, description = "无权限"),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn add_permission(
+    Path(id): Path<i64>, State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
+    Json(req): Json<KbPermissionCreateReq>,
+) -> ApiResult<Json<KbPermissionItem>> {
+    let is_admin = auth_user.is_admin();
+    let user_perm = get_kb_permission(&pool, id, &auth_user.user_id, is_admin).await;
+    if !meets_requirement(user_perm.as_deref(), "admin") {
+        return Err(ApiError::Forbidden("Permission denied. Admin role required.".to_string()));
+    }
+
+    // Validate permission value
+    let perm = req.permission.trim().to_lowercase();
+    if !matches!(perm.as_str(), "viewer" | "editor" | "admin") {
+        return Err(ApiError::BadRequest(
+            "Invalid permission. Use 'viewer', 'editor', or 'admin'.".to_string(),
+        ));
+    }
+
+    // Prevent adding permission for the owner (owner already has admin implicitly)
+    let owner: Option<String> = sqlx::query_scalar("SELECT user_id FROM knowledge_bases WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&pool)
+        .await?;
+    if owner.as_deref() == Some(&req.user_id) {
+        return Err(ApiError::BadRequest("Cannot set permission for the owner.".to_string()));
+    }
+
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+
+    sqlx::query(
+        "INSERT INTO kb_permissions (kb_id, user_id, permission, created_at, updated_at) VALUES (?, ?, ?, ?, ?) \
+         ON CONFLICT(kb_id, user_id) DO UPDATE SET permission = excluded.permission, updated_at = excluded.updated_at",
+    )
+    .bind(id)
+    .bind(&req.user_id)
+    .bind(&perm)
+    .bind(now)
+    .bind(now)
+    .execute(&pool)
+    .await?;
+
+    Ok(Json(KbPermissionItem {
+        user_id: req.user_id,
+        permission: perm,
+        created_at: now,
+    }))
+}
+
+/// 删除知识库权限
+#[utoipa::path(
+    delete,
+    path = "/api/v1/knowledge/knowledge_base/{id}/permissions/{user_id}",
+    operation_id = "kb_permission_remove",
+    tag = "knowledge_base",
+    params(
+        ("id" = i64, Path, description = "知识库 ID"),
+        ("user_id" = String, Path, description = "用户 ID")
+    ),
+    responses(
+        (status = 200, description = "成功删除权限"),
+        (status = 403, description = "无权限"),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn remove_permission(
+    Path((id, target_user_id)): Path<(i64, String)>,
+    State(pool): State<SqlitePool>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<()> {
+    let is_admin = auth_user.is_admin();
+    let user_perm = get_kb_permission(&pool, id, &auth_user.user_id, is_admin).await;
+    if !meets_requirement(user_perm.as_deref(), "admin") {
+        return Err(ApiError::Forbidden("Permission denied. Admin role required.".to_string()));
+    }
+
+    let result = sqlx::query("DELETE FROM kb_permissions WHERE kb_id = ? AND user_id = ?")
+        .bind(id)
+        .bind(target_user_id)
+        .execute(&pool)
+        .await?;
+
+    if result.rows_affected() == 0 {
+        return Err(ApiError::NotFound("Permission not found.".to_string()));
+    }
+
+    Ok(())
 }

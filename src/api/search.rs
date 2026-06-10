@@ -823,28 +823,45 @@ async fn send_done_event(tx: &mpsc::Sender<Result<Event, Infallible>>) -> anyhow
 }
 
 fn has_visibility_permission(
-    file: Option<(bool, &str)>, kb: Option<(bool, &str)>, user_id: &str, is_admin: bool,
+    file: Option<(bool, &str)>,
+    kb: Option<(bool, &str, i64)>,
+    user_id: &str,
+    is_admin: bool,
+    allowed_kb_ids: Option<&HashSet<i64>>,
 ) -> bool {
     if is_admin {
         return true;
     }
-    if let Some((is_public, owner_id)) = file
-        && !is_public && owner_id != user_id {
-            return false;
+    // If a KB is associated, permission is determined at the KB level.
+    if let Some((kb_is_public, kb_owner_id, kb_id)) = kb {
+        if kb_is_public || kb_owner_id == user_id {
+            return true;
         }
-    if let Some((is_public, owner_id)) = kb
-        && !is_public && owner_id != user_id {
-            return false;
+        if let Some(allowed) = allowed_kb_ids {
+            return allowed.contains(&kb_id);
         }
+        return false;
+    }
+    // Unassigned file: check file-level ownership/public flag.
+    if let Some((is_public, owner_id)) = file {
+        return is_public || owner_id == user_id;
+    }
     true
 }
 
-fn has_permission(file: Option<&FileInfo>, kb: Option<&KbInfo>, user_id: &str, is_admin: bool) -> bool {
+fn has_permission(
+    file: Option<&FileInfo>,
+    kb: Option<&KbInfo>,
+    user_id: &str,
+    is_admin: bool,
+    allowed_kb_ids: Option<&HashSet<i64>>,
+) -> bool {
     has_visibility_permission(
         file.map(|f| (f.is_public, f.user_id.as_str())),
-        kb.map(|k| (k.is_public, k.user_id.as_str())),
+        kb.map(|k| (k.is_public, k.user_id.as_str(), k.id)),
         user_id,
         is_admin,
+        allowed_kb_ids,
     )
 }
 
@@ -879,12 +896,19 @@ async fn build_slice_results_from_raw(
     let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(pool, &kb_ids).await? } else { HashMap::new() };
     let slice_positions = get_slice_positions(pool, &slice_ids).await?;
 
+    let allowed_kb_ids: HashSet<i64> = if is_admin {
+        HashSet::new()
+    } else {
+        crate::api::knowledge_base::get_user_viewable_kb_ids(pool, &user_id, false).await.into_iter().collect()
+    };
+    let allowed_ref = if is_admin { None } else { Some(&allowed_kb_ids) };
+
     let mut seen_contents: HashSet<String> = HashSet::new();
     let mut results = Vec::new();
     for r in raw_results {
         let file = file_map.get(&r.file_id).cloned();
         let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
-        if !has_permission(file.as_ref(), kb.as_ref(), &user_id, is_admin) {
+        if !has_permission(file.as_ref(), kb.as_ref(), &user_id, is_admin, allowed_ref) {
             continue;
         }
         if dedupe_by_content && !seen_contents.insert(r.content.clone()) {
@@ -938,6 +962,13 @@ async fn collect_relevant_slices(
     let file_map = get_files_by_ids(pool, &file_ids).await?;
     let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(pool, &kb_ids).await? } else { HashMap::new() };
 
+    let allowed_kb_ids: HashSet<i64> = if is_admin {
+        HashSet::new()
+    } else {
+        crate::api::knowledge_base::get_user_viewable_kb_ids(pool, user_id, false).await.into_iter().collect()
+    };
+    let allowed_ref = if is_admin { None } else { Some(&allowed_kb_ids) };
+
     raw_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(Ordering::Equal));
 
     let mut selected_slices = Vec::new();
@@ -963,7 +994,7 @@ async fn collect_relevant_slices(
             .kb_id
             .and_then(|kid| kb_map.get(&kid).cloned())
             .or_else(|| file.kb_id.and_then(|kid| kb_map.get(&kid).cloned()));
-        if !has_permission(Some(&file), kb.as_ref(), user_id, is_admin) {
+        if !has_permission(Some(&file), kb.as_ref(), user_id, is_admin, allowed_ref) {
             permission_denied_count += 1;
             continue;
         }
@@ -1568,6 +1599,13 @@ pub async fn search_full(
         return Ok(Json(FullSearchResult { results: vec![] }));
     }
 
+    let allowed_kb_ids: HashSet<i64> = if is_admin {
+        HashSet::new()
+    } else {
+        crate::api::knowledge_base::get_user_viewable_kb_ids(&pool, &user_id, false).await.into_iter().collect()
+    };
+    let allowed_ref = if is_admin { None } else { Some(&allowed_kb_ids) };
+
     let file_ids = if let Some(filename) = params.filename.as_ref().filter(|f| !f.is_empty()) {
         let matched_ids =
             search_file_ids_by_name(&pool, filename, kb_ids_to_search.as_ref(), &user_id, is_admin).await?;
@@ -1606,9 +1644,10 @@ pub async fn search_full(
             .filter_map(|f| {
                 if !has_visibility_permission(
                     Some((f.is_public, f.user_id.as_str())),
-                    f.kb_id.and_then(|kid| kb_map.get(&kid)).map(|k| (k.is_public, k.user_id.as_str())),
+                    f.kb_id.and_then(|kid| kb_map.get(&kid)).map(|k| (k.is_public, k.user_id.as_str(), k.id)),
                     &user_id,
                     is_admin,
+                    allowed_ref,
                 ) {
                     return None;
                 }
@@ -1642,9 +1681,10 @@ pub async fn search_full(
                 let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
                 if has_visibility_permission(
                     file.as_ref().map(|f| (f.is_public, f.user_id.as_str())),
-                    kb.as_ref().map(|k| (k.is_public, k.user_id.as_str())),
+                    kb.as_ref().map(|k| (k.is_public, k.user_id.as_str(), k.id)),
                     &user_id,
                     is_admin,
+                    allowed_ref,
                 ) {
                     Some(FullSearchResultItem { snippet: r.snippet, score: r.score, file, kb })
                 } else {
@@ -2545,7 +2585,9 @@ async fn search_file_ids_by_name(
     if !is_admin {
         qb.push(" AND (user_id = ");
         qb.push_bind(user_id);
-        qb.push(" OR is_public = 1)");
+        qb.push(" OR is_public = 1 OR kb_id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ");
+        qb.push_bind(user_id);
+        qb.push("))");
     }
     if let Some(ids) = kb_ids
         && !ids.is_empty() {

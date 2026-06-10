@@ -1,13 +1,14 @@
 use std::collections::HashMap;
 
 use axum::{
-    extract::{Path, Query, State}, response::Json
+    Extension, extract::{Path, Query, State}, response::Json
 };
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use utoipa::{IntoParams, ToSchema};
 
 use crate::api::error::ApiError;
+use crate::AuthUser;
 
 // Type aliases for complex SQL row types
 #[allow(clippy::type_complexity)]
@@ -51,7 +52,18 @@ pub struct EntitySearchParams {
 )]
 pub async fn search_entities(
     Query(params): Query<EntitySearchParams>, State(pool): State<SqlitePool>,
+    Extension(auth_user): Extension<AuthUser>,
 ) -> Result<Json<Vec<EntityInfo>>, ApiError> {
+    let is_admin = auth_user.is_admin();
+
+    // Check KB permission if kb_id is specified
+    if let Some(kb_id) = params.kb_id {
+        let perm = crate::api::knowledge_base::get_kb_permission(&pool, kb_id, &auth_user.user_id, is_admin).await;
+        if !crate::api::knowledge_base::meets_requirement(perm.as_deref(), "viewer") {
+            return Err(ApiError::Forbidden("Permission denied.".to_string()));
+        }
+    }
+
     let mut sql =
         "SELECT id, name, entity_type, properties, file_id, kb_id, created_at FROM graph_nodes WHERE 1=1".to_string();
 
@@ -95,16 +107,29 @@ pub async fn search_entities(
 
     let rows = query.fetch_all(&pool).await?;
 
+    // Preload accessible KB ids for filtering
+    let allowed_kb_ids: std::collections::HashSet<i64> = if is_admin {
+        std::collections::HashSet::new()
+    } else {
+        crate::api::knowledge_base::get_user_viewable_kb_ids(&pool, &auth_user.user_id, false).await.into_iter().collect()
+    };
+
     let entities: Vec<EntityInfo> = rows
         .into_iter()
-        .map(|(id, name, entity_type, properties_json, file_id, kb_id, created_at)| {
+        .filter_map(|(id, name, entity_type, properties_json, file_id, kb_id, created_at)| {
+            // Filter by KB permission
+            if let Some(kid) = kb_id {
+                if !is_admin && !allowed_kb_ids.contains(&kid) {
+                    return None;
+                }
+            }
             let properties: HashMap<String, String> = if let Some(ref json) = properties_json {
                 serde_json::from_str(json).unwrap_or_default()
             } else {
                 HashMap::new()
             };
 
-            EntityInfo { id, name, entity_type, properties, file_id, kb_id, created_at }
+            Some(EntityInfo { id, name, entity_type, properties, file_id, kb_id, created_at })
         })
         .collect();
 
@@ -148,7 +173,10 @@ pub struct MentionInfo {
         (status = 404, description = "实体不存在")
     )
 )]
-pub async fn get_entity(Path(id): Path<i64>, State(pool): State<SqlitePool>) -> Result<Json<EntityDetail>, ApiError> {
+pub async fn get_entity(
+    Path(id): Path<i64>, State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
+) -> Result<Json<EntityDetail>, ApiError> {
+    let is_admin = auth_user.is_admin();
     // 查询实体基本信息
     let entity_sql =
         "SELECT id, name, entity_type, properties, file_id, kb_id, created_at FROM graph_nodes WHERE id = ?";
@@ -156,6 +184,15 @@ pub async fn get_entity(Path(id): Path<i64>, State(pool): State<SqlitePool>) -> 
         sqlx::query_as(entity_sql).bind(id).fetch_optional(&pool).await?;
 
     let entity_row = entity_row.ok_or_else(|| ApiError::Internal("Entity not found".to_string()))?;
+
+    // Check permission on the entity's KB
+    if let Some(kb_id) = entity_row.5 {
+        let perm = crate::api::knowledge_base::get_kb_permission(
+            &pool, kb_id, &auth_user.user_id, is_admin).await;
+        if !crate::api::knowledge_base::meets_requirement(perm.as_deref(), "viewer") {
+            return Err(ApiError::Forbidden("Permission denied.".to_string()));
+        }
+    }
 
     let properties: HashMap<String, String> =
         if let Some(ref json) = entity_row.3 { serde_json::from_str(json).unwrap_or_default() } else { HashMap::new() };
@@ -271,7 +308,19 @@ pub struct StatsParams {
 )]
 pub async fn get_graph_stats(
     Query(params): Query<StatsParams>, State(pool): State<SqlitePool>,
+    Extension(auth_user): Extension<AuthUser>,
 ) -> Result<Json<GraphStats>, ApiError> {
+    let is_admin = auth_user.is_admin();
+
+    // Check KB permission if kb_id is specified
+    if let Some(kb_id) = params.kb_id {
+        let perm = crate::api::knowledge_base::get_kb_permission(
+            &pool, kb_id, &auth_user.user_id, is_admin).await;
+        if !crate::api::knowledge_base::meets_requirement(perm.as_deref(), "viewer") {
+            return Err(ApiError::Forbidden("Permission denied.".to_string()));
+        }
+    }
+
     // 构建 WHERE 子句
     let where_clause = if let Some(file_id) = params.file_id {
         format!("WHERE file_id = {}", file_id)

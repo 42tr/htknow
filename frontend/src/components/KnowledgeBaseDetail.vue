@@ -76,6 +76,17 @@ watch(() => props.kb.id, () => {
              ]">
                {{ kb.kb_type === 'storage' ? '🗄️ 存储型' : '🧠 分析型' }}
              </span>
+             <span
+               v-if="kb.current_user_permission"
+               class="px-2 py-0.5 text-xs rounded-full border"
+               :class="{
+                 'bg-purple-50 text-purple-600 border-purple-200': kb.current_user_permission === 'admin',
+                 'bg-blue-50 text-blue-600 border-blue-200': kb.current_user_permission === 'editor',
+                 'bg-slate-50 text-slate-500 border-slate-200': kb.current_user_permission === 'viewer'
+               }"
+             >
+               {{ kb.current_user_permission === 'admin' ? '⚙️ 管理员' : kb.current_user_permission === 'editor' ? '✏️ 可写' : '👁️ 只读' }}
+             </span>
            </h2>
            <p class="text-sm text-slate-500">{{ kb.description || '暂无描述' }}</p>
          </div>

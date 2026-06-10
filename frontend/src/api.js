@@ -426,6 +426,34 @@ export const api = {
     return response.json()
   },
 
+  // 知识库权限管理
+  async getKbPermissions(kbId) {
+    const response = await fetch(`${API_BASE}/knowledge_base/${kbId}/permissions`, {
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error('获取权限列表失败')
+    return response.json()
+  },
+
+  async addKbPermission(kbId, userId, permission) {
+    const response = await fetch(`${API_BASE}/knowledge_base/${kbId}/permissions`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ user_id: userId, permission }),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '添加权限失败'))
+    return response.json()
+  },
+
+  async removeKbPermission(kbId, userId) {
+    const response = await fetch(`${API_BASE}/knowledge_base/${kbId}/permissions/${userId}`, {
+      method: 'DELETE',
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '删除权限失败'))
+    return response.json()
+  },
+
   // 文件
   async uploadFiles(knowledgeBaseId, files, tags = [], isPublic = false, sliceType = 'smart') {
     const formData = new FormData()

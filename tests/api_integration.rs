@@ -76,8 +76,12 @@ struct TestUser {
 
 impl TestUser {
     fn new(prefix: &str) -> Self {
+        Self::with_role(prefix, "admin")
+    }
+
+    fn with_role(prefix: &str, role: &str) -> Self {
         let seq = next_seq();
-        Self { id: format!("{}-{}", prefix, seq), name: format!("{}-name-{}", prefix, seq), role: "admin".to_string() }
+        Self { id: format!("{}-{}", prefix, seq), name: format!("{}-name-{}", prefix, seq), role: role.to_string() }
     }
 }
 
@@ -109,7 +113,12 @@ fn authed_multipart_request(
 
 async fn response_json(res: Response) -> Value {
     let bytes = res.into_body().collect().await.unwrap().to_bytes();
-    serde_json::from_slice(&bytes).unwrap()
+    if bytes.is_empty() {
+        panic!("response body is empty");
+    }
+    serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        panic!("failed to parse JSON response: {}\nbody: {}", e, String::from_utf8_lossy(&bytes));
+    })
 }
 
 async fn insert_kb(
@@ -554,4 +563,343 @@ async fn search_full_empty_and_image_requires_file() {
     let image_req = authed_multipart_request("POST", "/api/v1/knowledge/search/image", &user, &boundary, body);
     let image_res = app.clone().oneshot(image_req).await.unwrap();
     assert_eq!(image_res.status(), StatusCode::BAD_REQUEST);
+}
+
+#[tokio::test]
+async fn kb_permission_viewer_can_read_but_not_modify() {
+    let app = app().await;
+    let owner = TestUser::with_role("kb-perm-owner", "user");
+    let viewer = TestUser::with_role("kb-perm-viewer", "user");
+
+    // Owner creates a private KB
+    let create_body = serde_json::json!({
+        "name": "Permission Test KB",
+        "description": "kb for permission tests",
+        "kb_type": "analysis",
+        "parent_id": null,
+        "is_public": false
+    });
+    let create_req = authed_json_request("POST", "/api/v1/knowledge/knowledge_base/", &owner, create_body);
+    let create_res = app.clone().oneshot(create_req).await.unwrap();
+    assert_eq!(create_res.status(), StatusCode::OK);
+    let created = response_json(create_res).await;
+    let kb_id = created["id"].as_i64().expect("created kb id");
+    assert_eq!(created["current_user_permission"].as_str(), Some("admin"));
+
+    // Owner grants viewer permission
+    let grant_req = authed_json_request(
+        "POST",
+        format!("/api/v1/knowledge/knowledge_base/{}/permissions", kb_id),
+        &owner,
+        serde_json::json!({ "user_id": viewer.id, "permission": "viewer" }),
+    );
+    let grant_res = app.clone().oneshot(grant_req).await.unwrap();
+    assert_eq!(grant_res.status(), StatusCode::OK);
+
+    // Viewer can list the KB
+    let list_req = authed_empty_request("GET", "/api/v1/knowledge/knowledge_base/", &viewer);
+    let list_res = app.clone().oneshot(list_req).await.unwrap();
+    assert_eq!(list_res.status(), StatusCode::OK);
+    let list_bytes = list_res.into_body().collect().await.unwrap().to_bytes();
+    let list: Vec<Value> = serde_json::from_slice(&list_bytes).unwrap();
+    let kb = list.iter().find(|k| k["id"].as_i64() == Some(kb_id)).expect("viewer sees the kb");
+    assert_eq!(kb["current_user_permission"].as_str(), Some("viewer"));
+
+    // Viewer can get detail
+    let get_req = authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}", kb_id), &viewer);
+    let get_res = app.clone().oneshot(get_req).await.unwrap();
+    assert_eq!(get_res.status(), StatusCode::OK);
+    let get_json = response_json(get_res).await;
+    assert_eq!(get_json["current_user_permission"].as_str(), Some("viewer"));
+
+    // Viewer cannot update the KB
+    let update_req = authed_json_request(
+        "PUT",
+        format!("/api/v1/knowledge/knowledge_base/{}", kb_id),
+        &viewer,
+        serde_json::json!({ "name": "Hacked" }),
+    );
+    let update_res = app.clone().oneshot(update_req).await.unwrap();
+    assert_eq!(update_res.status(), StatusCode::FORBIDDEN);
+
+    // Viewer cannot reparse
+    let reparse_req = authed_empty_request("POST", format!("/api/v1/knowledge/knowledge_base/{}/reparse", kb_id), &viewer);
+    let reparse_res = app.clone().oneshot(reparse_req).await.unwrap();
+    assert_eq!(reparse_res.status(), StatusCode::FORBIDDEN);
+
+    // Viewer cannot delete
+    let delete_req = authed_empty_request("DELETE", format!("/api/v1/knowledge/knowledge_base/{}", kb_id), &viewer);
+    let delete_res = app.clone().oneshot(delete_req).await.unwrap();
+    assert_eq!(delete_res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn kb_permission_editor_can_upload_but_not_delete() {
+    let app = app().await;
+    let env = setup_env();
+    let owner = TestUser::with_role("kb-editor-owner", "user");
+    let editor = TestUser::with_role("kb-editor-editor", "user");
+
+    // Owner creates a private storage KB (so we can upload without parse complications)
+    let create_body = serde_json::json!({
+        "name": "Editor Test KB",
+        "description": "kb for editor permission tests",
+        "kb_type": "storage",
+        "parent_id": null,
+        "is_public": false
+    });
+    let create_req = authed_json_request("POST", "/api/v1/knowledge/knowledge_base/", &owner, create_body);
+    let create_res = app.clone().oneshot(create_req).await.unwrap();
+    assert_eq!(create_res.status(), StatusCode::OK);
+    let kb_id = response_json(create_res).await["id"].as_i64().unwrap();
+
+    // Owner grants editor permission
+    let grant_req = authed_json_request(
+        "POST",
+        format!("/api/v1/knowledge/knowledge_base/{}/permissions", kb_id),
+        &owner,
+        serde_json::json!({ "user_id": editor.id, "permission": "editor" }),
+    );
+    let grant_res = app.clone().oneshot(grant_req).await.unwrap();
+    assert_eq!(grant_res.status(), StatusCode::OK);
+
+    // Editor can update the KB name/description
+    let update_req = authed_json_request(
+        "PUT",
+        format!("/api/v1/knowledge/knowledge_base/{}", kb_id),
+        &editor,
+        serde_json::json!({ "name": "Renamed by Editor", "description": "updated" }),
+    );
+    let update_res = app.clone().oneshot(update_req).await.unwrap();
+    assert_eq!(update_res.status(), StatusCode::OK);
+
+    // Editor cannot change visibility
+    let vis_req = authed_json_request(
+        "PUT",
+        format!("/api/v1/knowledge/knowledge_base/{}", kb_id),
+        &editor,
+        serde_json::json!({ "is_public": true }),
+    );
+    let vis_res = app.clone().oneshot(vis_req).await.unwrap();
+    assert_eq!(vis_res.status(), StatusCode::FORBIDDEN);
+
+    // Editor can upload a file
+    let file_dir = env.data_dir.join("files");
+    fs::create_dir_all(&file_dir).unwrap();
+    let test_file = file_dir.join(format!("editor-upload-{}.txt", next_seq()));
+    fs::write(&test_file, b"editor upload test").unwrap();
+
+    let boundary = format!("boundary-{}", next_seq());
+    let upload_req = authed_multipart_request_with_file(
+        "POST",
+        "/api/v1/knowledge/files/",
+        &editor,
+        &boundary,
+        &[
+            ("kb_id", &kb_id.to_string()),
+            ("slice_type", "text"),
+        ],
+        "file",
+        "test.txt",
+        b"editor upload test",
+    );
+    let upload_res = app.clone().oneshot(upload_req).await.unwrap();
+    assert_eq!(upload_res.status(), StatusCode::OK);
+
+    // Editor cannot delete the KB
+    let delete_req = authed_empty_request("DELETE", format!("/api/v1/knowledge/knowledge_base/{}", kb_id), &editor);
+    let delete_res = app.clone().oneshot(delete_req).await.unwrap();
+    assert_eq!(delete_res.status(), StatusCode::FORBIDDEN);
+}
+
+#[tokio::test]
+async fn kb_permission_admin_can_manage_permissions() {
+    let app = app().await;
+    let owner = TestUser::with_role("kb-admin-owner", "user");
+    let viewer = TestUser::with_role("kb-admin-viewer", "user");
+
+    // Owner creates KB
+    let create_body = serde_json::json!({
+        "name": "Admin Perm Test KB",
+        "description": "test",
+        "kb_type": "analysis",
+        "is_public": false
+    });
+    let create_req = authed_json_request("POST", "/api/v1/knowledge/knowledge_base/", &owner, create_body);
+    let create_res = app.clone().oneshot(create_req).await.unwrap();
+    let kb_id = response_json(create_res).await["id"].as_i64().unwrap();
+
+    // Owner lists permissions (should be empty initially except no explicit rows)
+    let list_req = authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}/permissions", kb_id), &owner);
+    let list_res = app.clone().oneshot(list_req).await.unwrap();
+    assert_eq!(list_res.status(), StatusCode::OK);
+
+    // Owner grants viewer permission
+    let grant_req = authed_json_request(
+        "POST",
+        format!("/api/v1/knowledge/knowledge_base/{}/permissions", kb_id),
+        &owner,
+        serde_json::json!({ "user_id": viewer.id, "permission": "viewer" }),
+    );
+    let grant_res = app.clone().oneshot(grant_req).await.unwrap();
+    assert_eq!(grant_res.status(), StatusCode::OK);
+    let grant_json = response_json(grant_res).await;
+    assert_eq!(grant_json["user_id"].as_str(), Some(viewer.id.as_str()));
+    assert_eq!(grant_json["permission"].as_str(), Some("viewer"));
+
+    // Viewer cannot call permission APIs
+    let viewer_list_req = authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}/permissions", kb_id), &viewer);
+    let viewer_list_res = app.clone().oneshot(viewer_list_req).await.unwrap();
+    assert_eq!(viewer_list_res.status(), StatusCode::FORBIDDEN);
+
+    // Owner upgrades viewer to admin
+    let upgrade_req = authed_json_request(
+        "POST",
+        format!("/api/v1/knowledge/knowledge_base/{}/permissions", kb_id),
+        &owner,
+        serde_json::json!({ "user_id": viewer.id, "permission": "admin" }),
+    );
+    let upgrade_res = app.clone().oneshot(upgrade_req).await.unwrap();
+    assert_eq!(upgrade_res.status(), StatusCode::OK);
+
+    // Now viewer (as KB admin) can list permissions
+    let list2_req = authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}/permissions", kb_id), &viewer);
+    let list2_res = app.clone().oneshot(list2_req).await.unwrap();
+    assert_eq!(list2_res.status(), StatusCode::OK);
+
+    // Owner removes viewer permission
+    let remove_req = authed_empty_request(
+        "DELETE",
+        format!("/api/v1/knowledge/knowledge_base/{}/permissions/{}", kb_id, viewer.id),
+        &owner,
+    );
+    let remove_res = app.clone().oneshot(remove_req).await.unwrap();
+    assert_eq!(remove_res.status(), StatusCode::OK);
+
+    // After removal, viewer can no longer access the KB
+    let get_req = authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}", kb_id), &viewer);
+    let get_res = app.clone().oneshot(get_req).await.unwrap();
+    assert_eq!(get_res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn kb_permission_search_filters_unauthorized_kb() {
+    let app = app().await;
+    let pool = get_pool().await;
+    let owner = TestUser::with_role("kb-search-owner", "user");
+    let other = TestUser::with_role("kb-search-other", "user");
+
+    // Owner creates a private KB with a file
+    let kb_id = insert_kb(&pool, &owner, "Search Permission KB", "analysis", None, false).await;
+    let file_dir = setup_env().data_dir.join("files");
+    fs::create_dir_all(&file_dir).unwrap();
+    let test_file = file_dir.join(format!("search-perm-{}.txt", next_seq()));
+    fs::write(&test_file, b"secret content about dragons").unwrap();
+    let file_id = insert_file(&pool, &owner, "secret-perm.txt", &test_file, Some(kb_id), vec![], false).await;
+
+    // Set file as completed so it appears in full search
+    sqlx::query("UPDATE files SET status = 1 WHERE id = ?")
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // Owner can use full-search filename filter and find the file
+    let owner_search_req = authed_empty_request(
+        "GET",
+        "/api/v1/knowledge/search/full?filename=secret-perm.txt",
+        &owner,
+    );
+    let owner_search_res = app.clone().oneshot(owner_search_req).await.unwrap();
+    assert_eq!(owner_search_res.status(), StatusCode::OK);
+    let owner_json = response_json(owner_search_res).await;
+    let owner_results = owner_json["results"].as_array().expect("results");
+    assert!(
+        owner_results.iter().any(|r| r["file"]["id"].as_i64() == Some(file_id)),
+        "owner should find their own file"
+    );
+
+    // Other user without permission cannot see the result
+    let other_search_req = authed_empty_request(
+        "GET",
+        "/api/v1/knowledge/search/full?filename=secret-perm.txt",
+        &other,
+    );
+    let other_search_res = app.clone().oneshot(other_search_req).await.unwrap();
+    assert_eq!(other_search_res.status(), StatusCode::OK);
+    let other_json = response_json(other_search_res).await;
+    let other_results = other_json["results"].as_array().expect("results");
+    assert!(
+        !other_results.iter().any(|r| r["file"]["id"].as_i64() == Some(file_id)),
+        "other user should not see unauthorized file"
+    );
+
+    // Grant viewer permission and verify search now returns result
+    let grant_req = authed_json_request(
+        "POST",
+        format!("/api/v1/knowledge/knowledge_base/{}/permissions", kb_id),
+        &owner,
+        serde_json::json!({ "user_id": other.id, "permission": "viewer" }),
+    );
+    let grant_res = app.clone().oneshot(grant_req).await.unwrap();
+    assert_eq!(grant_res.status(), StatusCode::OK);
+
+    // Verify other can now access the KB detail
+    let get_req = authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}", kb_id), &other);
+    let get_res = app.clone().oneshot(get_req).await.unwrap();
+    assert_eq!(get_res.status(), StatusCode::OK);
+    let get_json = response_json(get_res).await;
+    assert_eq!(get_json["current_user_permission"].as_str(), Some("viewer"));
+
+
+    let granted_search_req = authed_empty_request(
+        "GET",
+        "/api/v1/knowledge/search/full?filename=secret-perm.txt",
+        &other,
+    );
+    let granted_search_res = app.clone().oneshot(granted_search_req).await.unwrap();
+    assert_eq!(granted_search_res.status(), StatusCode::OK);
+    let granted_json = response_json(granted_search_res).await;
+    let granted_results = granted_json["results"].as_array().expect("results");
+    assert!(
+        granted_results.iter().any(|r| r["file"]["id"].as_i64() == Some(file_id)),
+        "viewer should now find the file"
+    );
+}
+
+// Helper: build multipart request that includes an actual file field
+fn authed_multipart_request_with_file(
+    method: &str,
+    uri: impl Into<String>,
+    user: &TestUser,
+    boundary: &str,
+    extra_fields: &[(&str, &str)],
+    field_name: &str,
+    file_name: &str,
+    file_content: &[u8],
+) -> Request<Body> {
+    let mut body = Vec::new();
+    for (name, value) in extra_fields {
+        body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", name).as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    }
+    body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
+    body.extend_from_slice(
+        format!(
+            "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
+            field_name, file_name
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(b"Content-Type: text/plain\r\n\r\n");
+    body.extend_from_slice(file_content);
+    body.extend_from_slice(b"\r\n");
+    body.extend_from_slice(format!("--{}--\r\n", boundary).as_bytes());
+
+    let content_type = format!("multipart/form-data; boundary={}", boundary);
+    authed_request(method, uri.into(), user, Body::from(body), Some(content_type))
 }

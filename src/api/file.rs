@@ -425,6 +425,12 @@ pub async fn upload(
                 .await?;
         let (_, kb_type_value) = kb.ok_or_else(|| ApiError::NotFound("Knowledge base not found".to_string()))?;
         kb_type = kb_type_value;
+
+        // Check KB permission: need editor or admin to upload
+        let perm = super::knowledge_base::get_kb_permission(&pool, kb_id_value, &auth_user.user_id, auth_user.is_admin()).await;
+        if !super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
+            return Err(ApiError::Forbidden("Permission denied. Requires editor or admin to upload files.".to_string()));
+        }
     }
 
     let is_storage_kb = matches!(kb_type.as_deref(), Some("storage"));
@@ -736,19 +742,39 @@ pub async fn update(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Extension(auth_user): Extension<AuthUser>, Path(id): Path<i64>, Json(req): Json<UpdateFileReq>,
 ) -> ApiResult<Json<File>> {
+    let is_admin = auth_user.is_admin();
+
+    // Check permission on the file's KB
+    let file_kb: Option<Option<i64>> = sqlx::query_scalar("SELECT kb_id FROM files WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&pool)
+        .await?;
+    let kb_id = file_kb.ok_or_else(|| ApiError::NotFound("File not found".to_string()))?;
+    match kb_id {
+        Some(kid) => {
+            let perm = super::knowledge_base::get_kb_permission(&pool, kid, &auth_user.user_id, is_admin).await;
+            if !super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
+                return Err(ApiError::Forbidden("Permission denied. Requires editor or admin.".to_string()));
+            }
+        }
+        None => {
+            // Unassigned file: only owner or admin can modify
+            if !is_admin {
+                let owner: Option<String> =
+                    sqlx::query_scalar("SELECT user_id FROM files WHERE id = ?").bind(id).fetch_optional(&pool).await?;
+                if owner.as_deref() != Some(&auth_user.user_id) {
+                    return Err(ApiError::Forbidden("Permission denied.".to_string()));
+                }
+            }
+        }
+    }
+
     let mut has_updates = false;
     let update_is_public = req.is_public.is_some();
     let mut reset_parse_data = false;
     let mut image_paths_to_remove = Vec::new();
     debug!("update_is_public: {}", update_is_public);
-    if update_is_public {
-        let owner: Option<String> =
-            sqlx::query_scalar("SELECT user_id FROM files WHERE id = ?").bind(id).fetch_optional(&pool).await?;
-        let owner = owner.ok_or_else(|| ApiError::NotFound("File not found or permission denied".to_string()))?;
-        if owner != auth_user.user_id {
-            return Err(ApiError::NotFound("File not found or permission denied".to_string()));
-        }
-    }
+
     let mut qb = QueryBuilder::<Sqlite>::new("UPDATE files SET ");
     let mut separated = qb.separated(", ");
 
@@ -805,10 +831,6 @@ pub async fn update(
     separated.push("updated_at = ").push_bind_unseparated(now);
     qb.push(" WHERE id = ");
     qb.push_bind(id);
-    if update_is_public {
-        qb.push(" AND user_id = ");
-        qb.push_bind(&auth_user.user_id);
-    }
     if reset_parse_data {
         let mut tx = pool.begin().await?;
         clear_file_parse_rows_in_tx(&mut tx, id).await?;
@@ -824,15 +846,7 @@ pub async fn update(
         qb.build().execute(&pool).await?;
     }
 
-    let file = if update_is_public {
-        sqlx::query_as("SELECT * FROM files WHERE id = ? AND user_id = ?")
-            .bind(id)
-            .bind(&auth_user.user_id)
-            .fetch_one(&pool)
-            .await?
-    } else {
-        sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?
-    };
+    let file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
     Ok(Json(file))
 }
 
@@ -867,16 +881,26 @@ pub async fn move_to_kb(
         }
 
     let is_admin = auth_user.is_admin();
-    let file = if is_admin {
-        sqlx::query_as::<_, File>("SELECT * FROM files WHERE id = ?").bind(id).fetch_optional(&pool).await?
-    } else {
-        sqlx::query_as::<_, File>("SELECT * FROM files WHERE id = ? AND user_id = ?")
-            .bind(id)
-            .bind(&auth_user.user_id)
-            .fetch_optional(&pool)
-            .await?
+    let file: File = sqlx::query_as::<_, File>("SELECT * FROM files WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&pool)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("File not found".to_string()))?;
+
+    // Check source KB permission
+    match file.kb_id {
+        Some(src_kb_id) => {
+            let perm = super::knowledge_base::get_kb_permission(&pool, src_kb_id, &auth_user.user_id, is_admin).await;
+            if !super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
+                return Err(ApiError::Forbidden("Permission denied on source knowledge base.".to_string()));
+            }
+        }
+        None => {
+            if !is_admin && file.user_id != auth_user.user_id {
+                return Err(ApiError::Forbidden("Permission denied.".to_string()));
+            }
+        }
     }
-    .ok_or_else(|| ApiError::NotFound("File not found or permission denied".to_string()))?;
 
     if file.status == 2 {
         return Err(ApiError::BadRequest("File is processing, cannot move now".to_string()));
@@ -886,22 +910,18 @@ pub async fn move_to_kb(
         return Ok(Json(file));
     }
 
-    let target_kb_type = match req.target_kb_id {
+    // Check target KB permission
+    let target_kb_type: Option<String> = match req.target_kb_id {
         Some(target_kb_id) => {
-            let kb_type = if is_admin {
-                sqlx::query_scalar::<_, String>("SELECT kb_type FROM knowledge_bases WHERE id = ?")
-                    .bind(target_kb_id)
-                    .fetch_optional(&pool)
-                    .await?
-            } else {
-                sqlx::query_scalar::<_, String>("SELECT kb_type FROM knowledge_bases WHERE id = ? AND user_id = ?")
-                    .bind(target_kb_id)
-                    .bind(&auth_user.user_id)
-                    .fetch_optional(&pool)
-                    .await?
+            let perm = super::knowledge_base::get_kb_permission(&pool, target_kb_id, &auth_user.user_id, is_admin).await;
+            if !super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
+                return Err(ApiError::Forbidden("Permission denied on target knowledge base.".to_string()));
             }
-            .ok_or_else(|| ApiError::NotFound("Knowledge base not found or permission denied".to_string()))?;
-            Some(kb_type)
+            let kb_type: Option<String> = sqlx::query_scalar("SELECT kb_type FROM knowledge_bases WHERE id = ?")
+                .bind(target_kb_id)
+                .fetch_optional(&pool)
+                .await?;
+            Some(kb_type.ok_or_else(|| ApiError::NotFound("Knowledge base not found".to_string()))?)
         }
         None => None,
     };
@@ -1055,13 +1075,35 @@ fn push_i64_list(qb: &mut QueryBuilder<Sqlite>, ids: &[i64]) {
 }
 
 async fn query_deletable_files(pool: &SqlitePool, ids: &[i64], auth_user: &AuthUser) -> Result<Vec<File>, sqlx::Error> {
+    let is_admin = auth_user.is_admin();
+    // Fetch all files by id first
     let mut qb = QueryBuilder::<Sqlite>::new("SELECT * FROM files WHERE id IN (");
     push_i64_list(&mut qb, ids);
     qb.push(")");
-    if !auth_user.is_admin() {
-        qb.push(" AND user_id = ").push_bind(&auth_user.user_id);
+    let all_files: Vec<File> = qb.build_query_as::<File>().fetch_all(pool).await?;
+
+    if is_admin {
+        return Ok(all_files);
     }
-    qb.build_query_as::<File>().fetch_all(pool).await
+
+    // Filter: keep files where user has editor permission on the KB, or owns unassigned files
+    let mut deletable = Vec::new();
+    for file in all_files {
+        match file.kb_id {
+            Some(kb_id) => {
+                let perm = super::knowledge_base::get_kb_permission(pool, kb_id, &auth_user.user_id, false).await;
+                if super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
+                    deletable.push(file);
+                }
+            }
+            None => {
+                if file.user_id == auth_user.user_id {
+                    deletable.push(file);
+                }
+            }
+        }
+    }
+    Ok(deletable)
 }
 
 async fn clear_file_parse_rows_in_tx(tx: &mut sqlx::Transaction<'_, Sqlite>, file_id: i64) -> Result<(), sqlx::Error> {
@@ -1125,24 +1167,11 @@ pub(crate) async fn delete_file_rows_in_tx(
     Ok(())
 }
 
-async fn ensure_kb_owned_for_mutation(pool: &SqlitePool, kb_id: i64, auth_user: &AuthUser) -> ApiResult<()> {
-    let exists = if auth_user.is_admin() {
-        sqlx::query_scalar::<_, i64>("SELECT id FROM knowledge_bases WHERE id = ?")
-            .bind(kb_id)
-            .fetch_optional(pool)
-            .await?
-    } else {
-        sqlx::query_scalar::<_, i64>("SELECT id FROM knowledge_bases WHERE id = ? AND user_id = ?")
-            .bind(kb_id)
-            .bind(&auth_user.user_id)
-            .fetch_optional(pool)
-            .await?
-    };
-
-    if exists.is_none() {
-        return Err(ApiError::NotFound("Knowledge base not found or permission denied".to_string()));
+async fn ensure_kb_editor_or_admin(pool: &SqlitePool, kb_id: i64, auth_user: &AuthUser) -> ApiResult<()> {
+    let perm = super::knowledge_base::get_kb_permission(pool, kb_id, &auth_user.user_id, auth_user.is_admin()).await;
+    if !super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
+        return Err(ApiError::Forbidden("Permission denied. Requires editor or admin.".to_string()));
     }
-
     Ok(())
 }
 
@@ -1162,31 +1191,36 @@ async fn query_failed_file_ids_for_reparse(
     }
 
     if let Some(kb_id) = req.kb_id {
-        ensure_kb_owned_for_mutation(pool, kb_id, auth_user).await?;
+        ensure_kb_editor_or_admin(pool, kb_id, auth_user).await?;
 
         if req.include_descendants {
             let mut qb = QueryBuilder::<Sqlite>::new(
                 "WITH RECURSIVE descendants AS (SELECT id, kb_type FROM knowledge_bases WHERE id = ",
             );
             qb.push_bind(kb_id);
-            if !is_admin {
-                qb.push(" AND user_id = ").push_bind(&auth_user.user_id);
-            }
             qb.push(
-                " UNION ALL SELECT kb.id, kb.kb_type FROM knowledge_bases kb JOIN descendants d ON kb.parent_id = d.id",
+                " UNION ALL SELECT kb.id, kb.kb_type FROM knowledge_bases kb JOIN descendants d ON kb.parent_id = d.id)",
             );
-            if !is_admin {
-                qb.push(" WHERE kb.user_id = ").push_bind(&auth_user.user_id);
-            }
-            qb.push(
-                ") SELECT f.id FROM files f JOIN descendants d ON f.kb_id = d.id WHERE f.status = -1 AND d.kb_type != ",
-            );
+            qb.push(" SELECT id, kb_type FROM descendants WHERE kb_type != ");
             qb.push_bind("storage");
-            if !is_admin {
-                qb.push(" AND f.user_id = ").push_bind(&auth_user.user_id);
+            let rows: Vec<(i64, String)> = qb.build_query_as().fetch_all(pool).await?;
+            let mut allowed_kb_ids: Vec<i64> = Vec::new();
+            for (desc_kb_id, _) in rows {
+                let perm = super::knowledge_base::get_kb_permission(pool, desc_kb_id, &auth_user.user_id, is_admin).await;
+                if super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
+                    allowed_kb_ids.push(desc_kb_id);
+                }
             }
-            qb.push(" ORDER BY f.updated_at DESC");
-            let ids = qb.build_query_scalar::<i64>().fetch_all(pool).await?;
+            if allowed_kb_ids.is_empty() {
+                return Ok(Vec::new());
+            }
+            let mut qb2 = QueryBuilder::<Sqlite>::new("SELECT f.id FROM files f WHERE f.status = -1 AND f.kb_id IN (");
+            let mut sep = qb2.separated(", ");
+            for id in &allowed_kb_ids {
+                sep.push_bind(id);
+            }
+            qb2.push(") ORDER BY f.updated_at DESC");
+            let ids = qb2.build_query_scalar::<i64>().fetch_all(pool).await?;
             return Ok(ids);
         }
 
@@ -1198,7 +1232,6 @@ async fn query_failed_file_ids_for_reparse(
         qb.push_bind(kb_id);
         qb.push(" AND kb.kb_type != ").push_bind("storage");
         if !is_admin {
-            qb.push(" AND kb.user_id = ").push_bind(&auth_user.user_id);
             qb.push(" AND f.user_id = ").push_bind(&auth_user.user_id);
         }
         qb.push(" ORDER BY f.updated_at DESC");
@@ -1206,8 +1239,9 @@ async fn query_failed_file_ids_for_reparse(
         return Ok(ids);
     }
 
+    // Global reparse-failed: only user's own files + files in KBs where user has editor permission
     let mut qb = QueryBuilder::<Sqlite>::new(
-        "SELECT f.id FROM files f \
+        "SELECT f.id, f.kb_id FROM files f \
          LEFT JOIN knowledge_bases kb ON kb.id = f.kb_id \
          WHERE f.status = -1 AND (f.kb_id IS NULL OR kb.kb_type != ",
     );
@@ -1216,12 +1250,27 @@ async fn query_failed_file_ids_for_reparse(
     if !req.include_unassigned {
         qb.push(" AND f.kb_id IS NOT NULL");
     }
-    if !is_admin {
-        qb.push(" AND f.user_id = ").push_bind(&auth_user.user_id);
-    }
     qb.push(" ORDER BY f.updated_at DESC");
-    let ids = qb.build_query_scalar::<i64>().fetch_all(pool).await?;
-    Ok(ids)
+    let rows: Vec<(i64, Option<i64>)> = qb.build_query_as().fetch_all(pool).await?;
+
+    let mut allowed_ids = Vec::new();
+    for (file_id, file_kb_id) in rows {
+        match file_kb_id {
+            None => {
+                // unassigned file: only own files
+                if is_admin {
+                    allowed_ids.push(file_id);
+                }
+            }
+            Some(kid) => {
+                let perm = super::knowledge_base::get_kb_permission(pool, kid, &auth_user.user_id, is_admin).await;
+                if super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
+                    allowed_ids.push(file_id);
+                }
+            }
+        }
+    }
+    Ok(allowed_ids)
 }
 
 async fn remove_converted_pdfs(file_ids: &[i64]) {

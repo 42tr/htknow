@@ -5,6 +5,7 @@ import FileCard from './FileCard.vue'
 import CreateKnowledgeBase from './CreateKnowledgeBase.vue'
 import FileStatusSummary from './FileStatusSummary.vue'
 import ExportRecordPanel from './ExportRecordPanel.vue'
+import KbPermissionModal from './KbPermissionModal.vue'
 import { setCurrentKb } from '../store'
 
 // Reactive state for the current view
@@ -20,6 +21,15 @@ const currentKbReparseLoading = ref(false)
 const childKbReparseLoading = ref({})
 const priorityDrafts = ref({})
 const prioritySaving = ref({})
+
+// Permission modal state
+const showPermissionModal = ref(false)
+const permissionModalKb = ref(null)
+
+const openPermissionModal = (kb) => {
+  permissionModalKb.value = kb
+  showPermissionModal.value = true
+}
 
 // Export state
 const selectedKbIds = ref(new Set())
@@ -505,8 +515,30 @@ onMounted(() => {
             <div class="w-12 h-12 bg-linear-to-br from-blue-100 to-indigo-100 rounded-xl flex items-center justify-center">
               <span class="text-2xl">📚</span>
             </div>
-            <div class="flex items-center gap-1">
+             <div class="flex items-center gap-1">
+                <span
+                  v-if="kb.current_user_permission"
+                  class="px-2 py-0.5 text-xs rounded-full border"
+                  :class="{
+                    'bg-purple-50 text-purple-600 border-purple-200': kb.current_user_permission === 'admin',
+                    'bg-blue-50 text-blue-600 border-blue-200': kb.current_user_permission === 'editor',
+                    'bg-slate-50 text-slate-500 border-slate-200': kb.current_user_permission === 'viewer'
+                  }"
+                >
+                  {{ kb.current_user_permission === 'admin' ? '⚙️ 管理员' : kb.current_user_permission === 'editor' ? '✏️ 可写' : '👁️ 只读' }}
+                </span>
                 <button
+                  v-if="kb.current_user_permission === 'admin'"
+                  @click="(e) => { e.stopPropagation(); openPermissionModal(kb) }"
+                  class="opacity-0 group-hover:opacity-100 p-2 text-slate-400 hover:text-purple-500 hover:bg-purple-50 rounded-lg transition-all"
+                  title="权限管理"
+                >
+                  <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
+                  </svg>
+                </button>
+                <button
+                  v-if="kb.current_user_permission === 'admin'"
                   @click="(e) => handleTogglePublic(e, kb.id, kb.is_public)"
                   :class="[
                     'opacity-0 group-hover:opacity-100 p-2 rounded-lg transition-all',
@@ -522,6 +554,7 @@ onMounted(() => {
                  </svg>
                </button>
                <button
+                 v-if="kb.current_user_permission === 'editor' || kb.current_user_permission === 'admin'"
                  @click="(e) => handleReparseChildKb(e, kb)"
                  :disabled="kb.kb_type === 'storage' || childKbReparseLoading[kb.id]"
                  class="opacity-0 group-hover:opacity-100 p-2 text-slate-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed"
@@ -532,6 +565,7 @@ onMounted(() => {
                 </svg>
                </button>
                <button
+                 v-if="kb.current_user_permission === 'admin'"
                  @click="(e) => handleDeleteKb(e, kb.id)"
                  class="opacity-0 group-hover:opacity-100 p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
                  title="删除"
@@ -570,12 +604,12 @@ onMounted(() => {
                  min="0"
                  max="100"
                  step="1"
-                 :disabled="kb.kb_type === 'storage' || prioritySaving[kb.id]"
+                 :disabled="kb.kb_type === 'storage' || prioritySaving[kb.id] || (kb.current_user_permission !== 'editor' && kb.current_user_permission !== 'admin')"
                  class="w-24 px-2 py-1 text-sm border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-slate-100 disabled:text-slate-400"
                />
                <button
                  type="button"
-                 :disabled="kb.kb_type === 'storage' || prioritySaving[kb.id]"
+                 :disabled="kb.kb_type === 'storage' || prioritySaving[kb.id] || (kb.current_user_permission !== 'editor' && kb.current_user_permission !== 'admin')"
                  @click="(e) => handleSaveParsePriority(e, kb)"
                  class="px-2.5 py-1 text-xs font-medium rounded-md border border-slate-200 bg-white text-slate-700 hover:border-blue-300 hover:text-blue-600 disabled:bg-slate-100 disabled:text-slate-400 disabled:border-slate-200"
                >
@@ -608,6 +642,13 @@ onMounted(() => {
     <ExportRecordPanel
       :records="exportRecords"
       @clear="clearExportRecords"
+    />
+
+    <!-- Permission Modal -->
+    <KbPermissionModal
+      :kb="permissionModalKb || {}"
+      :show="showPermissionModal"
+      @close="showPermissionModal = false"
     />
   </div>
 </template>

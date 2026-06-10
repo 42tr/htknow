@@ -211,3 +211,17 @@ CREATE TABLE IF NOT EXISTS index_rebuild_jobs (
 
 CREATE INDEX IF NOT EXISTS idx_index_rebuild_jobs_status ON index_rebuild_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_index_rebuild_jobs_updated_at ON index_rebuild_jobs(updated_at);
+
+-- 知识库成员权限表
+CREATE TABLE IF NOT EXISTS kb_permissions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    kb_id INTEGER NOT NULL,
+    user_id TEXT NOT NULL,
+    permission TEXT NOT NULL DEFAULT 'viewer', -- 'viewer' | 'editor' | 'admin'
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    updated_at INTEGER DEFAULT (strftime('%s','now')),
+    FOREIGN KEY(kb_id) REFERENCES knowledge_bases(id) ON DELETE CASCADE,
+    UNIQUE(kb_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_kb_permissions_kb_id ON kb_permissions(kb_id);
+CREATE INDEX IF NOT EXISTS idx_kb_permissions_user_id ON kb_permissions(user_id);

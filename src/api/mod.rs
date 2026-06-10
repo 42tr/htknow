@@ -1,5 +1,5 @@
 use axum::{
-    Extension, Router, routing::{get, post, put}
+    Extension, Router, routing::{delete, get, post, put}
 };
 use sqlx::SqlitePool;
 use utoipa::OpenApi;
@@ -32,6 +32,9 @@ use crate::search::SearchEngine;
         knowledge_base::delete,
         knowledge_base::tree,
         knowledge_base::batch_export_kb,
+        knowledge_base::list_permissions,
+        knowledge_base::add_permission,
+        knowledge_base::remove_permission,
         // File
         file::upload,
         file::list,
@@ -91,6 +94,8 @@ use crate::search::SearchEngine;
             knowledge_base::ReparseKnowledgeBaseResponse,
             knowledge_base::ExportKbResponse,
             knowledge_base::BatchExportKbRequest,
+            knowledge_base::KbPermissionItem,
+            knowledge_base::KbPermissionCreateReq,
             crate::export::ExportManifest,
             file::File,
             file::UpdateFileReq,
@@ -169,7 +174,9 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/{id}/reparse", post(knowledge_base::reparse_by_id))
         .route("/export", post(knowledge_base::batch_export_kb))
         .route("/tree", get(knowledge_base::tree))
-        .route("/{id}", get(knowledge_base::get).put(knowledge_base::update).delete(knowledge_base::delete));
+        .route("/{id}", get(knowledge_base::get).put(knowledge_base::update).delete(knowledge_base::delete))
+        .route("/{id}/permissions", get(knowledge_base::list_permissions).post(knowledge_base::add_permission))
+        .route("/{id}/permissions/{user_id}", delete(knowledge_base::remove_permission));
     let file_router = Router::new()
         .route("/", get(file::list).post(file::upload))
         .route("/batch-delete", post(file::batch_delete))
