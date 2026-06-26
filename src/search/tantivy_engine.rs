@@ -478,33 +478,34 @@ fn build_query(
     subqueries.push((Occur::Must, Box::new(content_bool)));
 
     if let Some(ids) = file_ids
-        && !ids.is_empty() {
-            let mut file_id_queries = Vec::new();
-            let file_id_field = get_field(schema, "file_id");
-            for file_id in ids {
-                let file_id_query =
-                    TermQuery::new(Term::from_field_i64(file_id_field, *file_id), IndexRecordOption::Basic);
-                file_id_queries.push((Occur::Should, Box::new(file_id_query) as Box<dyn Query>));
-            }
-            if !file_id_queries.is_empty() {
-                let file_ids_bool_query = BooleanQuery::new(file_id_queries);
-                subqueries.push((Occur::Must, Box::new(file_ids_bool_query)));
-            }
+        && !ids.is_empty()
+    {
+        let mut file_id_queries = Vec::new();
+        let file_id_field = get_field(schema, "file_id");
+        for file_id in ids {
+            let file_id_query = TermQuery::new(Term::from_field_i64(file_id_field, *file_id), IndexRecordOption::Basic);
+            file_id_queries.push((Occur::Should, Box::new(file_id_query) as Box<dyn Query>));
         }
+        if !file_id_queries.is_empty() {
+            let file_ids_bool_query = BooleanQuery::new(file_id_queries);
+            subqueries.push((Occur::Must, Box::new(file_ids_bool_query)));
+        }
+    }
 
     if let Some(ids) = kb_ids
-        && !ids.is_empty() {
-            let mut kb_id_queries = Vec::new();
-            let kb_id_field = get_field(schema, "kb_id");
-            for kb_id in ids {
-                let kb_id_query = TermQuery::new(Term::from_field_i64(kb_id_field, *kb_id), IndexRecordOption::Basic);
-                kb_id_queries.push((Occur::Should, Box::new(kb_id_query) as Box<dyn Query>));
-            }
-            if !kb_id_queries.is_empty() {
-                let kb_ids_bool_query = BooleanQuery::new(kb_id_queries);
-                subqueries.push((Occur::Must, Box::new(kb_ids_bool_query)));
-            }
+        && !ids.is_empty()
+    {
+        let mut kb_id_queries = Vec::new();
+        let kb_id_field = get_field(schema, "kb_id");
+        for kb_id in ids {
+            let kb_id_query = TermQuery::new(Term::from_field_i64(kb_id_field, *kb_id), IndexRecordOption::Basic);
+            kb_id_queries.push((Occur::Should, Box::new(kb_id_query) as Box<dyn Query>));
         }
+        if !kb_id_queries.is_empty() {
+            let kb_ids_bool_query = BooleanQuery::new(kb_id_queries);
+            subqueries.push((Occur::Must, Box::new(kb_ids_bool_query)));
+        }
+    }
     Ok(Box::new(BooleanQuery::new(subqueries)))
 }
 
@@ -570,17 +571,18 @@ fn build_snippet_terms(query: &str, synonym_map: Option<&SynonymMap>) -> Vec<Str
             terms.push(trimmed.to_string());
         }
         if let Some(map) = synonym_map
-            && let Some(synonyms) = map.get(trimmed) {
-                for synonym in synonyms {
-                    let syn = synonym.term.trim();
-                    if syn.is_empty() {
-                        continue;
-                    }
-                    if seen.insert(syn.to_string()) {
-                        terms.push(syn.to_string());
-                    }
+            && let Some(synonyms) = map.get(trimmed)
+        {
+            for synonym in synonyms {
+                let syn = synonym.term.trim();
+                if syn.is_empty() {
+                    continue;
+                }
+                if seen.insert(syn.to_string()) {
+                    terms.push(syn.to_string());
                 }
             }
+        }
     }
     terms.sort_by_key(|b| std::cmp::Reverse(b.len()));
     terms
@@ -605,17 +607,18 @@ fn build_query_terms(input: &str, synonym_map: Option<&SynonymMap>) -> Vec<Query
             terms.push(QueryTerm { term: trimmed.to_string(), boost: 1.0 });
         }
         if let Some(map) = synonym_map
-            && let Some(synonyms) = map.get(trimmed) {
-                for synonym in synonyms {
-                    let syn = synonym.term.trim();
-                    if syn.is_empty() || syn == trimmed {
-                        continue;
-                    }
-                    if seen.insert(syn.to_string()) {
-                        terms.push(QueryTerm { term: syn.to_string(), boost: synonym.boost.max(0.01) });
-                    }
+            && let Some(synonyms) = map.get(trimmed)
+        {
+            for synonym in synonyms {
+                let syn = synonym.term.trim();
+                if syn.is_empty() || syn == trimmed {
+                    continue;
+                }
+                if seen.insert(syn.to_string()) {
+                    terms.push(QueryTerm { term: syn.to_string(), boost: synonym.boost.max(0.01) });
                 }
             }
+        }
     }
 
     if terms.is_empty() {
@@ -623,17 +626,18 @@ fn build_query_terms(input: &str, synonym_map: Option<&SynonymMap>) -> Vec<Query
         if !raw.is_empty() {
             terms.push(QueryTerm { term: raw.to_string(), boost: 1.0 });
             if let Some(map) = synonym_map
-                && let Some(synonyms) = map.get(raw) {
-                    for synonym in synonyms {
-                        let syn = synonym.term.trim();
-                        if syn.is_empty() || syn == raw {
-                            continue;
-                        }
-                        if seen.insert(syn.to_string()) {
-                            terms.push(QueryTerm { term: syn.to_string(), boost: synonym.boost.max(0.01) });
-                        }
+                && let Some(synonyms) = map.get(raw)
+            {
+                for synonym in synonyms {
+                    let syn = synonym.term.trim();
+                    if syn.is_empty() || syn == raw {
+                        continue;
+                    }
+                    if seen.insert(syn.to_string()) {
+                        terms.push(QueryTerm { term: syn.to_string(), boost: synonym.boost.max(0.01) });
                     }
                 }
+            }
         }
     }
 

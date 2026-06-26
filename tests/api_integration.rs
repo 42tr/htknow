@@ -623,7 +623,8 @@ async fn kb_permission_viewer_can_read_but_not_modify() {
     assert_eq!(update_res.status(), StatusCode::FORBIDDEN);
 
     // Viewer cannot reparse
-    let reparse_req = authed_empty_request("POST", format!("/api/v1/knowledge/knowledge_base/{}/reparse", kb_id), &viewer);
+    let reparse_req =
+        authed_empty_request("POST", format!("/api/v1/knowledge/knowledge_base/{}/reparse", kb_id), &viewer);
     let reparse_res = app.clone().oneshot(reparse_req).await.unwrap();
     assert_eq!(reparse_res.status(), StatusCode::FORBIDDEN);
 
@@ -695,10 +696,7 @@ async fn kb_permission_editor_can_upload_but_not_delete() {
         "/api/v1/knowledge/files/",
         &editor,
         &boundary,
-        &[
-            ("kb_id", &kb_id.to_string()),
-            ("slice_type", "text"),
-        ],
+        &[("kb_id", &kb_id.to_string()), ("slice_type", "text")],
         "file",
         "test.txt",
         b"editor upload test",
@@ -730,7 +728,8 @@ async fn kb_permission_admin_can_manage_permissions() {
     let kb_id = response_json(create_res).await["id"].as_i64().unwrap();
 
     // Owner lists permissions (should be empty initially except no explicit rows)
-    let list_req = authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}/permissions", kb_id), &owner);
+    let list_req =
+        authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}/permissions", kb_id), &owner);
     let list_res = app.clone().oneshot(list_req).await.unwrap();
     assert_eq!(list_res.status(), StatusCode::OK);
 
@@ -748,7 +747,8 @@ async fn kb_permission_admin_can_manage_permissions() {
     assert_eq!(grant_json["permission"].as_str(), Some("viewer"));
 
     // Viewer cannot call permission APIs
-    let viewer_list_req = authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}/permissions", kb_id), &viewer);
+    let viewer_list_req =
+        authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}/permissions", kb_id), &viewer);
     let viewer_list_res = app.clone().oneshot(viewer_list_req).await.unwrap();
     assert_eq!(viewer_list_res.status(), StatusCode::FORBIDDEN);
 
@@ -763,7 +763,8 @@ async fn kb_permission_admin_can_manage_permissions() {
     assert_eq!(upgrade_res.status(), StatusCode::OK);
 
     // Now viewer (as KB admin) can list permissions
-    let list2_req = authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}/permissions", kb_id), &viewer);
+    let list2_req =
+        authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}/permissions", kb_id), &viewer);
     let list2_res = app.clone().oneshot(list2_req).await.unwrap();
     assert_eq!(list2_res.status(), StatusCode::OK);
 
@@ -798,18 +799,11 @@ async fn kb_permission_search_filters_unauthorized_kb() {
     let file_id = insert_file(&pool, &owner, "secret-perm.txt", &test_file, Some(kb_id), vec![], false).await;
 
     // Set file as completed so it appears in full search
-    sqlx::query("UPDATE files SET status = 1 WHERE id = ?")
-        .bind(file_id)
-        .execute(&pool)
-        .await
-        .unwrap();
+    sqlx::query("UPDATE files SET status = 1 WHERE id = ?").bind(file_id).execute(&pool).await.unwrap();
 
     // Owner can use full-search filename filter and find the file
-    let owner_search_req = authed_empty_request(
-        "GET",
-        "/api/v1/knowledge/search/full?filename=secret-perm.txt",
-        &owner,
-    );
+    let owner_search_req =
+        authed_empty_request("GET", "/api/v1/knowledge/search/full?filename=secret-perm.txt", &owner);
     let owner_search_res = app.clone().oneshot(owner_search_req).await.unwrap();
     assert_eq!(owner_search_res.status(), StatusCode::OK);
     let owner_json = response_json(owner_search_res).await;
@@ -820,11 +814,8 @@ async fn kb_permission_search_filters_unauthorized_kb() {
     );
 
     // Other user without permission cannot see the result
-    let other_search_req = authed_empty_request(
-        "GET",
-        "/api/v1/knowledge/search/full?filename=secret-perm.txt",
-        &other,
-    );
+    let other_search_req =
+        authed_empty_request("GET", "/api/v1/knowledge/search/full?filename=secret-perm.txt", &other);
     let other_search_res = app.clone().oneshot(other_search_req).await.unwrap();
     assert_eq!(other_search_res.status(), StatusCode::OK);
     let other_json = response_json(other_search_res).await;
@@ -851,12 +842,8 @@ async fn kb_permission_search_filters_unauthorized_kb() {
     let get_json = response_json(get_res).await;
     assert_eq!(get_json["current_user_permission"].as_str(), Some("viewer"));
 
-
-    let granted_search_req = authed_empty_request(
-        "GET",
-        "/api/v1/knowledge/search/full?filename=secret-perm.txt",
-        &other,
-    );
+    let granted_search_req =
+        authed_empty_request("GET", "/api/v1/knowledge/search/full?filename=secret-perm.txt", &other);
     let granted_search_res = app.clone().oneshot(granted_search_req).await.unwrap();
     assert_eq!(granted_search_res.status(), StatusCode::OK);
     let granted_json = response_json(granted_search_res).await;
@@ -869,31 +856,19 @@ async fn kb_permission_search_filters_unauthorized_kb() {
 
 // Helper: build multipart request that includes an actual file field
 fn authed_multipart_request_with_file(
-    method: &str,
-    uri: impl Into<String>,
-    user: &TestUser,
-    boundary: &str,
-    extra_fields: &[(&str, &str)],
-    field_name: &str,
-    file_name: &str,
-    file_content: &[u8],
+    method: &str, uri: impl Into<String>, user: &TestUser, boundary: &str, extra_fields: &[(&str, &str)],
+    field_name: &str, file_name: &str, file_content: &[u8],
 ) -> Request<Body> {
     let mut body = Vec::new();
     for (name, value) in extra_fields {
         body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
-        body.extend_from_slice(
-            format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", name).as_bytes(),
-        );
+        body.extend_from_slice(format!("Content-Disposition: form-data; name=\"{}\"\r\n\r\n", name).as_bytes());
         body.extend_from_slice(value.as_bytes());
         body.extend_from_slice(b"\r\n");
     }
     body.extend_from_slice(format!("--{}\r\n", boundary).as_bytes());
     body.extend_from_slice(
-        format!(
-            "Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n",
-            field_name, file_name
-        )
-        .as_bytes(),
+        format!("Content-Disposition: form-data; name=\"{}\"; filename=\"{}\"\r\n", field_name, file_name).as_bytes(),
     );
     body.extend_from_slice(b"Content-Type: text/plain\r\n\r\n");
     body.extend_from_slice(file_content);
