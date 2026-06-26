@@ -2,6 +2,7 @@ use std::{collections::HashSet, time::Duration};
 
 use anyhow::{Context, Result, anyhow};
 use log::{info, warn};
+use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
@@ -10,6 +11,10 @@ use super::SearchResultItem;
 use crate::config;
 
 const MAX_NEIGHBOR_SLICES: i64 = 30;
+
+/// 复用的 LLM HTTP client（连接池）。LLM 调用超时较长，固定 600s。
+static LLM_HTTP_CLIENT: Lazy<Client> =
+    Lazy::new(|| Client::builder().timeout(Duration::from_secs(600)).build().expect("build reqwest client"));
 
 #[derive(Clone)]
 pub struct LlmClient {
@@ -29,8 +34,8 @@ impl LlmClient {
     pub fn new() -> Self {
         let cfg = config::get();
         let llm = cfg.llm.clone();
-        let client = Client::builder().timeout(Duration::from_secs(600)).build().expect("build reqwest client");
-        Self { client, api_url: llm.api_url, api_key: llm.api_key, model: llm.model }
+        // 复用全局 client，避免每次构造都新建连接池
+        Self { client: LLM_HTTP_CLIENT.clone(), api_url: llm.api_url, api_key: llm.api_key, model: llm.model }
     }
 
     pub fn is_enabled(&self) -> bool {
@@ -263,8 +268,11 @@ pub struct RefineOutcome {
 pub async fn assemble_context_chunk(
     pool: &SqlitePool, center: &SearchResultItem, per_side_chars: usize,
 ) -> Result<ContextChunk> {
-    let before_rows = fetch_before_slices(pool, center.file_id, center.id).await?;
-    let after_rows = fetch_after_slices(pool, center.file_id, center.id).await?;
+    // 前后切片两条查询相互独立，并发执行
+    let (before_rows, after_rows) = tokio::try_join!(
+        fetch_before_slices(pool, center.file_id, center.id),
+        fetch_after_slices(pool, center.file_id, center.id),
+    )?;
 
     let before = take_with_limit(before_rows, per_side_chars, true);
     let after = take_with_limit(after_rows, per_side_chars, false);

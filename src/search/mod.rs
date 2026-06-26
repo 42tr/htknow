@@ -661,20 +661,8 @@ impl SearchEngine {
             return Ok(merged_results);
         }
 
-        // 使用 BGE-Rerank 重排序
-        let fallback_results = merged_results.clone();
-        let final_results = match self.rerank(query, merged_results).await {
-            Ok(reranked_results) => {
-                info!("Reranked results count: {}", reranked_results.len());
-                reranked_results
-            }
-            Err(err) => {
-                warn!("Rerank failed for query {:?}, returning merged search results without rerank: {}", query, err);
-                fallback_results
-            }
-        };
-
-        let mut final_results = final_results;
+        // 使用 BGE-Rerank 重排序（失败时内部回退为原结果，无需预先 clone 整个结果集）
+        let mut final_results = self.rerank(query, merged_results).await;
         let limit = config::get().search.limit.max(1);
         if final_results.len() > limit {
             final_results.truncate(limit);
@@ -713,22 +701,25 @@ impl SearchEngine {
         lancedb::search_image(image_embedding, file_ids, kb_ids).await
     }
 
-    async fn rerank(&self, query: &str, results: Vec<SearchResultItem>) -> anyhow::Result<Vec<SearchResultItem>> {
+    /// 计算每个结果（按输入顺序对齐）的 rerank 分数。
+    /// 仅借用 results，失败时不消耗它，使调用方可零拷贝回退。
+    async fn compute_rerank_scores(
+        &self, query: &str, results: &[SearchResultItem],
+    ) -> anyhow::Result<Vec<Option<f32>>> {
         let cfg = config::get();
-        let rerank_total_start = Instant::now();
 
-        // 提取所有文档内容用于重排序，并做去重
+        // 提取所有文档内容用于重排序，并做去重（按内容借用，去重映射只需单次 clone 进 documents）
         let mut documents: Vec<String> = Vec::new();
         let mut document_index_map: Vec<usize> = Vec::with_capacity(results.len());
-        let mut document_index_by_content: HashMap<String, usize> = HashMap::new();
+        let mut document_index_by_content: HashMap<&str, usize> = HashMap::new();
         for result in results.iter() {
-            if let Some(&idx) = document_index_by_content.get(&result.content) {
+            if let Some(&idx) = document_index_by_content.get(result.content.as_str()) {
                 document_index_map.push(idx);
                 continue;
             }
             let idx = documents.len();
             documents.push(result.content.clone());
-            document_index_by_content.insert(result.content.clone(), idx);
+            document_index_by_content.insert(result.content.as_str(), idx);
             document_index_map.push(idx);
         }
 
@@ -806,16 +797,33 @@ impl SearchEngine {
             }
         }
 
+        // 将去重后的分数映射回每个结果（按输入顺序）
+        let per_result: Vec<Option<f32>> =
+            document_index_map.iter().map(|&doc_idx| rerank_scores.get(doc_idx).copied().flatten()).collect();
+        Ok(per_result)
+    }
+
+    async fn rerank(&self, query: &str, results: Vec<SearchResultItem>) -> Vec<SearchResultItem> {
+        let rerank_total_start = Instant::now();
+        let cfg = config::get();
+
+        // 计算分数；失败则原样返回（无需 clone 回退）
+        let scores = match self.compute_rerank_scores(query, &results).await {
+            Ok(scores) => scores,
+            Err(err) => {
+                warn!("Rerank failed for query {:?}, returning merged search results without rerank: {}", query, err);
+                return results;
+            }
+        };
+
         // 使用重排序分数更新结果
         let mut reranked_results: Vec<SearchResultItem> = results
             .into_iter()
             .enumerate()
             .map(|(i, mut result)| {
-                // 根据去重后的 index 找到对应的重排序结果
-                if let Some(doc_index) = document_index_map.get(i)
-                    && let Some(score) = rerank_scores.get(*doc_index).and_then(|s| *s) {
-                        result.score = score;
-                    }
+                if let Some(Some(score)) = scores.get(i) {
+                    result.score = *score;
+                }
                 result
             })
             .collect();
@@ -823,9 +831,11 @@ impl SearchEngine {
         // 按新分数降序排序
         reranked_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
         let threshold = cfg.ai.rerank_threshold;
-        let filter_results = reranked_results.into_iter().filter(|f| f.score >= threshold).collect();
+        let filter_results: Vec<SearchResultItem> =
+            reranked_results.into_iter().filter(|f| f.score >= threshold).collect();
+        info!("Reranked results count: {}", filter_results.len());
         debug!("Rerank total {}ms", rerank_total_start.elapsed().as_millis());
-        Ok(filter_results)
+        filter_results
     }
 
     /// 使用知识图谱扩展查询
@@ -843,14 +853,15 @@ impl SearchEngine {
         qb.push_bind(format!("%{}%", query));
 
         if let Some(ids) = kb_ids
-            && !ids.is_empty() {
-                qb.push(" AND kb_id IN (");
-                let mut separated = qb.separated(", ");
-                for id in ids {
-                    separated.push_bind(id);
-                }
-                qb.push(")");
+            && !ids.is_empty()
+        {
+            qb.push(" AND kb_id IN (");
+            let mut separated = qb.separated(", ");
+            for id in ids {
+                separated.push_bind(id);
             }
+            qb.push(")");
+        }
         qb.push(" LIMIT 10");
         let entities: Vec<(String, String)> = qb.build_query_as().fetch_all(pool).await?;
 
@@ -994,16 +1005,21 @@ impl SearchEngine {
             return self.search(query, file_ids, kb_ids).await;
         }
 
-        // 2. 对每个扩展查询进行搜索
+        // 2. 对每个扩展查询并发搜索（彼此独立，无需串行）
         let mut all_results: HashMap<i64, SearchResultItem> = HashMap::new();
 
-        for (idx, expanded_query) in expanded_queries.iter().enumerate() {
-            let results = self.search(expanded_query, file_ids, kb_ids).await?;
-
+        let search_futures = expanded_queries.iter().enumerate().map(|(idx, expanded_query)| {
             // 原始查询的结果权重更高
             let weight = if idx == 0 { 1.0 } else { 0.7 };
+            async move {
+                let results = self.search(expanded_query, file_ids, kb_ids).await;
+                (weight, results)
+            }
+        });
+        let per_query = futures::future::join_all(search_futures).await;
 
-            for mut result in results {
+        for (weight, results) in per_query {
+            for mut result in results? {
                 result.score *= weight;
 
                 all_results

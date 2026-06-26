@@ -775,9 +775,10 @@ async fn send_step_event(
         "status": status,
     });
     if let Value::Object(ref mut map) = payload
-        && let Some(details) = details {
-            map.insert("details".to_string(), details);
-        }
+        && let Some(details) = details
+    {
+        map.insert("details".to_string(), details);
+    }
     send_event_json(tx, "step", &payload).await
 }
 
@@ -823,10 +824,7 @@ async fn send_done_event(tx: &mpsc::Sender<Result<Event, Infallible>>) -> anyhow
 }
 
 fn has_visibility_permission(
-    file: Option<(bool, &str)>,
-    kb: Option<(bool, &str, i64)>,
-    user_id: &str,
-    is_admin: bool,
+    file: Option<(bool, &str)>, kb: Option<(bool, &str, i64)>, user_id: &str, is_admin: bool,
     allowed_kb_ids: Option<&HashSet<i64>>,
 ) -> bool {
     if is_admin {
@@ -850,11 +848,7 @@ fn has_visibility_permission(
 }
 
 fn has_permission(
-    file: Option<&FileInfo>,
-    kb: Option<&KbInfo>,
-    user_id: &str,
-    is_admin: bool,
-    allowed_kb_ids: Option<&HashSet<i64>>,
+    file: Option<&FileInfo>, kb: Option<&KbInfo>, user_id: &str, is_admin: bool, allowed_kb_ids: Option<&HashSet<i64>>,
 ) -> bool {
     has_visibility_permission(
         file.map(|f| (f.is_public, f.user_id.as_str())),
@@ -892,9 +886,10 @@ async fn build_slice_results_from_raw(
     let kb_ids: Vec<i64> = raw_results.iter().filter_map(|r| r.kb_id).collect();
     let slice_ids: Vec<i64> = raw_results.iter().map(|r| r.id).collect();
 
-    let file_map = get_files_by_ids(pool, &file_ids).await?;
-    let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(pool, &kb_ids).await? } else { HashMap::new() };
-    let slice_positions = get_slice_positions(pool, &slice_ids).await?;
+    // 三条查询相互独立，并发执行
+    let kb_fut = async { if !kb_ids.is_empty() { get_kbs_by_ids(pool, &kb_ids).await } else { Ok(HashMap::new()) } };
+    let (file_map, kb_map, slice_positions) =
+        tokio::try_join!(get_files_by_ids(pool, &file_ids), kb_fut, get_slice_positions(pool, &slice_ids))?;
 
     let allowed_kb_ids: HashSet<i64> = if is_admin {
         HashSet::new()
@@ -1340,42 +1335,40 @@ async fn execute_page_content_step_core(
                     "{} context assemble failed: request_id={}, file_id={}, base_slice_id={}, error={}",
                     log_prefix, request_id, candidate.file.id, base_slice.id, err
                 );
-                if debug_events
-                    && let Some(tx) = tx {
-                        let _ = send_event_json(
-                            tx,
-                            "candidate",
-                            &json!({
-                                "step_action": PlanAction::PageContent,
-                                "file": candidate.file.clone(),
-                                "kb": candidate.kb.clone(),
-                                "error": format!("上下文拼接失败: {}", err),
-                            }),
-                        )
-                        .await;
-                    }
+                if debug_events && let Some(tx) = tx {
+                    let _ = send_event_json(
+                        tx,
+                        "candidate",
+                        &json!({
+                            "step_action": PlanAction::PageContent,
+                            "file": candidate.file.clone(),
+                            "kb": candidate.kb.clone(),
+                            "error": format!("上下文拼接失败: {}", err),
+                        }),
+                    )
+                    .await;
+                }
                 continue;
             }
         };
 
-        if debug_events
-            && let Some(tx) = tx {
-                let preview = preview_text(&context_chunk.content, 160);
-                let _ = send_event_json(
-                    tx,
-                    "candidate",
-                    &json!({
-                        "step_action": PlanAction::PageContent,
-                        "file": candidate.file.clone(),
-                        "kb": candidate.kb.clone(),
-                        "score": base_slice.score,
-                        "slice_ids": context_chunk.slice_ids.clone(),
-                        "preview": preview,
-                        "stage": "before_refine",
-                    }),
-                )
-                .await;
-            }
+        if debug_events && let Some(tx) = tx {
+            let preview = preview_text(&context_chunk.content, 160);
+            let _ = send_event_json(
+                tx,
+                "candidate",
+                &json!({
+                    "step_action": PlanAction::PageContent,
+                    "file": candidate.file.clone(),
+                    "kb": candidate.kb.clone(),
+                    "score": base_slice.score,
+                    "slice_ids": context_chunk.slice_ids.clone(),
+                    "preview": preview,
+                    "stage": "before_refine",
+                }),
+            )
+            .await;
+        }
 
         let judge_outcome = judge.judge(query, &context_chunk.content).await;
         if !judge_outcome.is_relevant {
@@ -1392,21 +1385,20 @@ async fn execute_page_content_step_core(
                     preview_for_log(&judge_outcome.reason, 120)
                 );
             }
-            if debug_events
-                && let Some(tx) = tx {
-                    let _ = send_event_json(
-                        tx,
-                        "filtered",
-                        &json!({
-                            "step_action": PlanAction::PageContent,
-                            "file": candidate.file.clone(),
-                            "kb": candidate.kb.clone(),
-                            "reason": judge_outcome.reason,
-                            "score": judge_outcome.score,
-                        }),
-                    )
-                    .await;
-                }
+            if debug_events && let Some(tx) = tx {
+                let _ = send_event_json(
+                    tx,
+                    "filtered",
+                    &json!({
+                        "step_action": PlanAction::PageContent,
+                        "file": candidate.file.clone(),
+                        "kb": candidate.kb.clone(),
+                        "reason": judge_outcome.reason,
+                        "score": judge_outcome.score,
+                    }),
+                )
+                .await;
+            }
             continue;
         }
 
@@ -2590,14 +2582,15 @@ async fn search_file_ids_by_name(
         qb.push("))");
     }
     if let Some(ids) = kb_ids
-        && !ids.is_empty() {
-            qb.push(" AND kb_id IN (");
-            let mut separated = qb.separated(", ");
-            for id in ids {
-                separated.push_bind(id);
-            }
-            qb.push(")");
+        && !ids.is_empty()
+    {
+        qb.push(" AND kb_id IN (");
+        let mut separated = qb.separated(", ");
+        for id in ids {
+            separated.push_bind(id);
         }
+        qb.push(")");
+    }
     qb.push(" AND status = 1");
     let ids: Vec<i64> = qb.build_query_scalar().fetch_all(pool).await?;
     Ok(ids)

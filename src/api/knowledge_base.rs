@@ -83,6 +83,75 @@ pub async fn get_kb_permission(pool: &SqlitePool, kb_id: i64, user_id: &str, is_
     None
 }
 
+/// Batch version of [`get_kb_permission`]: resolve permissions for many KBs in a fixed
+/// number of queries (2 instead of 3*N), avoiding the N+1 pattern in bulk operations.
+///
+/// Returns a map kb_id -> highest permission. KBs the user cannot access are absent from the map.
+pub async fn get_kb_permissions_batch(
+    pool: &SqlitePool, kb_ids: &[i64], user_id: &str, is_admin: bool,
+) -> HashMap<i64, String> {
+    let mut result = HashMap::new();
+    if kb_ids.is_empty() {
+        return result;
+    }
+
+    if is_admin {
+        for &id in kb_ids {
+            result.insert(id, "admin".to_string());
+        }
+        return result;
+    }
+
+    // Dedupe ids to keep the IN lists small.
+    let unique_ids: Vec<i64> = {
+        let set: std::collections::HashSet<i64> = kb_ids.iter().copied().collect();
+        set.into_iter().collect()
+    };
+
+    // Query 1: owner + is_public for each KB.
+    let mut kb_qb = QueryBuilder::<Sqlite>::new("SELECT id, user_id, is_public FROM knowledge_bases WHERE id IN (");
+    {
+        let mut sep = kb_qb.separated(", ");
+        for id in &unique_ids {
+            sep.push_bind(*id);
+        }
+    }
+    kb_qb.push(")");
+    let kb_rows: Vec<(i64, String, i64)> = kb_qb.build_query_as().fetch_all(pool).await.unwrap_or_default();
+
+    // Query 2: explicit permissions for this user.
+    let mut perm_qb = QueryBuilder::<Sqlite>::new("SELECT kb_id, permission FROM kb_permissions WHERE user_id = ");
+    perm_qb.push_bind(user_id);
+    perm_qb.push(" AND kb_id IN (");
+    {
+        let mut sep = perm_qb.separated(", ");
+        for id in &unique_ids {
+            sep.push_bind(*id);
+        }
+    }
+    perm_qb.push(")");
+    let perm_rows: Vec<(i64, String)> = perm_qb.build_query_as().fetch_all(pool).await.unwrap_or_default();
+    let explicit: HashMap<i64, String> = perm_rows.into_iter().collect();
+
+    for (id, owner, is_public) in kb_rows {
+        // Priority: owner > explicit permission > is_public.
+        let perm = if owner == user_id {
+            Some("admin".to_string())
+        } else if let Some(p) = explicit.get(&id) {
+            Some(p.clone())
+        } else if is_public == 1 {
+            Some("viewer".to_string())
+        } else {
+            None
+        };
+        if let Some(perm) = perm {
+            result.insert(id, perm);
+        }
+    }
+
+    result
+}
+
 /// Numeric level for comparison: admin=3, editor=2, viewer=1, none=0.
 pub fn perm_level(perm: &str) -> i32 {
     match perm {
@@ -103,10 +172,7 @@ pub fn meets_requirement(actual: Option<&str>, required: &str) -> bool {
 /// Get all KB ids that the user has at least viewer access to.
 pub async fn get_user_viewable_kb_ids(pool: &SqlitePool, user_id: &str, is_admin: bool) -> Vec<i64> {
     if is_admin {
-        return sqlx::query_scalar("SELECT id FROM knowledge_bases")
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
+        return sqlx::query_scalar("SELECT id FROM knowledge_bases").fetch_all(pool).await.unwrap_or_default();
     }
     sqlx::query_scalar(
         "SELECT id FROM knowledge_bases WHERE user_id = ?1 OR is_public = 1 \
@@ -279,7 +345,11 @@ pub async fn list(
     );
     if !is_admin {
         let user_id = auth_user.user_id.clone();
-        qb.push(" AND (user_id = ").push_bind(user_id.clone()).push(" OR is_public = 1 OR id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ").push_bind(user_id).push("))");
+        qb.push(" AND (user_id = ")
+            .push_bind(user_id.clone())
+            .push(" OR is_public = 1 OR id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ")
+            .push_bind(user_id)
+            .push("))");
     }
 
     // Filter by parent_id
@@ -553,13 +623,12 @@ pub async fn update(
 
     // Prevent moving a knowledge base into itself.
     if let Some(Some(parent_id)) = knowledge.parent_id
-        && parent_id == id {
-            return Err(crate::api::error::ApiError::BadRequest(
-                "Cannot move a knowledge base into itself.".to_string(),
-            ));
-        }
-        // A full descendant check would be needed for production to prevent moving a KB into its own child.
-        // This requires a recursive query and is omitted for this iteration.
+        && parent_id == id
+    {
+        return Err(crate::api::error::ApiError::BadRequest("Cannot move a knowledge base into itself.".to_string()));
+    }
+    // A full descendant check would be needed for production to prevent moving a KB into its own child.
+    // This requires a recursive query and is omitted for this iteration.
 
     // Only admin-level can change sensitive fields: is_public, parent_id, kb_type
     let is_kb_admin = meets_requirement(Some(perm_str), "admin");
@@ -717,7 +786,11 @@ pub async fn get(
         qb.push_bind(id);
         if !is_admin {
             let uid = user_id.clone();
-            qb.push(" AND (user_id = ").push_bind(uid.clone()).push(" OR is_public = 1 OR id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ").push_bind(uid).push("))");
+            qb.push(" AND (user_id = ")
+                .push_bind(uid.clone())
+                .push(" OR is_public = 1 OR id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ")
+                .push_bind(uid)
+                .push("))");
         }
         qb.push(" ORDER BY name");
         qb.build_query_as::<Knowledge>().fetch_all(&pool).await
@@ -891,10 +964,7 @@ pub async fn delete(
 
     super::file::delete_file_rows_in_tx(&mut tx, &file_ids).await?;
 
-    let result = sqlx::query("DELETE FROM knowledge_bases WHERE id = ?")
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
+    let result = sqlx::query("DELETE FROM knowledge_bases WHERE id = ?").bind(id).execute(&mut *tx).await?;
 
     if result.rows_affected() == 0 {
         return Err(crate::api::error::ApiError::NotFound(
@@ -1023,22 +1093,20 @@ pub async fn reparse(
             .await?;
 
     // Also include KBs where user has editor/admin via kb_permissions
-    let perm_kb_ids: Vec<i64> = sqlx::query_scalar(
-        "SELECT kb_id FROM kb_permissions WHERE user_id = ? AND permission IN ('editor', 'admin')"
-    )
-    .bind(&auth_user.user_id)
-    .fetch_all(&pool)
-    .await?;
+    let perm_kb_ids: Vec<i64> =
+        sqlx::query_scalar("SELECT kb_id FROM kb_permissions WHERE user_id = ? AND permission IN ('editor', 'admin')")
+            .bind(&auth_user.user_id)
+            .fetch_all(&pool)
+            .await?;
 
     for kb_id in perm_kb_ids {
         if !analysis_kb_ids.contains(&kb_id) {
-            let is_analysis: Option<i64> = sqlx::query_scalar(
-                "SELECT 1 FROM knowledge_bases WHERE id = ? AND kb_type != ?"
-            )
-            .bind(kb_id)
-            .bind(KB_TYPE_STORAGE)
-            .fetch_optional(&pool)
-            .await?;
+            let is_analysis: Option<i64> =
+                sqlx::query_scalar("SELECT 1 FROM knowledge_bases WHERE id = ? AND kb_type != ?")
+                    .bind(kb_id)
+                    .bind(KB_TYPE_STORAGE)
+                    .fetch_optional(&pool)
+                    .await?;
             if is_analysis.is_some() {
                 analysis_kb_ids.push(kb_id);
             }
@@ -1122,7 +1190,8 @@ async fn load_tree_knowledges(
     pool: &SqlitePool, root_kb_id: Option<i64>, user_id: &str, is_admin: bool,
 ) -> anyhow::Result<Vec<TreeKnowledge>> {
     let access_clause = "(user_id = ? OR is_public = 1 OR id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ?))";
-    let access_where = "WHERE kb.user_id = ? OR kb.is_public = 1 OR kb.id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ?)";
+    let access_where =
+        "WHERE kb.user_id = ? OR kb.is_public = 1 OR kb.id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ?)";
 
     let rows = match (root_kb_id, is_admin) {
         (Some(kb_id), true) => {
@@ -1516,24 +1585,17 @@ pub async fn add_permission(
     // Validate permission value
     let perm = req.permission.trim().to_lowercase();
     if !matches!(perm.as_str(), "viewer" | "editor" | "admin") {
-        return Err(ApiError::BadRequest(
-            "Invalid permission. Use 'viewer', 'editor', or 'admin'.".to_string(),
-        ));
+        return Err(ApiError::BadRequest("Invalid permission. Use 'viewer', 'editor', or 'admin'.".to_string()));
     }
 
     // Prevent adding permission for the owner (owner already has admin implicitly)
-    let owner: Option<String> = sqlx::query_scalar("SELECT user_id FROM knowledge_bases WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&pool)
-        .await?;
+    let owner: Option<String> =
+        sqlx::query_scalar("SELECT user_id FROM knowledge_bases WHERE id = ?").bind(id).fetch_optional(&pool).await?;
     if owner.as_deref() == Some(&req.user_id) {
         return Err(ApiError::BadRequest("Cannot set permission for the owner.".to_string()));
     }
 
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 
     sqlx::query(
         "INSERT INTO kb_permissions (kb_id, user_id, permission, created_at, updated_at) VALUES (?, ?, ?, ?, ?) \
@@ -1547,11 +1609,7 @@ pub async fn add_permission(
     .execute(&pool)
     .await?;
 
-    Ok(Json(KbPermissionItem {
-        user_id: req.user_id,
-        permission: perm,
-        created_at: now,
-    }))
+    Ok(Json(KbPermissionItem { user_id: req.user_id, permission: perm, created_at: now }))
 }
 
 /// 删除知识库权限
@@ -1575,8 +1633,7 @@ pub async fn add_permission(
     )
 )]
 pub async fn remove_permission(
-    Path((id, target_user_id)): Path<(i64, String)>,
-    State(pool): State<SqlitePool>,
+    Path((id, target_user_id)): Path<(i64, String)>, State(pool): State<SqlitePool>,
     Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<()> {
     let is_admin = auth_user.is_admin();

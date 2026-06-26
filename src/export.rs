@@ -25,12 +25,31 @@ const EXPORT_DB_FILENAME: &str = "app.sqlite";
 #[allow(clippy::type_complexity)]
 type KbRow = (i64, String, String, String, String, String, Option<i64>, i32, i32, i64, i64);
 #[allow(clippy::type_complexity)]
-type FileRow =
-    (i64, String, String, String, String, String, i64, Option<String>, String, i32, String, String, Option<i64>, i32, i32, Option<String>, i64, i64);
+type FileRow = (
+    i64,
+    String,
+    String,
+    String,
+    String,
+    String,
+    i64,
+    Option<String>,
+    String,
+    i32,
+    String,
+    String,
+    Option<i64>,
+    i32,
+    i32,
+    Option<String>,
+    i64,
+    i64,
+);
 #[allow(clippy::type_complexity)]
 type SlicePosRow = (i64, i64, i32, i32, i32, i32, i32, Option<String>, Option<i32>, i64);
 #[allow(clippy::type_complexity)]
-type PdfContentRow = (i64, i64, i32, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>, i64, i64);
+type PdfContentRow =
+    (i64, i64, i32, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>, i64, i64);
 #[allow(clippy::type_complexity)]
 type EntityRow = (i64, String, String, Option<String>, Option<Vec<u8>>, Option<i64>, Option<i64>, i32, i64, i64);
 #[allow(clippy::type_complexity)]
@@ -185,6 +204,11 @@ pub async fn export_knowledge_bases(
     let target_kb_ids_for_stats = target_kb_ids.clone();
     let pool_clone = pool.clone();
 
+    // 提前取出各 future 需要的路径（owned），避免 async move 各自去移动同一个 Arc<AppConfig> 的字段
+    let tantivy_index_path = cfg.search.tantivy_index_path.clone();
+    let tantivy_full_index_path = cfg.search.tantivy_full_index_path.clone();
+    let lancedb_path = cfg.storage.lancedb_path.clone();
+
     let copy_files_future = async move {
         let s = std::time::Instant::now();
         let result = copy_files(&file_ids_for_copy, &files_dir, &pdfs_dir, &images_dir, &pool_clone).await;
@@ -194,16 +218,13 @@ pub async fn export_knowledge_bases(
 
     let tantivy_future = async move {
         let s = std::time::Instant::now();
-        let count = export_tantivy_index(
-            &cfg.search.tantivy_index_path,
-            &tantivy_dir.to_string_lossy(),
-            &target_kb_ids_for_tantivy,
-        )
-        .await
-        .unwrap_or_else(|e| {
-            warn!("Failed to export Tantivy slice index: {}", e);
-            0
-        });
+        let count =
+            export_tantivy_index(&tantivy_index_path, &tantivy_dir.to_string_lossy(), &target_kb_ids_for_tantivy)
+                .await
+                .unwrap_or_else(|e| {
+                    warn!("Failed to export Tantivy slice index: {}", e);
+                    0
+                });
         info!("[step] Export Tantivy slice index: {}ms", s.elapsed().as_millis());
         count
     };
@@ -211,7 +232,7 @@ pub async fn export_knowledge_bases(
     let tantivy_full_future = async move {
         let s = std::time::Instant::now();
         let count = export_tantivy_index(
-            &cfg.search.tantivy_full_index_path,
+            &tantivy_full_index_path,
             &tantivy_full_dir.to_string_lossy(),
             &target_kb_ids_for_tantivy_full,
         )
@@ -226,13 +247,12 @@ pub async fn export_knowledge_bases(
 
     let lancedb_future = async move {
         let s = std::time::Instant::now();
-        let count =
-            export_lancedb(&cfg.storage.lancedb_path, &lancedb_dir.to_string_lossy(), &target_kb_ids_for_lancedb)
-                .await
-                .unwrap_or_else(|e| {
-                    warn!("Failed to export LanceDB: {}", e);
-                    0
-                });
+        let count = export_lancedb(&lancedb_path, &lancedb_dir.to_string_lossy(), &target_kb_ids_for_lancedb)
+            .await
+            .unwrap_or_else(|e| {
+                warn!("Failed to export LanceDB: {}", e);
+                0
+            });
         info!("[step] Export LanceDB: {}ms", s.elapsed().as_millis());
         count
     };

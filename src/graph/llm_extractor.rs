@@ -1,11 +1,21 @@
 use std::time::Duration;
 
 use anyhow::{Result, anyhow};
+use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
 use super::{Entity, EntityType, Relation, RelationType};
 use crate::config;
+
+/// 复用的 LLM HTTP client（连接池）。
+static LLM_HTTP_CLIENT: Lazy<Client> = Lazy::new(|| {
+    #[cfg(test)]
+    let builder = Client::builder().timeout(Duration::from_secs(120)).no_proxy();
+    #[cfg(not(test))]
+    let builder = Client::builder().timeout(Duration::from_secs(120));
+    builder.build().expect("build llm extractor http client")
+});
 
 /// LLM API响应格式（OpenAI 兼容格式）
 #[derive(Debug, Deserialize)]
@@ -88,11 +98,8 @@ impl LLMGraphExtractor {
         let api_key = llm_config.api_key.clone();
         let model = llm_config.model.clone();
 
-        #[cfg(test)]
-        let client_builder = Client::builder().timeout(Duration::from_secs(120)).no_proxy();
-        #[cfg(not(test))]
-        let client_builder = Client::builder().timeout(Duration::from_secs(120));
-        let client = client_builder.build().unwrap();
+        // 复用全局 client，避免每次构造都新建连接池
+        let client = LLM_HTTP_CLIENT.clone();
 
         Self { client, api_url, api_key, model, enabled }
     }

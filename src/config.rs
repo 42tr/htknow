@@ -7,10 +7,13 @@ use std::sync::{Arc, RwLock};
 use once_cell::sync::Lazy;
 
 /// 全局配置单例
-static CONFIG: Lazy<Arc<RwLock<AppConfig>>> = Lazy::new(|| Arc::new(RwLock::new(AppConfig::from_env())));
+///
+/// 内层存 `Arc<AppConfig>`，`get()` 只克隆 Arc（廉价），避免每次深拷贝整个配置结构体。
+/// 保留外层 `RwLock` 以支持未来的配置热更新（替换内层 Arc 即可）。
+static CONFIG: Lazy<RwLock<Arc<AppConfig>>> = Lazy::new(|| RwLock::new(Arc::new(AppConfig::from_env())));
 
-/// 获取当前配置的只读快照
-pub fn get() -> AppConfig {
+/// 获取当前配置的只读快照（克隆 Arc，零深拷贝）
+pub fn get() -> Arc<AppConfig> {
     CONFIG.read().unwrap().clone()
 }
 

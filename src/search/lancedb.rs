@@ -272,9 +272,12 @@ pub async fn delete_by_kbs(kb_ids: &[i64]) -> Result<()> {
 /// 清理已删除的记录，释放磁盘和内存空间
 pub async fn compact() -> Result<CompactStats> {
     let table = get_table()?;
-    let storage_path = &config::get().storage.lancedb_path;
+    let storage_path = config::get().storage.lancedb_path.clone();
 
-    let size_before_bytes = dir_size_bytes(Path::new(storage_path))?;
+    let size_before_bytes = {
+        let path = storage_path.clone();
+        tokio::task::spawn_blocking(move || dir_size_bytes(Path::new(&path))).await??
+    };
     let total_rows_before = table.count_rows(None).await? as u64;
     let deleted_rows_before = table.count_rows(Some(format!("{} = true", IS_DELETED_COLUMN))).await? as u64;
 
@@ -297,7 +300,10 @@ pub async fn compact() -> Result<CompactStats> {
 
     let total_rows_after = table.count_rows(None).await? as u64;
     let deleted_rows_after = table.count_rows(Some(format!("{} = true", IS_DELETED_COLUMN))).await? as u64;
-    let size_after_bytes = dir_size_bytes(Path::new(storage_path))?;
+    let size_after_bytes = {
+        let path = storage_path.clone();
+        tokio::task::spawn_blocking(move || dir_size_bytes(Path::new(&path))).await??
+    };
 
     Ok(CompactStats {
         deleted_rows: deleted_rows_before.saturating_sub(deleted_rows_after),
@@ -469,15 +475,15 @@ async fn create_record_batch(docs: Vec<Document>, schema: &Arc<ArrowSchema>) -> 
     let is_images: Vec<bool> = docs.iter().map(|d| d.is_image).collect();
     let is_deleted: Vec<bool> = vec![false; docs.len()];
 
+    // 先用 contents 计算 embedding，再把所有权转移给 StringArray，避免多一次 clone
+    let embeddings = embedding::get_embeddings(&contents).await?;
+
     let id_array: ArrayRef = Arc::new(Int64Array::from(ids));
     let file_id_array: ArrayRef = Arc::new(Int64Array::from(file_ids));
     let kb_id_array: ArrayRef = Arc::new(Int64Array::from(kb_ids));
-    let content_array: ArrayRef = Arc::new(StringArray::from(contents.clone()));
+    let content_array: ArrayRef = Arc::new(StringArray::from(contents));
     let is_image_array: ArrayRef = Arc::new(BooleanArray::from(is_images));
     let is_deleted_array: ArrayRef = Arc::new(BooleanArray::from(is_deleted));
-
-    // 获取真实的 embedding 向量
-    let embeddings = embedding::get_embeddings(&contents).await?;
 
     let value_builder = Float32Builder::new();
     let mut list_builder = FixedSizeListBuilder::new(value_builder, vector_dim);

@@ -19,6 +19,22 @@ use crate::{
     AuthUser, api::error::{ApiError, ApiResult}, archive::{self, ArchiveEntry, ExtractResult}, config, pdf_highlight, processor, search::SearchEngine
 };
 
+/// 以流式方式打开文件，返回 (字节数, Body)。
+///
+/// 避免将整个文件读入内存（大文件下载会按 chunk 流式发送），同时返回文件大小用于 Content-Length。
+async fn open_file_stream(path: &std::path::Path) -> Result<(u64, Body), ApiError> {
+    let file = fs::File::open(path).await?;
+    let len = file.metadata().await?.len();
+    let stream = tokio_util::io::ReaderStream::new(file);
+    Ok((len, Body::from_stream(stream)))
+}
+
+/// `files` 表去掉大字段 `content` 的列清单（content 以 NULL 占位）。
+///
+/// 列表类查询不需要全文 content，用此清单避免把可能很大的 content 列从 SQLite 读进内存。
+const FILE_COLS_NO_CONTENT: &str = "id, user_id, user_name, hash, filename, path, size, NULL as content, \
+     tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at";
+
 /// Excel 单 sheet 数据
 #[derive(Debug, Serialize, ToSchema)]
 pub struct ExcelSheetData {
@@ -427,9 +443,13 @@ pub async fn upload(
         kb_type = kb_type_value;
 
         // Check KB permission: need editor or admin to upload
-        let perm = super::knowledge_base::get_kb_permission(&pool, kb_id_value, &auth_user.user_id, auth_user.is_admin()).await;
+        let perm =
+            super::knowledge_base::get_kb_permission(&pool, kb_id_value, &auth_user.user_id, auth_user.is_admin())
+                .await;
         if !super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
-            return Err(ApiError::Forbidden("Permission denied. Requires editor or admin to upload files.".to_string()));
+            return Err(ApiError::Forbidden(
+                "Permission denied. Requires editor or admin to upload files.".to_string(),
+            ));
         }
     }
 
@@ -745,10 +765,8 @@ pub async fn update(
     let is_admin = auth_user.is_admin();
 
     // Check permission on the file's KB
-    let file_kb: Option<Option<i64>> = sqlx::query_scalar("SELECT kb_id FROM files WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&pool)
-        .await?;
+    let file_kb: Option<Option<i64>> =
+        sqlx::query_scalar("SELECT kb_id FROM files WHERE id = ?").bind(id).fetch_optional(&pool).await?;
     let kb_id = file_kb.ok_or_else(|| ApiError::NotFound("File not found".to_string()))?;
     match kb_id {
         Some(kid) => {
@@ -876,9 +894,10 @@ pub async fn move_to_kb(
     Extension(auth_user): Extension<AuthUser>, Path(id): Path<i64>, Json(req): Json<MoveFileReq>,
 ) -> ApiResult<Json<File>> {
     if let Some(target_kb_id) = req.target_kb_id
-        && target_kb_id <= 0 {
-            return Err(ApiError::BadRequest("Invalid target_kb_id".to_string()));
-        }
+        && target_kb_id <= 0
+    {
+        return Err(ApiError::BadRequest("Invalid target_kb_id".to_string()));
+    }
 
     let is_admin = auth_user.is_admin();
     let file: File = sqlx::query_as::<_, File>("SELECT * FROM files WHERE id = ?")
@@ -913,7 +932,8 @@ pub async fn move_to_kb(
     // Check target KB permission
     let target_kb_type: Option<String> = match req.target_kb_id {
         Some(target_kb_id) => {
-            let perm = super::knowledge_base::get_kb_permission(&pool, target_kb_id, &auth_user.user_id, is_admin).await;
+            let perm =
+                super::knowledge_base::get_kb_permission(&pool, target_kb_id, &auth_user.user_id, is_admin).await;
             if !super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
                 return Err(ApiError::Forbidden("Permission denied on target knowledge base.".to_string()));
             }
@@ -956,9 +976,10 @@ pub async fn move_to_kb(
     let cfg = config::get();
     let pdf_path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", id));
     if let Err(e) = fs::remove_file(&pdf_path).await
-        && !matches!(e.kind(), std::io::ErrorKind::NotFound) {
-            warn!("Failed to delete converted pdf {} after file move: {}", pdf_path.display(), e);
-        }
+        && !matches!(e.kind(), std::io::ErrorKind::NotFound)
+    {
+        warn!("Failed to delete converted pdf {} after file move: {}", pdf_path.display(), e);
+    }
 
     let moved: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
     Ok(Json(moved))
@@ -1086,13 +1107,17 @@ async fn query_deletable_files(pool: &SqlitePool, ids: &[i64], auth_user: &AuthU
         return Ok(all_files);
     }
 
-    // Filter: keep files where user has editor permission on the KB, or owns unassigned files
+    // Filter: keep files where user has editor permission on the KB, or owns unassigned files.
+    // Batch-resolve KB permissions to avoid an N+1 query per file.
+    let kb_ids: Vec<i64> = all_files.iter().filter_map(|f| f.kb_id).collect();
+    let perms = super::knowledge_base::get_kb_permissions_batch(pool, &kb_ids, &auth_user.user_id, false).await;
+
     let mut deletable = Vec::new();
     for file in all_files {
         match file.kb_id {
             Some(kb_id) => {
-                let perm = super::knowledge_base::get_kb_permission(pool, kb_id, &auth_user.user_id, false).await;
-                if super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
+                let perm = perms.get(&kb_id).map(String::as_str);
+                if super::knowledge_base::meets_requirement(perm, "editor") {
                     deletable.push(file);
                 }
             }
@@ -1204,10 +1229,13 @@ async fn query_failed_file_ids_for_reparse(
             qb.push(" SELECT id, kb_type FROM descendants WHERE kb_type != ");
             qb.push_bind("storage");
             let rows: Vec<(i64, String)> = qb.build_query_as().fetch_all(pool).await?;
+            let desc_kb_ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+            let perms =
+                super::knowledge_base::get_kb_permissions_batch(pool, &desc_kb_ids, &auth_user.user_id, is_admin).await;
             let mut allowed_kb_ids: Vec<i64> = Vec::new();
             for (desc_kb_id, _) in rows {
-                let perm = super::knowledge_base::get_kb_permission(pool, desc_kb_id, &auth_user.user_id, is_admin).await;
-                if super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
+                let perm = perms.get(&desc_kb_id).map(String::as_str);
+                if super::knowledge_base::meets_requirement(perm, "editor") {
                     allowed_kb_ids.push(desc_kb_id);
                 }
             }
@@ -1253,6 +1281,11 @@ async fn query_failed_file_ids_for_reparse(
     qb.push(" ORDER BY f.updated_at DESC");
     let rows: Vec<(i64, Option<i64>)> = qb.build_query_as().fetch_all(pool).await?;
 
+    // Batch-resolve permissions for all assigned KBs to avoid an N+1 query per file.
+    let assigned_kb_ids: Vec<i64> = rows.iter().filter_map(|(_, kb)| *kb).collect();
+    let perms =
+        super::knowledge_base::get_kb_permissions_batch(pool, &assigned_kb_ids, &auth_user.user_id, is_admin).await;
+
     let mut allowed_ids = Vec::new();
     for (file_id, file_kb_id) in rows {
         match file_kb_id {
@@ -1263,8 +1296,8 @@ async fn query_failed_file_ids_for_reparse(
                 }
             }
             Some(kid) => {
-                let perm = super::knowledge_base::get_kb_permission(pool, kid, &auth_user.user_id, is_admin).await;
-                if super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
+                let perm = perms.get(&kid).map(String::as_str);
+                if super::knowledge_base::meets_requirement(perm, "editor") {
                     allowed_ids.push(file_id);
                 }
             }
@@ -1283,9 +1316,10 @@ async fn remove_converted_pdfs(file_ids: &[i64]) {
     for file_id in file_ids {
         let pdf_path = pdf_root.join(format!("{}.pdf", file_id));
         if let Err(e) = fs::remove_file(&pdf_path).await
-            && !matches!(e.kind(), std::io::ErrorKind::NotFound) {
-                warn!("Failed to delete converted pdf {}: {}", pdf_path.display(), e);
-            }
+            && !matches!(e.kind(), std::io::ErrorKind::NotFound)
+        {
+            warn!("Failed to delete converted pdf {}: {}", pdf_path.display(), e);
+        }
     }
 }
 
@@ -1324,37 +1358,40 @@ pub(crate) async fn cleanup_deleted_files(
     let cfg = config::get();
     for file in files {
         if let Err(e) = fs::remove_file(&file.path).await
-            && !matches!(e.kind(), std::io::ErrorKind::NotFound) {
-                warn!("Failed to delete file {}: {}", file.path, e);
-                cleanup_failed.push(BatchDeleteCleanupFailedItem {
-                    id: file.id,
-                    stage: "file".to_string(),
-                    error: e.to_string(),
-                });
-            }
+            && !matches!(e.kind(), std::io::ErrorKind::NotFound)
+        {
+            warn!("Failed to delete file {}: {}", file.path, e);
+            cleanup_failed.push(BatchDeleteCleanupFailedItem {
+                id: file.id,
+                stage: "file".to_string(),
+                error: e.to_string(),
+            });
+        }
 
         let pdf_path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", file.id));
         if let Err(e) = fs::remove_file(&pdf_path).await
-            && !matches!(e.kind(), std::io::ErrorKind::NotFound) {
-                warn!("Failed to delete converted pdf {}: {}", pdf_path.display(), e);
-                cleanup_failed.push(BatchDeleteCleanupFailedItem {
-                    id: file.id,
-                    stage: "pdf".to_string(),
-                    error: e.to_string(),
-                });
-            }
+            && !matches!(e.kind(), std::io::ErrorKind::NotFound)
+        {
+            warn!("Failed to delete converted pdf {}: {}", pdf_path.display(), e);
+            cleanup_failed.push(BatchDeleteCleanupFailedItem {
+                id: file.id,
+                stage: "pdf".to_string(),
+                error: e.to_string(),
+            });
+        }
 
         // 清理压缩文件解压目录
         let archive_dir = std::path::Path::new(&cfg.storage.archives_path).join(file.id.to_string());
         if archive_dir.exists()
-            && let Err(e) = tokio::fs::remove_dir_all(&archive_dir).await {
-                warn!("Failed to delete archive dir {}: {}", archive_dir.display(), e);
-                cleanup_failed.push(BatchDeleteCleanupFailedItem {
-                    id: file.id,
-                    stage: "archive".to_string(),
-                    error: e.to_string(),
-                });
-            }
+            && let Err(e) = tokio::fs::remove_dir_all(&archive_dir).await
+        {
+            warn!("Failed to delete archive dir {}: {}", archive_dir.display(), e);
+            cleanup_failed.push(BatchDeleteCleanupFailedItem {
+                id: file.id,
+                stage: "archive".to_string(),
+                error: e.to_string(),
+            });
+        }
 
         if let Err(e) = search_engine.delete(Some(file.id), None).await {
             warn!("Failed to delete search index for file {}: {}", file.id, e);
@@ -1501,10 +1538,11 @@ pub(crate) async fn collect_image_raw_paths_for_files(
         let rows: Vec<(i64, Option<String>)> = qb.build_query_as().fetch_all(pool).await?;
         for (file_id, meta) in rows {
             if let Some(paths) = extract_custom_image_paths_from_meta(meta.as_deref())
-                && let Some(state) = states.get_mut(&file_id) {
-                    state.meta_checked = true;
-                    state.paths.extend(paths);
-                }
+                && let Some(state) = states.get_mut(&file_id)
+            {
+                state.meta_checked = true;
+                state.paths.extend(paths);
+            }
         }
     }
 
@@ -1516,9 +1554,10 @@ pub(crate) async fn collect_image_raw_paths_for_files(
     let mut regex_paths = extract_slice_image_paths_by_file(pool, &regex_candidate_ids).await?;
     for file_id in regex_candidate_ids {
         if let Some(paths) = regex_paths.remove(&file_id)
-            && let Some(state) = states.get_mut(&file_id) {
-                state.paths.extend(paths);
-            }
+            && let Some(state) = states.get_mut(&file_id)
+        {
+            state.paths.extend(paths);
+        }
     }
 
     let mut raw_paths = Vec::new();
@@ -1802,14 +1841,17 @@ pub(crate) async fn remove_image_files(image_paths: Vec<String>) {
         }
         if let Err(e) = fs::remove_file(&full_path).await {
             if matches!(e.kind(), std::io::ErrorKind::NotFound) {
-                if !candidate.is_absolute() && (trimmed.contains('/') || trimmed.contains('\\'))
-                    && let Some(file_name) = candidate.file_name() {
-                        let fallback_path = images_root.join(file_name);
-                        if let Err(e) = fs::remove_file(&fallback_path).await
-                            && !matches!(e.kind(), std::io::ErrorKind::NotFound) {
-                                log::warn!("Failed to delete image {}: {}", fallback_path.display(), e);
-                            }
+                if !candidate.is_absolute()
+                    && (trimmed.contains('/') || trimmed.contains('\\'))
+                    && let Some(file_name) = candidate.file_name()
+                {
+                    let fallback_path = images_root.join(file_name);
+                    if let Err(e) = fs::remove_file(&fallback_path).await
+                        && !matches!(e.kind(), std::io::ErrorKind::NotFound)
+                    {
+                        log::warn!("Failed to delete image {}: {}", fallback_path.display(), e);
                     }
+                }
             } else {
                 log::warn!("Failed to delete image {}: {}", full_path.display(), e);
             }
@@ -1857,12 +1899,14 @@ pub async fn list(
         // 明确指定查询未分配知识库的文件
         Some("null") | Some("unassigned") => {
             if is_admin {
-                sqlx::query_as("SELECT * FROM files WHERE kb_id IS NULL ORDER BY created_at DESC")
-                    .fetch_all(&pool)
-                    .await?
+                sqlx::query_as(&format!(
+                    "SELECT {FILE_COLS_NO_CONTENT} FROM files WHERE kb_id IS NULL ORDER BY created_at DESC"
+                ))
+                .fetch_all(&pool)
+                .await?
             } else {
                 sqlx::query_as(
-                    "SELECT * FROM files WHERE kb_id IS NULL AND (user_id = ? OR is_public = 1) ORDER BY created_at DESC",
+                    &format!("SELECT {FILE_COLS_NO_CONTENT} FROM files WHERE kb_id IS NULL AND (user_id = ? OR is_public = 1) ORDER BY created_at DESC"),
                 )
                 .bind(&auth_user.user_id)
                 .fetch_all(&pool)
@@ -1874,13 +1918,15 @@ pub async fn list(
             let kb_id = kb_id_str.parse::<i64>().map_err(|_| ApiError::internal("Invalid kb_id format"))?;
             ensure_kb_accessible(&pool, kb_id, &auth_user.user_id, is_admin).await?;
             if is_admin {
-                sqlx::query_as("SELECT * FROM files WHERE kb_id = ? ORDER BY created_at DESC")
-                    .bind(kb_id)
-                    .fetch_all(&pool)
-                    .await?
+                sqlx::query_as(&format!(
+                    "SELECT {FILE_COLS_NO_CONTENT} FROM files WHERE kb_id = ? ORDER BY created_at DESC"
+                ))
+                .bind(kb_id)
+                .fetch_all(&pool)
+                .await?
             } else {
                 sqlx::query_as(
-                    "SELECT * FROM files WHERE kb_id = ? AND (user_id = ? OR is_public = 1) ORDER BY created_at DESC",
+                    &format!("SELECT {FILE_COLS_NO_CONTENT} FROM files WHERE kb_id = ? AND (user_id = ? OR is_public = 1) ORDER BY created_at DESC"),
                 )
                 .bind(kb_id)
                 .bind(&auth_user.user_id)
@@ -1891,9 +1937,11 @@ pub async fn list(
         // 不传参数，查询所有文件
         None => {
             if is_admin {
-                sqlx::query_as("SELECT * FROM files ORDER BY created_at DESC").fetch_all(&pool).await?
+                sqlx::query_as(&format!("SELECT {FILE_COLS_NO_CONTENT} FROM files ORDER BY created_at DESC"))
+                    .fetch_all(&pool)
+                    .await?
             } else {
-                sqlx::query_as("SELECT * FROM files WHERE (user_id = ? OR is_public = 1) ORDER BY created_at DESC")
+                sqlx::query_as(&format!("SELECT {FILE_COLS_NO_CONTENT} FROM files WHERE (user_id = ? OR is_public = 1) ORDER BY created_at DESC"))
                     .bind(&auth_user.user_id)
                     .fetch_all(&pool)
                     .await?
@@ -2075,7 +2123,7 @@ pub async fn get_slices(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> 
 )]
 pub async fn get_image_by_filename(
     Path(filename): Path<String>,
-) -> Result<(StatusCode, [(header::HeaderName, String); 1], Body), ApiError> {
+) -> Result<(StatusCode, [(header::HeaderName, String); 2], Body), ApiError> {
     let mut components = std::path::Path::new(&filename).components();
     match components.next() {
         Some(Component::Normal(_)) if components.next().is_none() => {}
@@ -2088,10 +2136,10 @@ pub async fn get_image_by_filename(
         return Err(ApiError::NotFound("Image not found".to_string()));
     }
 
-    let file_content = fs::read(&image_path).await?;
+    let (len, body) = open_file_stream(&image_path).await?;
     let mime_type = mime_guess::from_path(&filename).first_or_octet_stream().to_string();
 
-    Ok((StatusCode::OK, [(header::CONTENT_TYPE, mime_type)], Body::from(file_content)))
+    Ok((StatusCode::OK, [(header::CONTENT_TYPE, mime_type), (header::CONTENT_LENGTH, len.to_string())], body))
 }
 
 /// 下载文件
@@ -2114,21 +2162,25 @@ pub async fn get_image_by_filename(
 )]
 pub async fn download(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
-) -> Result<(StatusCode, [(header::HeaderName, String); 2], Body), ApiError> {
+) -> Result<(StatusCode, [(header::HeaderName, String); 3], Body), ApiError> {
     let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
 
     if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
         return Err(ApiError::NotFound("File not found or permission denied".to_string()));
     }
 
-    let file_content = tokio::fs::read(&file.path).await?;
+    let (len, body) = open_file_stream(std::path::Path::new(&file.path)).await?;
     let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().to_string();
     let content_disposition = format!("attachment; filename=\"{}\"", file.filename);
 
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, mime_type), (header::CONTENT_DISPOSITION, content_disposition)],
-        Body::from(file_content),
+        [
+            (header::CONTENT_TYPE, mime_type),
+            (header::CONTENT_DISPOSITION, content_disposition),
+            (header::CONTENT_LENGTH, len.to_string()),
+        ],
+        body,
     ))
 }
 
@@ -2209,26 +2261,27 @@ pub async fn get_highlighted_pdf(
         let mut bounds: HashMap<i32, pdf_highlight::PageCoordBounds> = HashMap::new();
         for row in rows {
             if let Ok(bbox) = serde_json::from_str::<Vec<f32>>(&row.bbox)
-                && bbox.len() == 4 {
-                    let x1 = bbox[0];
-                    let y1 = bbox[1];
-                    let x2 = bbox[2];
-                    let y2 = bbox[3];
-                    let min_x = x1.min(x2);
-                    let min_y = y1.min(y2);
-                    let max_x = x1.max(x2);
-                    let max_y = y1.max(y2);
+                && bbox.len() == 4
+            {
+                let x1 = bbox[0];
+                let y1 = bbox[1];
+                let x2 = bbox[2];
+                let y2 = bbox[3];
+                let min_x = x1.min(x2);
+                let min_y = y1.min(y2);
+                let max_x = x1.max(x2);
+                let max_y = y1.max(y2);
 
-                    bounds
-                        .entry(row.page_idx)
-                        .and_modify(|b| {
-                            b.min_x = b.min_x.min(min_x);
-                            b.min_y = b.min_y.min(min_y);
-                            b.max_x = b.max_x.max(max_x);
-                            b.max_y = b.max_y.max(max_y);
-                        })
-                        .or_insert(pdf_highlight::PageCoordBounds { min_x, min_y, max_x, max_y });
-                }
+                bounds
+                    .entry(row.page_idx)
+                    .and_modify(|b| {
+                        b.min_x = b.min_x.min(min_x);
+                        b.min_y = b.min_y.min(min_y);
+                        b.max_x = b.max_x.max(max_x);
+                        b.max_y = b.max_y.max(max_y);
+                    })
+                    .or_insert(pdf_highlight::PageCoordBounds { min_x, min_y, max_x, max_y });
+            }
         }
 
         bounds.retain(|_, b| {
@@ -2338,9 +2391,10 @@ pub async fn excel_data(
 
         for sheet_name in &sheet_names {
             if let Some(ref target) = filter_sheet
-                && sheet_name != target {
-                    continue;
-                }
+                && sheet_name != target
+            {
+                continue;
+            }
 
             let range = match workbook.worksheet_range(sheet_name) {
                 Ok(r) => r,
@@ -2600,17 +2654,19 @@ pub async fn archive_download(
 
     // 尝试从解压目录读取
     if let Some(resolved) = archive::resolve_archive_entry_path(&cfg.storage.archives_path, id, entry_path)
-        && resolved.exists() && resolved.is_file() {
-            let file_content = fs::read(&resolved).await?;
-            let mime_type = mime_guess::from_path(entry_path).first_or_octet_stream().to_string();
-            let filename = std::path::Path::new(entry_path).file_name().and_then(|n| n.to_str()).unwrap_or(entry_path);
-            let content_disposition = format!("attachment; filename=\"{}\"", filename);
-            return Ok((
-                StatusCode::OK,
-                [(header::CONTENT_TYPE, mime_type), (header::CONTENT_DISPOSITION, content_disposition)],
-                Body::from(file_content),
-            ));
-        }
+        && resolved.exists()
+        && resolved.is_file()
+    {
+        let file_content = fs::read(&resolved).await?;
+        let mime_type = mime_guess::from_path(entry_path).first_or_octet_stream().to_string();
+        let filename = std::path::Path::new(entry_path).file_name().and_then(|n| n.to_str()).unwrap_or(entry_path);
+        let content_disposition = format!("attachment; filename=\"{}\"", filename);
+        return Ok((
+            StatusCode::OK,
+            [(header::CONTENT_TYPE, mime_type), (header::CONTENT_DISPOSITION, content_disposition)],
+            Body::from(file_content),
+        ));
+    }
 
     // 如果解压目录没有，尝试直接从压缩包读取（ZIP/TAR 支持）
     let src_path = file.path.clone();

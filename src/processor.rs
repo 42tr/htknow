@@ -7,6 +7,7 @@ use std::{
 use base64::{Engine, engine::general_purpose::STANDARD};
 use log::{debug, error, info, warn};
 use lopdf::Document;
+use once_cell::sync::Lazy;
 use reqwest::multipart;
 use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
@@ -17,6 +18,12 @@ use crate::{
         File, collect_image_paths_for_files, collect_image_raw_paths_for_files, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta
     }, archive, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, SearchEngine, tantivy_engine}
 };
+
+/// 复用的外部服务 HTTP client（连接池），超时取自启动时配置。
+static SERVICES_HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
+    let timeout = Duration::from_secs(config::get().services.request_timeout_secs);
+    reqwest::Client::builder().timeout(timeout).build().expect("build services http client")
+});
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Result {
@@ -469,8 +476,8 @@ impl FileProcessor {
     }
 
     fn services_http_client(&self) -> anyhow::Result<reqwest::Client> {
-        let timeout = Duration::from_secs(config::get().services.request_timeout_secs);
-        Ok(reqwest::Client::builder().timeout(timeout).build()?)
+        // 复用全局 client，避免每次请求重建连接池（reqwest::Client 内部 Arc，clone 廉价）
+        Ok(SERVICES_HTTP_CLIENT.clone())
     }
 
     /// 启动后台处理任务
@@ -782,12 +789,11 @@ impl FileProcessor {
                 return Ok(());
             }
 
-            if !skip_reuse
-                && timing.step("reuse_check", self.try_reuse_existing_data(file)).await? {
-                    timing.set_pipeline("reuse");
-                    info!("File {} reused existing parsed data, skipping processing pipeline", file.id);
-                    return Ok(());
-                }
+            if !skip_reuse && timing.step("reuse_check", self.try_reuse_existing_data(file)).await? {
+                timing.set_pipeline("reuse");
+                info!("File {} reused existing parsed data, skipping processing pipeline", file.id);
+                return Ok(());
+            }
 
             timing
                 .step("set_processing_status", async {
@@ -880,12 +886,13 @@ impl FileProcessor {
             }
 
             if let Some(custom_url) = custom_url
-                && is_pdf {
-                    timing.set_pipeline("custom_parser");
-                    info!("Custom parse enabled, routing file {} to {}", file.id, custom_url);
-                    self.process_file_with_custom_parser(file, custom_url, Some(&mut timing)).await?;
-                    return Ok(());
-                }
+                && is_pdf
+            {
+                timing.set_pipeline("custom_parser");
+                info!("Custom parse enabled, routing file {} to {}", file.id, custom_url);
+                self.process_file_with_custom_parser(file, custom_url, Some(&mut timing)).await?;
+                return Ok(());
+            }
 
             if is_pdf {
                 timing.set_pipeline("pdf");
@@ -955,8 +962,7 @@ impl FileProcessor {
             self.save_custom_images(&normalized.images, timing.as_deref_mut()).await?;
         }
 
-        self.save_custom_slices(file, &normalized.slices, normalized.full_content.as_deref(), timing)
-            .await?;
+        self.save_custom_slices(file, &normalized.slices, normalized.full_content.as_deref(), timing).await?;
 
         Ok(())
     }
@@ -1085,9 +1091,10 @@ impl FileProcessor {
         if let Some(items) = content_list.as_mut() {
             for item in items {
                 if let Some(img_path) = item.img_path.as_deref()
-                    && let Some(new_path) = Self::lookup_image_mapping(&image_mapping, img_path) {
-                        item.img_path = Some(new_path);
-                    }
+                    && let Some(new_path) = Self::lookup_image_mapping(&image_mapping, img_path)
+                {
+                    item.img_path = Some(new_path);
+                }
             }
         }
 
@@ -1159,9 +1166,10 @@ impl FileProcessor {
         let mut refs = Vec::new();
         for cap in api_re.captures_iter(content) {
             if let Some(path) = cap.get(1).map(|m| m.as_str().trim()).filter(|path| !path.is_empty())
-                && !refs.iter().any(|existing| existing == path) {
-                    refs.push(path.to_string());
-                }
+                && !refs.iter().any(|existing| existing == path)
+            {
+                refs.push(path.to_string());
+            }
         }
         for cap in markdown_re.captures_iter(content) {
             let Some(path) = cap.get(1).map(|m| m.as_str().trim()).filter(|path| !path.is_empty()) else {
@@ -1600,70 +1608,77 @@ impl FileProcessor {
 
     /// 解析 Excel 文件，按 sheet+行 生成切片
     async fn parse_excel_to_slices(&self, file: &File) -> anyhow::Result<Vec<SliceWithPositions>> {
-        use calamine::{Reader, open_workbook_auto};
+        // calamine 打开/解析 Excel 是同步阻塞的 CPU+IO，放到阻塞线程池，避免阻塞 async 运行时
+        let path = file.path.clone();
+        let file_id = file.id;
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<SliceWithPositions>> {
+            use calamine::{Reader, open_workbook_auto};
 
-        let path = std::path::Path::new(&file.path);
-        let mut workbook: calamine::Sheets<std::io::BufReader<std::fs::File>> =
-            open_workbook_auto(path).map_err(|e| anyhow::anyhow!("Failed to open Excel file: {}", e))?;
+            let path = std::path::Path::new(&path);
+            let mut workbook: calamine::Sheets<std::io::BufReader<std::fs::File>> =
+                open_workbook_auto(path).map_err(|e| anyhow::anyhow!("Failed to open Excel file: {}", e))?;
 
-        let mut slices = Vec::new();
-        let sheet_names = workbook.sheet_names().to_vec();
+            let mut slices = Vec::new();
+            let sheet_names = workbook.sheet_names().to_vec();
 
-        for (sheet_idx, sheet_name) in sheet_names.iter().enumerate() {
-            let range = match workbook.worksheet_range(sheet_name) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!("Failed to read sheet '{}' in file {}: {}", sheet_name, file.id, e);
-                    continue;
-                }
-            };
-
-            let rows: Vec<_> = range.rows().collect();
-            if rows.len() < 2 {
-                continue;
-            }
-
-            let header: Vec<String> = rows[0]
-                .iter()
-                .enumerate()
-                .map(|(col_idx, cell)| {
-                    let s = cell.to_string().trim().to_string();
-                    if s.is_empty() { format!("列{}", col_idx + 1) } else { s }
-                })
-                .collect();
-
-            for (row_idx, row) in rows.iter().enumerate().skip(1) {
-                let mut lines = Vec::new();
-                let mut has_data = false;
-
-                for (col_idx, cell) in row.iter().enumerate() {
-                    let value = cell.to_string().trim().to_string();
-                    if !value.is_empty() {
-                        let header_label = header.get(col_idx).cloned().unwrap_or_else(|| format!("列{}", col_idx + 1));
-                        lines.push(format!("{}: {}", header_label, value));
-                        has_data = true;
+            for (sheet_idx, sheet_name) in sheet_names.iter().enumerate() {
+                let range = match workbook.worksheet_range(sheet_name) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        warn!("Failed to read sheet '{}' in file {}: {}", sheet_name, file_id, e);
+                        continue;
                     }
-                }
+                };
 
-                if !has_data {
+                let rows: Vec<_> = range.rows().collect();
+                if rows.len() < 2 {
                     continue;
                 }
 
-                let mut content = format!("Sheet: {}\n", sheet_name);
-                content.push_str(&lines.join("\n"));
+                let header: Vec<String> = rows[0]
+                    .iter()
+                    .enumerate()
+                    .map(|(col_idx, cell)| {
+                        let s = cell.to_string().trim().to_string();
+                        if s.is_empty() { format!("列{}", col_idx + 1) } else { s }
+                    })
+                    .collect();
 
-                let positions = vec![SlicePosition {
-                    page_idx: sheet_idx as i32,
-                    bbox: [0, 0, 0, 0],
-                    sheet_name: Some(sheet_name.clone()),
-                    row_num: Some((row_idx + 1) as i32),
-                }];
+                for (row_idx, row) in rows.iter().enumerate().skip(1) {
+                    let mut lines = Vec::new();
+                    let mut has_data = false;
 
-                slices.push(SliceWithPositions { content, positions });
+                    for (col_idx, cell) in row.iter().enumerate() {
+                        let value = cell.to_string().trim().to_string();
+                        if !value.is_empty() {
+                            let header_label =
+                                header.get(col_idx).cloned().unwrap_or_else(|| format!("列{}", col_idx + 1));
+                            lines.push(format!("{}: {}", header_label, value));
+                            has_data = true;
+                        }
+                    }
+
+                    if !has_data {
+                        continue;
+                    }
+
+                    let mut content = format!("Sheet: {}\n", sheet_name);
+                    content.push_str(&lines.join("\n"));
+
+                    let positions = vec![SlicePosition {
+                        page_idx: sheet_idx as i32,
+                        bbox: [0, 0, 0, 0],
+                        sheet_name: Some(sheet_name.clone()),
+                        row_num: Some((row_idx + 1) as i32),
+                    }];
+
+                    slices.push(SliceWithPositions { content, positions });
+                }
             }
-        }
 
-        Ok(slices)
+            Ok(slices)
+        })
+        .await?
     }
 
     /// 处理 PDF 文件，调用 MinerU API
@@ -1930,9 +1945,12 @@ impl FileProcessor {
         let cfg = config::get();
 
         if !is_image && cfg.services.mineru_max_pages > 0 {
-            match Document::load(&file.path) {
-                Ok(doc) => {
-                    let total_pages = doc.get_pages().len();
+            // lopdf 解析整个 PDF 是同步阻塞操作（仅用于获取页数），放到阻塞线程池
+            let path = file.path.clone();
+            let page_count =
+                tokio::task::spawn_blocking(move || Document::load(&path).map(|doc| doc.get_pages().len())).await?;
+            match page_count {
+                Ok(total_pages) => {
                     if total_pages > cfg.services.mineru_max_pages {
                         return timed_step_opt(timing.as_deref_mut(), "mineru_api_in_ranges", async {
                             self.call_mineru_api_in_ranges(file, total_pages, cfg.services.mineru_max_pages).await
@@ -2185,8 +2203,7 @@ impl FileProcessor {
             Ok(tokio::fs::read_to_string(file.path.as_str()).await?)
         })
         .await?;
-        self.process_plain_text_content(file, &content, "Processing completed successfully", timing)
-            .await
+        self.process_plain_text_content(file, &content, "Processing completed successfully", timing).await
     }
 
     async fn process_audio_file(&self, file: &File, mut timing: Option<&mut ParseTimingCtx>) -> anyhow::Result<()> {
@@ -2207,9 +2224,10 @@ impl FileProcessor {
         let cfg = config::get();
         let mut req_builder = client.post(&cfg.services.audio_transcription_url).multipart(form);
         if let Some(key) = &cfg.services.audio_transcription_key
-            && !key.is_empty() {
-                req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
-            }
+            && !key.is_empty()
+        {
+            req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
+        }
 
         let response =
             timed_step_opt(timing.as_deref_mut(), "audio_transcription_api", async { Ok(req_builder.send().await?) })
@@ -2901,9 +2919,10 @@ impl FileProcessor {
         }
         let mut source_for_reindex = source.clone();
         if !meta_image_mapping.is_empty()
-            && let Some(content) = source_for_reindex.content.clone() {
-                source_for_reindex.content = Some(Self::rewrite_custom_image_refs(&content, &meta_image_mapping));
-            }
+            && let Some(content) = source_for_reindex.content.clone()
+        {
+            source_for_reindex.content = Some(Self::rewrite_custom_image_refs(&content, &meta_image_mapping));
+        }
 
         let mut tx = self.pool.begin().await?;
         self.insert_pdf_rows(&mut tx, target.id, &pdf_rows, &image_mapping).await?;
@@ -2992,9 +3011,7 @@ impl FileProcessor {
         (jobs, mapping)
     }
 
-    fn prepare_raw_image_jobs(
-        paths: &[String], source_id: i64, target_id: i64,
-    ) -> RawImageJobs {
+    fn prepare_raw_image_jobs(paths: &[String], source_id: i64, target_id: i64) -> RawImageJobs {
         let mut jobs = Vec::new();
         let mut mapping = HashMap::new();
         let mut target_paths = Vec::new();
