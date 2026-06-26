@@ -490,13 +490,21 @@ impl FileProcessor {
                 error!("Failed to reset in-progress files: {}", e);
             }
 
+            // 自适应轮询：队列空闲时逐步拉长检查间隔，有任务到达后立即回到基础间隔，
+            // 避免长期无文件时仍以固定频率空转查询数据库。上限取基础间隔的 3 倍，
+            // 兼顾空闲负载与新文件的响应延迟。
+            let base_interval = processor.interval;
+            let max_idle_interval = base_interval * 3;
+            let mut idle_interval = base_interval;
+
             loop {
                 if is_parse_paused() {
-                    debug!("File processor paused, sleeping for {:?}", processor.interval);
-                    time::sleep(processor.interval).await;
+                    debug!("File processor paused, sleeping for {:?}", base_interval);
+                    time::sleep(base_interval).await;
                     continue;
                 }
                 // 持续处理直到没有待处理的文件
+                let mut did_work = false;
                 loop {
                     if is_parse_paused() {
                         debug!("File processor paused while processing queue");
@@ -510,6 +518,7 @@ impl FileProcessor {
                                 break;
                             }
                             // 有更多文件，继续处理
+                            did_work = true;
                             debug!("More files pending, continuing processing");
                         }
                         Err(e) => {
@@ -519,8 +528,13 @@ impl FileProcessor {
                     }
                 }
 
-                // 等待指定时间后再次检查
-                time::sleep(processor.interval).await;
+                // 根据是否处理过文件调整下次检查的等待时间
+                if did_work {
+                    idle_interval = base_interval;
+                } else {
+                    idle_interval = (idle_interval * 2).min(max_idle_interval);
+                }
+                time::sleep(idle_interval).await;
             }
         });
     }
@@ -1845,25 +1859,27 @@ impl FileProcessor {
             .await?;
         }
 
-        let (full_content, full_segments) = timed_step_opt(timing.as_deref_mut(), "build_full_content", async {
-            Ok(self.build_full_content_and_segments(&content_list))
-        })
-        .await?;
-
-        // 根据 slice_type 决定切片方式
-        let slices = timed_step_opt(timing.as_deref_mut(), "slice_build", async {
-            let slices = if file.slice_type == "smart" || file.slice_type.is_empty() {
-                // 智能切片：使用 content_list
-                self.smart_slice_content_with_positions(&content_list)?
-            } else if file.slice_type == "fixed" {
-                self.fixed_slice_content_with_positions(&full_content, &full_segments)?
-            } else {
-                self.slice_content(&full_content, &file.slice_type)?
-                    .into_iter()
-                    .map(|content| SliceWithPositions { content, positions: vec![] })
-                    .collect()
-            };
-            Ok(slices)
+        // 构建全文与切片均为 CPU 密集操作，合并放到阻塞线程池执行，避免阻塞异步运行时。
+        // content_list 在此之后不再使用，直接移入闭包。
+        let slice_type = file.slice_type.clone();
+        let (full_content, slices) = timed_step_opt(timing.as_deref_mut(), "slice_build", async {
+            tokio::task::spawn_blocking(move || -> anyhow::Result<(String, Vec<SliceWithPositions>)> {
+                let (full_content, full_segments) = Self::build_full_content_and_segments(&content_list);
+                let slices = if slice_type == "smart" || slice_type.is_empty() {
+                    // 智能切片：使用 content_list
+                    Self::smart_slice_content_with_positions(&content_list)?
+                } else if slice_type == "fixed" {
+                    Self::fixed_slice_content_with_positions(&full_content, &full_segments)?
+                } else {
+                    Self::slice_content(&full_content, &slice_type)?
+                        .into_iter()
+                        .map(|content| SliceWithPositions { content, positions: vec![] })
+                        .collect()
+                };
+                Ok((full_content, slices))
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("slice task failed: {e}"))?
         })
         .await?;
 
@@ -2253,9 +2269,13 @@ impl FileProcessor {
         if !self.ensure_file_exists(file.id, "before writing slices").await? {
             return Ok(());
         }
-        // 示例：根据 slice_type 进行分片处理
+        // 示例：根据 slice_type 进行分片处理（CPU 密集，放到阻塞线程池）
         let slices = timed_step_opt(timing.as_deref_mut(), "slice_build", async {
-            self.slice_content(content, &file.slice_type)
+            let content_owned = content.to_string();
+            let slice_type = file.slice_type.clone();
+            tokio::task::spawn_blocking(move || Self::slice_content(&content_owned, &slice_type))
+                .await
+                .map_err(|e| anyhow::anyhow!("slice_content task failed: {e}"))?
         })
         .await?;
         let slice_count = slices.len();
@@ -2454,7 +2474,7 @@ impl FileProcessor {
     }
 
     /// 根据 slice_type 对内容进行分片
-    fn slice_content(&self, content: &str, slice_type: &str) -> anyhow::Result<Vec<String>> {
+    fn slice_content(content: &str, slice_type: &str) -> anyhow::Result<Vec<String>> {
         match slice_type {
             "paragraph" => {
                 // 按段落分片（以双换行符分隔）
@@ -2500,7 +2520,7 @@ impl FileProcessor {
         }
     }
 
-    fn build_full_content_and_segments(&self, content_list: &[ContentItem]) -> (String, Vec<Segment>) {
+    fn build_full_content_and_segments(content_list: &[ContentItem]) -> (String, Vec<Segment>) {
         let mut full_content = String::new();
         let mut segments = Vec::new();
         let mut current_len = 0usize;
@@ -2560,7 +2580,7 @@ impl FileProcessor {
     }
 
     fn fixed_slice_content_with_positions(
-        &self, content: &str, segments: &[Segment],
+        content: &str, segments: &[Segment],
     ) -> anyhow::Result<Vec<SliceWithPositions>> {
         let cfg = config::get();
         let chunk_size = cfg.slice.smart_slice_max_chars;
@@ -2589,9 +2609,7 @@ impl FileProcessor {
         Ok(slices)
     }
 
-    fn smart_slice_content_with_positions(
-        &self, content_list: &[ContentItem],
-    ) -> anyhow::Result<Vec<SliceWithPositions>> {
+    fn smart_slice_content_with_positions(content_list: &[ContentItem]) -> anyhow::Result<Vec<SliceWithPositions>> {
         let cfg = config::get();
         let max_chars = cfg.slice.smart_slice_max_chars;
 
@@ -2620,7 +2638,7 @@ impl FileProcessor {
 
                         // 如果当前有累积的内容，先保存
                         if !current_slice.trim().is_empty() {
-                            self.flush_slice_with_positions(
+                            Self::flush_slice_with_positions(
                                 &mut slices,
                                 &mut current_slice,
                                 &mut current_segments,
@@ -2696,7 +2714,7 @@ impl FileProcessor {
             if test_len > max_chars {
                 // 超过限制，保存当前切片
                 if !current_slice.trim().is_empty() {
-                    self.flush_slice_with_positions(&mut slices, &mut current_slice, &mut current_segments, max_chars);
+                    Self::flush_slice_with_positions(&mut slices, &mut current_slice, &mut current_segments, max_chars);
                     current_len = 0;
                 }
 
@@ -2759,28 +2777,25 @@ impl FileProcessor {
 
         // 保存最后的切片
         if !current_slice.trim().is_empty() {
-            self.flush_slice_with_positions(&mut slices, &mut current_slice, &mut current_segments, max_chars);
+            Self::flush_slice_with_positions(&mut slices, &mut current_slice, &mut current_segments, max_chars);
         }
 
         Ok(slices)
     }
 
     fn flush_slice_with_positions(
-        &self, slices: &mut Vec<SliceWithPositions>, current_slice: &mut String, segments: &mut Vec<Segment>,
-        max_chars: usize,
+        slices: &mut Vec<SliceWithPositions>, current_slice: &mut String, segments: &mut Vec<Segment>, max_chars: usize,
     ) {
         if current_slice.trim().is_empty() {
             return;
         }
         let content = std::mem::take(current_slice);
         let segment_data = std::mem::take(segments);
-        let mut new_slices = self.split_slice_with_positions(&content, &segment_data, max_chars);
+        let mut new_slices = Self::split_slice_with_positions(&content, &segment_data, max_chars);
         slices.append(&mut new_slices);
     }
 
-    fn split_slice_with_positions(
-        &self, content: &str, segments: &[Segment], max_chars: usize,
-    ) -> Vec<SliceWithPositions> {
+    fn split_slice_with_positions(content: &str, segments: &[Segment], max_chars: usize) -> Vec<SliceWithPositions> {
         let char_count = content.chars().count();
         if char_count == 0 {
             return Vec::new();

@@ -5,7 +5,7 @@ use std::{
 use anyhow::Context;
 use log::info;
 use sqlx::{
-    Row, SqlitePool, sqlite::{SqliteConnectOptions, SqlitePoolOptions}
+    Row, SqlitePool, sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous}
 };
 
 use crate::config;
@@ -33,12 +33,23 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     );
 
     let is_file_db = sqlite_path_from_url(database_url).is_some();
-    let connect_options = database_url
+    let mut connect_options = database_url
         .parse::<SqliteConnectOptions>()
         .with_context(|| format!("failed to parse sqlite database url: {}", database_url))?
         .create_if_missing(is_file_db)
         .foreign_keys(true)
         .busy_timeout(Duration::from_millis(cfg.database.busy_timeout_ms));
+
+    // 文件型 SQLite 的写性能调优：WAL 下 NORMAL 同步级别足够安全且明显更快；
+    // 增大页缓存与 mmap、临时表落内存，减少磁盘 IO。内存库无需这些设置。
+    if is_file_db {
+        connect_options = connect_options
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .pragma("cache_size", "-65536") // 64MB 页缓存（负值表示 KB）
+            .pragma("mmap_size", "268435456") // 256MB 内存映射
+            .pragma("temp_store", "MEMORY");
+    }
 
     info!("Connecting to SQLite database...");
 

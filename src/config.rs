@@ -260,7 +260,8 @@ impl DatabaseConfig {
     fn from_env() -> Self {
         Self {
             url: env_or("DATABASE_URL", "sqlite://data/app.sqlite"),
-            max_connections: env_or_parse("HTKNOW_DB_MAX_CONNECTIONS", 50),
+            // 文件型 SQLite 写操作串行，连接数过高只会加剧锁竞争；WAL 下读可并发，16 足够。
+            max_connections: env_or_parse("HTKNOW_DB_MAX_CONNECTIONS", 16),
             busy_timeout_ms: env_or_parse("HTKNOW_DB_BUSY_TIMEOUT_MS", 5000),
             init_default_kbs: env_or_parse("HTKNOW_DB_INIT_DEFAULT_KBS", true),
         }

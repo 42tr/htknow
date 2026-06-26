@@ -32,7 +32,7 @@ async fn open_file_stream(path: &std::path::Path) -> Result<(u64, Body), ApiErro
 /// `files` 表去掉大字段 `content` 的列清单（content 以 NULL 占位）。
 ///
 /// 列表类查询不需要全文 content，用此清单避免把可能很大的 content 列从 SQLite 读进内存。
-const FILE_COLS_NO_CONTENT: &str = "id, user_id, user_name, hash, filename, path, size, NULL as content, \
+pub(crate) const FILE_COLS_NO_CONTENT: &str = "id, user_id, user_name, hash, filename, path, size, NULL as content, \
      tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at";
 
 /// Excel 单 sheet 数据
@@ -482,7 +482,10 @@ pub async fn upload(
             .await?
             .last_insert_rowid();
 
-        let mut file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+        let mut file: File = sqlx::query_as(&format!("SELECT {FILE_COLS_NO_CONTENT} FROM files WHERE id = ?"))
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
         if file.status == 3 {
             uploaded_files.push(file);
             uploaded_file_ids.push(id);
@@ -495,7 +498,10 @@ pub async fn upload(
                 match processor::try_reuse_file_with_file(pool.clone(), search_engine.clone(), file.clone()).await {
                     Ok(true) => {
                         reused_now = true;
-                        file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+                        file = sqlx::query_as(&format!("SELECT {FILE_COLS_NO_CONTENT} FROM files WHERE id = ?"))
+                            .bind(id)
+                            .fetch_one(&pool)
+                            .await?;
                     }
                     Ok(false) => {}
                     Err(e) => {
@@ -1189,6 +1195,24 @@ pub(crate) async fn delete_file_rows_in_tx(
         files_qb.build().execute(&mut **tx).await?;
     }
 
+    Ok(())
+}
+
+/// 每批文件在独立事务里删除的批大小。SQLite 写串行，单个超大事务会长时间持有写锁、
+/// 阻塞其它写入；分批提交把锁持有时间限制在每批范围内。
+const FILE_DELETE_TX_BATCH_SIZE: usize = 500;
+
+/// 分批删除文件相关行，每批独立提交。
+///
+/// 与 [`delete_file_rows_in_tx`] 的区别：后者把全部删除塞进调用方的单个事务（适合少量文件、
+/// 需要与其它操作原子提交的场景）；本函数用于删除可能极多的文件（如删除整个知识库），
+/// 牺牲整体原子性换取更短的写锁持有时间。失败时已提交的批次不会回滚，重试可继续。
+pub(crate) async fn delete_file_rows_batched(pool: &SqlitePool, file_ids: &[i64]) -> Result<(), sqlx::Error> {
+    for batch in file_ids.chunks(FILE_DELETE_TX_BATCH_SIZE) {
+        let mut tx = pool.begin().await?;
+        delete_file_rows_in_tx(&mut tx, batch).await?;
+        tx.commit().await?;
+    }
     Ok(())
 }
 
@@ -2574,7 +2598,17 @@ pub async fn archive_extract(
         }
     };
 
-    // 写入数据库
+    // 写入数据库：批量 INSERT 的多个 chunk 与末尾的 meta 更新合并进单个事务，
+    // 把多次提交合成一次 fsync，并保证 entries 与 meta 的原子性。
+    let meta = serde_json::json!({
+        "archive": {
+            "extracted": true,
+            "needs_password": false,
+            "entry_count": entries.len()
+        }
+    });
+
+    let mut tx = pool.begin().await?;
     if !entries.is_empty() {
         let binds_per_row = 4_usize;
         let max_vars = 999_usize;
@@ -2588,23 +2622,15 @@ pub async fn archive_extract(
                     .push_bind(entry.size)
                     .push_bind(entry.is_directory);
             });
-            chunk_qb.build().execute(&pool).await?;
+            chunk_qb.build().execute(&mut *tx).await?;
         }
     }
-
-    // 更新 meta
-    let meta = serde_json::json!({
-        "archive": {
-            "extracted": true,
-            "needs_password": false,
-            "entry_count": entries.len()
-        }
-    });
     sqlx::query("UPDATE files SET meta = ?, updated_at = strftime('%s','now') WHERE id = ?")
         .bind(meta.to_string())
         .bind(id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await?;
+    tx.commit().await?;
 
     Ok(Json(ExtractResult { entries, needs_password: false }))
 }

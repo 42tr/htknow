@@ -62,7 +62,7 @@ impl Document {
 pub async fn init() -> Result<()> {
     let cfg = config::get();
     let storage_path = &cfg.storage.lancedb_path;
-    std::fs::create_dir_all(storage_path)?;
+    tokio::fs::create_dir_all(storage_path).await?;
 
     let db = connect(storage_path).execute().await?;
     LANCEDB.set(Arc::new(db)).map_err(|_| anyhow::anyhow!("Failed to initialize LanceDB"))?;

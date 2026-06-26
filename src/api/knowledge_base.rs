@@ -949,7 +949,8 @@ pub async fn delete(
         ));
     }
 
-    let mut files_qb = QueryBuilder::new("SELECT * FROM files WHERE kb_id IN (");
+    let mut files_qb =
+        QueryBuilder::new(format!("SELECT {} FROM files WHERE kb_id IN (", super::file::FILE_COLS_NO_CONTENT));
     let mut files_separated = files_qb.separated(", ");
     for kb_id in &all_kb_ids {
         files_separated.push_bind(kb_id);
@@ -960,10 +961,12 @@ pub async fn delete(
     let file_ids: Vec<i64> = files.iter().map(|f| f.id).collect();
     let image_paths = super::file::collect_image_paths_for_files(&pool, &file_ids).await?;
 
+    // 先分批删除文件相关行（每批独立提交）。删除整个知识库时文件数可能极多，
+    // 单个事务级联删除会长时间持有 SQLite 写锁、阻塞其它写入；分批提交把锁持有时间限制在每批内。
+    super::file::delete_file_rows_batched(&pool, &file_ids).await?;
+
+    // 文件已删除，再在一个短事务里删除知识库本身（含子库由外键级联处理，与原行为一致）。
     let mut tx = pool.begin().await?;
-
-    super::file::delete_file_rows_in_tx(&mut tx, &file_ids).await?;
-
     let result = sqlx::query("DELETE FROM knowledge_bases WHERE id = ?").bind(id).execute(&mut *tx).await?;
 
     if result.rows_affected() == 0 {

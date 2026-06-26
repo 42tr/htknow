@@ -347,6 +347,10 @@ impl SearchEngine {
         Ok(())
     }
 
+    /// 批量写入切片到默认索引与 LanceDB。
+    ///
+    /// 注意：写入后不会自动 reload reader，调用方需在完成全部写入后调用 [`reload_readers`]，
+    /// 避免批量处理时每次写入都重建 reader。
     pub async fn write_batch(
         &self, docs: Vec<tantivy_engine::Document>, image_embeddings: Vec<Option<Vec<f32>>>,
     ) -> anyhow::Result<()> {
@@ -357,7 +361,6 @@ impl SearchEngine {
         {
             let _guard = self.index_write_lock.lock().await;
             tantivy_engine::write_documents_batch(&self.index, &self.schema, docs.clone()).await?;
-            reload_reader(&self.index_reader, "index")?;
         }
 
         let lancedb_docs: Vec<lancedb::Document> = docs
@@ -376,11 +379,11 @@ impl SearchEngine {
         Ok(())
     }
 
+    /// 写入全文索引。注意：写入后不会自动 reload reader，调用方需在完成全部写入后调用 [`reload_readers`]。
     pub async fn write_full(&self, doc: tantivy_engine::Document) -> anyhow::Result<()> {
         {
             let _guard = self.full_index_write_lock.lock().await;
             tantivy_engine::write_documents(&self.full_index, &self.full_schema, doc).await?;
-            reload_reader(&self.full_index_reader, "full_index")?;
         }
         Ok(())
     }

@@ -179,10 +179,18 @@ fn create_writer_with_timing_blocking(index: &Index, label: &str) -> tantivy::Re
 }
 
 pub async fn write_documents(index: &Index, schema: &Schema, doc: Document) -> tantivy::Result<()> {
-    let mut index_writer = create_writer(index).await?;
-    index_writer.add_document(create_document(doc, schema))?;
-    index_writer.commit()?;
-    Ok(())
+    // 建 writer、add_document、commit 均为 CPU+IO 阻塞操作（commit 需 flush segment 到磁盘），
+    // 放到阻塞线程池执行，避免阻塞异步运行时。
+    let index = index.clone();
+    let schema = schema.clone();
+    tokio::task::spawn_blocking(move || -> tantivy::Result<()> {
+        let mut index_writer = create_writer_blocking(&index)?;
+        index_writer.add_document(create_document(doc, &schema))?;
+        index_writer.commit()?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| TantivyError::SystemError(format!("write_documents task panicked: {e}")))?
 }
 
 pub async fn create_rebuild_writer(index: &Index, label: &str) -> tantivy::Result<tantivy::IndexWriter> {
@@ -212,10 +220,17 @@ pub async fn write_documents_batch(index: &Index, schema: &Schema, docs: Vec<Doc
     if docs.is_empty() {
         return Ok(());
     }
-    let mut index_writer = create_writer(index).await?;
-    let doc_count = add_documents(&mut index_writer, schema, docs)?;
-    commit_writer(&mut index_writer, "write_documents_batch", doc_count)?;
-    Ok(())
+    // 建 writer、批量 add、commit 均为 CPU+IO 阻塞操作，放到阻塞线程池执行。
+    let index = index.clone();
+    let schema = schema.clone();
+    tokio::task::spawn_blocking(move || -> tantivy::Result<()> {
+        let mut index_writer = create_writer_blocking(&index)?;
+        let doc_count = add_documents(&mut index_writer, &schema, docs)?;
+        commit_writer(&mut index_writer, "write_documents_batch", doc_count)?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| TantivyError::SystemError(format!("write_documents_batch task panicked: {e}")))?
 }
 
 pub fn search_sync(
