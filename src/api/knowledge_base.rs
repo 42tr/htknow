@@ -828,12 +828,9 @@ pub async fn get(
     let status_breakdown =
         file::get_file_status_breakdown_for_kb(&pool, id, true, &auth_user.user_id, is_admin).await?;
 
-    // Compute permission for each child KB
-    let mut child_perms = HashMap::new();
-    for kb in &children_kbs {
-        let cp = get_kb_permission(&pool, kb.id, &user_id, is_admin).await;
-        child_perms.insert(kb.id, cp.unwrap_or_else(|| "viewer".to_string()));
-    }
+    // Compute permission for each child KB in a fixed number of queries (avoid N+1).
+    let child_ids: Vec<i64> = children_kbs.iter().map(|kb| kb.id).collect();
+    let child_perms = get_kb_permissions_batch(&pool, &child_ids, &user_id, is_admin).await;
 
     let children_kbs: Vec<KnowledgeResponse> = children_kbs
         .into_iter()
@@ -859,20 +856,22 @@ pub async fn get(
         });
     }
 
-    // 3. Fetch the breadcrumb path
-    let mut path = Vec::new();
-    let mut current_parent_id = main_kb.parent_id;
-    while let Some(parent_id) = current_parent_id {
-        let parent_kb: Knowledge = sqlx::query_as(
-            "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE id = ?",
-        )
-        .bind(parent_id)
-        .fetch_one(&pool)
-        .await?;
-        current_parent_id = parent_kb.parent_id;
-        path.push(parent_kb);
-    }
-    path.reverse(); // Reverse to get the correct order from root to parent
+    // 3. Fetch the breadcrumb path in a single recursive CTE query (root -> parent),
+    //    avoiding one round-trip per ancestor level.
+    let path: Vec<Knowledge> = sqlx::query_as(
+        "WITH RECURSIVE ancestors(id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority, depth) AS ( \
+             SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority, 0 \
+             FROM knowledge_bases WHERE id = ? \
+             UNION ALL \
+             SELECT k.id, k.user_id, k.user_name, k.name, k.description, k.kb_type, k.parent_id, k.is_public, k.parse_priority, a.depth + 1 \
+             FROM knowledge_bases k INNER JOIN ancestors a ON k.id = a.parent_id \
+         ) \
+         SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority \
+         FROM ancestors ORDER BY depth DESC",
+    )
+    .bind(main_kb.parent_id)
+    .fetch_all(&pool)
+    .await?;
 
     // 4. Construct the response
     let response = KnowledgeDetailResponse {

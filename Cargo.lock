@@ -2424,6 +2424,7 @@ dependencies = [
  "axum 0.8.8",
  "base64",
  "bincode",
+ "bytes",
  "bzip2 0.4.4",
  "calamine",
  "chrono",

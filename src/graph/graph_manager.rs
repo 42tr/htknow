@@ -77,8 +77,8 @@ impl KnowledgeGraph {
         Ok(Self { graph, node_index, node_id_to_index, pool, kb_id })
     }
 
-    /// 添加节点
-    pub async fn add_node(&mut self, entity: &Entity) -> Result<NodeIndex> {
+    /// 添加节点（在给定事务连接上执行，调用方负责提交）
+    async fn add_node(&mut self, entity: &Entity, conn: &mut sqlx::SqliteConnection) -> Result<NodeIndex> {
         if let Some(&idx) = self.node_index.get(&entity.name) {
             return Ok(idx);
         }
@@ -99,7 +99,7 @@ impl KnowledgeGraph {
             .bind(&properties_json)
             .bind(entity.file_id)
             .bind(entity.kb_id.or(self.kb_id))
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *conn)
             .await?;
 
         let node = Node::from_entity(entity, id.0);
@@ -110,9 +110,9 @@ impl KnowledgeGraph {
         Ok(idx)
     }
 
-    /// 添加边
-    pub async fn add_edge(
-        &mut self, source_name: &str, target_name: &str, relation: &Relation,
+    /// 添加边（在给定事务连接上执行，调用方负责提交）
+    async fn add_edge(
+        &mut self, source_name: &str, target_name: &str, relation: &Relation, conn: &mut sqlx::SqliteConnection,
     ) -> Result<Option<petgraph::graph::EdgeIndex>> {
         let source_idx = match self.node_index.get(source_name) {
             Some(&idx) => idx,
@@ -141,7 +141,7 @@ impl KnowledgeGraph {
             .bind(&properties_json)
             .bind(relation.weight)
             .bind(relation.file_id)
-            .fetch_one(&self.pool)
+            .fetch_one(&mut *conn)
             .await?;
 
         let edge = Edge::from_relation(relation, id.0);
@@ -150,16 +150,19 @@ impl KnowledgeGraph {
         Ok(Some(edge_idx))
     }
 
-    /// 增量更新
+    /// 增量更新：所有实体/关系的写入在单个事务内完成，避免逐条提交的往返开销
     pub async fn incremental_update(&mut self, entities: Vec<Entity>, relations: Vec<Relation>) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+
         for entity in &entities {
-            self.add_node(entity).await?;
+            self.add_node(entity, &mut tx).await?;
         }
 
         for relation in &relations {
-            self.add_edge(&relation.source_name, &relation.target_name, relation).await?;
+            self.add_edge(&relation.source_name, &relation.target_name, relation, &mut tx).await?;
         }
 
+        tx.commit().await?;
         Ok(())
     }
 

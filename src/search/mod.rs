@@ -68,6 +68,30 @@ struct SynonymRow {
     bidirectional: i64,
 }
 
+/// 同义词表 TTL 缓存：避免每次查询都扫库。变更会在 TTL 窗口内生效。
+const SYNONYM_CACHE_TTL: Duration = Duration::from_secs(60);
+
+struct SynonymCache {
+    loaded_at: Instant,
+    rows: Vec<SynonymRow>,
+    /// row.term -> rows 下标
+    by_term: HashMap<String, Vec<usize>>,
+    /// row.synonym -> rows 下标
+    by_synonym: HashMap<String, Vec<usize>>,
+}
+
+impl SynonymCache {
+    fn build(rows: Vec<SynonymRow>) -> Self {
+        let mut by_term: HashMap<String, Vec<usize>> = HashMap::new();
+        let mut by_synonym: HashMap<String, Vec<usize>> = HashMap::new();
+        for (idx, row) in rows.iter().enumerate() {
+            by_term.entry(row.term.clone()).or_default().push(idx);
+            by_synonym.entry(row.synonym.clone()).or_default().push(idx);
+        }
+        Self { loaded_at: Instant::now(), rows, by_term, by_synonym }
+    }
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct LexiconRow {
     term: String,
@@ -109,6 +133,7 @@ pub struct SearchEngine {
     full_index_write_lock: Arc<Mutex<()>>,
     rebuild_lock: Arc<Mutex<()>>,
     pool: Option<SqlitePool>,
+    synonym_cache: Arc<tokio::sync::RwLock<Option<SynonymCache>>>,
 }
 
 impl SearchEngine {
@@ -129,6 +154,7 @@ impl SearchEngine {
             full_index_write_lock: Arc::new(Mutex::new(())),
             rebuild_lock: Arc::new(Mutex::new(())),
             pool: None,
+            synonym_cache: Arc::new(tokio::sync::RwLock::new(None)),
         }
     }
 
@@ -921,6 +947,36 @@ impl SearchEngine {
         Ok((slice_stats, full_stats))
     }
 
+    /// 确保同义词缓存新鲜（TTL 内复用，过期则重载全部 enabled 行）。
+    async fn ensure_synonym_cache(&self, pool: &SqlitePool) -> anyhow::Result<()> {
+        {
+            let guard = self.synonym_cache.read().await;
+            if let Some(cache) = guard.as_ref()
+                && cache.loaded_at.elapsed() < SYNONYM_CACHE_TTL
+            {
+                return Ok(());
+            }
+        }
+        let mut guard = self.synonym_cache.write().await;
+        // 双检：可能已有其他任务在等待写锁期间刷新过。
+        if let Some(cache) = guard.as_ref()
+            && cache.loaded_at.elapsed() < SYNONYM_CACHE_TTL
+        {
+            return Ok(());
+        }
+        let rows: Vec<SynonymRow> =
+            sqlx::query_as("SELECT term, synonym, weight, bidirectional FROM search_synonyms WHERE enabled = 1")
+                .fetch_all(pool)
+                .await?;
+        *guard = Some(SynonymCache::build(rows));
+        Ok(())
+    }
+
+    /// 主动失效同义词缓存（同义词增删改后调用，使变更立即生效）。
+    pub async fn invalidate_synonym_cache(&self) {
+        *self.synonym_cache.write().await = None;
+    }
+
     async fn load_query_synonyms(&self, query: &str) -> anyhow::Result<tantivy_engine::SynonymMap> {
         let cfg = config::get();
         if !cfg.search.synonym_enabled {
@@ -935,27 +991,26 @@ impl SearchEngine {
             return Ok(HashMap::new());
         }
 
-        let mut qb = QueryBuilder::new(
-            "SELECT term, synonym, weight, bidirectional FROM search_synonyms \
-            WHERE enabled = 1 AND (term IN (",
-        );
-        {
-            let mut separated = qb.separated(", ");
-            for term in &terms {
-                separated.push_bind(term);
-            }
+        self.ensure_synonym_cache(pool).await?;
+        let cache_guard = self.synonym_cache.read().await;
+        let Some(cache) = cache_guard.as_ref() else {
+            return Ok(HashMap::new());
+        };
+        if cache.rows.is_empty() {
+            return Ok(HashMap::new());
         }
-        qb.push(") OR synonym IN (");
-        {
-            let mut separated = qb.separated(", ");
-            for term in &terms {
-                separated.push_bind(term);
-            }
-        }
-        qb.push("))");
 
-        let rows: Vec<SynonymRow> = qb.build_query_as().fetch_all(pool).await?;
-        if rows.is_empty() {
+        // 收集与查询词相关的候选行下标（命中 term 或 synonym 列）。
+        let mut candidate_idx: HashSet<usize> = HashSet::new();
+        for term in &terms {
+            if let Some(idxs) = cache.by_term.get(term) {
+                candidate_idx.extend(idxs.iter().copied());
+            }
+            if let Some(idxs) = cache.by_synonym.get(term) {
+                candidate_idx.extend(idxs.iter().copied());
+            }
+        }
+        if candidate_idx.is_empty() {
             return Ok(HashMap::new());
         }
 
@@ -966,7 +1021,8 @@ impl SearchEngine {
         let boost_factor = cfg.search.synonym_boost.max(0.0);
         let mut total_inserted = 0usize;
 
-        for row in rows {
+        for idx in candidate_idx {
+            let row = &cache.rows[idx];
             let boost = row.weight.max(0.0) * boost_factor;
             if boost <= 0.0 {
                 continue;

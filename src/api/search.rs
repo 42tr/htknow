@@ -2221,7 +2221,8 @@ pub async fn list_synonyms(
     )
 )]
 pub async fn create_synonym(
-    State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Json(req): Json<CreateSynonymReq>,
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
+    Extension(auth_user): Extension<AuthUser>, Json(req): Json<CreateSynonymReq>,
 ) -> ApiResult<Json<SynonymItem>> {
     ensure_admin(&auth_user)?;
 
@@ -2259,6 +2260,7 @@ pub async fn create_synonym(
     let id = result.last_insert_rowid();
     let row =
         fetch_synonym_row_by_id(&pool, id).await?.ok_or_else(|| ApiError::internal("created synonym not found"))?;
+    search_engine.invalidate_synonym_cache().await;
     Ok(Json(synonym_row_to_item(row)))
 }
 
@@ -2283,8 +2285,8 @@ pub async fn create_synonym(
     )
 )]
 pub async fn update_synonym(
-    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
-    Json(req): Json<UpdateSynonymReq>,
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(search_engine): Extension<SearchEngine>,
+    Extension(auth_user): Extension<AuthUser>, Json(req): Json<UpdateSynonymReq>,
 ) -> ApiResult<Json<SynonymItem>> {
     ensure_admin(&auth_user)?;
 
@@ -2339,6 +2341,7 @@ pub async fn update_synonym(
 
     let row =
         fetch_synonym_row_by_id(&pool, id).await?.ok_or_else(|| ApiError::NotFound("synonym not found".to_string()))?;
+    search_engine.invalidate_synonym_cache().await;
     Ok(Json(synonym_row_to_item(row)))
 }
 
@@ -2361,7 +2364,8 @@ pub async fn update_synonym(
     )
 )]
 pub async fn delete_synonym(
-    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(search_engine): Extension<SearchEngine>,
+    Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<DeleteSynonymResponse>> {
     ensure_admin(&auth_user)?;
 
@@ -2370,6 +2374,7 @@ pub async fn delete_synonym(
         return Err(ApiError::NotFound("synonym not found".to_string()));
     }
 
+    search_engine.invalidate_synonym_cache().await;
     Ok(Json(DeleteSynonymResponse { id, deleted: true }))
 }
 
@@ -2393,8 +2398,8 @@ pub async fn delete_synonym(
     )
 )]
 pub async fn toggle_synonym_enabled(
-    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
-    Json(req): Json<ToggleSynonymReq>,
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(search_engine): Extension<SearchEngine>,
+    Extension(auth_user): Extension<AuthUser>, Json(req): Json<ToggleSynonymReq>,
 ) -> ApiResult<Json<SynonymItem>> {
     ensure_admin(&auth_user)?;
 
@@ -2409,6 +2414,7 @@ pub async fn toggle_synonym_enabled(
 
     let row =
         fetch_synonym_row_by_id(&pool, id).await?.ok_or_else(|| ApiError::NotFound("synonym not found".to_string()))?;
+    search_engine.invalidate_synonym_cache().await;
     Ok(Json(synonym_row_to_item(row)))
 }
 

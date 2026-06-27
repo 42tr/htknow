@@ -1378,47 +1378,62 @@ async fn execute_reparse_failed(
 pub(crate) async fn cleanup_deleted_files(
     search_engine: &SearchEngine, files: &[File], image_paths: Vec<String>,
 ) -> Vec<BatchDeleteCleanupFailedItem> {
-    let mut cleanup_failed = Vec::new();
     let cfg = config::get();
-    for file in files {
-        if let Err(e) = fs::remove_file(&file.path).await
-            && !matches!(e.kind(), std::io::ErrorKind::NotFound)
-        {
-            warn!("Failed to delete file {}: {}", file.path, e);
-            cleanup_failed.push(BatchDeleteCleanupFailedItem {
-                id: file.id,
-                stage: "file".to_string(),
-                error: e.to_string(),
-            });
-        }
 
-        let pdf_path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", file.id));
-        if let Err(e) = fs::remove_file(&pdf_path).await
-            && !matches!(e.kind(), std::io::ErrorKind::NotFound)
-        {
-            warn!("Failed to delete converted pdf {}: {}", pdf_path.display(), e);
-            cleanup_failed.push(BatchDeleteCleanupFailedItem {
-                id: file.id,
-                stage: "pdf".to_string(),
-                error: e.to_string(),
-            });
-        }
+    // 各文件的磁盘清理彼此独立，并发执行；搜索索引删除合并为一次批量提交。
+    let fs_cleanups = files.iter().map(|file| {
+        let cfg = cfg.clone();
+        async move {
+            let mut failed = Vec::new();
 
-        // 清理压缩文件解压目录
-        let archive_dir = std::path::Path::new(&cfg.storage.archives_path).join(file.id.to_string());
-        if archive_dir.exists()
-            && let Err(e) = tokio::fs::remove_dir_all(&archive_dir).await
-        {
-            warn!("Failed to delete archive dir {}: {}", archive_dir.display(), e);
-            cleanup_failed.push(BatchDeleteCleanupFailedItem {
-                id: file.id,
-                stage: "archive".to_string(),
-                error: e.to_string(),
-            });
-        }
+            if let Err(e) = fs::remove_file(&file.path).await
+                && !matches!(e.kind(), std::io::ErrorKind::NotFound)
+            {
+                warn!("Failed to delete file {}: {}", file.path, e);
+                failed.push(BatchDeleteCleanupFailedItem {
+                    id: file.id,
+                    stage: "file".to_string(),
+                    error: e.to_string(),
+                });
+            }
 
-        if let Err(e) = search_engine.delete(Some(file.id), None).await {
-            warn!("Failed to delete search index for file {}: {}", file.id, e);
+            let pdf_path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", file.id));
+            if let Err(e) = fs::remove_file(&pdf_path).await
+                && !matches!(e.kind(), std::io::ErrorKind::NotFound)
+            {
+                warn!("Failed to delete converted pdf {}: {}", pdf_path.display(), e);
+                failed.push(BatchDeleteCleanupFailedItem {
+                    id: file.id,
+                    stage: "pdf".to_string(),
+                    error: e.to_string(),
+                });
+            }
+
+            // 清理压缩文件解压目录
+            let archive_dir = std::path::Path::new(&cfg.storage.archives_path).join(file.id.to_string());
+            if archive_dir.exists()
+                && let Err(e) = tokio::fs::remove_dir_all(&archive_dir).await
+            {
+                warn!("Failed to delete archive dir {}: {}", archive_dir.display(), e);
+                failed.push(BatchDeleteCleanupFailedItem {
+                    id: file.id,
+                    stage: "archive".to_string(),
+                    error: e.to_string(),
+                });
+            }
+
+            failed
+        }
+    });
+
+    let (fs_results, _) = tokio::join!(futures::future::join_all(fs_cleanups), remove_image_files(image_paths));
+    let mut cleanup_failed: Vec<BatchDeleteCleanupFailedItem> = fs_results.into_iter().flatten().collect();
+
+    // 一次性删除所有文件的搜索索引，避免逐个文件触发 commit/锁竞争。
+    let file_ids: Vec<i64> = files.iter().map(|f| f.id).collect();
+    if let Err(e) = search_engine.delete_batch(Some(&file_ids), None).await {
+        warn!("Failed to delete search index for files {:?}: {}", file_ids, e);
+        for file in files {
             cleanup_failed.push(BatchDeleteCleanupFailedItem {
                 id: file.id,
                 stage: "search".to_string(),
@@ -1427,7 +1442,6 @@ pub(crate) async fn cleanup_deleted_files(
         }
     }
 
-    remove_image_files(image_paths).await;
     cleanup_failed
 }
 
@@ -2344,12 +2358,16 @@ pub async fn get_highlighted_pdf(
     // 读取原始 PDF
     let pdf_bytes = tokio::fs::read(&pdf_path).await?;
 
-    // 添加高亮标注
+    // 添加高亮标注（lopdf 解析为 CPU 密集操作，放到阻塞线程池执行）
     let highlighted_pdf = if positions.is_empty() {
         pdf_bytes
     } else {
-        pdf_highlight::add_highlights_to_pdf_with_bounds(&pdf_bytes, &positions, coord_bounds_by_page.as_ref())
-            .map_err(|e| ApiError::Internal(format!("Failed to add highlights: {}", e)))?
+        tokio::task::spawn_blocking(move || {
+            pdf_highlight::add_highlights_to_pdf_with_bounds(&pdf_bytes, &positions, coord_bounds_by_page.as_ref())
+        })
+        .await
+        .map_err(|e| ApiError::Internal(format!("PDF highlight task panicked: {}", e)))?
+        .map_err(|e| ApiError::Internal(format!("Failed to add highlights: {}", e)))?
     };
 
     let content_disposition = format!("inline; filename=\"highlighted_{}.pdf\"", file.id);

@@ -1511,8 +1511,9 @@ async fn export_lancedb(src_path: &str, dst_path: &str, kb_ids: &[i64]) -> anyho
 
     let dst_conn = lancedb::connect(dst_path).execute().await?;
 
-    let mut all_batches = Vec::new();
     let mut total_count = 0;
+    // 流式写出：每读到一个 batch 立即写入目标表，避免把全部数据（含向量）累积到内存。
+    let mut dst_table: Option<lancedb::Table> = None;
 
     for chunk in kb_ids.chunks(SQLITE_BATCH_SIZE) {
         let predicate = if chunk.len() == 1 {
@@ -1529,24 +1530,24 @@ async fn export_lancedb(src_path: &str, dst_path: &str, kb_ids: &[i64]) -> anyho
             let batch = batch_result?;
             chunk_count += batch.num_rows();
             total_count += batch.num_rows();
-            all_batches.push(batch);
+            match &dst_table {
+                None => {
+                    dst_conn.create_table("documents", batch).execute().await?;
+                    dst_table = Some(dst_conn.open_table("documents").execute().await?);
+                }
+                Some(table) => {
+                    table.add(batch).execute().await?;
+                }
+            }
         }
         info!("  [lancedb] Query chunk ({} kb_ids, {} rows): {}ms", chunk.len(), chunk_count, s.elapsed().as_millis());
     }
 
-    let s = std::time::Instant::now();
-    if all_batches.is_empty() {
-        // Create empty table with correct schema
+    if dst_table.is_none() {
+        // 没有任何数据：创建带正确 schema 的空表
         let empty_batch = create_empty_batch_for_schema(&schema)?;
         dst_conn.create_table("documents", empty_batch).execute().await?;
-    } else {
-        dst_conn.create_table("documents", all_batches.remove(0)).execute().await?;
-        for batch in all_batches {
-            let dst_table = dst_conn.open_table("documents").execute().await?;
-            dst_table.add(batch).execute().await?;
-        }
     }
-    info!("  [lancedb] Write to destination: {}ms", s.elapsed().as_millis());
 
     info!("Exported {} LanceDB rows to {} (total {}ms)", total_count, dst_path, step_start.elapsed().as_millis());
     Ok(total_count)

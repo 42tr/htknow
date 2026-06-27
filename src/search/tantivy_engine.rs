@@ -321,7 +321,26 @@ pub async fn search_with_snippet(
     reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     max_chars: usize, synonym_map: Option<&SynonymMap>,
 ) -> anyhow::Result<Vec<FullSearchResultItem>> {
-    search_with_snippet_sync(reader, schema, query, file_ids, kb_ids, max_chars, synonym_map)
+    // 搜索 + 取文档 + 生成 snippet 均为 CPU 密集的同步操作，放到阻塞线程池执行，避免阻塞异步运行时。
+    let reader = reader.clone();
+    let schema = schema.clone();
+    let query = query.to_string();
+    let file_ids = file_ids.cloned();
+    let kb_ids = kb_ids.cloned();
+    let synonym_map = synonym_map.cloned();
+    tokio::task::spawn_blocking(move || {
+        search_with_snippet_sync(
+            &reader,
+            &schema,
+            &query,
+            file_ids.as_ref(),
+            kb_ids.as_ref(),
+            max_chars,
+            synonym_map.as_ref(),
+        )
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("search_with_snippet task panicked: {e}"))?
 }
 
 pub async fn delete_by_file(index: &Index, schema: &Schema, file_id: i64) -> anyhow::Result<()> {

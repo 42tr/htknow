@@ -1441,7 +1441,9 @@ impl FileProcessor {
         let pdf_filename = format!("{}.pdf", file.id);
         let stored_pdf_path = pdf_dir.join(&pdf_filename);
         let temp_pdf_path = pdf_dir.join(format!(".{}.pdf.tmp", file.id));
-        let file_bytes = tokio::fs::read(&file.path).await?;
+        // 用 Bytes 包装文件内容：重试时只做引用计数 clone，避免大文件重复整份拷贝。
+        let file_bytes = bytes::Bytes::from(tokio::fs::read(&file.path).await?);
+        let file_len = file_bytes.len() as u64;
         let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string();
         let mut convert_url = reqwest::Url::parse(&cfg.services.office_convert_url)?;
         if !convert_url.query_pairs().any(|(key, _)| key == "target_format") {
@@ -1452,7 +1454,9 @@ impl FileProcessor {
         for attempt in 0..2 {
             let form = multipart::Form::new().part(
                 "file",
-                multipart::Part::bytes(file_bytes.clone()).file_name(file.filename.clone()).mime_str(&mime_type)?,
+                multipart::Part::stream_with_length(file_bytes.clone(), file_len)
+                    .file_name(file.filename.clone())
+                    .mime_str(&mime_type)?,
             );
 
             let client = self.services_http_client()?;
@@ -2180,29 +2184,52 @@ impl FileProcessor {
         };
 
         let mut content_list = data.content_list;
-        let mut images = HashMap::new();
-        for item in &mut content_list {
+
+        // 去重收集需要下载的图片（filename -> url）
+        let mut to_download: HashMap<String, String> = HashMap::new();
+        for item in &content_list {
             let Some(img_path) = item.img_path.as_deref() else { continue };
             let filename = std::path::Path::new(img_path)
                 .file_name()
                 .and_then(|name| name.to_str())
                 .unwrap_or(img_path)
                 .to_string();
+            to_download
+                .entry(filename)
+                .or_insert_with(|| format!("{}/output/{}", origin, img_path.trim_start_matches('/')));
+        }
 
-            if !images.contains_key(&filename) {
-                let image_url = format!("{}/output/{}", origin, img_path.trim_start_matches('/'));
-                let image_response = client.get(&image_url).send().await?;
-                if !image_response.status().is_success() {
-                    let error_text = image_response.text().await?;
-                    return Err(anyhow::anyhow!("MinerU image download failed: {}", error_text));
+        // 并发下载图片（限制并发数，避免打爆 MinerU），各图片之间无依赖。
+        use futures::stream::{StreamExt, TryStreamExt};
+        let images: HashMap<String, String> =
+            futures::stream::iter(to_download.into_iter().map(|(filename, image_url)| {
+                let client = client.clone();
+                async move {
+                    let image_response = client.get(&image_url).send().await?;
+                    if !image_response.status().is_success() {
+                        let error_text = image_response.text().await?;
+                        return Err(anyhow::anyhow!("MinerU image download failed: {}", error_text));
+                    }
+                    let image_bytes = image_response.bytes().await?;
+                    let image_mime = mime_guess::from_path(&filename).first_or_octet_stream().essence_str().to_string();
+                    let image_base64 = STANDARD.encode(image_bytes);
+                    anyhow::Ok((filename, format!("data:{};base64,{}", image_mime, image_base64)))
                 }
-                let image_bytes = image_response.bytes().await?;
-                let image_mime = mime_guess::from_path(&filename).first_or_octet_stream().essence_str().to_string();
-                let image_base64 = STANDARD.encode(image_bytes);
-                images.insert(filename.clone(), format!("data:{};base64,{}", image_mime, image_base64));
-            }
+            }))
+            .buffer_unordered(8)
+            .try_collect()
+            .await?;
 
-            item.img_path = Some(filename);
+        // 回填 img_path 为去掉目录的文件名
+        for item in &mut content_list {
+            if let Some(img_path) = item.img_path.as_deref() {
+                let filename = std::path::Path::new(img_path)
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or(img_path)
+                    .to_string();
+                item.img_path = Some(filename);
+            }
         }
 
         let content_list_json = serde_json::to_string(&content_list)?;
