@@ -32,7 +32,7 @@ const openPermissionModal = (kb) => {
 }
 
 // Export state
-const selectedKbIds = ref(new Set())
+const selectedKbs = ref(new Map())
 const exportLoading = ref(false)
 const exportIncludeChildren = ref(false)
 const exportRecords = ref([])
@@ -77,32 +77,46 @@ const clearExportRecords = () => {
   localStorage.removeItem(EXPORT_RECORDS_KEY)
 }
 
-const hasSelectedKbs = computed(() => selectedKbIds.value.size > 0)
-const selectedKbNames = computed(() => {
-  return childrenKbs.value
-    .filter(kb => selectedKbIds.value.has(kb.id))
-    .map(kb => kb.name)
+const selectedKbIds = computed(() => Array.from(selectedKbs.value.keys()))
+const selectedKbCount = computed(() => selectedKbs.value.size)
+const hasSelectedKbs = computed(() => selectedKbCount.value > 0)
+const selectedKbNames = computed(() => Array.from(selectedKbs.value.values()).map(kb => kb.name))
+const selectedKbPreview = computed(() => {
+  if (selectedKbNames.value.length === 0) return ''
+  if (selectedKbNames.value.length <= 3) return selectedKbNames.value.join('、')
+  return `${selectedKbNames.value.slice(0, 3).join('、')} 等 ${selectedKbNames.value.length} 个`
 })
 
-const toggleKbSelection = (kbId) => {
-  if (selectedKbIds.value.has(kbId)) {
-    selectedKbIds.value.delete(kbId)
+const toggleKbSelection = (kb) => {
+  const next = new Map(selectedKbs.value)
+  if (next.has(kb.id)) {
+    next.delete(kb.id)
   } else {
-    selectedKbIds.value.add(kbId)
+    next.set(kb.id, { id: kb.id, name: kb.name })
   }
+  selectedKbs.value = next
 }
 
 const selectAllKbs = () => {
-  if (selectedKbIds.value.size === childrenKbs.value.length) {
-    selectedKbIds.value.clear()
+  const currentPageIds = childrenKbs.value.map(kb => kb.id)
+  const allSelected = currentPageIds.length > 0 && currentPageIds.every(id => selectedKbs.value.has(id))
+  const next = new Map(selectedKbs.value)
+
+  if (allSelected) {
+    currentPageIds.forEach(id => next.delete(id))
   } else {
-    childrenKbs.value.forEach(kb => selectedKbIds.value.add(kb.id))
+    childrenKbs.value.forEach(kb => next.set(kb.id, { id: kb.id, name: kb.name }))
   }
+  selectedKbs.value = next
+}
+
+const clearSelectedKbs = () => {
+  selectedKbs.value = new Map()
 }
 
 const handleExport = async () => {
-  if (selectedKbIds.value.size === 0) return
-  const ids = Array.from(selectedKbIds.value)
+  if (selectedKbCount.value === 0) return
+  const ids = selectedKbIds.value
   const names = selectedKbNames.value
   const label = names.length <= 2 ? names.join('、') : `${names[0]} 等 ${names.length} 个`
   if (!confirm(`确定要导出「${label}」${exportIncludeChildren.value ? '（含子知识库）' : ''}吗？`)) return
@@ -112,7 +126,7 @@ const handleExport = async () => {
     const result = await api.exportKnowledgeBases(ids, exportIncludeChildren.value)
     addExportRecord(result)
     alert(`导出成功！\n路径：${result.export_path}`)
-    selectedKbIds.value.clear()
+    clearSelectedKbs()
   } catch (e) {
     alert('导出失败：' + e.message)
   } finally {
@@ -194,7 +208,6 @@ const loadKbContent = async (kbId) => {
     priorityDrafts.value = nextPriorityDrafts
     currentKb.value = newCurrentKb;
     setCurrentKb(newCurrentKb); // Update global store
-    selectedKbIds.value.clear()
     await fetchStats(targetId)
   } catch (e) {
     error.value = e.message
@@ -427,9 +440,21 @@ onMounted(() => {
         </button>
 
         <!-- Export Controls -->
-        <div v-if="childrenKbs.length > 0" class="flex items-center gap-2"
+        <div v-if="childrenKbs.length > 0 || hasSelectedKbs" class="flex items-center gap-2"
           :class="hasSelectedKbs ? 'opacity-100' : 'opacity-60'"
         >
+          <button
+            v-if="childrenKbs.length > 0"
+            @click="selectAllKbs"
+            type="button"
+            class="px-3 py-2 text-sm rounded-xl border border-slate-200 bg-white text-slate-600 hover:border-blue-300 hover:text-blue-600 transition-all duration-200"
+          >
+            {{
+              childrenKbs.length > 0 && childrenKbs.every(kb => selectedKbs.has(kb.id))
+                ? '取消本层全选'
+                : '全选本层'
+            }}
+          </button>
           <label class="flex items-center gap-1.5 text-sm text-slate-600 cursor-pointer select-none"
             @click.stop
           >
@@ -453,12 +478,37 @@ onMounted(() => {
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" />
             </svg>
-            {{ exportLoading ? '导出中...' : `导出选中 (${selectedKbIds.size})` }}
+            {{ exportLoading ? '导出中...' : `导出选中 (${selectedKbCount})` }}
+          </button>
+          <button
+            v-if="hasSelectedKbs"
+            @click="clearSelectedKbs"
+            type="button"
+            class="px-3 py-2 text-sm rounded-xl border border-slate-200 bg-white text-slate-500 hover:border-red-300 hover:text-red-600 transition-all duration-200"
+          >
+            清空已选
           </button>
         </div>
 
         <CreateKnowledgeBase :parent-id="currentKb?.id" @created="handleKbCreated" />
       </div>
+    </div>
+
+    <div
+      v-if="hasSelectedKbs"
+      class="mb-4 flex items-center justify-between gap-3 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800"
+    >
+      <div class="min-w-0">
+        <span class="font-medium">已选 {{ selectedKbCount }} 个知识库：</span>
+        <span class="truncate">{{ selectedKbPreview }}</span>
+      </div>
+      <button
+        type="button"
+        @click="clearSelectedKbs"
+        class="shrink-0 rounded-lg border border-blue-200 bg-white px-3 py-1.5 text-blue-700 hover:border-blue-300"
+      >
+        清空
+      </button>
     </div>
 
     <FileStatusSummary
@@ -506,8 +556,8 @@ onMounted(() => {
           <div class="absolute top-3 left-3 z-10" @click.stop>
             <input
               type="checkbox"
-              :checked="selectedKbIds.has(kb.id)"
-              @change="toggleKbSelection(kb.id)"
+              :checked="selectedKbs.has(kb.id)"
+              @change="toggleKbSelection(kb)"
               class="w-5 h-5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
             />
           </div>
