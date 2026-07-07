@@ -65,80 +65,62 @@
         const params = new URLSearchParams(window.location.search);
         const fileId = params.get("file_id") || params.get("fileId");
         const sliceId = params.get("slice_id") || params.get("sliceId");
-        const positionsParam = params.get("positions");
-        const pageParam = params.get("page");
 
         if (!fileId) {
           showError("Missing file_id parameter");
           return;
         }
 
-        // 构建带高亮的 PDF URL
-        let pdfUrl = `/api/v1/knowledge/files/${fileId}/highlighted-pdf`;
-        const queryParams = new URLSearchParams();
-
-        if (positionsParam) {
-          queryParams.set("positions", positionsParam);
-        } else if (sliceId) {
-          queryParams.set("slice_id", sliceId);
+        if (!sliceId) {
+          showError("Missing slice_id parameter");
+          return;
         }
 
-        const queryString = queryParams.toString();
-        if (queryString) {
-          pdfUrl += `?${queryString}`;
-        }
-
-        const resolveTargetPage = () => {
-          const page = Number(pageParam);
-          if (Number.isFinite(page) && page > 0) {
-            return Math.floor(page);
-          }
-          if (!positionsParam) {
-            return null;
-          }
+        async function resolveTargetPage() {
           try {
-            const decoded = atob(positionsParam);
-            const positions = JSON.parse(decoded);
-            if (!Array.isArray(positions) || positions.length === 0) {
-              return null;
-            }
-            let minIdx = Infinity;
-            for (const pos of positions) {
-              const idx = Number(pos?.page_idx);
-              if (Number.isFinite(idx) && idx < minIdx) {
-                minIdx = idx;
-              }
-            }
-            if (!Number.isFinite(minIdx)) {
-              return null;
-            }
-            return Math.max(1, minIdx + 1);
-          } catch (err) {
-            return null;
-          }
-        };
-
-        const targetPage = resolveTargetPage();
-
-        // 使用 fetch 获取 PDF（带认证 header），然后创建 blob URL 显示
-        fetch(pdfUrl, { headers: HEADERS })
-          .then((res) => {
+            const res = await fetch(
+              `/api/v1/knowledge/files/${fileId}/slices/${sliceId}/highlight-page`,
+              { headers: HEADERS }
+            );
             if (!res.ok) {
-              throw new Error(`Request failed: ${res.status}`);
+              return null;
             }
-            return res.blob();
-          })
-          .then((blob) => {
-            const blobUrl = URL.createObjectURL(blob);
-            const iframe = document.createElement("iframe");
-            iframe.src = targetPage ? `${blobUrl}#page=${targetPage}` : blobUrl;
-            iframe.title = "PDF Viewer";
-            container.innerHTML = "";
-            container.appendChild(iframe);
-          })
-          .catch((err) => {
-            showError(err.message || "Failed to load PDF");
-          });
+            const data = await res.json();
+            if (typeof data.page_idx === "number") {
+              // 后端返回 0-based 页码，PDF 查看器 #page= 需要 1-based
+              return data.page_idx + 1;
+            }
+          } catch (err) {
+            console.error("Failed to resolve highlight page:", err);
+          }
+          return null;
+        }
+
+        const pdfUrl = `/api/v1/knowledge/files/${fileId}/highlighted-pdf?slice_id=${encodeURIComponent(sliceId)}`;
+
+        (async () => {
+          const targetPage = await resolveTargetPage();
+
+          // 使用 fetch 获取 PDF（带认证 header），然后创建 blob URL 显示
+          fetch(pdfUrl, { headers: HEADERS })
+            .then((res) => {
+              if (!res.ok) {
+                throw new Error(`Request failed: ${res.status}`);
+              }
+              return res.blob();
+            })
+            .then((blob) => {
+              const blobUrl = URL.createObjectURL(blob);
+              const iframe = document.createElement("iframe");
+              iframe.src = targetPage ? `${blobUrl}#page=${targetPage}` : blobUrl;
+              iframe.title = "PDF Viewer";
+              container.innerHTML = "";
+              container.appendChild(iframe);
+            })
+            .catch((err) => {
+              showError(err.message || "Failed to load PDF");
+            });
+        })();
       })();
     </script>
   </body>

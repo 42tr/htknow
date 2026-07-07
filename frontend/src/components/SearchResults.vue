@@ -27,19 +27,19 @@ const isExcelFile = (filename) => {
 
 const getFileEmoji = (filename) => (isImageFile(filename) ? '🖼️' : '📄')
 
-const canHighlight = (result) =>
-  Boolean(result?.positions?.length) && isOfficeFile(result.file?.filename)
+const canHighlight = (result) => isOfficeFile(result.file?.filename)
 
 const openViewer = (result) => {
   if (!canHighlight(result)) return
 
+  const fileId = String(result.file?.id || '')
+  const sliceId = String(result.id)
+
   // Excel 文件 → 表格预览器
   if (isExcelFile(result.file?.filename)) {
-    const pos = result.positions?.[0]
     const params = new URLSearchParams({
-      file_id: String(result.file?.id || ''),
-      sheet_name: pos?.sheet_name || '',
-      row_num: String(pos?.row_num || ''),
+      file_id: fileId,
+      slice_id: sliceId,
     })
     window.open(`/excel-viewer.html?${params.toString()}`, '_blank', 'noopener')
     return
@@ -47,12 +47,9 @@ const openViewer = (result) => {
 
   // PDF/Word/PPT → PDF 高亮
   const params = new URLSearchParams({
-    file_id: String(result.file?.id || ''),
-    slice_id: String(result.id),
+    file_id: fileId,
+    slice_id: sliceId,
   })
-  if (Array.isArray(result.positions) && result.positions.length > 0) {
-    params.set('positions', btoa(JSON.stringify(result.positions)))
-  }
   const url = `/pdf-highlight.html?${params.toString()}`
   window.open(url, '_blank', 'noopener')
 }

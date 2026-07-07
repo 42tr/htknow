@@ -183,16 +183,26 @@ async fn insert_slice(pool: &SqlitePool, file_id: i64, content: &str) -> i64 {
 }
 
 async fn insert_slice_position(pool: &SqlitePool, slice_id: i64, page_idx: i32, bbox: [i32; 4]) {
-    sqlx::query("INSERT INTO slice_positions (slice_id, page_idx, x1, y1, x2, y2) VALUES (?, ?, ?, ?, ?, ?)")
-        .bind(slice_id)
-        .bind(page_idx)
-        .bind(bbox[0])
-        .bind(bbox[1])
-        .bind(bbox[2])
-        .bind(bbox[3])
-        .execute(pool)
-        .await
-        .unwrap();
+    insert_slice_position_full(pool, slice_id, page_idx, bbox, None, None).await;
+}
+
+async fn insert_slice_position_full(
+    pool: &SqlitePool, slice_id: i64, page_idx: i32, bbox: [i32; 4], sheet_name: Option<&str>, row_num: Option<i32>,
+) {
+    sqlx::query(
+        "INSERT INTO slice_positions (slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(slice_id)
+    .bind(page_idx)
+    .bind(bbox[0])
+    .bind(bbox[1])
+    .bind(bbox[2])
+    .bind(bbox[3])
+    .bind(sheet_name)
+    .bind(row_num)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 async fn insert_graph_node(
@@ -471,15 +481,154 @@ async fn file_endpoints_flow() {
     let slices_json = response_json(slices_res).await;
     let slices = slices_json.as_array().expect("slice list");
     let slice = slices.iter().find(|s| s["id"].as_i64() == Some(slice_id)).expect("slice entry");
-    let positions = slice["positions"].as_array().expect("slice positions");
-    assert_eq!(positions.len(), 1);
-    assert_eq!(positions[0]["page_idx"].as_i64(), Some(1));
-    assert_eq!(positions[0]["bbox"].as_array().unwrap().len(), 4);
+    assert_eq!(slice["file_id"].as_i64(), Some(file_id));
+    assert_eq!(slice["content"].as_str(), Some("slice content"));
+    assert!(slice["positions"].is_null(), "slices endpoint should not return positions");
 
     let delete_req = authed_empty_request("DELETE", format!("/api/v1/knowledge/files/{}", file_id), &user);
     let delete_res = app.clone().oneshot(delete_req).await.unwrap();
     assert_eq!(delete_res.status(), StatusCode::OK);
     assert!(!file_path.exists());
+}
+
+#[tokio::test]
+async fn slice_highlight_by_id() {
+    let app = app().await;
+    let pool = get_pool().await;
+    let env = setup_env();
+    let user = TestUser::new("slice_highlight");
+
+    let kb_id = insert_kb(&pool, &user, "Slice Highlight KB", "analysis", None, false).await;
+
+    let file_suffix = next_seq();
+    let file_dir = env.data_dir.join("files");
+    fs::create_dir_all(&file_dir).unwrap();
+    let file_path = file_dir.join(format!("highlight-{}.txt", file_suffix));
+    fs::write(&file_path, b"highlight content").unwrap();
+
+    let file_id = insert_file(&pool, &user, "highlight.txt", &file_path, Some(kb_id), Vec::new(), false).await;
+
+    let slice_id = insert_slice(&pool, file_id, "slice content").await;
+    insert_slice_position(&pool, slice_id, 2, [10, 20, 100, 30]).await;
+
+    // 查询切片高亮信息
+    let highlight_req = authed_empty_request(
+        "GET",
+        format!("/api/v1/knowledge/files/{}/slices/{}/highlight", file_id, slice_id),
+        &user,
+    );
+    let highlight_res = app.clone().oneshot(highlight_req).await.unwrap();
+    assert_eq!(highlight_res.status(), StatusCode::OK);
+    let highlight_json = response_json(highlight_res).await;
+    let positions = highlight_json["positions"].as_array().expect("positions array");
+    assert_eq!(positions.len(), 1);
+    assert_eq!(positions[0]["page_idx"].as_i64(), Some(2));
+    let bbox = positions[0]["bbox"].as_array().expect("bbox array");
+    assert_eq!(bbox.len(), 4);
+    assert_eq!(bbox[0].as_i64(), Some(10));
+    assert_eq!(bbox[3].as_i64(), Some(30));
+
+    // 切片不属于该文件应返回 400
+    let other_file_id = insert_file(&pool, &user, "other.txt", &file_path, Some(kb_id), Vec::new(), false).await;
+    let bad_req = authed_empty_request(
+        "GET",
+        format!("/api/v1/knowledge/files/{}/slices/{}/highlight", other_file_id, slice_id),
+        &user,
+    );
+    let bad_res = app.clone().oneshot(bad_req).await.unwrap();
+    assert_eq!(bad_res.status(), StatusCode::BAD_REQUEST);
+
+    // 不存在的切片应返回 404
+    let missing_req =
+        authed_empty_request("GET", format!("/api/v1/knowledge/files/{}/slices/{}/highlight", file_id, 999999), &user);
+    let missing_res = app.clone().oneshot(missing_req).await.unwrap();
+    assert_eq!(missing_res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn slice_highlight_page_by_id() {
+    let app = app().await;
+    let pool = get_pool().await;
+    let env = setup_env();
+    let user = TestUser::new("slice_highlight_page");
+
+    let kb_id = insert_kb(&pool, &user, "Slice Highlight Page KB", "analysis", None, false).await;
+
+    let file_suffix = next_seq();
+    let file_dir = env.data_dir.join("files");
+    fs::create_dir_all(&file_dir).unwrap();
+    let file_path = file_dir.join(format!("highlight-page-{}.txt", file_suffix));
+    fs::write(&file_path, b"highlight content").unwrap();
+
+    let file_id = insert_file(&pool, &user, "highlight-page.txt", &file_path, Some(kb_id), Vec::new(), false).await;
+
+    // 场景 1：第一页位置数量少于阈值（默认 20）且存在第二页，应返回第二页
+    let slice_id_a = insert_slice(&pool, file_id, "slice a").await;
+    for _ in 0..19 {
+        insert_slice_position(&pool, slice_id_a, 0, [10, 20, 100, 30]).await;
+    }
+    insert_slice_position(&pool, slice_id_a, 1, [10, 20, 100, 30]).await;
+
+    let req_a = authed_empty_request(
+        "GET",
+        format!("/api/v1/knowledge/files/{}/slices/{}/highlight-page", file_id, slice_id_a),
+        &user,
+    );
+    let res_a = app.clone().oneshot(req_a).await.unwrap();
+    assert_eq!(res_a.status(), StatusCode::OK);
+    let json_a = response_json(res_a).await;
+    assert_eq!(json_a["page_idx"].as_i64(), Some(1));
+
+    // 场景 2：第一页位置数量达到阈值，应返回第一页
+    let slice_id_b = insert_slice(&pool, file_id, "slice b").await;
+    for _ in 0..21 {
+        insert_slice_position(&pool, slice_id_b, 0, [10, 20, 100, 30]).await;
+    }
+    insert_slice_position(&pool, slice_id_b, 1, [10, 20, 100, 30]).await;
+
+    let req_b = authed_empty_request(
+        "GET",
+        format!("/api/v1/knowledge/files/{}/slices/{}/highlight-page", file_id, slice_id_b),
+        &user,
+    );
+    let res_b = app.clone().oneshot(req_b).await.unwrap();
+    assert_eq!(res_b.status(), StatusCode::OK);
+    let json_b = response_json(res_b).await;
+    assert_eq!(json_b["page_idx"].as_i64(), Some(0));
+
+    // 场景 3：只有一页且数量少于阈值，仍返回第一页
+    let slice_id_c = insert_slice(&pool, file_id, "slice c").await;
+    insert_slice_position(&pool, slice_id_c, 2, [10, 20, 100, 30]).await;
+
+    let req_c = authed_empty_request(
+        "GET",
+        format!("/api/v1/knowledge/files/{}/slices/{}/highlight-page", file_id, slice_id_c),
+        &user,
+    );
+    let res_c = app.clone().oneshot(req_c).await.unwrap();
+    assert_eq!(res_c.status(), StatusCode::OK);
+    let json_c = response_json(res_c).await;
+    assert_eq!(json_c["page_idx"].as_i64(), Some(2));
+
+    // 场景 4：切片没有高亮位置应返回 404
+    let slice_id_d = insert_slice(&pool, file_id, "slice d").await;
+    let req_d = authed_empty_request(
+        "GET",
+        format!("/api/v1/knowledge/files/{}/slices/{}/highlight-page", file_id, slice_id_d),
+        &user,
+    );
+    let res_d = app.clone().oneshot(req_d).await.unwrap();
+    assert_eq!(res_d.status(), StatusCode::NOT_FOUND);
+
+    // 场景 5：切片不属于该文件应返回 400
+    let other_file_id = insert_file(&pool, &user, "other.txt", &file_path, Some(kb_id), Vec::new(), false).await;
+    let req_bad = authed_empty_request(
+        "GET",
+        format!("/api/v1/knowledge/files/{}/slices/{}/highlight-page", other_file_id, slice_id_a),
+        &user,
+    );
+    let res_bad = app.clone().oneshot(req_bad).await.unwrap();
+    assert_eq!(res_bad.status(), StatusCode::BAD_REQUEST);
 }
 
 #[tokio::test]

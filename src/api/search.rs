@@ -165,33 +165,11 @@ pub struct SearchResultItem {
     pub file: Option<FileInfo>,
     /// 知识库信息
     pub kb: Option<KbInfo>,
-    /// 切片位置
-    pub positions: Option<Vec<SlicePosition>>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SearchResult {
     pub results: Vec<SearchResultItem>,
-}
-
-#[derive(Debug, Clone, Serialize, ToSchema)]
-pub struct SlicePosition {
-    pub page_idx: i32,
-    pub bbox: [i32; 4],
-    pub sheet_name: Option<String>,
-    pub row_num: Option<i32>,
-}
-
-#[derive(Debug, sqlx::FromRow)]
-struct SlicePositionRow {
-    slice_id: i64,
-    page_idx: i32,
-    x1: i32,
-    y1: i32,
-    x2: i32,
-    y2: i32,
-    sheet_name: Option<String>,
-    row_num: Option<i32>,
 }
 
 /// 全文搜索结果项
@@ -716,7 +694,6 @@ struct AdvancedSelectedSliceResult {
     kb: Option<KbInfo>,
     score: f32,
     content: String,
-    slice_ids: Vec<i64>,
 }
 
 #[derive(Default)]
@@ -884,12 +861,10 @@ async fn build_slice_results_from_raw(
 
     let file_ids: Vec<i64> = raw_results.iter().map(|r| r.file_id).collect();
     let kb_ids: Vec<i64> = raw_results.iter().filter_map(|r| r.kb_id).collect();
-    let slice_ids: Vec<i64> = raw_results.iter().map(|r| r.id).collect();
 
-    // 三条查询相互独立，并发执行
+    // 文件和知识库查询相互独立，并发执行
     let kb_fut = async { if !kb_ids.is_empty() { get_kbs_by_ids(pool, &kb_ids).await } else { Ok(HashMap::new()) } };
-    let (file_map, kb_map, slice_positions) =
-        tokio::try_join!(get_files_by_ids(pool, &file_ids), kb_fut, get_slice_positions(pool, &slice_ids))?;
+    let (file_map, kb_map) = tokio::try_join!(get_files_by_ids(pool, &file_ids), kb_fut)?;
 
     let allowed_kb_ids: HashSet<i64> = if is_admin {
         HashSet::new()
@@ -909,15 +884,7 @@ async fn build_slice_results_from_raw(
         if dedupe_by_content && !seen_contents.insert(r.content.clone()) {
             continue;
         }
-        results.push(SearchResultItem {
-            id: r.id,
-            file_id: r.file_id,
-            content: r.content,
-            score: r.score,
-            file,
-            kb,
-            positions: slice_positions.get(&r.id).cloned(),
-        });
+        results.push(SearchResultItem { id: r.id, file_id: r.file_id, content: r.content, score: r.score, file, kb });
     }
     Ok(results)
 }
@@ -1197,7 +1164,6 @@ async fn run_advanced_plan_steps(
                         kb: finalized.kb,
                         score: finalized.base_score,
                         content: finalized.final_content,
-                        slice_ids,
                     });
                     emitted = 1;
                 }
@@ -1280,15 +1246,6 @@ async fn run_advanced_slice_search_non_stream(
         return Ok(Vec::new());
     };
 
-    let slice_positions_map = get_slice_positions(pool, &selected.slice_ids).await?;
-    let mut merged_positions = Vec::new();
-    for slice_id in &selected.slice_ids {
-        if let Some(positions) = slice_positions_map.get(slice_id) {
-            merged_positions.extend(positions.iter().cloned());
-        }
-    }
-    let positions = if merged_positions.is_empty() { None } else { Some(merged_positions) };
-
     Ok(vec![SearchResultItem {
         id: selected.base_slice_id,
         file_id: selected.file.id,
@@ -1296,7 +1253,6 @@ async fn run_advanced_slice_search_non_stream(
         score: selected.score,
         file: Some(selected.file),
         kb: selected.kb,
-        positions,
     }])
 }
 
@@ -2675,36 +2631,6 @@ async fn get_full_files_by_ids(pool: &SqlitePool, file_ids: &[i64]) -> Result<Ha
 
     let files: Vec<File> = q.fetch_all(pool).await?;
     Ok(files.into_iter().map(|f| (f.id, f)).collect())
-}
-
-async fn get_slice_positions(
-    pool: &SqlitePool, slice_ids: &[i64],
-) -> Result<HashMap<i64, Vec<SlicePosition>>, sqlx::Error> {
-    if slice_ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut qb = QueryBuilder::<Sqlite>::new(
-        "SELECT slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num FROM slice_positions WHERE slice_id IN (",
-    );
-    let mut separated = qb.separated(", ");
-    for slice_id in slice_ids {
-        separated.push_bind(slice_id);
-    }
-    qb.push(") ORDER BY slice_id, page_idx, id");
-    let rows: Vec<SlicePositionRow> = qb.build_query_as().fetch_all(pool).await?;
-
-    let mut slice_positions: HashMap<i64, Vec<SlicePosition>> = HashMap::new();
-    for row in rows {
-        slice_positions.entry(row.slice_id).or_default().push(SlicePosition {
-            page_idx: row.page_idx,
-            bbox: [row.x1, row.y1, row.x2, row.y2],
-            sheet_name: row.sheet_name,
-            row_num: row.row_num,
-        });
-    }
-
-    Ok(slice_positions)
 }
 
 async fn get_kbs_by_ids(pool: &SqlitePool, kb_ids: &[i64]) -> Result<HashMap<i64, KbInfo>, sqlx::Error> {

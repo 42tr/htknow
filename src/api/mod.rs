@@ -49,6 +49,8 @@ use crate::search::SearchEngine;
         file::get_image_by_filename,
         file::download,
         file::get_highlighted_pdf,
+        file::get_slice_highlight,
+        file::get_slice_highlight_page,
         file::excel_data,
         file::archive_entries,
         file::archive_extract,
@@ -108,6 +110,8 @@ use crate::search::SearchEngine;
             file::ReparseFailedFilesResp,
             file::Slice,
             file::SlicePosition,
+            file::SliceHighlight,
+            file::SliceHighlightPage,
             file::FileStatusBreakdown,
             file::ExcelData,
             file::ExcelSheetData,
@@ -115,7 +119,6 @@ use crate::search::SearchEngine;
             crate::archive::ExtractResult,
             search::SearchResult,
             search::SearchResultItem,
-            search::SlicePosition,
             search::FullSearchResult,
             search::FullSearchResultItem,
             search::FileInfo,
@@ -186,6 +189,8 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/{id}", get(file::get).put(file::update).delete(file::delete))
         .route("/{id}/move", put(file::move_to_kb))
         .route("/{id}/slices", get(file::get_slices))
+        .route("/{id}/slices/{slice_id}/highlight", get(file::get_slice_highlight))
+        .route("/{id}/slices/{slice_id}/highlight-page", get(file::get_slice_highlight_page))
         .route("/{id}/download", get(file::download))
         .route("/{id}/highlighted-pdf", get(file::get_highlighted_pdf))
         .route("/{id}/excel-data", get(file::excel_data))

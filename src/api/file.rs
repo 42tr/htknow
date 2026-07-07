@@ -2065,8 +2065,6 @@ pub struct Slice {
     pub content: String,
     pub created_at: i64,
     pub updated_at: i64,
-    #[sqlx(skip)]
-    pub positions: Option<Vec<SlicePosition>>,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -2077,9 +2075,20 @@ pub struct SlicePosition {
     pub row_num: Option<i32>,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SliceHighlight {
+    pub positions: Vec<SlicePosition>,
+}
+
+/// 切片推荐高亮页码
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SliceHighlightPage {
+    /// 推荐高亮页码（0-based，与 slice_positions.page_idx 保持一致）
+    pub page_idx: i32,
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct SlicePositionRow {
-    slice_id: i64,
     page_idx: i32,
     x1: i32,
     y1: i32,
@@ -2110,38 +2119,125 @@ struct PageBBoxRow {
     )
 )]
 pub async fn get_slices(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> ApiResult<Json<Vec<Slice>>> {
-    let mut slices: Vec<Slice> =
+    let slices: Vec<Slice> =
         sqlx::query_as("SELECT * FROM slices WHERE file_id = ? ORDER BY id").bind(id).fetch_all(&pool).await?;
-    if slices.is_empty() {
-        return Ok(Json(slices));
+    Ok(Json(slices))
+}
+
+/// 获取单个切片的高亮位置信息
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/files/{id}/slices/{slice_id}/highlight",
+    operation_id = "file_get_slice_highlight",
+    tag = "file",
+    params(
+        ("id" = i64, Path, description = "文件 ID"),
+        ("slice_id" = i64, Path, description = "切片 ID")
+    ),
+    responses(
+        (status = 200, description = "成功返回切片高亮位置", body = SliceHighlight),
+        (status = 400, description = "切片不属于该文件"),
+        (status = 404, description = "文件或切片不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn get_slice_highlight(
+    State(pool): State<SqlitePool>, Path((id, slice_id)): Path<(i64, i64)>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<SliceHighlight>> {
+    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+
+    if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
+        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
     }
 
-    let slice_ids: Vec<i64> = slices.iter().map(|s| s.id).collect();
-    let mut qb = QueryBuilder::<Sqlite>::new(
-        "SELECT slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num FROM slice_positions WHERE slice_id IN (",
-    );
-    let mut separated = qb.separated(", ");
-    for slice_id in slice_ids {
-        separated.push_bind(slice_id);
-    }
-    qb.push(") ORDER BY slice_id, page_idx, id");
+    let slice: Option<(i64,)> =
+        sqlx::query_as("SELECT file_id FROM slices WHERE id = ?").bind(slice_id).fetch_optional(&pool).await?;
 
-    let rows: Vec<SlicePositionRow> = qb.build_query_as().fetch_all(&pool).await?;
-    let mut position_map: std::collections::HashMap<i64, Vec<SlicePosition>> = std::collections::HashMap::new();
-    for row in rows {
-        position_map.entry(row.slice_id).or_default().push(SlicePosition {
+    match slice {
+        Some((file_id,)) if file_id == id => {}
+        Some(_) => return Err(ApiError::BadRequest("Slice does not belong to the file".to_string())),
+        None => return Err(ApiError::NotFound("Slice not found".to_string())),
+    }
+
+    let rows: Vec<SlicePositionRow> = sqlx::query_as(
+        "SELECT page_idx, x1, y1, x2, y2, sheet_name, row_num FROM slice_positions WHERE slice_id = ? ORDER BY page_idx, id",
+    )
+    .bind(slice_id)
+    .fetch_all(&pool)
+    .await?;
+
+    let positions = rows
+        .into_iter()
+        .map(|row| SlicePosition {
             page_idx: row.page_idx,
             bbox: [row.x1, row.y1, row.x2, row.y2],
             sheet_name: row.sheet_name,
             row_num: row.row_num,
-        });
+        })
+        .collect();
+
+    Ok(Json(SliceHighlight { positions }))
+}
+
+/// 获取切片推荐高亮页码
+///
+/// 优先返回 positions 数量最多的首页；如果第一页位置数量少于配置阈值且存在第二页，则返回第二页。
+/// 返回的 `page_idx` 为 0-based，前端展示时需自行 +1。
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/files/{id}/slices/{slice_id}/highlight-page",
+    operation_id = "file_get_slice_highlight_page",
+    tag = "file",
+    params(
+        ("id" = i64, Path, description = "文件 ID"),
+        ("slice_id" = i64, Path, description = "切片 ID")
+    ),
+    responses(
+        (status = 200, description = "成功返回推荐高亮页码", body = SliceHighlightPage),
+        (status = 400, description = "切片不属于该文件"),
+        (status = 404, description = "文件或切片不存在，或切片没有高亮位置")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn get_slice_highlight_page(
+    State(pool): State<SqlitePool>, Path((id, slice_id)): Path<(i64, i64)>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<SliceHighlightPage>> {
+    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+
+    if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
+        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
     }
 
-    for slice in &mut slices {
-        slice.positions = position_map.get(&slice.id).cloned();
+    let slice: Option<(i64,)> =
+        sqlx::query_as("SELECT file_id FROM slices WHERE id = ?").bind(slice_id).fetch_optional(&pool).await?;
+
+    match slice {
+        Some((file_id,)) if file_id == id => {}
+        Some(_) => return Err(ApiError::BadRequest("Slice does not belong to the file".to_string())),
+        None => return Err(ApiError::NotFound("Slice not found".to_string())),
     }
 
-    Ok(Json(slices))
+    let rows: Vec<(i32, i64)> = sqlx::query_as(
+        "SELECT page_idx, COUNT(*) as cnt FROM slice_positions WHERE slice_id = ? GROUP BY page_idx ORDER BY page_idx",
+    )
+    .bind(slice_id)
+    .fetch_all(&pool)
+    .await?;
+
+    if rows.is_empty() {
+        return Err(ApiError::NotFound("Slice has no highlight positions".to_string()));
+    }
+
+    let threshold = config::get().search.highlight_page_min_positions as i64;
+    let page_idx = if rows[0].1 < threshold && rows.len() > 1 { rows[1].0 } else { rows[0].0 };
+
+    Ok(Json(SliceHighlightPage { page_idx }))
 }
 
 /// 获取存储目录中的图片
@@ -2224,10 +2320,8 @@ pub async fn download(
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct HighlightQuery {
-    /// Base64 编码的 positions JSON 数组
-    pub positions: Option<String>,
-    /// 切片 ID（如果不传 positions，则从数据库查询）
-    pub slice_id: Option<i64>,
+    /// 切片 ID
+    pub slice_id: i64,
 }
 
 /// 获取带高亮标注的 PDF
@@ -2260,31 +2354,27 @@ pub async fn get_highlighted_pdf(
         return Err(ApiError::NotFound("File not found or permission denied".to_string()));
     }
 
-    // 解析高亮位置
-    let positions: Vec<pdf_highlight::HighlightPosition> = if let Some(positions_b64) = &params.positions {
-        // 从 Base64 解码 positions
-        let decoded = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, positions_b64)
-            .map_err(|e| ApiError::BadRequest(format!("Invalid base64 positions: {}", e)))?;
+    // 校验切片属于该文件
+    let slice: Option<(i64,)> =
+        sqlx::query_as("SELECT file_id FROM slices WHERE id = ?").bind(params.slice_id).fetch_optional(&pool).await?;
+    match slice {
+        Some((file_id,)) if file_id == id => {}
+        Some(_) => return Err(ApiError::BadRequest("Slice does not belong to the file".to_string())),
+        None => return Err(ApiError::NotFound("Slice not found".to_string())),
+    }
 
-        serde_json::from_slice(&decoded).map_err(|e| ApiError::BadRequest(format!("Invalid positions JSON: {}", e)))?
-    } else if let Some(slice_id) = params.slice_id {
-        // 从数据库查询 slice 的 positions
-        let rows: Vec<SlicePositionRow> = sqlx::query_as(
-            "SELECT slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num FROM slice_positions WHERE slice_id = ? ORDER BY page_idx, id",
-        )
-        .bind(slice_id)
-        .fetch_all(&pool)
-        .await?;
+    // 从数据库查询 slice 的 positions
+    let rows: Vec<SlicePositionRow> = sqlx::query_as(
+        "SELECT page_idx, x1, y1, x2, y2, sheet_name, row_num FROM slice_positions WHERE slice_id = ? ORDER BY page_idx, id",
+    )
+    .bind(params.slice_id)
+    .fetch_all(&pool)
+    .await?;
 
-        rows.iter()
-            .map(|row| pdf_highlight::HighlightPosition {
-                page_idx: row.page_idx,
-                bbox: [row.x1, row.y1, row.x2, row.y2],
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+    let positions: Vec<pdf_highlight::HighlightPosition> = rows
+        .iter()
+        .map(|row| pdf_highlight::HighlightPosition { page_idx: row.page_idx, bbox: [row.x1, row.y1, row.x2, row.y2] })
+        .collect();
 
     let coord_bounds_by_page = if positions.is_empty() {
         None

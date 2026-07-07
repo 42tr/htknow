@@ -196,8 +196,9 @@
 
         const params = new URLSearchParams(window.location.search);
         const fileId = params.get("file_id") || params.get("fileId");
-        const targetSheet = params.get("sheet_name") || "";
-        const targetRow = parseInt(params.get("row_num") || "0", 10);
+        const sliceId = params.get("slice_id") || params.get("sliceId");
+        const legacySheet = params.get("sheet_name") || "";
+        const legacyRow = parseInt(params.get("row_num") || "0", 10);
 
         const app = document.getElementById("app");
 
@@ -210,15 +211,40 @@
           return;
         }
 
-        fetch(`/api/v1/knowledge/files/${fileId}/excel-data`, { headers: HEADERS })
-          .then((res) => {
+        async function loadExcelData() {
+          const res = await fetch(`/api/v1/knowledge/files/${fileId}/excel-data`, { headers: HEADERS });
+          if (!res.ok) {
+            throw new Error(`请求失败: ${res.status}`);
+          }
+          return res.json();
+        }
+
+        async function resolveHighlight() {
+          if (!sliceId) {
+            return { targetSheet: legacySheet, targetRow: legacyRow };
+          }
+          try {
+            const res = await fetch(
+              `/api/v1/knowledge/files/${fileId}/slices/${sliceId}/highlight`,
+              { headers: HEADERS }
+            );
             if (!res.ok) {
-              throw new Error(`请求失败: ${res.status}`);
+              return { targetSheet: "", targetRow: 0 };
             }
-            return res.json();
-          })
-          .then((data) => {
-            render(data, targetSheet, targetRow);
+            const data = await res.json();
+            const pos = data.positions?.[0];
+            return {
+              targetSheet: pos?.sheet_name || "",
+              targetRow: pos?.row_num || 0,
+            };
+          } catch (err) {
+            return { targetSheet: "", targetRow: 0 };
+          }
+        }
+
+        Promise.all([loadExcelData(), resolveHighlight()])
+          .then(([data, highlight]) => {
+            render(data, highlight.targetSheet, highlight.targetRow);
           })
           .catch((err) => {
             showError(err.message || "加载 Excel 数据失败");

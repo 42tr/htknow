@@ -42,19 +42,19 @@ const isExcelFile = (filename) => {
   return /\.(xlsx|xls)$/i.test(filename)
 }
 
-const canHighlight = (slice) =>
-  isOfficeFile(props.file?.filename) && Array.isArray(slice?.positions) && slice.positions.length > 0
+const canHighlight = () => isOfficeFile(props.file?.filename)
 
 const openViewer = (slice) => {
-  if (!canHighlight(slice)) return
+  if (!canHighlight()) return
+
+  const fileId = String(props.file.id)
+  const sliceId = String(slice.id)
 
   // Excel 文件 → 表格预览器
   if (isExcelFile(props.file?.filename)) {
-    const pos = slice.positions?.[0]
     const params = new URLSearchParams({
-      file_id: String(props.file.id),
-      sheet_name: pos?.sheet_name || '',
-      row_num: String(pos?.row_num || ''),
+      file_id: fileId,
+      slice_id: sliceId,
     })
     window.open(`/excel-viewer.html?${params.toString()}`, '_blank', 'noopener')
     return
@@ -62,12 +62,9 @@ const openViewer = (slice) => {
 
   // PDF/Word/PPT → PDF 高亮
   const params = new URLSearchParams({
-    file_id: String(props.file.id),
-    slice_id: String(slice.id),
+    file_id: fileId,
+    slice_id: sliceId,
   })
-  if (Array.isArray(slice.positions) && slice.positions.length > 0) {
-    params.set('positions', btoa(JSON.stringify(slice.positions)))
-  }
   const url = `/pdf-highlight.html?${params.toString()}`
   window.open(url, '_blank', 'noopener')
 }
@@ -151,7 +148,7 @@ onMounted(() => {
                     <p v-if="slice.content && slice.content.length > 200" class="mt-2 text-xs text-blue-500">
                       {{ expandedSlice === slice.id ? '点击收起' : '点击展开全部' }}
                     </p>
-                    <div v-if="canHighlight(slice)" class="mt-3">
+                    <div v-if="canHighlight()" class="mt-3">
                       <button
                         class="inline-flex items-center gap-1 text-xs font-medium text-amber-700 bg-amber-50 px-2.5 py-1 rounded-full hover:bg-amber-100"
                         @click="openViewer(slice)"
