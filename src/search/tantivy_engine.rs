@@ -351,6 +351,10 @@ pub async fn delete_by_files(index: &Index, schema: &Schema, file_ids: &[i64]) -
     delete_by_i64_terms(index, schema, "file_id", file_ids, "delete_by_files").await
 }
 
+pub async fn delete_by_slices(index: &Index, schema: &Schema, slice_ids: &[i64]) -> anyhow::Result<()> {
+    delete_by_i64_terms(index, schema, "id", slice_ids, "delete_by_slices").await
+}
+
 pub async fn delete_by_kb(index: &Index, schema: &Schema, kb_id: i64) -> anyhow::Result<()> {
     delete_by_kbs(index, schema, &[kb_id]).await
 }

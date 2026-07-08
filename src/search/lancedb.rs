@@ -248,6 +248,23 @@ pub async fn delete_by_files(file_ids: &[i64]) -> Result<()> {
     Ok(())
 }
 
+pub async fn delete_by_slices(slice_ids: &[i64]) -> Result<()> {
+    if slice_ids.is_empty() {
+        return Ok(());
+    }
+
+    let table = get_table()?;
+    let predicate = if slice_ids.len() == 1 {
+        format!("id = {}", slice_ids[0])
+    } else {
+        let ids = slice_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+        format!("id IN ({})", ids)
+    };
+    table.update().only_if(predicate).column(IS_DELETED_COLUMN, "true").execute().await?;
+    invalidate_vector_fast_search();
+    Ok(())
+}
+
 pub async fn delete_by_kb(kb_id: i64) -> Result<()> {
     delete_by_kbs(&[kb_id]).await
 }

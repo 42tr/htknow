@@ -2067,6 +2067,17 @@ pub struct Slice {
     pub updated_at: i64,
 }
 
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateSliceItem {
+    pub id: i64,
+    pub content: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct UpdateSlicesReq {
+    pub slices: Vec<UpdateSliceItem>,
+}
+
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SlicePosition {
     pub page_idx: i32,
@@ -2119,6 +2130,151 @@ struct PageBBoxRow {
     )
 )]
 pub async fn get_slices(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> ApiResult<Json<Vec<Slice>>> {
+    let slices: Vec<Slice> =
+        sqlx::query_as("SELECT * FROM slices WHERE file_id = ? ORDER BY id").bind(id).fetch_all(&pool).await?;
+    Ok(Json(slices))
+}
+
+/// 批量更新文件切片内容
+#[utoipa::path(
+    put,
+    path = "/api/v1/knowledge/files/{id}/slices",
+    operation_id = "file_update_slices",
+    tag = "file",
+    params(
+        ("id" = i64, Path, description = "文件 ID")
+    ),
+    request_body = UpdateSlicesReq,
+    responses(
+        (status = 200, description = "成功更新切片", body = Vec<Slice>),
+        (status = 400, description = "请求参数错误"),
+        (status = 403, description = "无权限"),
+        (status = 404, description = "文件或切片不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn update_slices(
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
+    Extension(auth_user): Extension<AuthUser>, Path(id): Path<i64>, Json(req): Json<UpdateSlicesReq>,
+) -> ApiResult<Json<Vec<Slice>>> {
+    if req.slices.is_empty() {
+        return Err(ApiError::BadRequest("No slices to update".to_string()));
+    }
+
+    // 1. 查询文件信息并校验权限
+    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&pool)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("File not found".to_string()))?;
+
+    let is_admin = auth_user.is_admin();
+    match file.kb_id {
+        Some(kb_id) => {
+            let perm = super::knowledge_base::get_kb_permission(&pool, kb_id, &auth_user.user_id, is_admin).await;
+            if !super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
+                return Err(ApiError::Forbidden("Permission denied. Requires editor or admin.".to_string()));
+            }
+
+            // 校验知识库类型非 storage
+            let kb_type: Option<String> = sqlx::query_scalar("SELECT kb_type FROM knowledge_bases WHERE id = ?")
+                .bind(kb_id)
+                .fetch_optional(&pool)
+                .await?;
+            if matches!(kb_type.as_deref(), Some("storage")) {
+                return Err(ApiError::BadRequest(
+                    "Storage knowledge base files do not support slice editing.".to_string(),
+                ));
+            }
+        }
+        None => {
+            if !is_admin && file.user_id != auth_user.user_id {
+                return Err(ApiError::Forbidden("Permission denied.".to_string()));
+            }
+        }
+    }
+
+    // 2. 校验文件状态
+    if file.status != 1 {
+        return Err(ApiError::BadRequest("File is not processed".to_string()));
+    }
+
+    // 3. 校验 content 非空
+    for item in &req.slices {
+        if item.content.trim().is_empty() {
+            return Err(ApiError::BadRequest(format!("Slice {} content cannot be empty", item.id)));
+        }
+    }
+
+    // 4. 校验 slice id 存在且属于该文件
+    let requested_ids: Vec<i64> = req.slices.iter().map(|s| s.id).collect();
+    let existing_slices: Vec<Slice> =
+        sqlx::query_as("SELECT * FROM slices WHERE file_id = ? ORDER BY id").bind(id).fetch_all(&pool).await?;
+    let existing_ids: std::collections::HashSet<i64> = existing_slices.iter().map(|s| s.id).collect();
+
+    for item in &req.slices {
+        if !existing_ids.contains(&item.id) {
+            return Err(ApiError::NotFound(format!("Slice {} not found", item.id)));
+        }
+    }
+
+    // 5. 构建 id -> new content 映射
+    let mut content_map: std::collections::HashMap<i64, String> =
+        req.slices.into_iter().map(|s| (s.id, s.content)).collect();
+
+    // 6. SQLite 事务：更新 slices 并重建 files.content
+    let mut tx = pool.begin().await?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
+
+    for item_id in &requested_ids {
+        let content = content_map.get(item_id).unwrap();
+        sqlx::query("UPDATE slices SET content = ?, updated_at = ? WHERE id = ? AND file_id = ?")
+            .bind(content)
+            .bind(now)
+            .bind(item_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+
+    // 重新拼接完整内容：使用最新切片内容
+    let full_content = existing_slices
+        .iter()
+        .map(|s| content_map.get(&s.id).cloned().unwrap_or_else(|| s.content.clone()))
+        .collect::<Vec<_>>()
+        .join("\n\n");
+
+    sqlx::query("UPDATE files SET content = ?, updated_at = ? WHERE id = ?")
+        .bind(&full_content)
+        .bind(now)
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+
+    tx.commit().await?;
+
+    // 7. 同步搜索索引（事务外，失败仅记录 warning）
+    let updates: Vec<(i64, String)> = requested_ids
+        .iter()
+        .map(|slice_id| (*slice_id, content_map.remove(slice_id).unwrap_or_default()))
+        .filter(|(_, content)| !content.is_empty())
+        .collect();
+
+    let (slice_index_result, full_index_result) = tokio::join!(
+        search_engine.update_slices(id, file.kb_id, updates),
+        search_engine.update_full_index_for_file(id, file.kb_id, file.filename.clone(), full_content)
+    );
+    if let Err(e) = slice_index_result {
+        warn!("Failed to update slice search index for file {}: {}", id, e);
+    }
+    if let Err(e) = full_index_result {
+        warn!("Failed to update full search index for file {}: {}", id, e);
+    }
+
+    // 8. 返回更新后的切片列表
     let slices: Vec<Slice> =
         sqlx::query_as("SELECT * FROM slices WHERE file_id = ? ORDER BY id").bind(id).fetch_all(&pool).await?;
     Ok(Json(slices))

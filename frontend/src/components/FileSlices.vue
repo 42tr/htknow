@@ -16,6 +16,10 @@ const loading = ref(true)
 const error = ref('')
 const expandedSlice = ref(null)
 
+const editingSliceId = ref(null)
+const editingContent = ref('')
+const saving = ref(false)
+
 const loadSlices = async () => {
   loading.value = true
   error.value = ''
@@ -29,6 +33,7 @@ const loadSlices = async () => {
 }
 
 const toggleExpand = (id) => {
+  if (editingSliceId.value !== null) return
   expandedSlice.value = expandedSlice.value === id ? null : id
 }
 
@@ -45,7 +50,7 @@ const isExcelFile = (filename) => {
 const canHighlight = () => isOfficeFile(props.file?.filename)
 
 const openViewer = (slice) => {
-  if (!canHighlight()) return
+  if (!canHighlight() || editingSliceId.value !== null) return
 
   const fileId = String(props.file.id)
   const sliceId = String(slice.id)
@@ -72,6 +77,46 @@ const openViewer = (slice) => {
 const truncateText = (text, maxLength = 200) => {
   if (!text || text.length <= maxLength) return text
   return text.substring(0, maxLength) + '...'
+}
+
+const startEdit = (slice) => {
+  if (editingSliceId.value !== null && editingSliceId.value !== slice.id) {
+    if (!confirm('当前有未保存的修改，是否放弃？')) return
+  }
+  editingSliceId.value = slice.id
+  editingContent.value = slice.content
+  expandedSlice.value = slice.id
+}
+
+const cancelEdit = () => {
+  editingSliceId.value = null
+  editingContent.value = ''
+}
+
+const saveEdit = async (slice) => {
+  const content = editingContent.value.trim()
+  if (!content) {
+    alert('切片内容不能为空')
+    return
+  }
+
+  saving.value = true
+  try {
+    const updatedSlices = await api.updateSlices(props.file.id, [{ id: slice.id, content }])
+    const updated = updatedSlices.find((s) => s.id === slice.id)
+    if (updated) {
+      const idx = slices.value.findIndex((s) => s.id === slice.id)
+      if (idx !== -1) {
+        slices.value[idx] = updated
+      }
+    }
+    editingSliceId.value = null
+    editingContent.value = ''
+  } catch (e) {
+    alert('保存失败：' + e.message)
+  } finally {
+    saving.value = false
+  }
 }
 
 onMounted(() => {
@@ -139,17 +184,60 @@ onMounted(() => {
                     {{ index + 1 }}
                   </span>
                   <div class="flex-1 min-w-0">
-                    <p
-                      class="text-sm text-slate-700 whitespace-pre-wrap wrap-break-words cursor-pointer"
-                      @click="toggleExpand(slice.id)"
-                    >
-                      {{ expandedSlice === slice.id ? slice.content : truncateText(slice.content) }}
-                    </p>
-                    <p v-if="slice.content && slice.content.length > 200" class="mt-2 text-xs text-blue-500">
-                      {{ expandedSlice === slice.id ? '点击收起' : '点击展开全部' }}
-                    </p>
-                    <div v-if="canHighlight()" class="mt-3">
+                    <!-- View mode -->
+                    <div v-if="editingSliceId !== slice.id">
+                      <p
+                        class="text-sm text-slate-700 whitespace-pre-wrap wrap-break-words cursor-pointer"
+                        @click="toggleExpand(slice.id)"
+                      >
+                        {{ expandedSlice === slice.id ? slice.content : truncateText(slice.content) }}
+                      </p>
+                      <p v-if="slice.content && slice.content.length > 200" class="mt-2 text-xs text-blue-500">
+                        {{ expandedSlice === slice.id ? '点击收起' : '点击展开全部' }}
+                      </p>
+                    </div>
+
+                    <!-- Edit mode -->
+                    <div v-else class="space-y-3">
+                      <textarea
+                        v-model="editingContent"
+                        rows="6"
+                        class="w-full p-3 text-sm text-slate-700 bg-white border border-slate-300 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 resize-y"
+                        :disabled="saving"
+                        placeholder="请输入切片内容"
+                      ></textarea>
+                      <div class="flex gap-3">
+                        <button
+                          @click="cancelEdit"
+                          :disabled="saving"
+                          class="flex-1 py-2 px-4 bg-slate-100 text-slate-700 rounded-lg hover:bg-slate-200 disabled:opacity-50"
+                        >
+                          取消
+                        </button>
+                        <button
+                          @click="saveEdit(slice)"
+                          :disabled="saving"
+                          class="flex-1 py-2 px-4 bg-linear-to-r from-blue-500 to-indigo-600 text-white rounded-lg hover:from-blue-600 hover:to-indigo-700 disabled:opacity-50"
+                        >
+                          {{ saving ? '保存中...' : '保存' }}
+                        </button>
+                      </div>
+                    </div>
+
+                    <!-- Actions -->
+                    <div class="mt-3 flex flex-wrap items-center gap-2">
                       <button
+                        v-if="editingSliceId !== slice.id"
+                        @click="startEdit(slice)"
+                        class="inline-flex items-center gap-1 text-xs font-medium text-blue-700 bg-blue-50 px-2.5 py-1 rounded-full hover:bg-blue-100"
+                      >
+                        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15.232 5.232l3.536 3.536m-2.036-5.036a2.5 2.5 0 113.536 3.536L6.5 21.036H3v-3.572L16.732 3.732z" />
+                        </svg>
+                        <span>编辑</span>
+                      </button>
+                      <button
+                        v-if="canHighlight() && editingSliceId !== slice.id"
                         class="inline-flex items-center gap-1 text-xs font-medium text-amber-700 bg-amber-50 px-2.5 py-1 rounded-full hover:bg-amber-100"
                         @click="openViewer(slice)"
                       >

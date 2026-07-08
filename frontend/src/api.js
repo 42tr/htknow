@@ -628,6 +628,16 @@ export const api = {
     return response.json()
   },
 
+  async updateSlices(fileId, slices) {
+    const response = await fetch(`${API_BASE}/files/${fileId}/slices`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify({ slices }),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '更新切片失败'))
+    return response.json()
+  },
+
   // 压缩文件
   async getArchiveEntries(id) {
     const response = await fetch(`${API_BASE}/files/${id}/archive-entries`, {

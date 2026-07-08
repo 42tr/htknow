@@ -46,6 +46,7 @@ use crate::search::SearchEngine;
         file::reparse_failed,
         file::delete,
         file::get_slices,
+        file::update_slices,
         file::get_image_by_filename,
         file::download,
         file::get_highlighted_pdf,
@@ -109,6 +110,8 @@ use crate::search::SearchEngine;
             file::ReparseFailedFilesReq,
             file::ReparseFailedFilesResp,
             file::Slice,
+            file::UpdateSliceItem,
+            file::UpdateSlicesReq,
             file::SlicePosition,
             file::SliceHighlight,
             file::SliceHighlightPage,
@@ -188,7 +191,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/images/{filename}", get(file::get_image_by_filename))
         .route("/{id}", get(file::get).put(file::update).delete(file::delete))
         .route("/{id}/move", put(file::move_to_kb))
-        .route("/{id}/slices", get(file::get_slices))
+        .route("/{id}/slices", get(file::get_slices).put(file::update_slices))
         .route("/{id}/slices/{slice_id}/highlight", get(file::get_slice_highlight))
         .route("/{id}/slices/{slice_id}/highlight-page", get(file::get_slice_highlight_page))
         .route("/{id}/download", get(file::download))

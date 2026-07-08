@@ -414,6 +414,63 @@ impl SearchEngine {
         Ok(())
     }
 
+    /// 更新指定切片在默认索引与 LanceDB 中的内容。
+    ///
+    /// 内部会先删除旧 slice 文档/向量，再写入新内容，并 reload 默认索引 reader。
+    /// LanceDB 采用软删除，旧向量记录会被标记为 `is_deleted=true`，查询时不可见。
+    pub async fn update_slices(
+        &self, file_id: i64, kb_id: Option<i64>, updates: Vec<(i64, String)>,
+    ) -> anyhow::Result<()> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+
+        let slice_ids: Vec<i64> = updates.iter().map(|(id, _)| *id).collect();
+        let docs: Vec<tantivy_engine::Document> = updates
+            .into_iter()
+            .map(|(id, content)| tantivy_engine::Document::new(id, file_id, kb_id, content))
+            .collect();
+
+        // 1. 默认索引：删除旧 slice 文档并写入新文档，随后 reload reader
+        {
+            let _guard = self.index_write_lock.lock().await;
+            tantivy_engine::delete_by_slices(&self.index, &self.schema, &slice_ids).await?;
+            tantivy_engine::write_documents_batch(&self.index, &self.schema, docs.clone()).await?;
+            reload_reader(&self.index_reader, "index")?;
+        }
+
+        // 2. LanceDB：软删除旧向量并写入新向量（LanceDB 会自动为 content 生成 embedding）
+        lancedb::delete_by_slices(&slice_ids).await?;
+        let lancedb_docs: Vec<lancedb::Document> =
+            docs.into_iter().map(|doc| lancedb::Document::new(doc.id, doc.file_id, doc.kb_id, doc.content)).collect();
+        lancedb::write_documents_batch(lancedb_docs).await?;
+
+        Ok(())
+    }
+
+    /// 更新指定文件在全文索引中的内容。
+    ///
+    /// 会先删除该 file_id 对应的旧全文文档，再写入 `filename\n\nfull_content`。
+    pub async fn update_full_index_for_file(
+        &self, file_id: i64, kb_id: Option<i64>, filename: String, full_content: String,
+    ) -> anyhow::Result<()> {
+        let index_content =
+            if full_content.trim().is_empty() { filename } else { format!("{}\n\n{}", filename, full_content) };
+
+        {
+            let _guard = self.full_index_write_lock.lock().await;
+            tantivy_engine::delete_by_file(&self.full_index, &self.full_schema, file_id).await?;
+            tantivy_engine::write_documents(
+                &self.full_index,
+                &self.full_schema,
+                tantivy_engine::Document::new(file_id, file_id, kb_id, index_content),
+            )
+            .await?;
+            reload_reader(&self.full_index_reader, "full_index")?;
+        }
+        Ok(())
+    }
+
     pub fn reload_readers(&self) -> anyhow::Result<()> {
         reload_reader(&self.index_reader, "index")?;
         reload_reader(&self.full_index_reader, "full_index")?;
