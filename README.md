@@ -102,7 +102,8 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `DATABASE_URL` | `sqlite://data/app.sqlite` | 数据库连接 |
-| `HTKNOW_DB_MAX_CONNECTIONS` | `50` | 最大连接数 |
+| `HTKNOW_DB_MAX_CONNECTIONS` | `16` | 最大连接数 |
+| `HTKNOW_DB_MIN_CONNECTIONS` | `2` | 最小空闲连接数 |
 | `HTKNOW_DB_BUSY_TIMEOUT_MS` | `5000` | busy_timeout（毫秒） |
 | `HTKNOW_DB_INIT_DEFAULT_KBS` | `true` | 是否初始化默认知识库 |
 
@@ -115,6 +116,7 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | `HTKNOW_IMAGES_PATH` | `data/images` | 图片目录 |
 | `HTKNOW_PDF_PATH` | `data/pdfs` | PDF 目录 |
 | `HTKNOW_FILES_PATH` | `data/files` | 文件目录 |
+| `HTKNOW_ARCHIVES_PATH` | `data/archives` | 压缩文件解压目录 |
 
 ### 搜索
 | 环境变量 | 默认值 | 说明 |
@@ -124,12 +126,14 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | `HTKNOW_TANTIVY_FULL_INDEX_PATH` | `data/tantivy_full_index` | Tantivy 全文索引 |
 | `HTKNOW_TANTIVY_MEMORY_MB` | `50` | Tantivy 内存（MB） |
 | `HTKNOW_SEARCH_TANTIVY_REBUILD_BATCH_SIZE` | `100` | Tantivy 索引重建批次大小 |
+| `HTKNOW_SEARCH_LANCEDB_REBUILD_BATCH_SIZE` | `100` | LanceDB 从 SQLite 重建批次大小 |
 | `HTKNOW_SEARCH_EMBEDDING_TIMEOUT_SECS` | `30` | embedding / 图片 embedding 请求超时（秒） |
 | `HTKNOW_SEARCH_RERANK_TIMEOUT_SECS` | `20` | rerank 请求超时（秒） |
 | `HTKNOW_SEARCH_SYNONYM_ENABLED` | `true` | 是否启用同义词查询扩展 |
 | `HTKNOW_SEARCH_SYNONYM_BOOST` | `0.7` | 同义词权重因子（与行权重相乘） |
 | `HTKNOW_SEARCH_MAX_SYNONYMS_PER_TERM` | `5` | 每个词最多扩展同义词数 |
 | `HTKNOW_SEARCH_MAX_TOTAL_SYNONYMS` | `30` | 单次查询最多扩展同义词总数 |
+| `HTKNOW_HIGHLIGHT_PAGE_MIN_POSITIONS` | `20` | 高亮页码选择阈值：首选页位置数少于该值时优先使用第二页 |
 
 ### 切片
 | 环境变量 | 默认值 | 说明 |
