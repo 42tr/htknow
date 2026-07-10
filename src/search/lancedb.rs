@@ -1,10 +1,10 @@
 use std::{
-    path::Path, sync::{
+    collections::HashSet, path::Path, sync::{
         Arc, atomic::{AtomicBool, Ordering}
-    }
+    }, time::{SystemTime, UNIX_EPOCH}
 };
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use arrow_array::{
     Array, ArrayRef, BooleanArray, Float32Array, Int64Array, RecordBatch, StringArray, builder::{FixedSizeListBuilder, Float32Builder}
 };
@@ -59,7 +59,8 @@ impl Document {
     }
 }
 
-pub async fn init() -> Result<()> {
+/// 初始化 LanceDB。返回 `true` 表示表是新建或从损坏中恢复的，调用方应考虑从 SQLite 回填数据。
+pub async fn init() -> Result<bool> {
     let cfg = config::get();
     let storage_path = &cfg.storage.lancedb_path;
     tokio::fs::create_dir_all(storage_path).await?;
@@ -72,19 +73,28 @@ pub async fn init() -> Result<()> {
 
     // 检查表是否存在
     let conn = get_connection()?;
-    let table_exists = if let Ok(table_names) = conn.table_names().execute().await {
-        table_names.contains(&TABLE_NAME.to_string())
+    let table_exists = conn
+        .table_names()
+        .execute()
+        .await
+        .map(|table_names| table_names.contains(&TABLE_NAME.to_string()))
+        .unwrap_or(false);
+
+    let (table, was_recreated) = if table_exists {
+        match conn.open_table(TABLE_NAME).execute().await {
+            Ok(table) => (table, false),
+            Err(err) => {
+                warn!(
+                    "LanceDB table '{}' exists but cannot be opened (likely corrupted): {}. Attempting recovery...",
+                    TABLE_NAME, err
+                );
+                (recover_table(storage_path, &schema).await?, true)
+            }
+        }
     } else {
-        false
+        (create_empty_table(&schema).await?, true)
     };
 
-    if !table_exists {
-        // 表不存在，创建新表
-        let empty_batch = create_empty_batch(&schema)?;
-        conn.create_table(TABLE_NAME, empty_batch).execute().await?;
-    }
-
-    let table = conn.open_table(TABLE_NAME).execute().await?;
     ensure_is_deleted_column(&table).await?;
 
     if let Err(err) = ensure_search_indices(&table).await {
@@ -97,7 +107,40 @@ pub async fn init() -> Result<()> {
 
     LANCEDB_TABLE.set(Arc::new(table)).map_err(|_| anyhow::anyhow!("Failed to cache LanceDB table"))?;
 
-    Ok(())
+    Ok(was_recreated)
+}
+
+async fn create_empty_table(schema: &Arc<ArrowSchema>) -> Result<Table> {
+    let conn = get_connection()?;
+    let empty_batch = create_empty_batch(schema)?;
+    conn.create_table(TABLE_NAME, empty_batch)
+        .execute()
+        .await
+        .with_context(|| format!("Failed to create LanceDB table '{}'", TABLE_NAME))
+}
+
+async fn recover_table(storage_path: &str, schema: &Arc<ArrowSchema>) -> Result<Table> {
+    let conn = get_connection()?;
+
+    // 先尝试用 LanceDB API 优雅删除损坏的表
+    if let Err(err) = conn.drop_table(TABLE_NAME, &[]).await {
+        warn!("LanceDB drop_table failed (will remove filesystem directory instead): {}", err);
+    }
+
+    // 清理文件系统残留，并备份到带时间戳的目录
+    let table_dir = Path::new(storage_path).join(format!("{}.lance", TABLE_NAME));
+    if table_dir.exists() {
+        let backup_dir = {
+            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            table_dir.with_file_name(format!("documents.lance.corrupted.{}", timestamp))
+        };
+        warn!("Moving corrupted LanceDB table from {} to {}", table_dir.display(), backup_dir.display());
+        tokio::fs::rename(&table_dir, &backup_dir)
+            .await
+            .with_context(|| format!("Failed to move corrupted LanceDB table to {}", backup_dir.display()))?;
+    }
+
+    create_empty_table(schema).await
 }
 
 pub async fn write_documents(doc: Document) -> Result<()> {
@@ -339,6 +382,48 @@ fn get_connection() -> Result<Arc<Connection>> {
 
 fn get_table() -> Result<Arc<Table>> {
     LANCEDB_TABLE.get().cloned().ok_or_else(|| anyhow::anyhow!("LanceDB table not initialized"))
+}
+
+/// 统计 LanceDB 中未标记删除的文档数量。
+pub async fn count_valid_documents() -> Result<u64> {
+    let table = get_table()?;
+    let predicate = format!("({} = false OR {} IS NULL)", IS_DELETED_COLUMN, IS_DELETED_COLUMN);
+    let count = table.count_rows(Some(predicate)).await?;
+    Ok(count as u64)
+}
+
+/// 清空 LanceDB 中所有文档，用于从 SQLite 完全重建。
+pub async fn clear_all_documents() -> Result<()> {
+    let table = get_table()?;
+    table.delete("true").await?;
+    invalidate_vector_fast_search();
+    Ok(())
+}
+
+/// 查询给定 id 列表中已经在 LanceDB 里有效存在的 id。
+pub async fn find_existing_ids(ids: &[i64]) -> Result<HashSet<i64>> {
+    if ids.is_empty() {
+        return Ok(HashSet::new());
+    }
+
+    let table = get_table()?;
+    let ids_str = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+    let predicate = format!("id IN ({}) AND ({} = false OR {} IS NULL)", ids_str, IS_DELETED_COLUMN, IS_DELETED_COLUMN);
+
+    let mut existing = HashSet::with_capacity(ids.len());
+    let mut stream = table.query().select(Select::columns(&["id"])).only_if(predicate).execute().await?;
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result?;
+        let id_array = batch
+            .column_by_name("id")
+            .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| anyhow::anyhow!("Missing or invalid id column"))?;
+        for i in 0..batch.num_rows() {
+            existing.insert(id_array.value(i));
+        }
+    }
+
+    Ok(existing)
 }
 
 fn vector_fast_search_enabled() -> bool {

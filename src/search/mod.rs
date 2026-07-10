@@ -108,6 +108,14 @@ struct RebuildSliceRow {
 }
 
 #[derive(Debug, sqlx::FromRow)]
+struct RebuildLanceDbSliceRow {
+    id: i64,
+    file_id: i64,
+    kb_id: Option<i64>,
+    content: String,
+}
+
+#[derive(Debug, sqlx::FromRow)]
 struct RebuildFullMetaRow {
     id: i64,
     kb_id: Option<i64>,
@@ -119,6 +127,54 @@ pub struct RebuildProgress {
     pub phase: String,
     pub total_docs: i64,
     pub processed_docs: i64,
+}
+
+/// 根据文件名后缀判断是否为图片文件。
+fn is_image_filename(filename: &str) -> bool {
+    let lower = filename.to_lowercase();
+    lower.ends_with(".jpg")
+        || lower.ends_with(".jpeg")
+        || lower.ends_with(".png")
+        || lower.ends_with(".gif")
+        || lower.ends_with(".bmp")
+        || lower.ends_with(".webp")
+        || lower.ends_with(".tiff")
+        || lower.ends_with(".tif")
+        || lower.ends_with(".svg")
+        || lower.ends_with(".ico")
+        || lower.ends_with(".heic")
+        || lower.ends_with(".heif")
+}
+
+/// 为所有已完成的图片文件重新生成 image_embedding，按 file_id 缓存。
+async fn rebuild_image_embeddings(pool: &SqlitePool) -> anyhow::Result<HashMap<i64, Vec<f32>>> {
+    info!("Preloading image embeddings for LanceDB rebuild...");
+
+    let rows: Vec<(i64, String, String)> =
+        sqlx::query_as("SELECT id, filename, path FROM files WHERE status = 1").fetch_all(pool).await?;
+
+    let mut embeddings = HashMap::new();
+    let mut processed = 0usize;
+    let mut failed = 0usize;
+
+    for (file_id, filename, path) in rows {
+        if !is_image_filename(&filename) {
+            continue;
+        }
+        match embedding::get_image_embedding_from_path(&path, Some(&filename)).await {
+            Ok(embedding) => {
+                embeddings.insert(file_id, embedding);
+                processed += 1;
+            }
+            Err(err) => {
+                failed += 1;
+                warn!("Failed to get image embedding for file {} ({} at {}): {}", file_id, filename, path, err);
+            }
+        }
+    }
+
+    info!("Image embedding preload completed: {} succeeded, {} failed", processed, failed);
+    Ok(embeddings)
 }
 
 #[derive(Clone)]
@@ -134,11 +190,13 @@ pub struct SearchEngine {
     rebuild_lock: Arc<Mutex<()>>,
     pool: Option<SqlitePool>,
     synonym_cache: Arc<tokio::sync::RwLock<Option<SynonymCache>>>,
+    /// LanceDB 在本次启动时是否被新建或从损坏中恢复，true 表示需要从 SQLite 回填向量。
+    lancedb_recreated: bool,
 }
 
 impl SearchEngine {
     pub async fn init() -> Self {
-        lancedb::init().await.expect("init lancedb failed");
+        let lancedb_recreated = lancedb::init().await.expect("init lancedb failed");
         let (schema, index) = tantivy_engine::init().unwrap();
         let (full_schema, full_index) = tantivy_engine::init_full().unwrap();
         let index_reader = build_reader(&index, "index");
@@ -155,12 +213,111 @@ impl SearchEngine {
             rebuild_lock: Arc::new(Mutex::new(())),
             pool: None,
             synonym_cache: Arc::new(tokio::sync::RwLock::new(None)),
+            lancedb_recreated,
         }
     }
 
     pub fn with_pool(mut self, pool: SqlitePool) -> Self {
         self.pool = Some(pool);
         self
+    }
+
+    /// 检查 SQLite 的切片数量与 LanceDB 有效文档数是否一致，不一致则增量补齐缺失的切片。
+    /// 图片文件会重新调用图片 embedding 服务恢复 image_vector。
+    pub async fn maybe_rebuild_lancedb_from_db(&self) -> anyhow::Result<()> {
+        let Some(pool) = &self.pool else {
+            return Err(anyhow!("search engine db pool not set"));
+        };
+
+        let total_slices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM slices").fetch_one(pool).await?;
+        let lancedb_count = lancedb::count_valid_documents().await?;
+
+        if total_slices == 0 {
+            if lancedb_count > 0 {
+                warn!("SQLite has no slices but LanceDB has {} documents; clearing LanceDB", lancedb_count);
+                lancedb::clear_all_documents().await?;
+            }
+            return Ok(());
+        }
+
+        if lancedb_count == total_slices as u64 {
+            return Ok(());
+        }
+
+        if self.lancedb_recreated {
+            info!("LanceDB was recreated; rebuilding vectors from SQLite slices...");
+        } else {
+            warn!(
+                "LanceDB document count ({}) does not match SQLite slice count ({}); incrementally filling missing slices...",
+                lancedb_count, total_slices
+            );
+        }
+
+        // 预加载图片文件的 image_embedding：一个图片文件的所有切片共用同一个向量。
+        let image_embeddings = rebuild_image_embeddings(pool).await?;
+
+        let cfg = config::get();
+        let batch_size =
+            i64::try_from(cfg.search.lancedb_rebuild_batch_size).ok().filter(|value| *value > 0).unwrap_or(100_i64);
+        let mut last_id = 0_i64;
+        let mut processed = 0_i64;
+
+        loop {
+            let rows: Vec<RebuildLanceDbSliceRow> = sqlx::query_as(
+                "SELECT s.id, s.file_id, f.kb_id, s.content \
+                 FROM slices s \
+                 JOIN files f ON f.id = s.file_id \
+                 WHERE s.id > ? \
+                 ORDER BY s.id ASC \
+                 LIMIT ?",
+            )
+            .bind(last_id)
+            .bind(batch_size)
+            .fetch_all(pool)
+            .await?;
+
+            if rows.is_empty() {
+                break;
+            }
+
+            last_id = rows.last().map(|row| row.id).unwrap_or(last_id);
+            let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+            let existing_ids = lancedb::find_existing_ids(&ids).await?;
+
+            let missing_rows: Vec<RebuildLanceDbSliceRow> =
+                rows.into_iter().filter(|row| !existing_ids.contains(&row.id)).collect();
+
+            if !missing_rows.is_empty() {
+                let missing_count = missing_rows.len() as i64;
+                let docs: Vec<lancedb::Document> = missing_rows
+                    .into_iter()
+                    .map(|row| {
+                        let mut doc = lancedb::Document::new(row.id, row.file_id, row.kb_id, row.content);
+                        if let Some(embedding) = image_embeddings.get(&row.file_id) {
+                            doc = doc.with_image_embedding(embedding.clone());
+                        }
+                        doc
+                    })
+                    .collect();
+                lancedb::write_documents_batch(docs).await?;
+                processed += missing_count;
+            }
+
+            info!("LanceDB incremental rebuild progress: {}/{}", processed.min(total_slices), total_slices);
+        }
+
+        // 最终校验
+        let final_count = lancedb::count_valid_documents().await?;
+        if final_count != total_slices as u64 {
+            return Err(anyhow!(
+                "LanceDB rebuild incomplete: expected {} slices, got {}. Consider clearing lancedb_data manually and restart.",
+                total_slices,
+                final_count
+            ));
+        }
+
+        info!("LanceDB rebuild completed: {} slices restored", processed.min(total_slices));
+        Ok(())
     }
 
     pub async fn reload_lexicon(&self) -> anyhow::Result<usize> {

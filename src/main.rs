@@ -28,6 +28,7 @@ async fn main() -> anyhow::Result<()> {
 
     let pool = db::init().await?;
     let search_engine = search::SearchEngine::init().await.with_pool(pool.clone());
+    search_engine.maybe_rebuild_lancedb_from_db().await.expect("Failed to rebuild LanceDB from SQLite at startup");
     match search_engine.reload_lexicon().await {
         Ok(loaded) => log::info!("Search lexicon loaded: {} words", loaded),
         Err(e) => log::warn!("Failed to load search lexicon at startup: {}", e),

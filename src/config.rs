@@ -157,6 +157,8 @@ pub struct SearchConfig {
     pub tantivy_memory_mb: usize,
     /// Tantivy 重建批次大小
     pub tantivy_rebuild_batch_size: usize,
+    /// LanceDB 从 SQLite 重建时的批次大小
+    pub lancedb_rebuild_batch_size: usize,
     /// 文本 embedding 请求超时（秒）
     pub embedding_timeout_secs: u64,
     /// rerank 请求超时（秒）
@@ -299,6 +301,7 @@ impl SearchConfig {
             ),
             tantivy_memory_mb: env_or_parse("HTKNOW_TANTIVY_MEMORY_MB", 50),
             tantivy_rebuild_batch_size: env_or_parse("HTKNOW_SEARCH_TANTIVY_REBUILD_BATCH_SIZE", 100),
+            lancedb_rebuild_batch_size: env_or_parse("HTKNOW_SEARCH_LANCEDB_REBUILD_BATCH_SIZE", 100),
             embedding_timeout_secs: env_or_parse("HTKNOW_SEARCH_EMBEDDING_TIMEOUT_SECS", 30),
             rerank_timeout_secs: env_or_parse("HTKNOW_SEARCH_RERANK_TIMEOUT_SECS", 20),
             synonym_enabled: env_or_parse("HTKNOW_SEARCH_SYNONYM_ENABLED", true),
