@@ -4,6 +4,7 @@ use std::{
     }, time::{Duration, Instant, SystemTime, UNIX_EPOCH}
 };
 
+use aho_corasick::{AhoCorasick, MatchKind};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use log::{debug, error, info, warn};
 use lopdf::Document;
@@ -11,11 +12,13 @@ use once_cell::sync::Lazy;
 use reqwest::multipart;
 use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
-use tokio::{fs, io::AsyncReadExt, time};
+use tokio::{
+    fs, io::{AsyncBufReadExt, AsyncReadExt}, time
+};
 
 use crate::{
     api::{
-        File, collect_image_paths_for_files, collect_image_raw_paths_for_files, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta
+        FILE_COLS_NO_CONTENT, File, collect_image_paths_for_files, collect_image_raw_paths_for_files, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta
     }, archive, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, SearchEngine, tantivy_engine}
 };
 
@@ -745,7 +748,7 @@ impl FileProcessor {
 
     /// 原子领取一个待处理文件，按知识库解析优先级排序
     async fn claim_next_pending_file(&self) -> anyhow::Result<Option<File>> {
-        let file = sqlx::query_as::<_, File>(
+        let sql = format!(
             "UPDATE files
              SET status = 2, updated_at = strftime('%s','now')
              WHERE id = (
@@ -756,10 +759,9 @@ impl FileProcessor {
                  LIMIT 1
              )
              AND status = 0
-             RETURNING *",
-        )
-        .fetch_optional(&self.pool)
-        .await?;
+             RETURNING {FILE_COLS_NO_CONTENT}"
+        );
+        let file = sqlx::query_as::<_, File>(&sql).fetch_optional(&self.pool).await?;
         Ok(file)
     }
 
@@ -965,7 +967,7 @@ impl FileProcessor {
                         search::embedding::get_image_embedding_from_path(&file.path, Some(&file.filename)),
                     )
                     .await?;
-                self.process_pdf_file(file, Some(image_embedding), true, None, Some(&mut timing)).await?;
+                self.process_pdf_file(file, Some(Arc::new(image_embedding)), true, None, Some(&mut timing)).await?;
             } else if is_audio {
                 timing.set_pipeline("audio");
                 if !self.ensure_file_exists(file.id, "before audio processing").await? {
@@ -1239,11 +1241,7 @@ impl FileProcessor {
         refs
     }
 
-    fn rewrite_custom_image_refs(content: &str, mapping: &HashMap<String, String>) -> String {
-        if mapping.is_empty() || content.is_empty() {
-            return content.to_string();
-        }
-
+    fn fallback_rewrite_custom_image_refs(content: &str, mapping: &HashMap<String, String>) -> String {
         let mut rewritten = content.to_string();
         let mut pairs: Vec<(&String, &String)> = mapping.iter().collect();
         pairs.sort_by_key(|(right, _)| std::cmp::Reverse(right.len()));
@@ -1255,6 +1253,29 @@ impl FileProcessor {
             rewritten = rewritten.replace(&format!("]({})", old_path), &format!("]({})", new_path));
         }
         rewritten
+    }
+
+    fn rewrite_custom_image_refs(content: &str, mapping: &HashMap<String, String>) -> String {
+        if mapping.is_empty() || content.is_empty() {
+            return content.to_string();
+        }
+
+        let mut patterns = Vec::with_capacity(mapping.len() * 2);
+        let mut replacements = Vec::with_capacity(mapping.len() * 2);
+        for (old_path, new_path) in mapping {
+            patterns.push(format!("/api/v1/knowledge/files/{old_path}"));
+            replacements.push(format!("/api/v1/knowledge/files/{new_path}"));
+            patterns.push(format!("]({old_path})"));
+            replacements.push(format!("]({new_path})"));
+        }
+
+        match AhoCorasick::builder().match_kind(MatchKind::LeftmostLongest).build(&patterns) {
+            Ok(ac) => ac.replace_all(content, &replacements),
+            Err(e) => {
+                warn!("Failed to build aho-corasick automaton: {e}, fallback to loop");
+                Self::fallback_rewrite_custom_image_refs(content, mapping)
+            }
+        }
     }
 
     async fn call_custom_parse_api(&self, file: &File, custom_url: &str) -> anyhow::Result<CustomParseData> {
@@ -1734,7 +1755,7 @@ impl FileProcessor {
 
     /// 处理 PDF 文件，调用 MinerU API
     async fn process_pdf_file(
-        &self, file: &File, image_embedding: Option<Vec<f32>>, is_image: bool, index_filename: Option<&str>,
+        &self, file: &File, image_embedding: Option<Arc<Vec<f32>>>, is_image: bool, index_filename: Option<&str>,
         mut timing: Option<&mut ParseTimingCtx>,
     ) -> anyhow::Result<()> {
         if !self.ensure_file_exists(file.id, "pdf processing start").await? {
@@ -2266,17 +2287,162 @@ impl FileProcessor {
         Ok(Result { content_list: content_list_json, images })
     }
 
+    /// 流式读取文本文件，边读边分片，避免一次性把整个文件载入内存。
+    async fn stream_text_file(path: &str, slice_type: &str) -> anyhow::Result<(String, Vec<String>)> {
+        use tokio::io::BufReader;
+
+        let file = tokio::fs::File::open(path).await?;
+        let mut reader = BufReader::new(file);
+        let mut full_content = String::new();
+        let mut slices = Vec::new();
+
+        match slice_type {
+            "paragraph" => {
+                let mut current = String::new();
+                loop {
+                    let mut line = String::new();
+                    let n = reader.read_line(&mut line).await?;
+                    if n == 0 {
+                        break;
+                    }
+
+                    let (content, term) = if line.ends_with("\r\n") {
+                        let c = line.drain(..line.len() - 2).collect::<String>();
+                        (c, "\r\n")
+                    } else if line.ends_with('\n') {
+                        let c = line.drain(..line.len() - 1).collect::<String>();
+                        (c, "\n")
+                    } else {
+                        (line, "")
+                    };
+
+                    full_content.push_str(&content);
+                    full_content.push_str(term);
+
+                    if content.trim().is_empty() {
+                        if !current.trim().is_empty() {
+                            slices.push(current.trim().to_string());
+                            current.clear();
+                        }
+                    } else {
+                        if !current.is_empty() {
+                            current.push_str(term);
+                        }
+                        current.push_str(&content);
+                    }
+                }
+                if !current.trim().is_empty() {
+                    slices.push(current.trim().to_string());
+                }
+            }
+            "sentence" => {
+                const SENTENCE_END: [char; 6] = ['。', '.', '?', '!', '？', '！'];
+                let mut buf = String::new();
+                loop {
+                    let mut line = String::new();
+                    let n = reader.read_line(&mut line).await?;
+                    if n == 0 {
+                        break;
+                    }
+
+                    let (content, term) = if line.ends_with("\r\n") {
+                        let c = line.drain(..line.len() - 2).collect::<String>();
+                        (c, "\r\n")
+                    } else if line.ends_with('\n') {
+                        let c = line.drain(..line.len() - 1).collect::<String>();
+                        (c, "\n")
+                    } else {
+                        (line, "")
+                    };
+
+                    full_content.push_str(&content);
+                    full_content.push_str(term);
+
+                    for ch in content.chars().chain(term.chars()) {
+                        if SENTENCE_END.contains(&ch) {
+                            if !buf.trim().is_empty() {
+                                slices.push(buf.trim().to_string());
+                            }
+                            buf.clear();
+                        } else {
+                            buf.push(ch);
+                        }
+                    }
+                }
+                if !buf.trim().is_empty() {
+                    slices.push(buf.trim().to_string());
+                }
+            }
+            _ => {
+                let cfg = config::get();
+                let chunk_size = cfg.slice.smart_slice_max_chars;
+                let overlap = cfg.slice.fixed_slice_overlap_chars;
+                let mut buf: Vec<char> = Vec::new();
+
+                loop {
+                    let mut line = String::new();
+                    let n = reader.read_line(&mut line).await?;
+                    if n == 0 {
+                        break;
+                    }
+
+                    let (content, term) = if line.ends_with("\r\n") {
+                        let c = line.drain(..line.len() - 2).collect::<String>();
+                        (c, "\r\n")
+                    } else if line.ends_with('\n') {
+                        let c = line.drain(..line.len() - 1).collect::<String>();
+                        (c, "\n")
+                    } else {
+                        (line, "")
+                    };
+
+                    full_content.push_str(&content);
+                    full_content.push_str(term);
+
+                    for ch in content.chars().chain(term.chars()) {
+                        buf.push(ch);
+                        if buf.len() >= chunk_size {
+                            let slice: String = buf[..chunk_size].iter().collect();
+                            slices.push(slice);
+                            if overlap >= chunk_size || overlap == 0 {
+                                buf.clear();
+                            } else {
+                                let keep = buf.len() - overlap;
+                                buf.drain(0..keep);
+                            }
+                        }
+                    }
+                }
+
+                while !buf.is_empty() {
+                    let end = buf.len().min(chunk_size);
+                    let slice: String = buf[..end].iter().collect();
+                    slices.push(slice);
+                    if end == buf.len() {
+                        break;
+                    }
+                    if overlap >= end || overlap == 0 {
+                        break;
+                    }
+                    let keep = buf.len() - overlap;
+                    buf.drain(0..keep);
+                }
+            }
+        }
+
+        Ok((full_content, slices))
+    }
+
     /// 处理普通文本文件
     async fn process_text_file(&self, file: &File, mut timing: Option<&mut ParseTimingCtx>) -> anyhow::Result<()> {
         if !self.ensure_file_exists(file.id, "before reading text").await? {
             return Ok(());
         }
-        // 示例：读取文件内容
-        let content = timed_step_opt(timing.as_deref_mut(), "read_text_file", async {
-            Ok(tokio::fs::read_to_string(file.path.as_str()).await?)
+        let (content, slices) = timed_step_opt(timing.as_deref_mut(), "read_text_file", async {
+            Self::stream_text_file(&file.path, &file.slice_type).await
         })
         .await?;
-        self.process_plain_text_content(file, &content, "Processing completed successfully", timing).await
+        self.process_plain_text_content(file, content, slices, "Processing completed successfully", timing).await
     }
 
     async fn process_audio_file(&self, file: &File, mut timing: Option<&mut ParseTimingCtx>) -> anyhow::Result<()> {
@@ -2319,24 +2485,26 @@ impl FileProcessor {
             format!("Audio processed successfully (language: {})", language)
         };
 
-        self.process_plain_text_content(file, &text, &log_message, timing).await
-    }
-
-    async fn process_plain_text_content(
-        &self, file: &File, content: &str, log_message: &str, mut timing: Option<&mut ParseTimingCtx>,
-    ) -> anyhow::Result<()> {
-        if !self.ensure_file_exists(file.id, "before writing slices").await? {
-            return Ok(());
-        }
-        // 示例：根据 slice_type 进行分片处理（CPU 密集，放到阻塞线程池）
+        let text = timed_step_opt(timing.as_deref_mut(), "audio_transcription", async { Ok(text) }).await?;
         let slices = timed_step_opt(timing.as_deref_mut(), "slice_build", async {
-            let content_owned = content.to_string();
+            let content_owned = text.clone();
             let slice_type = file.slice_type.clone();
             tokio::task::spawn_blocking(move || Self::slice_content(&content_owned, &slice_type))
                 .await
                 .map_err(|e| anyhow::anyhow!("slice_content task failed: {e}"))?
         })
         .await?;
+
+        self.process_plain_text_content(file, text, slices, &log_message, timing).await
+    }
+
+    async fn process_plain_text_content(
+        &self, file: &File, content: String, slices: Vec<String>, log_message: &str,
+        mut timing: Option<&mut ParseTimingCtx>,
+    ) -> anyhow::Result<()> {
+        if !self.ensure_file_exists(file.id, "before writing slices").await? {
+            return Ok(());
+        }
         let slice_count = slices.len();
 
         // 保存分片到数据库并收集文档
@@ -3259,7 +3427,8 @@ impl FileProcessor {
             let embeddings = if is_image {
                 let embedding =
                     search::embedding::get_image_embedding_from_path(&target.path, Some(&target.filename)).await?;
-                (0..search_docs.len()).map(|_| Some(embedding.clone())).collect()
+                let arc_embedding = Arc::new(embedding);
+                (0..search_docs.len()).map(|_| Some(Arc::clone(&arc_embedding))).collect()
             } else {
                 vec![None; search_docs.len()]
             };
@@ -3382,14 +3551,11 @@ impl FileProcessor {
             relation.file_id = Some(file.id);
         }
 
-        // 6. 更新知识图谱
-        let mut graph = KnowledgeGraph::load_from_db(self.pool.clone(), file.kb_id).await?;
-
-        // 添加实体和关系
-        graph.incremental_update(entities, relations).await?;
+        // 6. 增量直写知识图谱（避免把整个 KB 的图加载到内存）
+        KnowledgeGraph::incremental_update_direct(self.pool.clone(), file.kb_id, entities, relations).await?;
 
         // 7. 保存图快照
-        graph.save_snapshot().await?;
+        KnowledgeGraph::save_snapshot_direct(&self.pool, file.kb_id).await?;
 
         info!("Knowledge graph updated successfully for file {} (LLM-generated)", file.id);
 

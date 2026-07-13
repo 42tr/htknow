@@ -49,12 +49,12 @@ pub struct CompactStats {
 
 #[derive(Clone)]
 pub struct Document {
-    pub id: i64,                           // 切片 ID
-    pub file_id: i64,                      // 文件 ID
-    pub kb_id: Option<i64>,                // 知识库 ID
-    pub content: String,                   // 内容
-    pub is_image: bool,                    // 是否为图片文件
-    pub image_embedding: Option<Vec<f32>>, // 图片 embedding
+    pub id: i64,                                // 切片 ID
+    pub file_id: i64,                           // 文件 ID
+    pub kb_id: Option<i64>,                     // 知识库 ID
+    pub content: String,                        // 内容
+    pub is_image: bool,                         // 是否为图片文件
+    pub image_embedding: Option<Arc<Vec<f32>>>, // 图片 embedding
 }
 
 impl Document {
@@ -62,7 +62,7 @@ impl Document {
         Document { id, file_id, kb_id, content, is_image: false, image_embedding: None }
     }
 
-    pub fn with_image_embedding(mut self, embedding: Vec<f32>) -> Self {
+    pub fn with_image_embedding(mut self, embedding: Arc<Vec<f32>>) -> Self {
         self.is_image = true;
         self.image_embedding = Some(embedding);
         self
@@ -721,7 +721,7 @@ async fn create_record_batch(docs: Vec<Document>, schema: &Arc<ArrowSchema>) -> 
                     image_embedding.len()
                 );
             }
-            for &value in image_embedding {
+            for &value in image_embedding.as_ref() {
                 values_builder.append_value(value);
             }
             image_list_builder.append(true);

@@ -147,7 +147,7 @@ fn is_image_filename(filename: &str) -> bool {
 }
 
 /// 为所有已完成的图片文件重新生成 image_embedding，按 file_id 缓存。
-async fn rebuild_image_embeddings(pool: &SqlitePool) -> anyhow::Result<HashMap<i64, Vec<f32>>> {
+async fn rebuild_image_embeddings(pool: &SqlitePool) -> anyhow::Result<HashMap<i64, Arc<Vec<f32>>>> {
     info!("Preloading image embeddings for LanceDB rebuild...");
 
     let rows: Vec<(i64, String, String)> =
@@ -163,7 +163,7 @@ async fn rebuild_image_embeddings(pool: &SqlitePool) -> anyhow::Result<HashMap<i
         }
         match embedding::get_image_embedding_from_path(&path, Some(&filename)).await {
             Ok(embedding) => {
-                embeddings.insert(file_id, embedding);
+                embeddings.insert(file_id, Arc::new(embedding));
                 processed += 1;
             }
             Err(err) => {
@@ -522,7 +522,9 @@ impl SearchEngine {
         rebuild_result
     }
 
-    pub async fn write(&self, doc: tantivy_engine::Document, image_embedding: Option<Vec<f32>>) -> anyhow::Result<()> {
+    pub async fn write(
+        &self, doc: tantivy_engine::Document, image_embedding: Option<Arc<Vec<f32>>>,
+    ) -> anyhow::Result<()> {
         {
             let _guard = self.index_write_lock.lock().await;
             self.index_writer.write_batch(vec![doc.clone()]).await?;
@@ -542,7 +544,7 @@ impl SearchEngine {
     /// 注意：写入后不会自动 reload reader，调用方需在完成全部写入后调用 [`reload_readers`]，
     /// 避免批量处理时每次写入都重建 reader。
     pub async fn write_batch(
-        &self, docs: Vec<tantivy_engine::Document>, image_embeddings: Vec<Option<Vec<f32>>>,
+        &self, docs: Vec<tantivy_engine::Document>, image_embeddings: Vec<Option<Arc<Vec<f32>>>>,
     ) -> anyhow::Result<()> {
         if docs.is_empty() {
             return Ok(());

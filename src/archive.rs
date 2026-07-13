@@ -3,10 +3,13 @@
 //! 支持 ZIP、TAR（及其 GZ/BZ2/XZ 变体）格式的解压。
 //! 7Z 和 RAR 格式暂不支持。
 
-use std::{io::Read, path::Path};
+use std::{
+    io::{Read, Write}, path::Path
+};
 
 use encoding_rs::GB18030;
 use serde::Serialize;
+use tempfile::NamedTempFile;
 use utoipa::ToSchema;
 
 /// 智能解码文件名：先尝试 UTF-8，发现乱码时回退到 GB18030（兼容 GBK/GB2312）
@@ -168,12 +171,13 @@ pub fn extract_archive_with_limits(
     }
 }
 
-/// 读取压缩包内单个文件内容到内存
+/// 读取压缩包内单个文件内容到临时文件
 ///
 /// `filename` 为原始文件名（含扩展名），用于判断压缩格式。
+/// 返回的 `NamedTempFile` 需要由调用方在合适时机消费/关闭。
 pub fn read_archive_entry(
     src_path: &str, filename: &str, entry_path: &str, password: Option<&str>,
-) -> Result<Vec<u8>, ArchiveError> {
+) -> Result<NamedTempFile, ArchiveError> {
     let lower = filename.to_lowercase();
     if lower.ends_with(".zip") {
         read_zip_entry(src_path, entry_path, password)
@@ -303,7 +307,7 @@ fn extract_zip(
     Ok(entries)
 }
 
-fn read_zip_entry(src_path: &str, entry_path: &str, password: Option<&str>) -> Result<Vec<u8>, ArchiveError> {
+fn read_zip_entry(src_path: &str, entry_path: &str, password: Option<&str>) -> Result<NamedTempFile, ArchiveError> {
     let file = std::fs::File::open(src_path)?;
     let mut archive = match zip::ZipArchive::new(file) {
         Ok(a) => a,
@@ -333,9 +337,10 @@ fn read_zip_entry(src_path: &str, entry_path: &str, password: Option<&str>) -> R
                 archive.by_index(i).map_err(|e| ArchiveError::Zip(e.to_string()))?
             };
 
-            let mut buf = Vec::new();
-            file_entry.read_to_end(&mut buf)?;
-            return Ok(buf);
+            let mut temp = NamedTempFile::new()?;
+            std::io::copy(&mut file_entry, &mut temp)?;
+            temp.flush()?;
+            return Ok(temp);
         }
     }
 
@@ -435,7 +440,7 @@ fn extract_tar(
     Ok(entries)
 }
 
-fn read_tar_entry(src_path: &str, entry_path: &str) -> Result<Vec<u8>, ArchiveError> {
+fn read_tar_entry(src_path: &str, entry_path: &str) -> Result<NamedTempFile, ArchiveError> {
     let reader = open_tar_reader(src_path)?;
     let mut archive = tar::Archive::new(reader);
 
@@ -448,9 +453,10 @@ fn read_tar_entry(src_path: &str, entry_path: &str) -> Result<Vec<u8>, ArchiveEr
         let name = decoded.replace('\\', "/").trim_start_matches('/').trim_end_matches('/').to_string();
 
         if name == normalized_target {
-            let mut buf = Vec::new();
-            entry.read_to_end(&mut buf)?;
-            return Ok(buf);
+            let mut temp = NamedTempFile::new()?;
+            std::io::copy(&mut entry, &mut temp)?;
+            temp.flush()?;
+            return Ok(temp);
         }
     }
 

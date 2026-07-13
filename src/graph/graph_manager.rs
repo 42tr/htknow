@@ -22,12 +22,15 @@ impl KnowledgeGraph {
         let mut node_index = HashMap::new();
         let mut node_id_to_index = HashMap::new();
 
-        let nodes_where_clause =
-            if let Some(kb_id) = kb_id { format!("WHERE kb_id = {}", kb_id) } else { "".to_string() };
-
         // 加载节点
-        let nodes_sql = format!("SELECT id, name, entity_type, properties FROM graph_nodes {}", nodes_where_clause);
-        let nodes: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(&nodes_sql).fetch_all(&pool).await?;
+        let nodes: Vec<(i64, String, String, Option<String>)> = if let Some(kb_id) = kb_id {
+            sqlx::query_as("SELECT id, name, entity_type, properties FROM graph_nodes WHERE kb_id = ?")
+                .bind(kb_id)
+                .fetch_all(&pool)
+                .await?
+        } else {
+            sqlx::query_as("SELECT id, name, entity_type, properties FROM graph_nodes").fetch_all(&pool).await?
+        };
 
         for (id, name, entity_type_str, properties_json) in nodes {
             let entity_type = EntityType::Custom(entity_type_str);
@@ -45,18 +48,27 @@ impl KnowledgeGraph {
         }
 
         // 加载边（使用 n1.kb_id 避免歧义）
-        let edges_where_clause =
-            if let Some(kb_id) = kb_id { format!("WHERE n1.kb_id = {}", kb_id) } else { "".to_string() };
-        let edges_sql = format!(
-            "SELECT e.id, e.source_node_id, e.target_node_id, e.relation_type, e.properties, e.weight \
-             FROM graph_edges e \
-             INNER JOIN graph_nodes n1 ON e.source_node_id = n1.id \
-             INNER JOIN graph_nodes n2 ON e.target_node_id = n2.id \
-             {}",
-            edges_where_clause
-        );
-        let edges: Vec<(i64, i64, i64, String, Option<String>, f32)> =
-            sqlx::query_as(&edges_sql).fetch_all(&pool).await?;
+        let edges: Vec<(i64, i64, i64, String, Option<String>, f32)> = if let Some(kb_id) = kb_id {
+            sqlx::query_as(
+                "SELECT e.id, e.source_node_id, e.target_node_id, e.relation_type, e.properties, e.weight \
+                 FROM graph_edges e \
+                 INNER JOIN graph_nodes n1 ON e.source_node_id = n1.id \
+                 INNER JOIN graph_nodes n2 ON e.target_node_id = n2.id \
+                 WHERE n1.kb_id = ?",
+            )
+            .bind(kb_id)
+            .fetch_all(&pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT e.id, e.source_node_id, e.target_node_id, e.relation_type, e.properties, e.weight \
+                 FROM graph_edges e \
+                 INNER JOIN graph_nodes n1 ON e.source_node_id = n1.id \
+                 INNER JOIN graph_nodes n2 ON e.target_node_id = n2.id",
+            )
+            .fetch_all(&pool)
+            .await?
+        };
 
         for (id, source_id, target_id, relation_type_str, properties_json, weight) in edges {
             if let (Some(&source_idx), Some(&target_idx)) =
@@ -166,6 +178,61 @@ impl KnowledgeGraph {
         Ok(())
     }
 
+    /// 不加载整个内存图，直接在数据库中做增量 upsert（用于后台文件处理）。
+    pub async fn incremental_update_direct(
+        pool: SqlitePool, kb_id: Option<i64>, entities: Vec<Entity>, relations: Vec<Relation>,
+    ) -> Result<()> {
+        let mut tx = pool.begin().await?;
+        let mut name_to_id: HashMap<String, i64> = HashMap::with_capacity(entities.len());
+
+        for entity in entities {
+            let entity_type_str = entity.entity_type.as_str();
+            let properties_json = serde_json::to_string(&entity.properties)?;
+            let id: (i64,) = sqlx::query_as(
+                "INSERT INTO graph_nodes (name, entity_type, properties, file_id, kb_id) \
+                 VALUES (?, ?, ?, ?, ?) \
+                 ON CONFLICT(name, entity_type, kb_id) DO UPDATE SET \
+                 properties = excluded.properties, \
+                 updated_at = strftime('%s','now') \
+                 RETURNING id",
+            )
+            .bind(&entity.name)
+            .bind(entity_type_str)
+            .bind(&properties_json)
+            .bind(entity.file_id)
+            .bind(entity.kb_id.or(kb_id))
+            .fetch_one(&mut *tx)
+            .await?;
+            name_to_id.insert(entity.name, id.0);
+        }
+
+        for relation in relations {
+            let Some(&source_id) = name_to_id.get(&relation.source_name) else {
+                continue;
+            };
+            let Some(&target_id) = name_to_id.get(&relation.target_name) else {
+                continue;
+            };
+            let relation_type_str = relation.relation_type.as_str();
+            let properties_json = serde_json::to_string(&relation.properties)?;
+            sqlx::query(
+                "INSERT INTO graph_edges (source_node_id, target_node_id, relation_type, properties, weight, file_id) \
+                 VALUES (?, ?, ?, ?, ?, ?)",
+            )
+            .bind(source_id)
+            .bind(target_id)
+            .bind(relation_type_str)
+            .bind(&properties_json)
+            .bind(relation.weight)
+            .bind(relation.file_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     /// 保存图快照
     pub async fn save_snapshot(&self) -> Result<()> {
         let node_count = self.graph.node_count() as i64;
@@ -183,6 +250,49 @@ impl KnowledgeGraph {
             .bind(edge_count)
             .execute(&self.pool)
             .await?;
+
+        Ok(())
+    }
+
+    /// 不加载内存图，直接统计数据库中当前 KB 的节点/边数量并保存快照。
+    pub async fn save_snapshot_direct(pool: &SqlitePool, kb_id: Option<i64>) -> Result<()> {
+        let (node_count,): (i64,) = if let Some(kb_id) = kb_id {
+            sqlx::query_as("SELECT COUNT(*) FROM graph_nodes WHERE kb_id = ?").bind(kb_id).fetch_one(pool).await?
+        } else {
+            sqlx::query_as("SELECT COUNT(*) FROM graph_nodes").fetch_one(pool).await?
+        };
+
+        let (edge_count,): (i64,) = if let Some(kb_id) = kb_id {
+            sqlx::query_as(
+                "SELECT COUNT(*) FROM graph_edges e \
+                 INNER JOIN graph_nodes n1 ON e.source_node_id = n1.id \
+                 WHERE n1.kb_id = ?",
+            )
+            .bind(kb_id)
+            .fetch_one(pool)
+            .await?
+        } else {
+            sqlx::query_as(
+                "SELECT COUNT(*) FROM graph_edges e \
+                 INNER JOIN graph_nodes n1 ON e.source_node_id = n1.id",
+            )
+            .fetch_one(pool)
+            .await?
+        };
+
+        let mut tx = pool.begin().await?;
+        sqlx::query("DELETE FROM graph_snapshots WHERE kb_id IS ?").bind(kb_id).execute(&mut *tx).await?;
+        sqlx::query(
+            "INSERT INTO graph_snapshots (kb_id, graph_data, node_count, edge_count) \
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(kb_id)
+        .bind(Vec::<u8>::new())
+        .bind(node_count)
+        .bind(edge_count)
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
 
         Ok(())
     }

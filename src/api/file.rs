@@ -6,6 +6,7 @@ use anyhow::Result as AnyResult;
 use axum::{
     Extension, body::Body, extract::{Multipart, Path, Query, State}, http::{StatusCode, header}, response::Json
 };
+use bytes::Bytes;
 use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -49,6 +50,18 @@ async fn body_from_bytes(bytes: Vec<u8>) -> Result<(u64, Body), ApiError> {
     .map_err(|e| ApiError::Internal(format!("failed to write temp file: {}", e)))?;
 
     let file = fs::File::from_std(std_file);
+    let stream = tokio_util::io::ReaderStream::new(file);
+    Ok((len, Body::from_stream(stream)))
+}
+
+/// 将已拥有所有权的 `std::fs::File`（通常来自 `NamedTempFile::into_file()`）转换为流式 Body。
+///
+/// 调用前需确保文件偏移在起始位置；返回 `(字节数, Body)`。
+fn stream_from_std_file(mut file: std::fs::File) -> Result<(u64, Body), ApiError> {
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0))?;
+    let len = file.metadata()?.len();
+    let file = fs::File::from_std(file);
     let stream = tokio_util::io::ReaderStream::new(file);
     Ok((len, Body::from_stream(stream)))
 }
@@ -375,19 +388,34 @@ pub async fn upload(
 
                 match field_name.as_deref() {
                     Some("file") => {
-                        let mut hasher = Sha256::new();
-                        let mut size: i64 = 0;
                         let filename = field.file_name().unwrap_or("unknown").to_string();
                         debug!("Uploading file: {}", filename);
                         let tempname = uuid::Uuid::new_v4().to_string();
                         let filepath = format!("{}/{}", dir, tempname);
                         let mut file = tokio::fs::File::create(filepath.clone()).await?;
+
+                        // 把 SHA-256 计算卸载到阻塞线程，避免在异步循环里做 CPU 密集哈希。
+                        let (hash_tx, hash_rx) = std::sync::mpsc::channel::<Bytes>();
+                        let hash_handle = tokio::task::spawn_blocking(move || {
+                            let mut hasher = Sha256::new();
+                            while let Ok(chunk) = hash_rx.recv() {
+                                hasher.update(&chunk);
+                            }
+                            hex::encode(hasher.finalize())
+                        });
+
+                        let mut size: i64 = 0;
                         while let Some(chunk) = field.chunk().await? {
                             size += chunk.len() as i64;
                             file.write_all(&chunk).await?;
-                            hasher.update(&chunk);
+                            if hash_tx.send(chunk).is_err() {
+                                break;
+                            }
                         }
-                        let hash = hex::encode(hasher.finalize());
+                        drop(hash_tx);
+                        let hash =
+                            hash_handle.await.map_err(|e| ApiError::Internal(format!("hash task panicked: {}", e)))?;
+
                         debug!("File saved to: {}", filepath);
                         files_data.push((hash, filename, filepath, size));
                     }
@@ -1128,7 +1156,7 @@ fn push_i64_list(qb: &mut QueryBuilder<Sqlite>, ids: &[i64]) {
 async fn query_deletable_files(pool: &SqlitePool, ids: &[i64], auth_user: &AuthUser) -> Result<Vec<File>, sqlx::Error> {
     let is_admin = auth_user.is_admin();
     // Fetch all files by id first
-    let mut qb = QueryBuilder::<Sqlite>::new("SELECT * FROM files WHERE id IN (");
+    let mut qb = QueryBuilder::<Sqlite>::new(&format!("SELECT {} FROM files WHERE id IN (", FILE_COLS_NO_CONTENT));
     push_i64_list(&mut qb, ids);
     qb.push(")");
     let all_files: Vec<File> = qb.build_query_as::<File>().fetch_all(pool).await?;
@@ -1777,6 +1805,7 @@ async fn extract_slice_image_paths_by_file(
     pool: &SqlitePool, file_ids: &[i64],
 ) -> Result<HashMap<i64, Vec<String>>, sqlx::Error> {
     let mut result: HashMap<i64, Vec<String>> = HashMap::new();
+    let mut seen: HashMap<i64, HashSet<String>> = HashMap::new();
     if file_ids.is_empty() {
         return Ok(result);
     }
@@ -1787,10 +1816,10 @@ async fn extract_slice_image_paths_by_file(
         qb.push(")");
         let rows: Vec<(i64, String)> = qb.build_query_as().fetch_all(pool).await?;
         for (file_id, content) in rows {
-            let paths = result.entry(file_id).or_default();
+            let file_seen = seen.entry(file_id).or_default();
             for path in extract_image_paths_from_text(&content) {
-                if !paths.iter().any(|existing| existing == &path) {
-                    paths.push(path);
+                if file_seen.insert(path.clone()) {
+                    result.entry(file_id).or_default().push(path);
                 }
             }
         }
@@ -1799,18 +1828,18 @@ async fn extract_slice_image_paths_by_file(
     Ok(result)
 }
 
-fn extract_image_paths_from_text(content: &str) -> Vec<String> {
+fn extract_image_paths_from_text(content: &str) -> HashSet<String> {
     static IMAGE_REF_RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = IMAGE_REF_RE.get_or_init(|| {
         regex::Regex::new(r"/api/v1/knowledge/files/([^\s'\)>]+)").expect("valid image reference regex")
     });
 
-    let mut paths = Vec::new();
+    let mut paths = HashSet::new();
     for cap in re.captures_iter(content) {
         let Some(matched) = cap.get(1) else { continue };
         let path = matched.as_str().trim();
-        if !path.is_empty() && !paths.iter().any(|existing| existing == path) {
-            paths.push(path.to_string());
+        if !path.is_empty() {
+            paths.insert(path.to_string());
         }
     }
     paths
@@ -2189,7 +2218,7 @@ pub async fn update_slices(
     }
 
     // 1. 查询文件信息并校验权限
-    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?")
+    let file: File = sqlx::query_as(&format!("SELECT {} FROM files WHERE id = ?", FILE_COLS_NO_CONTENT))
         .bind(id)
         .fetch_optional(&pool)
         .await?
@@ -2235,9 +2264,12 @@ pub async fn update_slices(
 
     // 4. 校验 slice id 存在且属于该文件
     let requested_ids: Vec<i64> = req.slices.iter().map(|s| s.id).collect();
-    let existing_slices: Vec<Slice> =
-        sqlx::query_as("SELECT * FROM slices WHERE file_id = ? ORDER BY id").bind(id).fetch_all(&pool).await?;
-    let existing_ids: std::collections::HashSet<i64> = existing_slices.iter().map(|s| s.id).collect();
+    let existing_slices: Vec<(i64, String)> =
+        sqlx::query_as("SELECT id, content FROM slices WHERE file_id = ? ORDER BY id")
+            .bind(id)
+            .fetch_all(&pool)
+            .await?;
+    let existing_ids: std::collections::HashSet<i64> = existing_slices.iter().map(|(id, _)| *id).collect();
 
     for item in &req.slices {
         if !existing_ids.contains(&item.id) {
@@ -2249,25 +2281,44 @@ pub async fn update_slices(
     let mut content_map: std::collections::HashMap<i64, String> =
         req.slices.into_iter().map(|s| (s.id, s.content)).collect();
 
-    // 6. SQLite 事务：更新 slices 并重建 files.content
+    // 6. SQLite 事务：批量更新 slices 并重建 files.content
     let mut tx = pool.begin().await?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 
-    for item_id in &requested_ids {
-        let content = content_map.get(item_id).unwrap();
-        sqlx::query("UPDATE slices SET content = ?, updated_at = ? WHERE id = ? AND file_id = ?")
-            .bind(content)
-            .bind(now)
-            .bind(item_id)
-            .bind(id)
-            .execute(&mut *tx)
-            .await?;
+    if !requested_ids.is_empty() {
+        // SQLite 变量上限约 999；每对 id/content 占 2 个变量，再留 updated_at + id IN + file_id。
+        let max_pairs = 450;
+        for chunk in requested_ids.chunks(max_pairs) {
+            let mut sql = String::from("UPDATE slices SET content = CASE id ");
+            for _ in chunk {
+                sql.push_str("WHEN ? THEN ? ");
+            }
+            sql.push_str("END, updated_at = ? WHERE id IN (");
+            for (i, _) in chunk.iter().enumerate() {
+                if i > 0 {
+                    sql.push(',');
+                }
+                sql.push('?');
+            }
+            sql.push_str(") AND file_id = ?");
+
+            let mut q = sqlx::query(&sql);
+            for item_id in chunk {
+                q = q.bind(item_id).bind(content_map.get(item_id).unwrap());
+            }
+            q = q.bind(now);
+            for item_id in chunk {
+                q = q.bind(item_id);
+            }
+            q = q.bind(id);
+            q.execute(&mut *tx).await?;
+        }
     }
 
     // 重新拼接完整内容：使用最新切片内容
     let full_content = existing_slices
         .iter()
-        .map(|s| content_map.get(&s.id).cloned().unwrap_or_else(|| s.content.clone()))
+        .map(|(slice_id, content)| content_map.get(slice_id).cloned().unwrap_or_else(|| content.clone()))
         .collect::<Vec<_>>()
         .join("\n\n");
 
@@ -2327,7 +2378,10 @@ pub async fn update_slices(
 pub async fn get_slice_highlight(
     State(pool): State<SqlitePool>, Path((id, slice_id)): Path<(i64, i64)>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<SliceHighlight>> {
-    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+    let file: File = sqlx::query_as(&format!("SELECT {} FROM files WHERE id = ?", FILE_COLS_NO_CONTENT))
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
 
     if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
         return Err(ApiError::NotFound("File not found or permission denied".to_string()));
@@ -2388,7 +2442,10 @@ pub async fn get_slice_highlight(
 pub async fn get_slice_highlight_page(
     State(pool): State<SqlitePool>, Path((id, slice_id)): Path<(i64, i64)>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<SliceHighlightPage>> {
-    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+    let file: File = sqlx::query_as(&format!("SELECT {} FROM files WHERE id = ?", FILE_COLS_NO_CONTENT))
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
 
     if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
         return Err(ApiError::NotFound("File not found or permission denied".to_string()));
@@ -2695,7 +2752,10 @@ pub async fn excel_data(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
     Query(query): Query<ExcelDataQuery>,
 ) -> ApiResult<Json<ExcelData>> {
-    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+    let file: File = sqlx::query_as(&format!("SELECT {} FROM files WHERE id = ?", FILE_COLS_NO_CONTENT))
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
 
     if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
         return Err(ApiError::NotFound("File not found or permission denied".to_string()));
@@ -2806,7 +2866,10 @@ pub async fn excel_data(
 pub async fn archive_entries(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<Vec<ArchiveEntry>>> {
-    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+    let file: File = sqlx::query_as(&format!("SELECT {} FROM files WHERE id = ?", FILE_COLS_NO_CONTENT))
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
 
     if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
         return Err(ApiError::NotFound("File not found or permission denied".to_string()));
@@ -2850,7 +2913,10 @@ pub async fn archive_extract(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
     Json(req): Json<ArchiveExtractReq>,
 ) -> ApiResult<Json<ExtractResult>> {
-    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+    let file: File = sqlx::query_as(&format!("SELECT {} FROM files WHERE id = ?", FILE_COLS_NO_CONTENT))
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
 
     if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
         return Err(ApiError::NotFound("File not found or permission denied".to_string()));
@@ -3012,12 +3078,12 @@ pub async fn archive_download(
     let src_path = file.path.clone();
     let filename = file.filename.clone();
     let entry_path_owned = entry_path.to_string();
-    let buf = match tokio::task::spawn_blocking(move || {
+    let temp = match tokio::task::spawn_blocking(move || {
         archive::read_archive_entry(&src_path, &filename, &entry_path_owned, None)
     })
     .await
     {
-        Ok(Ok(buf)) => buf,
+        Ok(Ok(temp)) => temp,
         Ok(Err(archive::ArchiveError::PasswordRequired)) => {
             return Err(ApiError::BadRequest("Archive is password protected".to_string()));
         }
@@ -3025,7 +3091,7 @@ pub async fn archive_download(
         Err(e) => return Err(ApiError::Internal(format!("Archive read task failed: {}", e))),
     };
 
-    let (len, body) = body_from_bytes(buf).await?;
+    let (len, body) = stream_from_std_file(temp.into_file())?;
     Ok((
         StatusCode::OK,
         [
