@@ -355,14 +355,15 @@ fn force_merge_index_stats(index: &str, stats: ForceMergeStats) -> TantivyForceM
 #[cfg(feature = "profiling")]
 async fn heap_profile_impl() -> ApiResult<Response> {
     use std::{
-        ffi::CString, time::{SystemTime, UNIX_EPOCH}
+        ffi::CString, io::Seek, time::{SystemTime, UNIX_EPOCH}
     };
 
     use axum::{
         body::Body, http::{HeaderValue, header}
     };
+    use tempfile::NamedTempFile;
     use tikv_jemalloc_ctl::raw;
-    use tokio::fs;
+    use tokio_util::io::ReaderStream;
 
     let pid = std::process::id();
     let ts = SystemTime::now()
@@ -371,24 +372,34 @@ async fn heap_profile_impl() -> ApiResult<Response> {
         .as_secs();
     let filename = format!("htknow.heap.{}.{}.heap", pid, ts);
 
-    let mut path = std::env::temp_dir();
-    path.push(&filename);
+    // 将堆 dump 写入临时文件后立即删除路径，只保留 fd 用于流式返回。
+    let temp = NamedTempFile::new().map_err(|e| ApiError::internal(format!("create temp file failed: {}", e)))?;
+    let path = temp.path().to_path_buf();
     let path_str = path.to_string_lossy().into_owned();
     let c_path =
         CString::new(path_str.clone()).map_err(|_| ApiError::internal("Failed to create C string for path"))?;
 
-    // 使用 raw::write，传递 C 字符串指针
     let ptr = c_path.as_ptr();
     unsafe {
         raw::write(b"prof.dump\0", ptr).map_err(|e| ApiError::internal(format!("jemalloc heap dump failed: {}", e)))?;
     }
 
-    let bytes = fs::read(&path).await?;
-    let _ = fs::remove_file(&path).await;
+    let mut std_file = temp.into_file();
+    std_file
+        .seek(std::io::SeekFrom::Start(0))
+        .map_err(|e| ApiError::internal(format!("seek temp file failed: {}", e)))?;
+    let file = tokio::fs::File::from_std(std_file);
+    let len = file.metadata().await.map_err(|e| ApiError::internal(format!("metadata failed: {}", e)))?.len();
+    let stream = ReaderStream::new(file);
 
-    let mut response = Response::new(Body::from(bytes));
+    let mut response = Response::new(Body::from_stream(stream));
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&len.to_string())
+            .map_err(|e| ApiError::internal(format!("Invalid header value: {}", e)))?,
+    );
     let disposition = format!("attachment; filename=\"{}\"", filename);
     headers.insert(
         header::CONTENT_DISPOSITION,
@@ -406,14 +417,16 @@ async fn heap_profile_impl() -> ApiResult<Response> {
 #[cfg(feature = "profiling")]
 async fn heap_profile_pdf_impl() -> ApiResult<Response> {
     use std::{
-        ffi::CString, time::{SystemTime, UNIX_EPOCH}
+        ffi::CString, process::Stdio, time::{SystemTime, UNIX_EPOCH}
     };
 
     use axum::{
         body::Body, http::{HeaderValue, header}
     };
+    use tempfile::NamedTempFile;
     use tikv_jemalloc_ctl::raw;
-    use tokio::{fs, process::Command};
+    use tokio::{io::AsyncSeekExt, process::Command};
+    use tokio_util::io::ReaderStream;
 
     let pid = std::process::id();
     let ts = SystemTime::now()
@@ -421,67 +434,77 @@ async fn heap_profile_pdf_impl() -> ApiResult<Response> {
         .map_err(|e| ApiError::internal(format!("SystemTime error: {}", e)))?
         .as_secs();
 
-    // 生成 heap dump 文件
-    let heap_filename = format!("htknow.heap.{}.{}.heap", pid, ts);
-    let mut heap_path = std::env::temp_dir();
-    heap_path.push(&heap_filename);
+    // 生成 heap dump 文件（路径需要保持到 jeprof 执行完毕）
+    let heap_temp = NamedTempFile::new().map_err(|e| ApiError::internal(format!("create heap temp failed: {}", e)))?;
+    let heap_path = heap_temp.path().to_path_buf();
     let heap_path_str = heap_path.to_string_lossy().into_owned();
     let c_path = CString::new(heap_path_str.clone())
         .map_err(|_| ApiError::internal("Failed to create C string for heap path"))?;
 
-    // 导出 heap dump
     log::info!("Generating heap dump: {}", heap_path_str);
     let ptr = c_path.as_ptr();
     unsafe {
         raw::write(b"prof.dump\0", ptr).map_err(|e| ApiError::internal(format!("jemalloc heap dump failed: {}", e)))?;
     }
 
-    // 生成 PDF 文件
-    let pdf_filename = format!("htknow.heap.{}.{}.pdf", pid, ts);
-    let mut pdf_path = std::env::temp_dir();
-    pdf_path.push(&pdf_filename);
-    let pdf_path_str = pdf_path.to_string_lossy().into_owned();
+    // 生成 PDF 文件（用 NamedTempFile 承接 jeprof 标准输出）
+    let pdf_temp = NamedTempFile::new().map_err(|e| ApiError::internal(format!("create pdf temp failed: {}", e)))?;
+    let pdf_std = pdf_temp.into_file();
+    let mut pdf_file = tokio::fs::File::from_std(pdf_std);
 
     // 获取当前二进制文件路径
     let binary_path =
         std::env::current_exe().map_err(|e| ApiError::internal(format!("Failed to get binary path: {}", e)))?;
     let binary_path_str = binary_path.to_string_lossy();
 
-    log::info!("Running jeprof: binary={}, heap={}, output={}", binary_path_str, heap_path_str, pdf_path_str);
+    log::info!("Running jeprof: binary={}, heap={}, output=pdf_stream", binary_path_str, heap_path_str);
 
-    // 执行 jeprof 命令
-    let output = Command::new("jeprof")
+    let mut child = Command::new("jeprof")
         .arg("--show_bytes")
         .arg("--pdf")
         .arg(binary_path_str.as_ref())
         .arg(&heap_path_str)
-        .output()
-        .await
+        .stdout(Stdio::piped())
+        .spawn()
         .map_err(|e| ApiError::internal(format!("Failed to execute jeprof (make sure jeprof is installed): {}", e)))?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        log::error!("jeprof failed: {}", stderr);
-        let _ = fs::remove_file(&heap_path).await;
-        return Err(ApiError::internal(format!("jeprof execution failed: {}", stderr)));
+    let mut stdout = child.stdout.take().ok_or_else(|| ApiError::internal("jeprof stdout unavailable"))?;
+    tokio::io::copy(&mut stdout, &mut pdf_file)
+        .await
+        .map_err(|e| ApiError::internal(format!("Failed to copy jeprof output: {}", e)))?;
+
+    let status = child.wait().await.map_err(|e| ApiError::internal(format!("jeprof process wait failed: {}", e)))?;
+
+    // jeprof 已完成，heap dump 临时文件可以清理
+    drop(heap_temp);
+
+    if !status.success() {
+        let code = status.code().unwrap_or(-1);
+        log::error!("jeprof failed with exit code: {}", code);
+        return Err(ApiError::internal(format!("jeprof execution failed with exit code: {}", code)));
     }
 
-    // 读取生成的 PDF
-    let pdf_bytes = output.stdout;
-    if pdf_bytes.is_empty() {
-        let _ = fs::remove_file(&heap_path).await;
+    pdf_file
+        .seek(std::io::SeekFrom::Start(0))
+        .await
+        .map_err(|e| ApiError::internal(format!("seek pdf temp failed: {}", e)))?;
+    let len = pdf_file.metadata().await.map_err(|e| ApiError::internal(format!("pdf metadata failed: {}", e)))?.len();
+    if len == 0 {
         return Err(ApiError::internal("jeprof generated empty PDF"));
     }
 
-    // 清理临时文件
-    let _ = fs::remove_file(&heap_path).await;
+    let pdf_filename = format!("htknow.heap.{}.{}.pdf", pid, ts);
+    log::info!("Successfully generated heap profile PDF: {} bytes", len);
 
-    log::info!("Successfully generated heap profile PDF: {} bytes", pdf_bytes.len());
-
-    // 返回 PDF 响应
-    let mut response = Response::new(Body::from(pdf_bytes));
+    let stream = ReaderStream::new(pdf_file);
+    let mut response = Response::new(Body::from_stream(stream));
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/pdf"));
+    headers.insert(
+        header::CONTENT_LENGTH,
+        HeaderValue::from_str(&len.to_string())
+            .map_err(|e| ApiError::internal(format!("Invalid header value: {}", e)))?,
+    );
     let disposition = format!("attachment; filename=\"{}\"", pdf_filename);
     headers.insert(
         header::CONTENT_DISPOSITION,

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet}, path::Component, sync::{Arc, OnceLock}, time::Instant
+    collections::{HashMap, HashSet}, io::{Seek, Write}, path::Component, sync::{Arc, OnceLock}, time::Instant
 };
 
 use anyhow::Result as AnyResult;
@@ -10,6 +10,7 @@ use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use tempfile::NamedTempFile;
 use tokio::{
     fs, io::AsyncWriteExt as _, spawn, sync::{OwnedSemaphorePermit, Semaphore}
 };
@@ -25,6 +26,29 @@ use crate::{
 async fn open_file_stream(path: &std::path::Path) -> Result<(u64, Body), ApiError> {
     let file = fs::File::open(path).await?;
     let len = file.metadata().await?.len();
+    let stream = tokio_util::io::ReaderStream::new(file);
+    Ok((len, Body::from_stream(stream)))
+}
+
+/// 将已位于内存中的字节写入临时文件并流式返回，避免把大 body 直接交给 axum 造成额外拷贝。
+///
+/// `NamedTempFile::into_file()` 会立即删除磁盘上的路径，只保留文件描述符；当返回的 `Body`
+/// 消费完毕、文件描述符关闭后，磁盘空间会自动释放。
+async fn body_from_bytes(bytes: Vec<u8>) -> Result<(u64, Body), ApiError> {
+    let (std_file, len) = tokio::task::spawn_blocking(move || {
+        let mut temp = NamedTempFile::new()?;
+        temp.write_all(&bytes)?;
+        temp.flush()?;
+        let mut file = temp.into_file();
+        file.seek(std::io::SeekFrom::Start(0))?;
+        let len = file.metadata()?.len();
+        anyhow::Ok((file, len))
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("temp file task panicked: {}", e)))?
+    .map_err(|e| ApiError::Internal(format!("failed to write temp file: {}", e)))?;
+
+    let file = fs::File::from_std(std_file);
     let stream = tokio_util::io::ReaderStream::new(file);
     Ok((len, Body::from_stream(stream)))
 }
@@ -2453,7 +2477,10 @@ pub async fn get_image_by_filename(
 pub async fn download(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
 ) -> Result<(StatusCode, [(header::HeaderName, String); 3], Body), ApiError> {
-    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+    let file: File = sqlx::query_as(&format!("SELECT {} FROM files WHERE id = ?", FILE_COLS_NO_CONTENT))
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
 
     if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
         return Err(ApiError::NotFound("File not found or permission denied".to_string()));
@@ -2503,8 +2530,11 @@ pub struct HighlightQuery {
 pub async fn get_highlighted_pdf(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Query(params): Query<HighlightQuery>,
     Extension(auth_user): Extension<AuthUser>,
-) -> Result<(StatusCode, [(header::HeaderName, String); 2], Body), ApiError> {
-    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+) -> Result<(StatusCode, [(header::HeaderName, String); 3], Body), ApiError> {
+    let file: File = sqlx::query_as(&format!("SELECT {} FROM files WHERE id = ?", FILE_COLS_NO_CONTENT))
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
 
     if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
         return Err(ApiError::NotFound("File not found or permission denied".to_string()));
@@ -2601,27 +2631,40 @@ pub async fn get_highlighted_pdf(
         return Err(ApiError::BadRequest("File is not a PDF, Word, PowerPoint, or Excel document".to_string()));
     };
 
-    // 读取原始 PDF
-    let pdf_bytes = tokio::fs::read(&pdf_path).await?;
-
-    // 添加高亮标注（lopdf 解析为 CPU 密集操作，放到阻塞线程池执行）
-    let highlighted_pdf = if positions.is_empty() {
-        pdf_bytes
-    } else {
-        tokio::task::spawn_blocking(move || {
-            pdf_highlight::add_highlights_to_pdf_with_bounds(&pdf_bytes, &positions, coord_bounds_by_page.as_ref())
-        })
-        .await
-        .map_err(|e| ApiError::Internal(format!("PDF highlight task panicked: {}", e)))?
-        .map_err(|e| ApiError::Internal(format!("Failed to add highlights: {}", e)))?
-    };
-
     let content_disposition = format!("inline; filename=\"highlighted_{}.pdf\"", file.id);
 
+    // 无高亮时直接流式返回原 PDF
+    if positions.is_empty() {
+        let (len, body) = open_file_stream(&pdf_path).await?;
+        return Ok((
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "application/pdf".to_string()),
+                (header::CONTENT_DISPOSITION, content_disposition),
+                (header::CONTENT_LENGTH, len.to_string()),
+            ],
+            body,
+        ));
+    }
+
+    // 有高亮时，在阻塞线程中生成高亮 PDF 并写入临时文件，然后流式返回
+    let highlighted_pdf = tokio::task::spawn_blocking(move || {
+        let pdf_bytes = std::fs::read(&pdf_path)?;
+        pdf_highlight::add_highlights_to_pdf_with_bounds(&pdf_bytes, &positions, coord_bounds_by_page.as_ref())
+    })
+    .await
+    .map_err(|e| ApiError::Internal(format!("PDF highlight task panicked: {}", e)))?
+    .map_err(|e| ApiError::Internal(format!("Failed to add highlights: {}", e)))?;
+
+    let (len, body) = body_from_bytes(highlighted_pdf).await?;
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, "application/pdf".to_string()), (header::CONTENT_DISPOSITION, content_disposition)],
-        Body::from(highlighted_pdf),
+        [
+            (header::CONTENT_TYPE, "application/pdf".to_string()),
+            (header::CONTENT_DISPOSITION, content_disposition),
+            (header::CONTENT_LENGTH, len.to_string()),
+        ],
+        body,
     ))
 }
 
@@ -2922,8 +2965,11 @@ pub async fn archive_extract(
 pub async fn archive_download(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Query(query): Query<ArchiveDownloadQuery>,
     Extension(auth_user): Extension<AuthUser>,
-) -> Result<(StatusCode, [(header::HeaderName, String); 2], Body), ApiError> {
-    let file: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+) -> Result<(StatusCode, [(header::HeaderName, String); 3], Body), ApiError> {
+    let file: File = sqlx::query_as(&format!("SELECT {} FROM files WHERE id = ?", FILE_COLS_NO_CONTENT))
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
 
     if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
         return Err(ApiError::NotFound("File not found or permission denied".to_string()));
@@ -2941,20 +2987,24 @@ pub async fn archive_download(
     }
 
     let cfg = config::get();
+    let mime_type = mime_guess::from_path(entry_path).first_or_octet_stream().to_string();
+    let filename = std::path::Path::new(entry_path).file_name().and_then(|n| n.to_str()).unwrap_or(entry_path);
+    let content_disposition = format!("attachment; filename=\"{}\"", filename);
 
     // 尝试从解压目录读取
     if let Some(resolved) = archive::resolve_archive_entry_path(&cfg.storage.archives_path, id, entry_path)
         && resolved.exists()
         && resolved.is_file()
     {
-        let file_content = fs::read(&resolved).await?;
-        let mime_type = mime_guess::from_path(entry_path).first_or_octet_stream().to_string();
-        let filename = std::path::Path::new(entry_path).file_name().and_then(|n| n.to_str()).unwrap_or(entry_path);
-        let content_disposition = format!("attachment; filename=\"{}\"", filename);
+        let (len, body) = open_file_stream(&resolved).await?;
         return Ok((
             StatusCode::OK,
-            [(header::CONTENT_TYPE, mime_type), (header::CONTENT_DISPOSITION, content_disposition)],
-            Body::from(file_content),
+            [
+                (header::CONTENT_TYPE, mime_type),
+                (header::CONTENT_DISPOSITION, content_disposition),
+                (header::CONTENT_LENGTH, len.to_string()),
+            ],
+            body,
         ));
     }
 
@@ -2975,12 +3025,14 @@ pub async fn archive_download(
         Err(e) => return Err(ApiError::Internal(format!("Archive read task failed: {}", e))),
     };
 
-    let mime_type = mime_guess::from_path(entry_path).first_or_octet_stream().to_string();
-    let filename = std::path::Path::new(entry_path).file_name().and_then(|n| n.to_str()).unwrap_or(entry_path);
-    let content_disposition = format!("attachment; filename=\"{}\"", filename);
+    let (len, body) = body_from_bytes(buf).await?;
     Ok((
         StatusCode::OK,
-        [(header::CONTENT_TYPE, mime_type), (header::CONTENT_DISPOSITION, content_disposition)],
-        Body::from(buf),
+        [
+            (header::CONTENT_TYPE, mime_type),
+            (header::CONTENT_DISPOSITION, content_disposition),
+            (header::CONTENT_LENGTH, len.to_string()),
+        ],
+        body,
     ))
 }

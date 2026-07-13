@@ -179,14 +179,14 @@ async fn rebuild_image_embeddings(pool: &SqlitePool) -> anyhow::Result<HashMap<i
 
 #[derive(Clone)]
 pub struct SearchEngine {
-    index: Index,
     schema: Schema,
     index_reader: IndexReader,
     index_write_lock: Arc<Mutex<()>>,
-    full_index: Index,
+    index_writer: Arc<tantivy_engine::IndexWriterHandle>,
     full_schema: Schema,
     full_index_reader: IndexReader,
     full_index_write_lock: Arc<Mutex<()>>,
+    full_index_writer: Arc<tantivy_engine::IndexWriterHandle>,
     rebuild_lock: Arc<Mutex<()>>,
     pool: Option<SqlitePool>,
     synonym_cache: Arc<tokio::sync::RwLock<Option<SynonymCache>>>,
@@ -201,15 +201,22 @@ impl SearchEngine {
         let (full_schema, full_index) = tantivy_engine::init_full().unwrap();
         let index_reader = build_reader(&index, "index");
         let full_index_reader = build_reader(&full_index, "full_index");
+        let index_writer = tantivy_engine::IndexWriterHandle::open(index, schema.clone(), "index".to_string())
+            .await
+            .expect("open tantivy index writer failed");
+        let full_index_writer =
+            tantivy_engine::IndexWriterHandle::open(full_index, full_schema.clone(), "full_index".to_string())
+                .await
+                .expect("open tantivy full index writer failed");
         Self {
-            index,
             schema,
             index_reader,
             index_write_lock: Arc::new(Mutex::new(())),
-            full_index,
+            index_writer,
             full_schema,
             full_index_reader,
             full_index_write_lock: Arc::new(Mutex::new(())),
+            full_index_writer,
             rebuild_lock: Arc::new(Mutex::new(())),
             pool: None,
             synonym_cache: Arc::new(tokio::sync::RwLock::new(None)),
@@ -518,7 +525,7 @@ impl SearchEngine {
     pub async fn write(&self, doc: tantivy_engine::Document, image_embedding: Option<Vec<f32>>) -> anyhow::Result<()> {
         {
             let _guard = self.index_write_lock.lock().await;
-            tantivy_engine::write_documents(&self.index, &self.schema, doc.clone()).await?;
+            self.index_writer.write_batch(vec![doc.clone()]).await?;
             reload_reader(&self.index_reader, "index")?;
         }
 
@@ -543,7 +550,7 @@ impl SearchEngine {
 
         {
             let _guard = self.index_write_lock.lock().await;
-            tantivy_engine::write_documents_batch(&self.index, &self.schema, docs.clone()).await?;
+            self.index_writer.write_batch(docs.clone()).await?;
         }
 
         let lancedb_docs: Vec<lancedb::Document> = docs
@@ -566,7 +573,7 @@ impl SearchEngine {
     pub async fn write_full(&self, doc: tantivy_engine::Document) -> anyhow::Result<()> {
         {
             let _guard = self.full_index_write_lock.lock().await;
-            tantivy_engine::write_documents(&self.full_index, &self.full_schema, doc).await?;
+            self.full_index_writer.write_batch(vec![doc]).await?;
         }
         Ok(())
     }
@@ -591,8 +598,8 @@ impl SearchEngine {
         // 1. 默认索引：删除旧 slice 文档并写入新文档，随后 reload reader
         {
             let _guard = self.index_write_lock.lock().await;
-            tantivy_engine::delete_by_slices(&self.index, &self.schema, &slice_ids).await?;
-            tantivy_engine::write_documents_batch(&self.index, &self.schema, docs.clone()).await?;
+            self.index_writer.delete_by_field("id", &slice_ids).await?;
+            self.index_writer.write_batch(docs.clone()).await?;
             reload_reader(&self.index_reader, "index")?;
         }
 
@@ -616,13 +623,10 @@ impl SearchEngine {
 
         {
             let _guard = self.full_index_write_lock.lock().await;
-            tantivy_engine::delete_by_file(&self.full_index, &self.full_schema, file_id).await?;
-            tantivy_engine::write_documents(
-                &self.full_index,
-                &self.full_schema,
-                tantivy_engine::Document::new(file_id, file_id, kb_id, index_content),
-            )
-            .await?;
+            self.full_index_writer.delete_by_field("file_id", &[file_id]).await?;
+            self.full_index_writer
+                .write_batch(vec![tantivy_engine::Document::new(file_id, file_id, kb_id, index_content)])
+                .await?;
             reload_reader(&self.full_index_reader, "full_index")?;
         }
         Ok(())
@@ -653,11 +657,7 @@ impl SearchEngine {
                         file_ids.len(),
                         lock_wait_start.elapsed().as_millis()
                     );
-                    if file_ids.len() == 1 {
-                        tantivy_engine::delete_by_file(&self.index, &self.schema, file_ids[0]).await?;
-                    } else {
-                        tantivy_engine::delete_by_files(&self.index, &self.schema, file_ids).await?;
-                    }
+                    self.index_writer.delete_by_field("file_id", file_ids).await?;
                     debug!(
                         "search_delete file_count={} tantivy_inner_ms={}",
                         file_ids.len(),
@@ -694,11 +694,7 @@ impl SearchEngine {
                         file_ids.len(),
                         lock_wait_start.elapsed().as_millis()
                     );
-                    if file_ids.len() == 1 {
-                        tantivy_engine::delete_by_file(&self.full_index, &self.full_schema, file_ids[0]).await?;
-                    } else {
-                        tantivy_engine::delete_by_files(&self.full_index, &self.full_schema, file_ids).await?;
-                    }
+                    self.full_index_writer.delete_by_field("file_id", file_ids).await?;
                     debug!(
                         "search_delete file_count={} tantivy_full_inner_ms={}",
                         file_ids.len(),
@@ -731,11 +727,7 @@ impl SearchEngine {
                         kb_ids.len(),
                         lock_wait_start.elapsed().as_millis()
                     );
-                    if kb_ids.len() == 1 {
-                        tantivy_engine::delete_by_kb(&self.index, &self.schema, kb_ids[0]).await?;
-                    } else {
-                        tantivy_engine::delete_by_kbs(&self.index, &self.schema, kb_ids).await?;
-                    }
+                    self.index_writer.delete_by_field("kb_id", kb_ids).await?;
                     debug!(
                         "search_delete kb_count={} tantivy_inner_ms={}",
                         kb_ids.len(),
@@ -768,11 +760,7 @@ impl SearchEngine {
                         kb_ids.len(),
                         lock_wait_start.elapsed().as_millis()
                     );
-                    if kb_ids.len() == 1 {
-                        tantivy_engine::delete_by_kb(&self.full_index, &self.full_schema, kb_ids[0]).await?;
-                    } else {
-                        tantivy_engine::delete_by_kbs(&self.full_index, &self.full_schema, kb_ids).await?;
-                    }
+                    self.full_index_writer.delete_by_field("kb_id", kb_ids).await?;
                     debug!(
                         "search_delete kb_count={} tantivy_full_inner_ms={}",
                         kb_ids.len(),
@@ -1150,8 +1138,8 @@ impl SearchEngine {
         let (slice_stats, full_stats) = {
             let _slice_write_guard = self.index_write_lock.lock().await;
             let _full_write_guard = self.full_index_write_lock.lock().await;
-            let slice_stats = tantivy_engine::force_merge(&self.index).await?;
-            let full_stats = tantivy_engine::force_merge(&self.full_index).await?;
+            let slice_stats = self.index_writer.force_merge().await?;
+            let full_stats = self.full_index_writer.force_merge().await?;
             (slice_stats, full_stats)
         };
 

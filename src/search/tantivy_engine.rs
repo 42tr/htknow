@@ -1,5 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet}, path::Path, thread, time::{Duration, Instant}
+    collections::{HashMap, HashSet}, path::Path, sync::{
+        Arc, mpsc::{self, Sender}
+    }, thread, time::{Duration, Instant}
 };
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -178,19 +180,235 @@ fn create_writer_with_timing_blocking(index: &Index, label: &str) -> tantivy::Re
     Ok(writer)
 }
 
-pub async fn write_documents(index: &Index, schema: &Schema, doc: Document) -> tantivy::Result<()> {
-    // 建 writer、add_document、commit 均为 CPU+IO 阻塞操作（commit 需 flush segment 到磁盘），
-    // 放到阻塞线程池执行，避免阻塞异步运行时。
-    let index = index.clone();
-    let schema = schema.clone();
-    tokio::task::spawn_blocking(move || -> tantivy::Result<()> {
-        let mut index_writer = create_writer_blocking(&index)?;
-        index_writer.add_document(create_document(doc, &schema))?;
-        index_writer.commit()?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| TantivyError::SystemError(format!("write_documents task panicked: {e}")))?
+/// 每个 Tantivy 索引对应一个长期存活的 writer 线程。
+///
+/// `IndexWriter` 不是 `Send`/`Sync`，不能放在 `Arc<Mutex<...>>` 里跨越 await，因此在线程内部持有 writer，
+/// 外部通过 channel 发送写/删除/merge 任务，并通过 oneshot 等待结果。每次操作后仍执行 commit，保留原
+/// 有的数据安全语义。
+pub struct IndexWriterHandle {
+    tx: Sender<WriterJob>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+
+struct WriterJob {
+    op: WriterOp,
+    reply: Option<tokio::sync::oneshot::Sender<WriterResult>>,
+}
+
+enum WriterOp {
+    WriteBatch(Vec<Document>),
+    DeleteTerms { field_name: &'static str, ids: Vec<i64> },
+    ForceMerge,
+    Shutdown,
+}
+
+enum WriterResult {
+    Ok,
+    WriteBatch,
+    ForceMerge(ForceMergeStats),
+    Err(String),
+}
+
+impl IndexWriterHandle {
+    pub async fn open(index: Index, schema: Schema, label: String) -> anyhow::Result<Arc<Self>> {
+        let (init_tx, init_rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
+        let (tx, rx) = mpsc::channel::<WriterJob>();
+        let thread_name = format!("tantivy-writer-{}", label);
+        let thread = thread::Builder::new().name(thread_name).spawn(move || {
+            let mut writer = match create_writer_with_timing_blocking(&index, &label) {
+                Ok(w) => {
+                    let _ = init_tx.send(Ok(()));
+                    Some(w)
+                }
+                Err(e) => {
+                    let _ = init_tx.send(Err(anyhow::anyhow!(e)));
+                    return;
+                }
+            };
+
+            while let Ok(job) = rx.recv() {
+                let current_writer = match writer.take() {
+                    Some(w) => w,
+                    None => {
+                        let result = WriterResult::Err("tantivy writer is not available".to_string());
+                        if let Some(reply) = job.reply {
+                            let _ = reply.send(result);
+                        }
+                        continue;
+                    }
+                };
+
+                let (result, maybe_writer) = match job.op {
+                    WriterOp::Shutdown => {
+                        drop(current_writer);
+                        break;
+                    }
+                    WriterOp::WriteBatch(docs) => {
+                        if docs.is_empty() {
+                            (WriterResult::WriteBatch, Some(current_writer))
+                        } else {
+                            let mut writer = current_writer;
+                            let result = match add_documents(&mut writer, &schema, docs) {
+                                Ok(count) => match commit_writer(&mut writer, &label, count) {
+                                    Ok(()) => WriterResult::WriteBatch,
+                                    Err(e) => WriterResult::Err(e.to_string()),
+                                },
+                                Err(e) => WriterResult::Err(e.to_string()),
+                            };
+                            (result, Some(writer))
+                        }
+                    }
+                    WriterOp::DeleteTerms { field_name, ids } => {
+                        if ids.is_empty() {
+                            (WriterResult::Ok, Some(current_writer))
+                        } else {
+                            let mut writer = current_writer;
+                            let field = get_field(&schema, field_name);
+                            let delete_start = Instant::now();
+                            for id in &ids {
+                                let term = Term::from_field_i64(field, *id);
+                                writer.delete_term(term);
+                            }
+                            debug!(
+                                "tantivy_delete_terms target={} count={} duration_ms={}",
+                                field_name,
+                                ids.len(),
+                                delete_start.elapsed().as_millis()
+                            );
+                            let result = match commit_writer(&mut writer, &label, ids.len()) {
+                                Ok(()) => WriterResult::Ok,
+                                Err(e) => WriterResult::Err(e.to_string()),
+                            };
+                            (result, Some(writer))
+                        }
+                    }
+                    WriterOp::ForceMerge => match force_merge_with_writer(&index, current_writer, &label) {
+                        Ok((stats, new_writer)) => (WriterResult::ForceMerge(stats), Some(new_writer)),
+                        Err(e) => (WriterResult::Err(e.to_string()), None),
+                    },
+                };
+
+                writer = maybe_writer;
+                if let Some(reply) = job.reply {
+                    let _ = reply.send(result);
+                }
+                // writer 为 None 时说明 force_merge 失败且未能重建，退出循环
+                if writer.is_none() {
+                    warn!("tantivy writer thread {} exiting after force_merge failure", label);
+                    break;
+                }
+            }
+            // writer 在这里 drop，释放目录锁
+        })?;
+
+        init_rx.await??;
+        Ok(Arc::new(Self { tx, thread: Some(thread) }))
+    }
+
+    pub async fn write_batch(&self, docs: Vec<Document>) -> anyhow::Result<()> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(WriterJob { op: WriterOp::WriteBatch(docs), reply: Some(reply_tx) })
+            .map_err(|e| anyhow::anyhow!("tantivy writer channel closed: {e}"))?;
+        match reply_rx.await? {
+            WriterResult::Ok | WriterResult::WriteBatch => Ok(()),
+            WriterResult::ForceMerge(_) => Err(anyhow::anyhow!("unexpected force_merge result from write_batch")),
+            WriterResult::Err(e) => Err(anyhow::anyhow!("tantivy write_batch failed: {e}")),
+        }
+    }
+
+    pub async fn delete_by_field(&self, field_name: &'static str, ids: &[i64]) -> anyhow::Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let ids = ids.to_vec();
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(WriterJob { op: WriterOp::DeleteTerms { field_name, ids }, reply: Some(reply_tx) })
+            .map_err(|e| anyhow::anyhow!("tantivy writer channel closed: {e}"))?;
+        match reply_rx.await? {
+            WriterResult::Ok => Ok(()),
+            WriterResult::WriteBatch => Err(anyhow::anyhow!("unexpected write result from delete")),
+            WriterResult::ForceMerge(_) => Err(anyhow::anyhow!("unexpected force_merge result from delete")),
+            WriterResult::Err(e) => Err(anyhow::anyhow!("tantivy delete failed: {e}")),
+        }
+    }
+
+    pub async fn force_merge(&self) -> anyhow::Result<ForceMergeStats> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(WriterJob { op: WriterOp::ForceMerge, reply: Some(reply_tx) })
+            .map_err(|e| anyhow::anyhow!("tantivy writer channel closed: {e}"))?;
+        match reply_rx.await? {
+            WriterResult::ForceMerge(stats) => Ok(stats),
+            WriterResult::Ok => Err(anyhow::anyhow!("unexpected ok result from force_merge")),
+            WriterResult::WriteBatch => Err(anyhow::anyhow!("unexpected write result from force_merge")),
+            WriterResult::Err(e) => Err(anyhow::anyhow!("tantivy force_merge failed: {e}")),
+        }
+    }
+}
+
+impl Drop for IndexWriterHandle {
+    fn drop(&mut self) {
+        if let Some(thread) = self.thread.take() {
+            let _ = self.tx.send(WriterJob { op: WriterOp::Shutdown, reply: None });
+            let _ = thread.join();
+        }
+    }
+}
+
+fn force_merge_with_writer(
+    index: &Index, mut writer: tantivy::IndexWriter, label: &str,
+) -> anyhow::Result<(ForceMergeStats, tantivy::IndexWriter)> {
+    let start = Instant::now();
+    let before_metas = index.searchable_segment_metas()?;
+    let before_segments = before_metas.len();
+    let before_docs = segment_docs(&before_metas);
+    let before_deleted_docs = segment_deleted_docs(&before_metas);
+
+    if before_segments < 2 {
+        let (gc_deleted_files, gc_failed_files) = garbage_collect_index_files(&writer, "force_merge_skipped")?;
+        writer.wait_merging_threads()?;
+        let new_writer = create_writer_with_timing_blocking(index, &format!("{}_gc", label))?;
+        return Ok((
+            ForceMergeStats {
+                before_segments,
+                after_segments: before_segments,
+                before_docs,
+                after_docs: before_docs,
+                before_deleted_docs,
+                after_deleted_docs: before_deleted_docs,
+                gc_deleted_files,
+                gc_failed_files,
+                skipped: true,
+                duration_ms: start.elapsed().as_millis(),
+            },
+            new_writer,
+        ));
+    }
+
+    let segment_ids = before_metas.iter().map(|meta| meta.id()).collect::<Vec<_>>();
+    writer.merge(&segment_ids).wait()?;
+    writer.wait_merging_threads()?;
+    let new_writer = create_writer_with_timing_blocking(index, &format!("{}_gc", label))?;
+    let (gc_deleted_files, gc_failed_files) = garbage_collect_index_files(&new_writer, "force_merge")?;
+
+    let after_metas = index.searchable_segment_metas()?;
+    Ok((
+        ForceMergeStats {
+            before_segments,
+            after_segments: after_metas.len(),
+            before_docs,
+            after_docs: segment_docs(&after_metas),
+            before_deleted_docs,
+            after_deleted_docs: segment_deleted_docs(&after_metas),
+            gc_deleted_files,
+            gc_failed_files,
+            skipped: false,
+            duration_ms: start.elapsed().as_millis(),
+        },
+        new_writer,
+    ))
 }
 
 pub async fn create_rebuild_writer(index: &Index, label: &str) -> tantivy::Result<tantivy::IndexWriter> {
@@ -213,24 +431,6 @@ pub fn commit_writer(index_writer: &mut tantivy::IndexWriter, label: &str, doc_c
     index_writer.commit()?;
     debug!("tantivy_commit label={} docs={} duration_ms={}", label, doc_count, commit_start.elapsed().as_millis());
     Ok(())
-}
-
-/// 批量写入文档，减少 commit 次数，避免产生大量小 segment
-pub async fn write_documents_batch(index: &Index, schema: &Schema, docs: Vec<Document>) -> tantivy::Result<()> {
-    if docs.is_empty() {
-        return Ok(());
-    }
-    // 建 writer、批量 add、commit 均为 CPU+IO 阻塞操作，放到阻塞线程池执行。
-    let index = index.clone();
-    let schema = schema.clone();
-    tokio::task::spawn_blocking(move || -> tantivy::Result<()> {
-        let mut index_writer = create_writer_blocking(&index)?;
-        let doc_count = add_documents(&mut index_writer, &schema, docs)?;
-        commit_writer(&mut index_writer, "write_documents_batch", doc_count)?;
-        Ok(())
-    })
-    .await
-    .map_err(|e| TantivyError::SystemError(format!("write_documents_batch task panicked: {e}")))?
 }
 
 pub fn search_sync(
@@ -341,121 +541,6 @@ pub async fn search_with_snippet(
     })
     .await
     .map_err(|e| anyhow::anyhow!("search_with_snippet task panicked: {e}"))?
-}
-
-pub async fn delete_by_file(index: &Index, schema: &Schema, file_id: i64) -> anyhow::Result<()> {
-    delete_by_files(index, schema, &[file_id]).await
-}
-
-pub async fn delete_by_files(index: &Index, schema: &Schema, file_ids: &[i64]) -> anyhow::Result<()> {
-    delete_by_i64_terms(index, schema, "file_id", file_ids, "delete_by_files").await
-}
-
-pub async fn delete_by_slices(index: &Index, schema: &Schema, slice_ids: &[i64]) -> anyhow::Result<()> {
-    delete_by_i64_terms(index, schema, "id", slice_ids, "delete_by_slices").await
-}
-
-pub async fn delete_by_kb(index: &Index, schema: &Schema, kb_id: i64) -> anyhow::Result<()> {
-    delete_by_kbs(index, schema, &[kb_id]).await
-}
-
-pub async fn delete_by_kbs(index: &Index, schema: &Schema, kb_ids: &[i64]) -> anyhow::Result<()> {
-    delete_by_i64_terms(index, schema, "kb_id", kb_ids, "delete_by_kbs").await
-}
-
-pub async fn force_merge(index: &Index) -> anyhow::Result<ForceMergeStats> {
-    let index = index.clone();
-    tokio::task::spawn_blocking(move || force_merge_blocking(&index))
-        .await
-        .map_err(|err| anyhow::anyhow!("tantivy force merge task failed: {}", err))?
-}
-
-async fn delete_by_i64_terms(
-    index: &Index, schema: &Schema, field_name: &'static str, ids: &[i64], writer_label: &'static str,
-) -> anyhow::Result<()> {
-    if ids.is_empty() {
-        return Ok(());
-    }
-
-    let index = index.clone();
-    let schema = schema.clone();
-    let ids = ids.to_vec();
-    tokio::task::spawn_blocking(move || delete_by_i64_terms_blocking(&index, &schema, field_name, &ids, writer_label))
-        .await
-        .map_err(|err| anyhow::anyhow!("tantivy delete task failed: {}", err))?
-}
-
-fn delete_by_i64_terms_blocking(
-    index: &Index, schema: &Schema, field_name: &str, ids: &[i64], writer_label: &str,
-) -> anyhow::Result<()> {
-    let mut writer = create_writer_with_timing_blocking(index, writer_label)?;
-    let field = get_field(schema, field_name);
-    let delete_start = Instant::now();
-    for id in ids {
-        let term = Term::from_field_i64(field, *id);
-        writer.delete_term(term);
-    }
-    debug!(
-        "tantivy_delete_terms target={} count={} duration_ms={}",
-        field_name,
-        ids.len(),
-        delete_start.elapsed().as_millis()
-    );
-    let commit_start = Instant::now();
-    writer.commit()?;
-    debug!(
-        "tantivy_commit target={} count={} duration_ms={}",
-        field_name,
-        ids.len(),
-        commit_start.elapsed().as_millis()
-    );
-    Ok(())
-}
-
-fn force_merge_blocking(index: &Index) -> anyhow::Result<ForceMergeStats> {
-    let start = Instant::now();
-    let before_metas = index.searchable_segment_metas()?;
-    let before_segments = before_metas.len();
-    let before_docs = segment_docs(&before_metas);
-    let before_deleted_docs = segment_deleted_docs(&before_metas);
-
-    if before_segments < 2 {
-        let writer = create_writer_with_timing_blocking(index, "force_merge_gc")?;
-        let (gc_deleted_files, gc_failed_files) = garbage_collect_index_files(&writer, "force_merge_skipped")?;
-        return Ok(ForceMergeStats {
-            before_segments,
-            after_segments: before_segments,
-            before_docs,
-            after_docs: before_docs,
-            before_deleted_docs,
-            after_deleted_docs: before_deleted_docs,
-            gc_deleted_files,
-            gc_failed_files,
-            skipped: true,
-            duration_ms: start.elapsed().as_millis(),
-        });
-    }
-
-    let segment_ids = before_metas.iter().map(|meta| meta.id()).collect::<Vec<_>>();
-    let mut writer = create_writer_with_timing_blocking(index, "force_merge")?;
-    writer.merge(&segment_ids).wait()?;
-    writer.wait_merging_threads()?;
-    let writer = create_writer_with_timing_blocking(index, "force_merge_gc")?;
-    let (gc_deleted_files, gc_failed_files) = garbage_collect_index_files(&writer, "force_merge")?;
-
-    let after_metas = index.searchable_segment_metas()?;
-    Ok(ForceMergeStats {
-        before_segments,
-        after_segments: after_metas.len(),
-        before_docs,
-        after_docs: segment_docs(&after_metas),
-        before_deleted_docs,
-        after_deleted_docs: segment_deleted_docs(&after_metas),
-        gc_deleted_files,
-        gc_failed_files,
-        skipped: false,
-        duration_ms: start.elapsed().as_millis(),
-    })
 }
 
 fn garbage_collect_index_files(writer: &tantivy::IndexWriter, label: &str) -> anyhow::Result<(usize, usize)> {

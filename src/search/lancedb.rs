@@ -1,6 +1,6 @@
 use std::{
     collections::HashSet, path::Path, sync::{
-        Arc, atomic::{AtomicBool, Ordering}
+        Arc, atomic::{AtomicBool, AtomicU64, Ordering}
     }, time::{SystemTime, UNIX_EPOCH}
 };
 
@@ -11,7 +11,9 @@ use arrow_array::{
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::stream::StreamExt;
 use lancedb::{
-    Connection, Table, connect, index::Index, query::{ExecutableQuery, QueryBase, Select}, table::{CompactionOptions, Duration, NewColumnTransform, OptimizeAction, OptimizeOptions}
+    Connection, Table, connect, index::{
+        Index, scalar::{BTreeIndexBuilder, BitmapIndexBuilder}
+    }, query::{ExecutableQuery, QueryBase, Select}, table::{CompactionOptions, NewColumnTransform, OptimizeAction, OptimizeOptions}
 };
 use log::{debug, info, warn};
 use once_cell::sync::OnceCell;
@@ -25,6 +27,14 @@ static TABLE_NAME: &str = "documents";
 static IS_DELETED_COLUMN: &str = "is_deleted";
 static SEARCH_SELECT_COLUMNS: &[&str] = &["id", "file_id", "kb_id", "content", "_distance"];
 static VECTOR_FAST_SEARCH_ENABLED: AtomicBool = AtomicBool::new(false);
+static IMAGE_FAST_SEARCH_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// 增量索引优化与 compact 之间的互斥锁。
+static OPTIMIZE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+/// 单调递增版本号，用于防抖：只有最新版本才实际执行优化。
+static OPTIMIZE_VERSION: AtomicU64 = AtomicU64::new(0);
+/// 写操作后触发增量索引优化的防抖间隔。
+const OPTIMIZE_DEBOUNCE_MS: u64 = 5000;
 
 #[derive(Debug, Clone)]
 pub struct CompactStats {
@@ -100,9 +110,13 @@ pub async fn init() -> Result<bool> {
     if let Err(err) = ensure_search_indices(&table).await {
         warn!("LanceDB ensure indices failed: {}", err);
     }
-    if let Err(err) = refresh_vector_fast_search_state(&table).await {
-        warn!("LanceDB refresh fast-search state failed: {}", err);
+    if let Err(err) = refresh_fast_search_state_for_column(&table, "vector", &VECTOR_FAST_SEARCH_ENABLED).await {
+        warn!("LanceDB refresh vector fast-search state failed: {}", err);
         VECTOR_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
+    }
+    if let Err(err) = refresh_fast_search_state_for_column(&table, "image_vector", &IMAGE_FAST_SEARCH_ENABLED).await {
+        warn!("LanceDB refresh image_vector fast-search state failed: {}", err);
+        IMAGE_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
     }
 
     LANCEDB_TABLE.set(Arc::new(table)).map_err(|_| anyhow::anyhow!("Failed to cache LanceDB table"))?;
@@ -148,7 +162,7 @@ pub async fn write_documents(doc: Document) -> Result<()> {
     let schema = create_schema();
     let batch = create_record_batch(vec![doc], &schema).await?;
     table.add(batch).execute().await?;
-    invalidate_vector_fast_search();
+    on_write_may_need_optimize();
     Ok(())
 }
 
@@ -161,7 +175,7 @@ pub async fn write_documents_batch(docs: Vec<Document>) -> Result<()> {
     let schema = create_schema();
     let batch = create_record_batch(docs, &schema).await?;
     table.add(batch).execute().await?;
-    invalidate_vector_fast_search();
+    on_write_may_need_optimize();
     Ok(())
 }
 
@@ -251,6 +265,10 @@ pub async fn search_image(
     let mut query_builder =
         table.query().nearest_to(query_vector)?.column("image_vector").select(Select::columns(SEARCH_SELECT_COLUMNS));
 
+    if image_fast_search_enabled() {
+        query_builder = query_builder.fast_search();
+    }
+
     let filter_conditions = build_filter_conditions(true, file_ids, kb_ids);
 
     if !filter_conditions.is_empty() {
@@ -287,7 +305,7 @@ pub async fn delete_by_files(file_ids: &[i64]) -> Result<()> {
         format!("file_id IN ({})", ids)
     };
     table.update().only_if(predicate).column(IS_DELETED_COLUMN, "true").execute().await?;
-    invalidate_vector_fast_search();
+    on_write_may_need_optimize();
     Ok(())
 }
 
@@ -304,7 +322,7 @@ pub async fn delete_by_slices(slice_ids: &[i64]) -> Result<()> {
         format!("id IN ({})", ids)
     };
     table.update().only_if(predicate).column(IS_DELETED_COLUMN, "true").execute().await?;
-    invalidate_vector_fast_search();
+    on_write_may_need_optimize();
     Ok(())
 }
 
@@ -325,12 +343,18 @@ pub async fn delete_by_kbs(kb_ids: &[i64]) -> Result<()> {
         format!("kb_id IN ({})", ids)
     };
     table.update().only_if(predicate).column(IS_DELETED_COLUMN, "true").execute().await?;
-    invalidate_vector_fast_search();
+    on_write_may_need_optimize();
     Ok(())
 }
 
 /// 清理已删除的记录，释放磁盘和内存空间
 pub async fn compact() -> Result<CompactStats> {
+    let _guard = OPTIMIZE_LOCK.lock().await;
+
+    // 先禁用 fast_search，避免在 compact 期间使用未就绪的索引
+    VECTOR_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
+    IMAGE_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
+
     let table = get_table()?;
     let storage_path = config::get().storage.lancedb_path.clone();
 
@@ -350,13 +374,14 @@ pub async fn compact() -> Result<CompactStats> {
     table.optimize(OptimizeAction::Index(OptimizeOptions::default())).await?;
     table
         .optimize(OptimizeAction::Prune {
-            older_than: Some(Duration::minutes(10)),
+            older_than: Some(lancedb::table::Duration::minutes(10)),
             delete_unverified: Some(false),
             error_if_tagged_old_versions: Some(true),
         })
         .await?;
 
-    refresh_vector_fast_search_state(&table).await?;
+    refresh_fast_search_state_for_column(&table, "vector", &VECTOR_FAST_SEARCH_ENABLED).await?;
+    refresh_fast_search_state_for_column(&table, "image_vector", &IMAGE_FAST_SEARCH_ENABLED).await?;
 
     let total_rows_after = table.count_rows(None).await? as u64;
     let deleted_rows_after = table.count_rows(Some(format!("{} = true", IS_DELETED_COLUMN))).await? as u64;
@@ -396,7 +421,7 @@ pub async fn count_valid_documents() -> Result<u64> {
 pub async fn clear_all_documents() -> Result<()> {
     let table = get_table()?;
     table.delete("true").await?;
-    invalidate_vector_fast_search();
+    on_write_may_need_optimize();
     Ok(())
 }
 
@@ -430,8 +455,88 @@ fn vector_fast_search_enabled() -> bool {
     VECTOR_FAST_SEARCH_ENABLED.load(Ordering::Relaxed)
 }
 
-fn invalidate_vector_fast_search() {
-    VECTOR_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
+fn image_fast_search_enabled() -> bool {
+    IMAGE_FAST_SEARCH_ENABLED.load(Ordering::Relaxed)
+}
+
+fn set_fast_search_enabled(enabled: bool, flag: &AtomicBool) {
+    flag.store(enabled, Ordering::Relaxed);
+}
+
+/// 写/删操作后立即调用：先禁用 fast_search 防止读到未索引数据，再触发一次防抖增量优化。
+fn on_write_may_need_optimize() {
+    set_fast_search_enabled(false, &VECTOR_FAST_SEARCH_ENABLED);
+    set_fast_search_enabled(false, &IMAGE_FAST_SEARCH_ENABLED);
+
+    let version = OPTIMIZE_VERSION.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(OPTIMIZE_DEBOUNCE_MS)).await;
+        run_debounced_optimize(version).await;
+    });
+}
+
+async fn run_debounced_optimize(version: u64) {
+    // 如果版本号已被后续写操作超过，跳过本次优化
+    if OPTIMIZE_VERSION.load(Ordering::Relaxed) != version {
+        return;
+    }
+
+    let _guard = OPTIMIZE_LOCK.lock().await;
+
+    // 再次检查版本，避免在等锁期间又有新写入
+    if OPTIMIZE_VERSION.load(Ordering::Relaxed) != version {
+        return;
+    }
+
+    let table = match get_table() {
+        Ok(t) => t,
+        Err(e) => {
+            warn!("LanceDB debounced optimize failed to get table: {}", e);
+            return;
+        }
+    };
+
+    let optimize_start = std::time::Instant::now();
+    match table.optimize(OptimizeAction::Index(OptimizeOptions::default())).await {
+        Ok(stats) => {
+            debug!("LanceDB debounced optimize_index done in {}ms: {:?}", optimize_start.elapsed().as_millis(), stats);
+            if let Err(e) = refresh_fast_search_state_for_column(&table, "vector", &VECTOR_FAST_SEARCH_ENABLED).await {
+                warn!("LanceDB refresh vector fast_search after optimize failed: {}", e);
+            }
+            if let Err(e) =
+                refresh_fast_search_state_for_column(&table, "image_vector", &IMAGE_FAST_SEARCH_ENABLED).await
+            {
+                warn!("LanceDB refresh image_vector fast_search after optimize failed: {}", e);
+            }
+        }
+        Err(e) => {
+            warn!("LanceDB debounced optimize_index failed: {} ({}ms)", e, optimize_start.elapsed().as_millis());
+        }
+    }
+}
+
+async fn refresh_fast_search_state_for_column(table: &Table, column: &str, flag: &AtomicBool) -> Result<()> {
+    let indices = table.list_indices().await?;
+    let Some(index_config) = indices.iter().find(|idx| idx.columns.iter().any(|c| c == column)) else {
+        set_fast_search_enabled(false, flag);
+        warn!("LanceDB index missing on column={}; fast_search disabled", column);
+        return Ok(());
+    };
+
+    let Some(stats) = table.index_stats(&index_config.name).await? else {
+        set_fast_search_enabled(false, flag);
+        warn!("LanceDB index stats missing for index={}; fast_search disabled", index_config.name);
+        return Ok(());
+    };
+
+    let fast_search = stats.num_unindexed_rows == 0 && stats.num_indexed_rows > 0;
+    set_fast_search_enabled(fast_search, flag);
+    info!(
+        "LanceDB index ready: column={} name={} type={:?} indexed_rows={} unindexed_rows={} fast_search={}",
+        column, index_config.name, stats.index_type, stats.num_indexed_rows, stats.num_unindexed_rows, fast_search
+    );
+
+    Ok(())
 }
 
 fn has_empty_scope(file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>) -> bool {
@@ -662,6 +767,25 @@ async fn ensure_search_indices(table: &Table) -> Result<()> {
         table.create_index(&["vector"], Index::Auto).replace(false).execute().await?;
     }
 
+    if !has_index_on_column(&existing_indices, "image_vector") {
+        info!("Creating LanceDB vector index on column=image_vector");
+        table.create_index(&["image_vector"], Index::Auto).replace(false).execute().await?;
+    }
+
+    let scalar_indices = [
+        ("id", Index::BTree(BTreeIndexBuilder::default())),
+        ("file_id", Index::BTree(BTreeIndexBuilder::default())),
+        ("kb_id", Index::BTree(BTreeIndexBuilder::default())),
+        ("is_deleted", Index::Bitmap(BitmapIndexBuilder::default())),
+        ("is_image", Index::Bitmap(BitmapIndexBuilder::default())),
+    ];
+    for (column, index) in scalar_indices {
+        if !has_index_on_column(&existing_indices, column) {
+            info!("Creating LanceDB scalar index on column={}", column);
+            table.create_index(&[column], index).replace(false).execute().await?;
+        }
+    }
+
     let refreshed_indices = table.list_indices().await?;
     debug!(
         "LanceDB indices: {}",
@@ -677,28 +801,4 @@ async fn ensure_search_indices(table: &Table) -> Result<()> {
 
 fn has_index_on_column(indices: &[lancedb::index::IndexConfig], column: &str) -> bool {
     indices.iter().any(|idx| idx.columns.iter().any(|candidate| candidate == column))
-}
-
-async fn refresh_vector_fast_search_state(table: &Table) -> Result<()> {
-    let indices = table.list_indices().await?;
-    let Some(vector_index) = indices.iter().find(|idx| idx.columns.iter().any(|column| column == "vector")) else {
-        VECTOR_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
-        warn!("LanceDB vector index missing on column=vector; fast_search disabled");
-        return Ok(());
-    };
-
-    let Some(stats) = table.index_stats(&vector_index.name).await? else {
-        VECTOR_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
-        warn!("LanceDB vector index stats missing for index={}; fast_search disabled", vector_index.name);
-        return Ok(());
-    };
-
-    let fast_search = stats.num_unindexed_rows == 0 && stats.num_indexed_rows > 0;
-    VECTOR_FAST_SEARCH_ENABLED.store(fast_search, Ordering::Relaxed);
-    info!(
-        "LanceDB vector index ready: name={} type={:?} indexed_rows={} unindexed_rows={} fast_search={}",
-        vector_index.name, stats.index_type, stats.num_indexed_rows, stats.num_unindexed_rows, fast_search
-    );
-
-    Ok(())
 }

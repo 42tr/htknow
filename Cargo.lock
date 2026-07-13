@@ -2454,6 +2454,7 @@ dependencies = [
  "sysinfo",
  "tantivy",
  "tar",
+ "tempfile",
  "thiserror 1.0.69",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",

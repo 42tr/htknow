@@ -11,13 +11,52 @@ use once_cell::sync::Lazy;
 use reqwest::multipart;
 use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
-use tokio::{fs, time};
+use tokio::{fs, io::AsyncReadExt, time};
 
 use crate::{
     api::{
         File, collect_image_paths_for_files, collect_image_raw_paths_for_files, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta
     }, archive, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, SearchEngine, tantivy_engine}
 };
+
+/// 将本地文件构造为流式 multipart Part，避免大文件全量读入内存。
+async fn stream_file_part(path: &str, filename: &str, mime_type: &str) -> anyhow::Result<reqwest::multipart::Part> {
+    let file = fs::File::open(path).await?;
+    let len = file.metadata().await?.len();
+    Ok(reqwest::multipart::Part::stream_with_length(file, len).file_name(filename.to_string()).mime_str(mime_type)?)
+}
+
+/// 将 HTTP 响应体流式写入文件，并返回写入的字节数。
+async fn stream_response_to_file(response: &mut reqwest::Response, path: &std::path::Path) -> anyhow::Result<u64> {
+    let mut file = fs::File::create(path).await?;
+    let mut total: u64 = 0;
+    while let Some(chunk) = response.chunk().await? {
+        total += chunk.len() as u64;
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+    }
+    Ok(total)
+}
+
+/// 判断文件是否以指定字节开头。
+async fn file_starts_with(path: &std::path::Path, prefix: &[u8]) -> bool {
+    let mut file = match fs::File::open(path).await {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = vec![0u8; prefix.len()];
+    match file.read(&mut buf).await {
+        Ok(n) if n == prefix.len() => buf == prefix,
+        _ => false,
+    }
+}
+
+/// 读取文件开头若干字节并转换为文本摘要，用于错误日志。
+async fn summarize_file_start(path: &std::path::Path) -> String {
+    match fs::read(path).await {
+        Ok(bytes) => summarize_http_body(&bytes),
+        Err(e) => format!("<read failed: {}>", e),
+    }
+}
 
 /// 复用的外部服务 HTTP client（连接池），超时取自启动时配置。
 static SERVICES_HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
@@ -1219,10 +1258,9 @@ impl FileProcessor {
     }
 
     async fn call_custom_parse_api(&self, file: &File, custom_url: &str) -> anyhow::Result<CustomParseData> {
-        let file_bytes = tokio::fs::read(&file.path).await?;
         let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string();
-        let form = multipart::Form::new()
-            .part("file", multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str(&mime_type)?);
+        let file_part = stream_file_part(&file.path, &file.filename, &mime_type).await?;
+        let form = multipart::Form::new().part("file", file_part);
 
         let client = self.services_http_client()?;
         let response = client.post(custom_url).multipart(form).send().await?;
@@ -1441,9 +1479,6 @@ impl FileProcessor {
         let pdf_filename = format!("{}.pdf", file.id);
         let stored_pdf_path = pdf_dir.join(&pdf_filename);
         let temp_pdf_path = pdf_dir.join(format!(".{}.pdf.tmp", file.id));
-        // 用 Bytes 包装文件内容：重试时只做引用计数 clone，避免大文件重复整份拷贝。
-        let file_bytes = bytes::Bytes::from(tokio::fs::read(&file.path).await?);
-        let file_len = file_bytes.len() as u64;
         let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string();
         let mut convert_url = reqwest::Url::parse(&cfg.services.office_convert_url)?;
         if !convert_url.query_pairs().any(|(key, _)| key == "target_format") {
@@ -1452,15 +1487,12 @@ impl FileProcessor {
 
         let mut last_error: Option<String> = None;
         for attempt in 0..2 {
-            let form = multipart::Form::new().part(
-                "file",
-                multipart::Part::stream_with_length(file_bytes.clone(), file_len)
-                    .file_name(file.filename.clone())
-                    .mime_str(&mime_type)?,
-            );
+            // 每次重试重新打开文件流，避免流式 body 不可复用。
+            let file_part = stream_file_part(&file.path, &file.filename, &mime_type).await?;
+            let form = multipart::Form::new().part("file", file_part);
 
             let client = self.services_http_client()?;
-            let response = match client.post(convert_url.clone()).multipart(form).send().await {
+            let mut response = match client.post(convert_url.clone()).multipart(form).send().await {
                 Ok(response) => response,
                 Err(err) => {
                     last_error = Some(format!("Office convert API request failed (url={}): {}", convert_url, err));
@@ -1477,27 +1509,28 @@ impl FileProcessor {
 
             let response_url = response.url().to_string();
             let status = response.status();
-            let body_bytes = response.bytes().await?;
+            let body_len = stream_response_to_file(&mut response, &temp_pdf_path).await?;
             if !status.is_success() {
+                let body_text = summarize_file_start(&temp_pdf_path).await;
                 last_error = Some(format!(
                     "Office convert API failed (status={}, url={}, body_len={}): {}",
                     status.as_u16(),
                     response_url,
-                    body_bytes.len(),
-                    summarize_http_body(&body_bytes)
+                    body_len,
+                    body_text
                 ));
-            } else if body_bytes.is_empty() {
+            } else if body_len == 0 {
                 last_error = Some(format!("Office convert API returned empty PDF body (url={})", response_url));
-            } else if !body_bytes.starts_with(b"%PDF-") {
+            } else if !file_starts_with(&temp_pdf_path, b"%PDF-").await {
+                let body_text = summarize_file_start(&temp_pdf_path).await;
                 last_error = Some(format!(
                     "Office convert API returned non-PDF body (status={}, url={}, body_len={}): {}",
                     status.as_u16(),
                     response_url,
-                    body_bytes.len(),
-                    summarize_http_body(&body_bytes)
+                    body_len,
+                    body_text
                 ));
             } else {
-                fs::write(&temp_pdf_path, &body_bytes).await?;
                 fs::rename(&temp_pdf_path, &stored_pdf_path).await?;
                 return Ok(stored_pdf_path);
             }
@@ -2070,7 +2103,6 @@ impl FileProcessor {
     async fn call_mineru_api_with_path(
         &self, file_path: &str, filename: &str, is_image: bool, start_page: Option<usize>, end_page: Option<usize>,
     ) -> anyhow::Result<Result> {
-        let file_bytes = tokio::fs::read(file_path).await?;
         let cfg = config::get();
         let mineru_url = cfg.services.mineru_url.trim_end_matches('/');
 
@@ -2083,6 +2115,7 @@ impl FileProcessor {
                 "application/pdf".to_string()
             };
 
+            let file_part = stream_file_part(file_path, filename, &mime_type).await?;
             let mut form = multipart::Form::new()
                 .text("return_middle_json", "false")
                 .text("return_model_output", "false")
@@ -2097,10 +2130,7 @@ impl FileProcessor {
                 .text("table_enable", "true")
                 .text("response_format_zip", "false")
                 .text("formula_enable", "true")
-                .part(
-                    "files",
-                    multipart::Part::bytes(file_bytes).file_name(filename.to_string()).mime_str(&mime_type)?,
-                );
+                .part("files", file_part);
             let start_page_id = start_page.unwrap_or(0);
             let end_page_id = end_page.map(|v| v.to_string()).unwrap_or_else(|| "99999".to_string());
             form = form.text("start_page_id", start_page_id.to_string()).text("end_page_id", end_page_id);
@@ -2158,8 +2188,8 @@ impl FileProcessor {
         }
 
         let mime_type = mime_guess::from_path(filename).first_or_octet_stream().essence_str().to_string();
-        let form = multipart::Form::new()
-            .part("file", multipart::Part::bytes(file_bytes).file_name(filename.to_string()).mime_str(&mime_type)?);
+        let file_part = stream_file_part(file_path, filename, &mime_type).await?;
+        let form = multipart::Form::new().part("file", file_part);
 
         let response = client.post(url.clone()).multipart(form).send().await?;
         if !response.status().is_success() {
@@ -2255,13 +2285,15 @@ impl FileProcessor {
         if !self.ensure_file_exists(file.id, "before reading audio").await? {
             return Ok(());
         }
-        let file_bytes =
-            timed_step_opt(timing.as_deref_mut(), "read_audio_file", async { Ok(tokio::fs::read(&file.path).await?) })
-                .await?;
         let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string();
+        let file_part = timed_step_opt(
+            timing.as_deref_mut(),
+            "open_audio_file",
+            stream_file_part(&file.path, &file.filename, &mime_type),
+        )
+        .await?;
 
-        let form = multipart::Form::new()
-            .part("file", multipart::Part::bytes(file_bytes).file_name(file.filename.clone()).mime_str(&mime_type)?);
+        let form = multipart::Form::new().part("file", file_part);
 
         let client = self.services_http_client()?;
         let cfg = config::get();

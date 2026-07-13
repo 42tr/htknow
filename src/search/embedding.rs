@@ -2,9 +2,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use once_cell::sync::Lazy;
-use reqwest::{Client, multipart};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
-use tokio::fs;
 
 use crate::config;
 
@@ -28,22 +27,16 @@ struct EmbeddingData {
 
 /// 获取图片的 embedding 向量（从文件路径）
 pub async fn get_image_embedding_from_path(path: &str, text: Option<&str>) -> Result<Vec<f32>> {
-    let bytes = fs::read(path).await?;
     let file_name = std::path::Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or("image");
     let mime = mime_guess::from_path(path).first_or_octet_stream();
-    get_image_embedding_from_bytes(file_name, Some(mime.essence_str()), bytes, text).await
-}
-
-/// 获取图片的 embedding 向量（从文件内容）
-pub async fn get_image_embedding_from_bytes(
-    file_name: &str, content_type: Option<&str>, bytes: Vec<u8>, text: Option<&str>,
-) -> Result<Vec<f32>> {
     let cfg = config::get();
-    let mut part = multipart::Part::bytes(bytes).file_name(file_name.to_string());
-    if let Some(content_type) = content_type {
-        part = part.mime_str(content_type)?;
-    }
-    let form = multipart::Form::new().part("file", part).text("text", text.unwrap_or(file_name).to_string());
+
+    let part = reqwest::multipart::Part::file(path)
+        .await
+        .with_context(|| format!("failed to open image file for embedding: {}", path))?
+        .file_name(file_name.to_string())
+        .mime_str(mime.essence_str())?;
+    let form = reqwest::multipart::Form::new().part("file", part).text("text", text.unwrap_or(file_name).to_string());
 
     let response = HTTP_CLIENT
         .post(&cfg.services.image_embedding_url)
@@ -58,6 +51,37 @@ pub async fn get_image_embedding_from_bytes(
             )
         })?;
 
+    handle_image_embedding_response(response).await
+}
+
+/// 获取图片的 embedding 向量（从文件内容）
+pub async fn get_image_embedding_from_bytes(
+    file_name: &str, content_type: Option<&str>, bytes: Vec<u8>, text: Option<&str>,
+) -> Result<Vec<f32>> {
+    let cfg = config::get();
+    let mut part = reqwest::multipart::Part::bytes(bytes).file_name(file_name.to_string());
+    if let Some(content_type) = content_type {
+        part = part.mime_str(content_type)?;
+    }
+    let form = reqwest::multipart::Form::new().part("file", part).text("text", text.unwrap_or(file_name).to_string());
+
+    let response = HTTP_CLIENT
+        .post(&cfg.services.image_embedding_url)
+        .timeout(Duration::from_secs(cfg.search.embedding_timeout_secs))
+        .multipart(form)
+        .send()
+        .await
+        .with_context(|| {
+            format!(
+                "image embedding request failed: url={}, file={}, timeout={}s",
+                cfg.services.image_embedding_url, file_name, cfg.search.embedding_timeout_secs
+            )
+        })?;
+
+    handle_image_embedding_response(response).await
+}
+
+async fn handle_image_embedding_response(response: reqwest::Response) -> Result<Vec<f32>> {
     if !response.status().is_success() {
         let status = response.status();
         let error_text = response.text().await.unwrap_or_default();
