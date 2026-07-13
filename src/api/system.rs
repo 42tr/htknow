@@ -5,7 +5,9 @@ use sqlx::SqlitePool;
 use utoipa::ToSchema;
 
 use crate::{
-    AuthUser, api::error::{ApiError, ApiResult}, search::{SearchEngine, tantivy_engine::ForceMergeStats}
+    AuthUser, api::{
+        common, error::{ApiError, ApiResult}
+    }, search::{SearchEngine, tantivy_engine::ForceMergeStats}
 };
 
 /// 进程内存占用
@@ -219,7 +221,7 @@ pub async fn lancedb_compact(
 pub async fn index_force_merge(
     Extension(search_engine): Extension<SearchEngine>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<TantivyForceMergeResponse>> {
-    ensure_admin(&auth_user)?;
+    common::ensure_admin(&auth_user)?;
 
     let start = std::time::Instant::now();
     let (index_stats, full_index_stats) = search_engine
@@ -251,7 +253,7 @@ pub async fn index_force_merge(
 pub async fn index_rebuild_status(
     State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<IndexRebuildStatus>> {
-    ensure_admin(&auth_user)?;
+    common::ensure_admin(&auth_user)?;
 
     let row: Option<IndexRebuildStatusRow> = sqlx::query_as(
         "SELECT id, status, phase, total_docs, processed_docs, started_at, updated_at, finished_at, error
@@ -330,10 +332,6 @@ pub async fn index_rebuild_status(
         finished_at: row.finished_at,
         error: row.error,
     }))
-}
-
-fn ensure_admin(auth_user: &AuthUser) -> ApiResult<()> {
-    if auth_user.is_admin() { Ok(()) } else { Err(ApiError::BadRequest("admin role required".to_string())) }
 }
 
 fn force_merge_index_stats(index: &str, stats: ForceMergeStats) -> TantivyForceMergeIndexStats {

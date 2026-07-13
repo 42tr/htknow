@@ -19,7 +19,9 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::File;
 use crate::{
-    AuthUser, api::error::{ApiError, ApiResult}, processor, search::{
+    AuthUser, api::{
+        common, error::{ApiError, ApiResult}
+    }, processor, search::{
         RebuildProgress, SearchEngine, SearchResultItem as EngineSearchResultItem, advanced::{
             ChunkRefiner, ChunkSegment, LlmClient, PlanAction, PlanStep, QueryPlanner, RefineOutcome, RelevanceJudge, assemble_context_chunk
         }
@@ -723,28 +725,60 @@ struct PageContentCoreOutcome {
     stats: PageContentStepStats,
 }
 
-async fn send_event_json<T: Serialize>(
-    tx: &mpsc::Sender<Result<Event, Infallible>>, event: &str, payload: &T,
+#[derive(Clone, Copy, Debug)]
+enum EventType {
+    Plan,
+    Step,
+    Status,
+    Error,
+    Done,
+    Result,
+    Candidate,
+    Filtered,
+}
+
+impl EventType {
+    fn name(&self) -> &'static str {
+        match self {
+            EventType::Plan => "plan",
+            EventType::Step => "step",
+            EventType::Status => "status",
+            EventType::Error => "error",
+            EventType::Done => "done",
+            EventType::Result => "result",
+            EventType::Candidate => "candidate",
+            EventType::Filtered => "filtered",
+        }
+    }
+}
+
+async fn send_event<T: Serialize>(
+    tx: &mpsc::Sender<Result<Event, Infallible>>, event_type: EventType, payload: &T,
 ) -> anyhow::Result<()> {
-    let evt = Event::default().event(event).json_data(payload).map_err(|e| anyhow!("SSE JSON encode failed: {}", e))?;
+    let evt = Event::default()
+        .event(event_type.name())
+        .json_data(payload)
+        .map_err(|e| anyhow!("SSE JSON encode failed: {}", e))?;
     tx.send(Ok(evt)).await.map_err(|_| anyhow!("SSE client disconnected"))
 }
 
-async fn maybe_send_event_json<T: Serialize>(
-    tx: Option<&mpsc::Sender<Result<Event, Infallible>>>, event: &str, payload: &T,
+async fn maybe_send_event<T: Serialize>(
+    tx: Option<&mpsc::Sender<Result<Event, Infallible>>>, event_type: EventType, payload: &T,
 ) -> anyhow::Result<()> {
     if let Some(tx) = tx {
-        send_event_json(tx, event, payload).await?;
+        send_event(tx, event_type, payload).await?;
     }
     Ok(())
 }
 
-async fn send_plan_event(tx: &mpsc::Sender<Result<Event, Infallible>>, steps: &[PlanStep]) -> anyhow::Result<()> {
-    send_event_json(tx, "plan", &json!({ "steps": steps })).await
+async fn maybe_send_plan_event(
+    tx: Option<&mpsc::Sender<Result<Event, Infallible>>>, steps: &[PlanStep],
+) -> anyhow::Result<()> {
+    maybe_send_event(tx, EventType::Plan, &json!({ "steps": steps })).await
 }
 
-async fn send_step_event(
-    tx: &mpsc::Sender<Result<Event, Infallible>>, step: &PlanStep, status: &str, details: Option<Value>,
+async fn maybe_send_step_event(
+    tx: Option<&mpsc::Sender<Result<Event, Infallible>>>, step: &PlanStep, status: &str, details: Option<Value>,
 ) -> anyhow::Result<()> {
     let mut payload = json!({
         "action": step.action,
@@ -756,48 +790,27 @@ async fn send_step_event(
     {
         map.insert("details".to_string(), details);
     }
-    send_event_json(tx, "step", &payload).await
+    maybe_send_event(tx, EventType::Step, &payload).await
 }
 
 async fn send_status_event(
     tx: &mpsc::Sender<Result<Event, Infallible>>, phase: &str, message: &str,
 ) -> anyhow::Result<()> {
-    send_event_json(tx, "status", &json!({ "phase": phase, "message": message })).await
+    send_event(tx, EventType::Status, &json!({ "phase": phase, "message": message })).await
 }
 
 async fn maybe_send_status_event(
     tx: Option<&mpsc::Sender<Result<Event, Infallible>>>, phase: &str, message: &str,
 ) -> anyhow::Result<()> {
-    if let Some(tx) = tx {
-        send_status_event(tx, phase, message).await?;
-    }
-    Ok(())
-}
-
-async fn maybe_send_step_event(
-    tx: Option<&mpsc::Sender<Result<Event, Infallible>>>, step: &PlanStep, status: &str, details: Option<Value>,
-) -> anyhow::Result<()> {
-    if let Some(tx) = tx {
-        send_step_event(tx, step, status, details).await?;
-    }
-    Ok(())
-}
-
-async fn maybe_send_plan_event(
-    tx: Option<&mpsc::Sender<Result<Event, Infallible>>>, steps: &[PlanStep],
-) -> anyhow::Result<()> {
-    if let Some(tx) = tx {
-        send_plan_event(tx, steps).await?;
-    }
-    Ok(())
+    maybe_send_event(tx, EventType::Status, &json!({ "phase": phase, "message": message })).await
 }
 
 async fn send_error_event(tx: &mpsc::Sender<Result<Event, Infallible>>, message: &str) -> anyhow::Result<()> {
-    send_event_json(tx, "error", &json!({ "message": message })).await
+    send_event(tx, EventType::Error, &json!({ "message": message })).await
 }
 
 async fn send_done_event(tx: &mpsc::Sender<Result<Event, Infallible>>) -> anyhow::Result<()> {
-    send_event_json(tx, "done", &json!({})).await
+    send_event(tx, EventType::Done, &json!({})).await
 }
 
 fn has_visibility_permission(
@@ -1143,7 +1156,7 @@ async fn run_advanced_plan_steps(
                         refine_reason: finalized.refine_reason.clone(),
                         content: finalized.final_content.clone(),
                     };
-                    maybe_send_event_json(tx, "result", &payload).await?;
+                    maybe_send_event(tx, EventType::Result, &payload).await?;
                     if tx.is_some() {
                         info!(
                             "execute_page_content_step emitted result after refine: request_id={}, file_id={}, kb_id={:?}, base_slice_id={}, slice_count={}, score={:.4}, judge_score={:.4}, refine_reason=\"{}\"",
@@ -1292,9 +1305,9 @@ async fn execute_page_content_step_core(
                     log_prefix, request_id, candidate.file.id, base_slice.id, err
                 );
                 if debug_events && let Some(tx) = tx {
-                    let _ = send_event_json(
+                    let _ = send_event(
                         tx,
-                        "candidate",
+                        EventType::Candidate,
                         &json!({
                             "step_action": PlanAction::PageContent,
                             "file": candidate.file.clone(),
@@ -1310,9 +1323,9 @@ async fn execute_page_content_step_core(
 
         if debug_events && let Some(tx) = tx {
             let preview = preview_text(&context_chunk.content, 160);
-            let _ = send_event_json(
+            let _ = send_event(
                 tx,
-                "candidate",
+                EventType::Candidate,
                 &json!({
                     "step_action": PlanAction::PageContent,
                     "file": candidate.file.clone(),
@@ -1342,9 +1355,9 @@ async fn execute_page_content_step_core(
                 );
             }
             if debug_events && let Some(tx) = tx {
-                let _ = send_event_json(
+                let _ = send_event(
                     tx,
-                    "filtered",
+                    EventType::Filtered,
                     &json!({
                         "step_action": PlanAction::PageContent,
                         "file": candidate.file.clone(),
@@ -1781,7 +1794,7 @@ pub async fn search_image(
 pub async fn list_lexicons(
     State(pool): State<SqlitePool>, Query(params): Query<LexiconListQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<LexiconListResponse>> {
-    ensure_admin(&auth_user)?;
+    common::ensure_admin(&auth_user)?;
 
     let q = params.q.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let limit = params.limit.clamp(1, 200);
@@ -1840,7 +1853,7 @@ pub async fn list_lexicons(
 pub async fn create_lexicon(
     State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Json(req): Json<CreateLexiconReq>,
 ) -> ApiResult<Json<LexiconItem>> {
-    ensure_admin(&auth_user)?;
+    common::ensure_admin(&auth_user)?;
 
     let term = normalize_lexicon_term(req.term.as_str())?;
     let freq = normalize_lexicon_freq(req.freq)?;
@@ -1893,7 +1906,7 @@ pub async fn update_lexicon(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
     Json(req): Json<UpdateLexiconReq>,
 ) -> ApiResult<Json<LexiconItem>> {
-    ensure_admin(&auth_user)?;
+    common::ensure_admin(&auth_user)?;
 
     if req.term.is_none() && req.freq.is_none() && req.tag.is_none() && req.enabled.is_none() {
         return Err(ApiError::BadRequest("no fields to update".to_string()));
@@ -1965,7 +1978,7 @@ pub async fn update_lexicon(
 pub async fn delete_lexicon(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<DeleteLexiconResponse>> {
-    ensure_admin(&auth_user)?;
+    common::ensure_admin(&auth_user)?;
 
     let result = sqlx::query("DELETE FROM search_lexicon WHERE id = ?").bind(id).execute(&pool).await?;
     if result.rows_affected() == 0 {
@@ -1998,7 +2011,7 @@ pub async fn toggle_lexicon_enabled(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
     Json(req): Json<ToggleLexiconReq>,
 ) -> ApiResult<Json<LexiconItem>> {
-    ensure_admin(&auth_user)?;
+    common::ensure_admin(&auth_user)?;
 
     let result = sqlx::query("UPDATE search_lexicon SET enabled = ?, updated_at = strftime('%s','now') WHERE id = ?")
         .bind(if req.enabled { 1_i64 } else { 0_i64 })
@@ -2032,7 +2045,7 @@ pub async fn toggle_lexicon_enabled(
 pub async fn reload_lexicon(
     Extension(search_engine): Extension<SearchEngine>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<ReloadLexiconResponse>> {
-    ensure_admin(&auth_user)?;
+    common::ensure_admin(&auth_user)?;
 
     let loaded = search_engine
         .reload_lexicon()
@@ -2060,7 +2073,7 @@ pub async fn publish_lexicon(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<PublishLexiconResponse>> {
-    ensure_admin(&auth_user)?;
+    common::ensure_admin(&auth_user)?;
 
     let running_job_id: Option<i64> =
         sqlx::query_scalar("SELECT id FROM index_rebuild_jobs WHERE status = 'running' ORDER BY id DESC LIMIT 1")
@@ -2113,7 +2126,7 @@ pub async fn publish_lexicon(
 pub async fn list_synonyms(
     State(pool): State<SqlitePool>, Query(params): Query<SynonymListQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<SynonymListResponse>> {
-    ensure_admin(&auth_user)?;
+    common::ensure_admin(&auth_user)?;
 
     let q = params.q.as_deref().map(str::trim).filter(|s| !s.is_empty()).map(str::to_string);
     let limit = params.limit.clamp(1, 200);
@@ -2180,7 +2193,7 @@ pub async fn create_synonym(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Extension(auth_user): Extension<AuthUser>, Json(req): Json<CreateSynonymReq>,
 ) -> ApiResult<Json<SynonymItem>> {
-    ensure_admin(&auth_user)?;
+    common::ensure_admin(&auth_user)?;
 
     let term = req.term.trim();
     let synonym = req.synonym.trim();
@@ -2244,7 +2257,7 @@ pub async fn update_synonym(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(search_engine): Extension<SearchEngine>,
     Extension(auth_user): Extension<AuthUser>, Json(req): Json<UpdateSynonymReq>,
 ) -> ApiResult<Json<SynonymItem>> {
-    ensure_admin(&auth_user)?;
+    common::ensure_admin(&auth_user)?;
 
     if req.term.is_none()
         && req.synonym.is_none()
@@ -2323,7 +2336,7 @@ pub async fn delete_synonym(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(search_engine): Extension<SearchEngine>,
     Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<DeleteSynonymResponse>> {
-    ensure_admin(&auth_user)?;
+    common::ensure_admin(&auth_user)?;
 
     let result = sqlx::query("DELETE FROM search_synonyms WHERE id = ?").bind(id).execute(&pool).await?;
     if result.rows_affected() == 0 {
@@ -2357,7 +2370,7 @@ pub async fn toggle_synonym_enabled(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(search_engine): Extension<SearchEngine>,
     Extension(auth_user): Extension<AuthUser>, Json(req): Json<ToggleSynonymReq>,
 ) -> ApiResult<Json<SynonymItem>> {
-    ensure_admin(&auth_user)?;
+    common::ensure_admin(&auth_user)?;
 
     let result = sqlx::query("UPDATE search_synonyms SET enabled = ?, updated_at = strftime('%s','now') WHERE id = ?")
         .bind(if req.enabled { 1_i64 } else { 0_i64 })
@@ -2503,10 +2516,6 @@ fn lexicon_row_to_item(row: LexiconItemRow) -> LexiconItem {
         created_at: row.created_at,
         updated_at: row.updated_at,
     }
-}
-
-fn ensure_admin(auth_user: &AuthUser) -> ApiResult<()> {
-    if auth_user.is_admin() { Ok(()) } else { Err(ApiError::BadRequest("admin role required".to_string())) }
 }
 
 async fn fetch_synonym_row_by_id(pool: &SqlitePool, id: i64) -> Result<Option<SynonymItemRow>, sqlx::Error> {

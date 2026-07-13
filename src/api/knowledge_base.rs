@@ -10,11 +10,13 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::file::{self, FileStatusBreakdown};
 use crate::{
-    AuthUser, api::error::{ApiError, ApiResult}, search::SearchEngine
+    AuthUser, api::{
+        common, error::{ApiError, ApiResult}
+    }, search::SearchEngine
 };
 
-const KB_TYPE_ANALYSIS: &str = "analysis";
-const KB_TYPE_STORAGE: &str = "storage";
+pub(crate) const KB_TYPE_ANALYSIS: &str = "analysis";
+pub(crate) const KB_TYPE_STORAGE: &str = "storage";
 
 fn normalize_kb_type(kb_type: Option<String>) -> Result<String, ApiError> {
     let raw = kb_type.unwrap_or_else(|| KB_TYPE_ANALYSIS.to_string());
@@ -415,25 +417,6 @@ pub async fn list(
     Ok(Json(knowledge_responses))
 }
 
-/// Build the access-filter clause used in CTEs.
-fn push_kb_access_filter<'a>(qb: &mut QueryBuilder<'a, Sqlite>, user_id: &'a str) {
-    qb.push(" AND (user_id = ");
-    qb.push_bind(user_id);
-    qb.push(" OR is_public = 1 OR id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ");
-    qb.push_bind(user_id);
-    qb.push(")");
-    qb.push(")");
-}
-
-fn push_kb_access_filter_where<'a>(qb: &mut QueryBuilder<'a, Sqlite>, user_id: &'a str) {
-    qb.push(" WHERE (kb.user_id = ");
-    qb.push_bind(user_id);
-    qb.push(" OR kb.is_public = 1 OR kb.id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ");
-    qb.push_bind(user_id);
-    qb.push(")");
-    qb.push(")");
-}
-
 async fn get_children_kb_counts(
     pool: &SqlitePool, knowledge_ids: &[i64], user_id: &str, is_admin: bool,
 ) -> anyhow::Result<HashMap<i64, i64>> {
@@ -450,12 +433,12 @@ async fn get_children_kb_counts(
     }
     qb.push(")");
     if !is_admin {
-        push_kb_access_filter(&mut qb, user_id);
+        common::push_kb_access_filter(&mut qb, user_id);
     }
     qb.push(" UNION ALL SELECT d.root_id, kb.id FROM knowledge_bases kb ");
     qb.push("JOIN descendants d ON kb.parent_id = d.kb_id");
     if !is_admin {
-        push_kb_access_filter_where(&mut qb, user_id);
+        common::push_kb_access_filter_where(&mut qb, user_id);
     }
     qb.push(") ");
     qb.push("SELECT root_id, COUNT(*) - 1 AS cnt FROM descendants GROUP BY root_id");
@@ -490,12 +473,12 @@ async fn get_file_counts(
     }
     qb.push(")");
     if !is_admin {
-        push_kb_access_filter(&mut qb, user_id);
+        common::push_kb_access_filter(&mut qb, user_id);
     }
     qb.push(" UNION ALL SELECT d.root_id, kb.id FROM knowledge_bases kb ");
     qb.push("JOIN descendants d ON kb.parent_id = d.kb_id");
     if !is_admin {
-        push_kb_access_filter_where(&mut qb, user_id);
+        common::push_kb_access_filter_where(&mut qb, user_id);
     }
     qb.push(") ");
     qb.push("SELECT d.root_id, COUNT(f.id) AS cnt FROM descendants d ");
@@ -997,13 +980,6 @@ pub struct ReparseKnowledgeBaseResponse {
     pub file_count: i64,
 }
 
-fn push_i64_list(qb: &mut QueryBuilder<Sqlite>, ids: &[i64]) {
-    let mut separated = qb.separated(", ");
-    for id in ids {
-        separated.push_bind(*id);
-    }
-}
-
 async fn query_file_ids_for_kbs(
     pool: &SqlitePool, kb_ids: &[i64], user_id_filter: Option<&str>,
 ) -> Result<Vec<i64>, sqlx::Error> {
@@ -1012,7 +988,7 @@ async fn query_file_ids_for_kbs(
     }
 
     let mut qb = QueryBuilder::<Sqlite>::new("SELECT id FROM files WHERE kb_id IN (");
-    push_i64_list(&mut qb, kb_ids);
+    crate::db::push_i64_list(&mut qb, kb_ids);
     qb.push(")");
     if let Some(user_id) = user_id_filter {
         qb.push(" AND user_id = ").push_bind(user_id);
@@ -1031,12 +1007,12 @@ async fn reset_reparse_scope(
     // 清理知识图谱数据（节点会级联删除边和提及）
     if !analysis_kb_ids.is_empty() {
         let mut del_nodes_qb = QueryBuilder::<Sqlite>::new("DELETE FROM graph_nodes WHERE kb_id IN (");
-        push_i64_list(&mut del_nodes_qb, analysis_kb_ids);
+        crate::db::push_i64_list(&mut del_nodes_qb, analysis_kb_ids);
         del_nodes_qb.push(")");
         del_nodes_qb.build().execute(pool).await?;
 
         let mut del_snapshots_qb = QueryBuilder::<Sqlite>::new("DELETE FROM graph_snapshots WHERE kb_id IN (");
-        push_i64_list(&mut del_snapshots_qb, analysis_kb_ids);
+        crate::db::push_i64_list(&mut del_snapshots_qb, analysis_kb_ids);
         del_snapshots_qb.push(")");
         del_snapshots_qb.build().execute(pool).await?;
     }
@@ -1047,7 +1023,7 @@ async fn reset_reparse_scope(
 
     if !file_ids.is_empty() {
         let mut del_slices_qb = QueryBuilder::<Sqlite>::new("DELETE FROM slices WHERE file_id IN (");
-        push_i64_list(&mut del_slices_qb, file_ids);
+        crate::db::push_i64_list(&mut del_slices_qb, file_ids);
         del_slices_qb.push(")");
         del_slices_qb.build().execute(pool).await?;
 
@@ -1055,7 +1031,7 @@ async fn reset_reparse_scope(
         let mut update_qb = QueryBuilder::<Sqlite>::new("UPDATE files SET status = 0, log = '', updated_at = ");
         update_qb.push_bind(now);
         update_qb.push(" WHERE id IN (");
-        push_i64_list(&mut update_qb, file_ids);
+        crate::db::push_i64_list(&mut update_qb, file_ids);
         update_qb.push(")");
         update_qb.build().execute(pool).await?;
     }
@@ -1158,22 +1134,7 @@ pub async fn reparse_by_id(
         return Err(ApiError::Forbidden("Permission denied. Requires editor or admin.".to_string()));
     }
 
-    let analysis_kb_ids: Vec<i64> = sqlx::query_scalar(
-        r#"
-        WITH RECURSIVE descendants AS (
-            SELECT id, kb_type FROM knowledge_bases WHERE id = ?
-            UNION ALL
-            SELECT kb.id, kb.kb_type
-            FROM knowledge_bases kb
-            INNER JOIN descendants d ON kb.parent_id = d.id
-        )
-        SELECT id FROM descendants WHERE kb_type != ?;
-        "#,
-    )
-    .bind(id)
-    .bind(KB_TYPE_STORAGE)
-    .fetch_all(&pool)
-    .await?;
+    let analysis_kb_ids: Vec<i64> = common::collect_kb_descendant_ids(&pool, id, true).await?;
 
     let file_ids = query_file_ids_for_kbs(&pool, &analysis_kb_ids, None).await?;
     if analysis_kb_ids.is_empty() {
@@ -1313,7 +1274,7 @@ async fn load_tree_files_by_kb(
 
     let mut qb =
         QueryBuilder::<Sqlite>::new("SELECT id, size, filename, meta, kb_id, is_public FROM files WHERE kb_id IN (");
-    push_i64_list(&mut qb, kb_ids);
+    crate::db::push_i64_list(&mut qb, kb_ids);
     qb.push(")");
     if !is_admin {
         qb.push(" AND (user_id = ").push_bind(user_id).push(" OR is_public = 1)");

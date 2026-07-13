@@ -171,35 +171,6 @@ struct CustomSlice {
     #[serde(default, deserialize_with = "deserialize_slice_positions")]
     positions: Vec<SlicePosition>,
 }
-/*
-"type": "text",
-"text": "维修服务信息",
-"text_level": 1,
-"bbox": [95, 198, 635, 265],
-"page_idx": 0
-
-"type": "image",
-"img_path": "images/a1d809e1c746e15f0ea9510353cdf241cd32a9d00ae7eba19d6f2bc943230297.jpg",
-"image_caption": [],
-"image_footnote": [],
-"bbox": [146, 558, 852, 892],
-"page_idx": 0
-
-"type": "table",
-"img_path": "images/5471f25a6a8b460b6cfc320a3a1c925fd0b44d9ea3a66011a5521928996f1e39.jpg",
-"table_caption": [],
-"table_footnote": [],
-"table_body": "<table><tr><td rowspan=1 colspan=4>油耗信息显示内容的多少与发动机有关</td></tr><tr><td rowspan=1 colspan=1>序号</td><td rowspan=1 colspan=1>内容</td><td rowspan=1 colspan=1>单位</td><td rowspan=1 colspan=1>描述</td></tr><tr><td rowspan=1 colspan=1>1</td><td rowspan=1 colspan=1>瞬时油耗</td><td rowspan=1 colspan=1>L/H</td><td rowspan=1 colspan=1>以当前的喷油量计算出1小时所消耗的油量</td></tr><tr><td rowspan=1 colspan=1>2</td><td rowspan=1 colspan=1>瞬时百公里油耗</td><td rowspan=1 colspan=1>L</td><td rowspan=1 colspan=1>在行驶时显示，以当前的喷油量计算出百公里所消耗的油量</td></tr><tr><td rowspan=1 colspan=1>3</td><td rowspan=1 colspan=1>百公里平均油耗</td><td rowspan=1 colspan=1>L</td><td rowspan=1 colspan=1>以本次运行过程中的平均燃油消耗量，计算出行驶100公里所消耗的油量</td></tr><tr><td rowspan=1 colspan=1>4</td><td rowspan=1 colspan=1>短途平均油耗</td><td rowspan=1 colspan=1>L</td><td rowspan=1 colspan=1>里程大于10Km/h时才会显示</td></tr><tr><td rowspan=1 colspan=1>5</td><td rowspan=1 colspan=1>小计油耗</td><td rowspan=1 colspan=1>L</td><td rowspan=1 colspan=1>本次发动机运行油耗显示（从启动到熄火)</td></tr><tr><td rowspan=1 colspan=1>6</td><td rowspan=1 colspan=1>总油耗</td><td rowspan=1 colspan=1>L</td><td rowspan=1 colspan=1>从发动机第一次运行开始到现在总计消耗的油量</td></tr><tr><td rowspan=1 colspan=1>7</td><td rowspan=1 colspan=1>发动机工作时间</td><td rowspan=1 colspan=1>H</td><td rowspan=1 colspan=1>从发动机第一次运行开始到现在的工作时间</td></tr><tr><td rowspan=1 colspan=4></td></tr><tr><td></td><td></td><td></td><td></td></tr></table>",
-"bbox": [70, 138, 925, 916],
-"page_idx": 12
-
-"type": "equation",
-"img_path": "images/544f359685e12c8500550eb3e209d1cdc4baa41933d8616b32d33a1df34d4a4e.jpg",
-"text": "$$\\nf _ { 1 } ( \\\\mathit { t } ) * f _ { 2 } ( \\\\mathit { t } ) = f _ { 2 } ( \\\\mathit { t } ) * f _ { 1 } ( \\\\mathit { t } )\\n$$",
-"text_format": "latex",
-"bbox": [333, 755, 634, 777],
-"page_idx": 89
-*/
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct ContentItem {
     #[serde(default, rename = "type")]
@@ -861,7 +832,7 @@ impl FileProcessor {
             // 检查文件是否为 PDF 或图片
             let filename_lower = file.filename.to_lowercase();
             let is_pdf = filename_lower.ends_with(".pdf");
-            let is_image = Self::is_image_file(&filename_lower);
+            let is_image = crate::search::is_image_file(&filename_lower);
             let is_audio = Self::is_audio_file(&filename_lower);
 
             // 检查文件是否为 Office 文档
@@ -1331,7 +1302,7 @@ impl FileProcessor {
     }
 
     async fn save_custom_slices(
-        &self, file: &File, slices: &[CustomSlice], full_content: Option<&str>, mut timing: Option<&mut ParseTimingCtx>,
+        &self, file: &File, slices: &[CustomSlice], full_content: Option<&str>, timing: Option<&mut ParseTimingCtx>,
     ) -> anyhow::Result<()> {
         if !self.ensure_file_exists(file.id, "before writing custom slices").await? {
             return Ok(());
@@ -1351,68 +1322,21 @@ impl FileProcessor {
             }
         };
 
-        let search_docs = timed_step_opt(timing.as_deref_mut(), "custom_insert_slices", async {
-            let owned_slices: Vec<SliceWithPositions> = slices
-                .iter()
-                .map(|slice| SliceWithPositions { content: slice.content.clone(), positions: slice.positions.clone() })
-                .collect();
-            let persisted = self.insert_slices_and_positions(file.id, owned_slices).await?;
-            let mut search_docs = Vec::with_capacity(persisted.len());
-            for (id, content) in persisted {
-                search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, content));
-            }
-            Ok(search_docs)
-        })
-        .await?;
-
-        if !search_docs.is_empty() {
-            timed_step_opt(timing.as_deref_mut(), "custom_write_search_batch", async {
-                let embeddings = vec![None; search_docs.len()];
-                self.search_engine.write_batch(search_docs, embeddings).await?;
-                Ok(())
-            })
-            .await?;
-        }
-
-        if !self.ensure_file_exists(file.id, "before writing custom full index").await? {
-            return Ok(());
-        }
-        timed_step_opt(timing.as_deref_mut(), "custom_write_full_index", async {
-            let index_full_content = format!("{}\n\n{}", file.filename, derived_full_content);
-            self.search_engine
-                .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
-                .await?;
-            Ok(())
-        })
-        .await?;
-
-        if !self.ensure_file_exists(file.id, "before updating custom status").await? {
-            return Ok(());
-        }
-        timed_step_opt(timing.as_deref_mut(), "custom_finalize_file_status", async {
-            let sql =
-                "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
-            sqlx::query(sql)
-                .bind(&derived_full_content)
-                .bind("Custom parse processed successfully")
-                .bind(file.id)
-                .execute(&self.pool)
-                .await?;
-            Ok(())
-        })
-        .await?;
-
-        info!("File {} processed successfully with {} custom slices", file.id, slices.len());
-
-        self.search_engine.reload_readers()?;
-
-        timed_step_opt(timing, "build_knowledge_graph", async {
-            self.maybe_build_knowledge_graph(file).await;
-            Ok(())
-        })
-        .await?;
-
-        Ok(())
+        let wrapped: Vec<SliceWithPositions> = slices
+            .iter()
+            .map(|slice| SliceWithPositions { content: slice.content.clone(), positions: slice.positions.clone() })
+            .collect();
+        let embeddings = vec![None; wrapped.len()];
+        self.finish_file_processing(
+            file,
+            wrapped,
+            embeddings,
+            &derived_full_content,
+            "Custom parse processed successfully",
+            None,
+            timing,
+        )
+        .await
     }
 
     async fn insert_custom_pdf_contents(
@@ -1615,67 +1539,17 @@ impl FileProcessor {
 
         let slice_count = slices.len();
         let full_content = slices.iter().map(|s| s.content.as_str()).collect::<Vec<_>>().join("\n\n");
-
-        let (search_docs, search_embeddings) = timed_step_opt(timing.as_deref_mut(), "insert_slices", async {
-            let persisted = self.insert_slices_and_positions(file.id, slices).await?;
-            let mut search_docs = Vec::with_capacity(persisted.len());
-            let mut search_embeddings = Vec::with_capacity(persisted.len());
-            for (id, content) in persisted {
-                search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, content));
-                search_embeddings.push(None);
-            }
-            Ok((search_docs, search_embeddings))
-        })
-        .await?;
-
-        if !search_docs.is_empty() {
-            timed_step_opt(timing.as_deref_mut(), "write_search_batch", async {
-                self.search_engine.write_batch(search_docs, search_embeddings).await?;
-                Ok(())
-            })
-            .await?;
-        }
-
-        timed_step_opt(timing.as_deref_mut(), "build_knowledge_graph", async {
-            self.maybe_build_knowledge_graph(file).await;
-            Ok(())
-        })
-        .await?;
-
-        if !self.ensure_file_exists(file.id, "before writing full index").await? {
-            return Ok(());
-        }
-
-        let index_full_content = format!("{}\n\n{}", file.filename, full_content);
-        timed_step_opt(timing.as_deref_mut(), "write_full_index", async {
-            self.search_engine
-                .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
-                .await?;
-            Ok(())
-        })
-        .await?;
-
-        if !self.ensure_file_exists(file.id, "before updating status").await? {
-            return Ok(());
-        }
-        timed_step_opt(timing, "finalize_file_status", async {
-            let sql =
-                "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
-            sqlx::query(sql)
-                .bind(&full_content)
-                .bind("Excel processed successfully")
-                .bind(file.id)
-                .execute(&self.pool)
-                .await?;
-            Ok(())
-        })
-        .await?;
-
-        info!("Excel file {} processed successfully with {} slices", file.id, slice_count);
-
-        self.search_engine.reload_readers()?;
-
-        Ok(())
+        let embeddings = vec![None; slice_count];
+        self.finish_file_processing(
+            file,
+            slices,
+            embeddings,
+            &full_content,
+            "Excel processed successfully",
+            None,
+            timing,
+        )
+        .await
     }
 
     /// 解析 Excel 文件，按 sheet+行 生成切片
@@ -1946,71 +1820,17 @@ impl FileProcessor {
         }
 
         let slice_count = slices.len();
-        let (search_docs, search_embeddings) = timed_step_opt(timing.as_deref_mut(), "insert_slices", async {
-            let persisted = self.insert_slices_and_positions(file.id, slices).await?;
-            let mut search_docs = Vec::with_capacity(persisted.len());
-            let mut search_embeddings = Vec::with_capacity(persisted.len());
-            for (id, content) in persisted {
-                search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, content));
-                search_embeddings.push(image_embedding.clone());
-            }
-            Ok((search_docs, search_embeddings))
-        })
-        .await?;
-
-        // 批量写入搜索引擎
-        if !search_docs.is_empty() {
-            timed_step_opt(timing.as_deref_mut(), "write_search_batch", async {
-                self.search_engine.write_batch(search_docs, search_embeddings).await?;
-                Ok(())
-            })
-            .await?;
-        }
-
-        // 构建知识图谱
-        timed_step_opt(timing.as_deref_mut(), "build_knowledge_graph", async {
-            self.maybe_build_knowledge_graph(file).await;
-            Ok(())
-        })
-        .await?;
-
-        if !self.ensure_file_exists(file.id, "before writing full index").await? {
-            return Ok(());
-        }
-
-        let index_filename = index_filename.unwrap_or(file.filename.as_str());
-        let index_full_content = format!("{}\n\n{}", index_filename, full_content);
-        debug!("write full content: {}", index_full_content);
-        timed_step_opt(timing.as_deref_mut(), "write_full_index", async {
-            self.search_engine
-                .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
-                .await?;
-            Ok(())
-        })
-        .await?;
-
-        // 更新文件状态
-        if !self.ensure_file_exists(file.id, "before updating status").await? {
-            return Ok(());
-        }
-        timed_step_opt(timing, "finalize_file_status", async {
-            let sql =
-                "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
-            sqlx::query(sql)
-                .bind(&full_content)
-                .bind("PDF processed successfully")
-                .bind(file.id)
-                .execute(&self.pool)
-                .await?;
-            Ok(())
-        })
-        .await?;
-
-        info!("PDF file {} processed successfully with {} slices", file.id, slice_count);
-
-        self.search_engine.reload_readers()?;
-
-        Ok(())
+        let embeddings = vec![image_embedding.clone(); slice_count];
+        self.finish_file_processing(
+            file,
+            slices,
+            embeddings,
+            &full_content,
+            "PDF processed successfully",
+            index_filename,
+            timing,
+        )
+        .await
     }
 
     async fn call_mineru_api(
@@ -2500,72 +2320,12 @@ impl FileProcessor {
 
     async fn process_plain_text_content(
         &self, file: &File, content: String, slices: Vec<String>, log_message: &str,
-        mut timing: Option<&mut ParseTimingCtx>,
+        timing: Option<&mut ParseTimingCtx>,
     ) -> anyhow::Result<()> {
-        if !self.ensure_file_exists(file.id, "before writing slices").await? {
-            return Ok(());
-        }
-        let slice_count = slices.len();
-
-        // 保存分片到数据库并收集文档
-        let search_docs = timed_step_opt(timing.as_deref_mut(), "insert_slices", async {
-            let wrapped: Vec<SliceWithPositions> =
-                slices.into_iter().map(|content| SliceWithPositions { content, positions: vec![] }).collect();
-            let persisted = self.insert_slices_and_positions(file.id, wrapped).await?;
-            let mut search_docs = Vec::with_capacity(persisted.len());
-            for (id, content) in persisted {
-                search_docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, content));
-            }
-            Ok(search_docs)
-        })
-        .await?;
-
-        // 批量写入搜索引擎
-        if !search_docs.is_empty() {
-            timed_step_opt(timing.as_deref_mut(), "write_search_batch", async {
-                let embeddings = vec![None; search_docs.len()];
-                self.search_engine.write_batch(search_docs, embeddings).await?;
-                Ok(())
-            })
-            .await?;
-        }
-
-        if !self.ensure_file_exists(file.id, "before writing full index").await? {
-            return Ok(());
-        }
-        let index_full_content = format!("{}\n\n{}", file.filename, content);
-        timed_step_opt(timing.as_deref_mut(), "write_full_index", async {
-            self.search_engine
-                .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
-                .await?;
-            Ok(())
-        })
-        .await?;
-
-        // 更新文件状态为已处理，并保存内容
-        if !self.ensure_file_exists(file.id, "before updating status").await? {
-            return Ok(());
-        }
-        timed_step_opt(timing.as_deref_mut(), "finalize_file_status", async {
-            let sql =
-                "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
-            sqlx::query(sql).bind(content).bind(log_message).bind(file.id).execute(&self.pool).await?;
-            Ok(())
-        })
-        .await?;
-
-        info!("File {} processed successfully with {} slices", file.id, slice_count);
-
-        self.search_engine.reload_readers()?;
-
-        // 构建知识图谱
-        timed_step_opt(timing, "build_knowledge_graph", async {
-            self.maybe_build_knowledge_graph(file).await;
-            Ok(())
-        })
-        .await?;
-
-        Ok(())
+        let wrapped: Vec<SliceWithPositions> =
+            slices.into_iter().map(|content| SliceWithPositions { content, positions: vec![] }).collect();
+        let embeddings = vec![None; wrapped.len()];
+        self.finish_file_processing(file, wrapped, embeddings, &content, log_message, None, timing).await
     }
 
     /// 标记文件处理失败
@@ -2581,7 +2341,80 @@ impl FileProcessor {
         Ok(())
     }
 
-    /// 事务化写入 slices 和 slice_positions，减少单条 INSERT 的提交开销。
+    #[allow(clippy::too_many_arguments)]
+    async fn finish_file_processing(
+        &self, file: &File, slices: Vec<SliceWithPositions>, embeddings: Vec<Option<Arc<Vec<f32>>>>,
+        full_content: &str, log_message: &str, index_name_override: Option<&str>,
+        mut timing: Option<&mut ParseTimingCtx>,
+    ) -> anyhow::Result<()> {
+        if !self.ensure_file_exists(file.id, "before writing slices").await? {
+            return Ok(());
+        }
+        let slice_count = slices.len();
+        anyhow::ensure!(
+            embeddings.len() == slice_count,
+            "embeddings count {} does not match slice count {}",
+            embeddings.len(),
+            slice_count
+        );
+
+        let (search_docs, search_embeddings) = timed_step_opt(timing.as_deref_mut(), "insert_slices", async {
+            let persisted = self.insert_slices_and_positions(file.id, slices).await?;
+            let mut docs = Vec::with_capacity(persisted.len());
+            let mut embs = Vec::with_capacity(persisted.len());
+            for (idx, (id, content)) in persisted.into_iter().enumerate() {
+                docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, content));
+                embs.push(embeddings.get(idx).cloned().flatten());
+            }
+            Ok((docs, embs))
+        })
+        .await?;
+
+        if !search_docs.is_empty() {
+            timed_step_opt(timing.as_deref_mut(), "write_search_batch", async {
+                self.search_engine.write_batch(search_docs, search_embeddings).await?;
+                Ok(())
+            })
+            .await?;
+        }
+
+        if !self.ensure_file_exists(file.id, "before writing full index").await? {
+            return Ok(());
+        }
+        let index_name = index_name_override.unwrap_or(&file.filename);
+        let index_full_content = format!("{}\n\n{}", index_name, full_content);
+        timed_step_opt(timing.as_deref_mut(), "write_full_index", async {
+            self.search_engine
+                .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
+                .await?;
+            Ok(())
+        })
+        .await?;
+
+        if !self.ensure_file_exists(file.id, "before updating status").await? {
+            return Ok(());
+        }
+        timed_step_opt(timing.as_deref_mut(), "finalize_file_status", async {
+            let sql =
+                "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
+            sqlx::query(sql).bind(full_content).bind(log_message).bind(file.id).execute(&self.pool).await?;
+            Ok(())
+        })
+        .await?;
+
+        info!("File {} processed successfully with {} slices", file.id, slice_count);
+
+        self.search_engine.reload_readers()?;
+
+        timed_step_opt(timing, "build_knowledge_graph", async {
+            self.maybe_build_knowledge_graph(file).await;
+            Ok(())
+        })
+        .await?;
+
+        Ok(())
+    }
+
     /// 返回每个 slice 的 (id, content) 供后续构建搜索文档使用。
     async fn insert_slices_and_positions(
         &self, file_id: i64, slices: Vec<SliceWithPositions>,
@@ -2667,21 +2500,6 @@ impl FileProcessor {
             .fetch_optional(&self.pool)
             .await?;
         Ok(matches!(kb_type.as_deref(), Some("storage")))
-    }
-
-    fn is_image_file(filename_lower: &str) -> bool {
-        filename_lower.ends_with(".jpg")
-            || filename_lower.ends_with(".jpeg")
-            || filename_lower.ends_with(".png")
-            || filename_lower.ends_with(".gif")
-            || filename_lower.ends_with(".bmp")
-            || filename_lower.ends_with(".webp")
-            || filename_lower.ends_with(".tiff")
-            || filename_lower.ends_with(".tif")
-            || filename_lower.ends_with(".svg")
-            || filename_lower.ends_with(".ico")
-            || filename_lower.ends_with(".heic")
-            || filename_lower.ends_with(".heif")
     }
 
     fn is_audio_file(filename_lower: &str) -> bool {
@@ -3423,7 +3241,7 @@ impl FileProcessor {
 
         if !search_docs.is_empty() {
             let filename_lower = target.filename.to_lowercase();
-            let is_image = Self::is_image_file(&filename_lower);
+            let is_image = crate::search::is_image_file(&filename_lower);
             let embeddings = if is_image {
                 let embedding =
                     search::embedding::get_image_embedding_from_path(&target.path, Some(&target.filename)).await?;

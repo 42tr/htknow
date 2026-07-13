@@ -579,29 +579,39 @@ async fn do_export_knowledge_bases(src_pool: &SqlitePool, dst_pool: &SqlitePool,
             })
             .collect();
 
-        for values_chunk in values.chunks(INSERT_BATCH_SIZE) {
-            let mut qb = QueryBuilder::<Sqlite>::new(
-                "INSERT INTO knowledge_bases \
-                 (id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority, created_at, updated_at) ",
-            );
-            qb.push_values(
-                values_chunk,
-                |mut b, (id, uid, uname, name, desc, kb_type, pid, is_pub, prio, cat, uat)| {
-                    b.push_bind(id)
-                        .push_bind(uid)
-                        .push_bind(uname)
-                        .push_bind(name)
-                        .push_bind(desc)
-                        .push_bind(kb_type)
-                        .push_bind(pid)
-                        .push_bind(is_pub)
-                        .push_bind(prio)
-                        .push_bind(cat)
-                        .push_bind(uat);
-                },
-            );
-            qb.build().execute(dst_pool).await?;
-        }
+        batch_insert_rows(
+            dst_pool,
+            "knowledge_bases",
+            &[
+                "id",
+                "user_id",
+                "user_name",
+                "name",
+                "description",
+                "kb_type",
+                "parent_id",
+                "is_public",
+                "parse_priority",
+                "created_at",
+                "updated_at",
+            ],
+            &values,
+            |b, (id, uid, uname, name, desc, kb_type, pid, is_pub, prio, cat, uat)| {
+                b.push_bind(id)
+                    .push_bind(uid)
+                    .push_bind(uname)
+                    .push_bind(name)
+                    .push_bind(desc)
+                    .push_bind(kb_type)
+                    .push_bind(pid)
+                    .push_bind(is_pub)
+                    .push_bind(prio)
+                    .push_bind(cat)
+                    .push_bind(uat);
+            },
+            false,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -664,57 +674,73 @@ async fn export_files(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i6
             })
             .collect();
 
-        for values_chunk in values.chunks(INSERT_BATCH_SIZE) {
-            let mut qb = QueryBuilder::<Sqlite>::new(
-                "INSERT INTO files \
-                 (id, user_id, user_name, hash, filename, path, size, content, tags, status, log, slice_type, \
-                  kb_id, parse_priority, is_public, meta, created_at, updated_at) ",
-            );
-            qb.push_values(
-                values_chunk,
-                |mut b,
-                 (
-                    id,
-                    uid,
-                    uname,
-                    hash,
-                    filename,
-                    path,
-                    size,
-                    content,
-                    tags,
-                    status,
-                    log,
-                    stype,
-                    kb_id,
-                    prio,
-                    is_pub,
-                    meta,
-                    cat,
-                    uat,
-                )| {
-                    b.push_bind(id)
-                        .push_bind(uid)
-                        .push_bind(uname)
-                        .push_bind(hash)
-                        .push_bind(filename)
-                        .push_bind(path)
-                        .push_bind(size)
-                        .push_bind(content)
-                        .push_bind(tags)
-                        .push_bind(status)
-                        .push_bind(log)
-                        .push_bind(stype)
-                        .push_bind(kb_id)
-                        .push_bind(prio)
-                        .push_bind(is_pub)
-                        .push_bind(meta)
-                        .push_bind(cat)
-                        .push_bind(uat);
-                },
-            );
-            qb.build().execute(dst_pool).await?;
-        }
+        batch_insert_rows(
+            dst_pool,
+            "files",
+            &[
+                "id",
+                "user_id",
+                "user_name",
+                "hash",
+                "filename",
+                "path",
+                "size",
+                "content",
+                "tags",
+                "status",
+                "log",
+                "slice_type",
+                "kb_id",
+                "parse_priority",
+                "is_public",
+                "meta",
+                "created_at",
+                "updated_at",
+            ],
+            &values,
+            |b,
+             (
+                id,
+                uid,
+                uname,
+                hash,
+                filename,
+                path,
+                size,
+                content,
+                tags,
+                status,
+                log,
+                stype,
+                kb_id,
+                prio,
+                is_pub,
+                meta,
+                cat,
+                uat,
+            )| {
+                b.push_bind(id)
+                    .push_bind(uid)
+                    .push_bind(uname)
+                    .push_bind(hash)
+                    .push_bind(filename)
+                    .push_bind(path)
+                    .push_bind(size)
+                    .push_bind(content)
+                    .push_bind(tags)
+                    .push_bind(status)
+                    .push_bind(log)
+                    .push_bind(stype)
+                    .push_bind(kb_id)
+                    .push_bind(prio)
+                    .push_bind(is_pub)
+                    .push_bind(meta)
+                    .push_bind(cat)
+                    .push_bind(uat);
+            },
+            false,
+        )
+        .await?;
     }
 
     Ok(file_ids)
@@ -724,6 +750,36 @@ const SQLITE_BATCH_SIZE: usize = 900;
 /// Max rows per INSERT to stay under SQLite's 999 variable limit.
 /// files table has 18 columns => 999/18 = 55; use 50 to be safe.
 const INSERT_BATCH_SIZE: usize = 50;
+
+async fn batch_insert_rows<Src>(
+    dst_pool: &SqlitePool, table: &str, columns: &[&str], rows: &[Src],
+    bind_row: impl Fn(&mut QueryBuilder<'_, Sqlite>, Src), insert_or_ignore: bool,
+) -> Result<(), sqlx::Error>
+where
+    Src: Clone, {
+    if rows.is_empty() {
+        return Ok(());
+    }
+    let col_list = columns.join(", ");
+    let prefix = if insert_or_ignore {
+        format!("INSERT OR IGNORE INTO {table} ({col_list}) VALUES ")
+    } else {
+        format!("INSERT INTO {table} ({col_list}) VALUES ")
+    };
+    for chunk in rows.chunks(INSERT_BATCH_SIZE) {
+        let mut qb = QueryBuilder::<Sqlite>::new(&prefix);
+        for (i, row) in chunk.iter().enumerate() {
+            if i > 0 {
+                qb.push(", ");
+            }
+            qb.push("(");
+            bind_row(&mut qb, row.clone());
+            qb.push(")");
+        }
+        qb.build().execute(dst_pool).await?;
+    }
+    Ok(())
+}
 
 async fn export_slices(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &[i64]) -> anyhow::Result<()> {
     if file_ids.is_empty() {
@@ -756,14 +812,17 @@ async fn export_slices(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &
             })
             .collect();
 
-        for values_chunk in values.chunks(INSERT_BATCH_SIZE) {
-            let mut qb =
-                QueryBuilder::<Sqlite>::new("INSERT INTO slices (id, file_id, content, created_at, updated_at) ");
-            qb.push_values(values_chunk, |mut b, (id, file_id, content, created_at, updated_at)| {
+        batch_insert_rows(
+            dst_pool,
+            "slices",
+            &["id", "file_id", "content", "created_at", "updated_at"],
+            &values,
+            |b, (id, file_id, content, created_at, updated_at)| {
                 b.push_bind(id).push_bind(file_id).push_bind(content).push_bind(created_at).push_bind(updated_at);
-            });
-            qb.build().execute(dst_pool).await?;
-        }
+            },
+            false,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -807,27 +866,26 @@ async fn export_slice_positions(src_pool: &SqlitePool, dst_pool: &SqlitePool, fi
             })
             .collect();
 
-        for values_chunk in values.chunks(INSERT_BATCH_SIZE) {
-            let mut qb = QueryBuilder::<Sqlite>::new(
-                "INSERT INTO slice_positions (id, slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num, created_at) ",
-            );
-            qb.push_values(
-                values_chunk,
-                |mut b, (id, slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num, created_at)| {
-                    b.push_bind(id)
-                        .push_bind(slice_id)
-                        .push_bind(page_idx)
-                        .push_bind(x1)
-                        .push_bind(y1)
-                        .push_bind(x2)
-                        .push_bind(y2)
-                        .push_bind(sheet_name)
-                        .push_bind(row_num)
-                        .push_bind(created_at);
-                },
-            );
-            qb.build().execute(dst_pool).await?;
-        }
+        batch_insert_rows(
+            dst_pool,
+            "slice_positions",
+            &["id", "slice_id", "page_idx", "x1", "y1", "x2", "y2", "sheet_name", "row_num", "created_at"],
+            &values,
+            |b, (id, slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num, created_at)| {
+                b.push_bind(id)
+                    .push_bind(slice_id)
+                    .push_bind(page_idx)
+                    .push_bind(x1)
+                    .push_bind(y1)
+                    .push_bind(x2)
+                    .push_bind(y2)
+                    .push_bind(sheet_name)
+                    .push_bind(row_num)
+                    .push_bind(created_at);
+            },
+            false,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -874,28 +932,37 @@ async fn export_pdf_contents(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_
             })
             .collect();
 
-        for values_chunk in values.chunks(INSERT_BATCH_SIZE) {
-            let mut qb = QueryBuilder::<Sqlite>::new(
-                "INSERT INTO pdf_contents \
-                 (id, file_id, page_idx, bbox, text, text_level, img_path, table_body, created_at, updated_at) ",
-            );
-            qb.push_values(
-                values_chunk,
-                |mut b, (id, file_id, page_idx, bbox, text, text_level, img_path, table_body, created_at, updated_at)| {
-                    b.push_bind(id)
-                        .push_bind(file_id)
-                        .push_bind(page_idx)
-                        .push_bind(bbox)
-                        .push_bind(text)
-                        .push_bind(text_level)
-                        .push_bind(img_path)
-                        .push_bind(table_body)
-                        .push_bind(created_at)
-                        .push_bind(updated_at);
-                },
-            );
-            qb.build().execute(dst_pool).await?;
-        }
+        batch_insert_rows(
+            dst_pool,
+            "pdf_contents",
+            &[
+                "id",
+                "file_id",
+                "page_idx",
+                "bbox",
+                "text",
+                "text_level",
+                "img_path",
+                "table_body",
+                "created_at",
+                "updated_at",
+            ],
+            &values,
+            |b, (id, file_id, page_idx, bbox, text, text_level, img_path, table_body, created_at, updated_at)| {
+                b.push_bind(id)
+                    .push_bind(file_id)
+                    .push_bind(page_idx)
+                    .push_bind(bbox)
+                    .push_bind(text)
+                    .push_bind(text_level)
+                    .push_bind(img_path)
+                    .push_bind(table_body)
+                    .push_bind(created_at)
+                    .push_bind(updated_at);
+            },
+            false,
+        )
+        .await?;
     }
 
     Ok(())
@@ -942,40 +1009,29 @@ async fn export_graph_nodes(
                 })
                 .collect();
 
-            for values_chunk in values.chunks(INSERT_BATCH_SIZE) {
-                let mut qb = QueryBuilder::<Sqlite>::new(
-                    "INSERT OR IGNORE INTO graph_nodes \
-                     (id, name, entity_type, properties, embedding, file_id, kb_id, is_public, created_at, updated_at) ",
-                );
-                qb.push_values(
-                    values_chunk,
-                    |mut b,
-                     (
-                        id,
-                        name,
-                        entity_type,
-                        properties,
-                        embedding,
-                        file_id,
-                        kb_id,
-                        is_public,
-                        created_at,
-                        updated_at,
-                    )| {
-                        b.push_bind(id)
-                            .push_bind(name)
-                            .push_bind(entity_type)
-                            .push_bind(properties)
-                            .push_bind(embedding)
-                            .push_bind(file_id)
-                            .push_bind(kb_id)
-                            .push_bind(is_public)
-                            .push_bind(created_at)
-                            .push_bind(updated_at);
-                    },
-                );
-                qb.build().execute(dst_pool).await?;
-            }
+            batch_insert_rows(
+                dst_pool,
+                "graph_nodes",
+                &[
+                    "id", "name", "entity_type", "properties", "embedding", "file_id", "kb_id", "is_public",
+                    "created_at", "updated_at",
+                ],
+                &values,
+                |b, (id, name, entity_type, properties, embedding, file_id, kb_id, is_public, created_at, updated_at)| {
+                    b.push_bind(id)
+                        .push_bind(name)
+                        .push_bind(entity_type)
+                        .push_bind(properties)
+                        .push_bind(embedding)
+                        .push_bind(file_id)
+                        .push_bind(kb_id)
+                        .push_bind(is_public)
+                        .push_bind(created_at)
+                        .push_bind(updated_at);
+                },
+                true,
+            )
+            .await?;
         }
     }
     Ok(())
@@ -1020,28 +1076,37 @@ async fn export_graph_nodes_by_kb_id(
             })
             .collect();
 
-        for values_chunk in values.chunks(INSERT_BATCH_SIZE) {
-            let mut qb = QueryBuilder::<Sqlite>::new(
-                "INSERT INTO graph_nodes \
-                 (id, name, entity_type, properties, embedding, file_id, kb_id, is_public, created_at, updated_at) ",
-            );
-            qb.push_values(
-                values_chunk,
-                |mut b, (id, name, entity_type, properties, embedding, file_id, kb_id, is_public, created_at, updated_at)| {
-                    b.push_bind(id)
-                        .push_bind(name)
-                        .push_bind(entity_type)
-                        .push_bind(properties)
-                        .push_bind(embedding)
-                        .push_bind(file_id)
-                        .push_bind(kb_id)
-                        .push_bind(is_public)
-                        .push_bind(created_at)
-                        .push_bind(updated_at);
-                },
-            );
-            qb.build().execute(dst_pool).await?;
-        }
+        batch_insert_rows(
+            dst_pool,
+            "graph_nodes",
+            &[
+                "id",
+                "name",
+                "entity_type",
+                "properties",
+                "embedding",
+                "file_id",
+                "kb_id",
+                "is_public",
+                "created_at",
+                "updated_at",
+            ],
+            &values,
+            |b, (id, name, entity_type, properties, embedding, file_id, kb_id, is_public, created_at, updated_at)| {
+                b.push_bind(id)
+                    .push_bind(name)
+                    .push_bind(entity_type)
+                    .push_bind(properties)
+                    .push_bind(embedding)
+                    .push_bind(file_id)
+                    .push_bind(kb_id)
+                    .push_bind(is_public)
+                    .push_bind(created_at)
+                    .push_bind(updated_at);
+            },
+            false,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1094,26 +1159,33 @@ async fn export_graph_edges(src_pool: &SqlitePool, dst_pool: &SqlitePool) -> any
             continue;
         }
 
-        for values_chunk in values.chunks(INSERT_BATCH_SIZE) {
-            let mut qb = QueryBuilder::<Sqlite>::new(
-                "INSERT INTO graph_edges \
-                 (id, source_node_id, target_node_id, relation_type, properties, weight, file_id, created_at) ",
-            );
-            qb.push_values(
-                values_chunk,
-                |mut b, (id, source, target, relation_type, properties, weight, file_id, created_at)| {
-                    b.push_bind(id)
-                        .push_bind(source)
-                        .push_bind(target)
-                        .push_bind(relation_type)
-                        .push_bind(properties)
-                        .push_bind(weight)
-                        .push_bind(file_id)
-                        .push_bind(created_at);
-                },
-            );
-            qb.build().execute(dst_pool).await?;
-        }
+        batch_insert_rows(
+            dst_pool,
+            "graph_edges",
+            &[
+                "id",
+                "source_node_id",
+                "target_node_id",
+                "relation_type",
+                "properties",
+                "weight",
+                "file_id",
+                "created_at",
+            ],
+            &values,
+            |b, (id, source, target, relation_type, properties, weight, file_id, created_at)| {
+                b.push_bind(id)
+                    .push_bind(source)
+                    .push_bind(target)
+                    .push_bind(relation_type)
+                    .push_bind(properties)
+                    .push_bind(weight)
+                    .push_bind(file_id)
+                    .push_bind(created_at);
+            },
+            false,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1166,25 +1238,23 @@ async fn export_entity_mentions(src_pool: &SqlitePool, dst_pool: &SqlitePool) ->
             continue;
         }
 
-        for values_chunk in values.chunks(INSERT_BATCH_SIZE) {
-            let mut qb = QueryBuilder::<Sqlite>::new(
-                "INSERT INTO entity_mentions \
-                 (id, node_id, slice_id, start_offset, end_offset, context, created_at) ",
-            );
-            qb.push_values(
-                values_chunk,
-                |mut b, (id, node_id, slice_id, start_offset, end_offset, context, created_at)| {
-                    b.push_bind(id)
-                        .push_bind(node_id)
-                        .push_bind(slice_id)
-                        .push_bind(start_offset)
-                        .push_bind(end_offset)
-                        .push_bind(context)
-                        .push_bind(created_at);
-                },
-            );
-            qb.build().execute(dst_pool).await?;
-        }
+        batch_insert_rows(
+            dst_pool,
+            "entity_mentions",
+            &["id", "node_id", "slice_id", "start_offset", "end_offset", "context", "created_at"],
+            &values,
+            |b, (id, node_id, slice_id, start_offset, end_offset, context, created_at)| {
+                b.push_bind(id)
+                    .push_bind(node_id)
+                    .push_bind(slice_id)
+                    .push_bind(start_offset)
+                    .push_bind(end_offset)
+                    .push_bind(context)
+                    .push_bind(created_at);
+            },
+            false,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1223,24 +1293,23 @@ async fn export_graph_snapshots(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb
             })
             .collect();
 
-        for values_chunk in values.chunks(INSERT_BATCH_SIZE) {
-            let mut qb = QueryBuilder::<Sqlite>::new(
-                "INSERT INTO graph_snapshots (id, kb_id, graph_data, node_count, edge_count, version, created_at) ",
-            );
-            qb.push_values(
-                values_chunk,
-                |mut b, (id, kb_id, graph_data, node_count, edge_count, version, created_at)| {
-                    b.push_bind(id)
-                        .push_bind(kb_id)
-                        .push_bind(graph_data)
-                        .push_bind(node_count)
-                        .push_bind(edge_count)
-                        .push_bind(version)
-                        .push_bind(created_at);
-                },
-            );
-            qb.build().execute(dst_pool).await?;
-        }
+        batch_insert_rows(
+            dst_pool,
+            "graph_snapshots",
+            &["id", "kb_id", "graph_data", "node_count", "edge_count", "version", "created_at"],
+            &values,
+            |b, (id, kb_id, graph_data, node_count, edge_count, version, created_at)| {
+                b.push_bind(id)
+                    .push_bind(kb_id)
+                    .push_bind(graph_data)
+                    .push_bind(node_count)
+                    .push_bind(edge_count)
+                    .push_bind(version)
+                    .push_bind(created_at);
+            },
+            false,
+        )
+        .await?;
     }
     Ok(())
 }

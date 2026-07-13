@@ -95,46 +95,81 @@ impl Default for ExtractLimits {
     }
 }
 
+/// 支持的压缩格式
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveFormat {
+    Zip,
+    SevenZ,
+    Tar,
+    TarGz,
+    Tgz,
+    TarBz2,
+    TarXz,
+    Unknown,
+}
+
+impl ArchiveFormat {
+    /// 根据文件名识别压缩格式（大小写不敏感）
+    pub fn from_filename(filename: &str) -> Self {
+        let lower = filename.to_lowercase();
+        if lower.ends_with(".zip") {
+            ArchiveFormat::Zip
+        } else if lower.ends_with(".7z") {
+            ArchiveFormat::SevenZ
+        } else if lower.ends_with(".tar.gz") {
+            ArchiveFormat::TarGz
+        } else if lower.ends_with(".tgz") {
+            ArchiveFormat::Tgz
+        } else if lower.ends_with(".tar.bz2") {
+            ArchiveFormat::TarBz2
+        } else if lower.ends_with(".tar.xz") {
+            ArchiveFormat::TarXz
+        } else if lower.ends_with(".tar") {
+            ArchiveFormat::Tar
+        } else {
+            ArchiveFormat::Unknown
+        }
+    }
+
+    /// 是否为已识别的压缩格式（含暂不解压的 7Z）
+    pub fn is_archive(self) -> bool {
+        !matches!(self, ArchiveFormat::Unknown)
+    }
+
+    /// 当前是否可直接解压
+    pub fn is_supported(self) -> bool {
+        matches!(self, ArchiveFormat::Zip) || self.is_tar_variant()
+    }
+
+    /// 是否为 tar 变体
+    pub fn is_tar_variant(self) -> bool {
+        matches!(
+            self,
+            ArchiveFormat::Tar
+                | ArchiveFormat::TarGz
+                | ArchiveFormat::Tgz
+                | ArchiveFormat::TarBz2
+                | ArchiveFormat::TarXz
+        )
+    }
+
+    /// 格式描述文本
+    pub fn desc(self) -> &'static str {
+        match self {
+            ArchiveFormat::Zip => "ZIP",
+            ArchiveFormat::SevenZ => "7Z",
+            ArchiveFormat::Tar => "TAR",
+            ArchiveFormat::TarGz | ArchiveFormat::Tgz => "TAR.GZ",
+            ArchiveFormat::TarBz2 => "TAR.BZ2",
+            ArchiveFormat::TarXz => "TAR.XZ",
+            ArchiveFormat::Unknown => "未知",
+        }
+    }
+}
+
 /// 判断文件是否为支持的压缩格式
 pub fn is_archive_file(filename: &str) -> bool {
-    let lower = filename.to_lowercase();
-    lower.ends_with(".zip")
-        || lower.ends_with(".7z")
-        || lower.ends_with(".tar")
-        || lower.ends_with(".tar.gz")
-        || lower.ends_with(".tgz")
-        || lower.ends_with(".tar.bz2")
-        || lower.ends_with(".tar.xz")
-}
-
-/// 判断文件是否为 tar 变体格式
-fn is_tar_variant(filename: &str) -> bool {
-    let lower = filename.to_lowercase();
-    lower.ends_with(".tar")
-        || lower.ends_with(".tar.gz")
-        || lower.ends_with(".tgz")
-        || lower.ends_with(".tar.bz2")
-        || lower.ends_with(".tar.xz")
-}
-
-/// 获取文件扩展名对应的压缩格式描述
-fn archive_format_desc(filename: &str) -> &'static str {
-    let lower = filename.to_lowercase();
-    if lower.ends_with(".zip") {
-        "ZIP"
-    } else if lower.ends_with(".7z") {
-        "7Z"
-    } else if lower.ends_with(".tar") {
-        "TAR"
-    } else if lower.ends_with(".tar.gz") || lower.ends_with(".tgz") {
-        "TAR.GZ"
-    } else if lower.ends_with(".tar.bz2") {
-        "TAR.BZ2"
-    } else if lower.ends_with(".tar.xz") {
-        "TAR.XZ"
-    } else {
-        "未知"
-    }
+    ArchiveFormat::from_filename(filename).is_archive()
 }
 
 /// 将压缩文件解压到指定目录
@@ -152,22 +187,19 @@ pub fn extract_archive(
 pub fn extract_archive_with_limits(
     src_path: &str, dest_dir: &str, filename: &str, password: Option<&str>, file_id: i64, limits: &ExtractLimits,
 ) -> Result<Vec<ArchiveEntry>, ArchiveError> {
-    if !is_archive_file(filename) {
-        return Err(ArchiveError::UnsupportedFormat(archive_format_desc(filename).to_string()));
+    let format = ArchiveFormat::from_filename(filename);
+    if !format.is_archive() {
+        return Err(ArchiveError::UnsupportedFormat(format.desc().to_string()));
     }
 
     // 创建目标目录
     std::fs::create_dir_all(dest_dir)?;
 
-    let lower = filename.to_lowercase();
-    if lower.ends_with(".zip") {
-        extract_zip(src_path, dest_dir, password, file_id, limits)
-    } else if lower.ends_with(".7z") {
-        Err(ArchiveError::UnsupportedFormat("7Z 格式暂不支持".to_string()))
-    } else if is_tar_variant(filename) {
-        extract_tar(src_path, dest_dir, file_id, limits)
-    } else {
-        Err(ArchiveError::UnsupportedFormat(archive_format_desc(filename).to_string()))
+    match format {
+        ArchiveFormat::Zip => extract_zip(src_path, dest_dir, password, file_id, limits),
+        ArchiveFormat::SevenZ => Err(ArchiveError::UnsupportedFormat("7Z 格式暂不支持".to_string())),
+        _ if format.is_tar_variant() => extract_tar(src_path, dest_dir, file_id, limits),
+        _ => Err(ArchiveError::UnsupportedFormat(format.desc().to_string())),
     }
 }
 
@@ -178,15 +210,12 @@ pub fn extract_archive_with_limits(
 pub fn read_archive_entry(
     src_path: &str, filename: &str, entry_path: &str, password: Option<&str>,
 ) -> Result<NamedTempFile, ArchiveError> {
-    let lower = filename.to_lowercase();
-    if lower.ends_with(".zip") {
-        read_zip_entry(src_path, entry_path, password)
-    } else if lower.ends_with(".7z") {
-        Err(ArchiveError::UnsupportedFormat("7Z 格式暂不支持".to_string()))
-    } else if is_tar_variant(filename) {
-        read_tar_entry(src_path, entry_path)
-    } else {
-        Err(ArchiveError::UnsupportedFormat(archive_format_desc(filename).to_string()))
+    let format = ArchiveFormat::from_filename(filename);
+    match format {
+        ArchiveFormat::Zip => read_zip_entry(src_path, entry_path, password),
+        ArchiveFormat::SevenZ => Err(ArchiveError::UnsupportedFormat("7Z 格式暂不支持".to_string())),
+        _ if format.is_tar_variant() => read_tar_entry(src_path, entry_path),
+        _ => Err(ArchiveError::UnsupportedFormat(format.desc().to_string())),
     }
 }
 

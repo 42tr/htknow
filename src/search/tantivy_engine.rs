@@ -10,7 +10,6 @@ use serde::Serialize;
 use tantivy::{
     Index, IndexReader, Result, TantivyDocument, TantivyError, Term, collector::TopDocs, directory::error::LockError, doc, merge_policy::LogMergePolicy, query::{BooleanQuery, BoostQuery, Occur, Query, TermQuery}, schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _}
 };
-use tokio::time::sleep;
 
 use super::chinese_tokenizer;
 use crate::config;
@@ -116,25 +115,38 @@ fn is_lock_busy_error(err: &TantivyError) -> bool {
     matches!(err, TantivyError::LockFailure(LockError::LockBusy, _))
 }
 
-async fn create_writer(index: &Index) -> tantivy::Result<tantivy::IndexWriter> {
-    let mut delay_ms = INDEX_WRITER_LOCK_RETRY_BASE_MS;
-
-    for attempt in 1..=INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS {
-        match open_writer(index) {
-            Ok(writer) => return Ok(writer),
-            Err(err) if is_lock_busy_error(&err) && attempt < INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS => {
-                warn!(
-                    "Tantivy index writer lock busy (attempt {}/{}), retry in {}ms",
-                    attempt, INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS, delay_ms
-                );
-                sleep(Duration::from_millis(delay_ms)).await;
-                delay_ms = (delay_ms * 2).min(800);
+/// Retry opening a Tantivy index writer with exponential backoff.
+///
+/// `$sleep` is a closure that performs the actual sleep for the given number of
+/// milliseconds.
+macro_rules! retry_open_writer {
+    ($index:expr, $sleep:expr) => {{
+        let mut delay_ms = INDEX_WRITER_LOCK_RETRY_BASE_MS;
+        let mut attempt = 1;
+        loop {
+            match open_writer($index) {
+                Ok(writer) => break Ok(writer),
+                Err(err) if is_lock_busy_error(&err) && attempt < INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS => {
+                    warn!(
+                        "Tantivy index writer lock busy (attempt {}/{}), retry in {}ms",
+                        attempt, INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS, delay_ms
+                    );
+                    $sleep(delay_ms);
+                    delay_ms = (delay_ms * 2).min(800);
+                    attempt += 1;
+                }
+                Err(err) => break Err(err),
             }
-            Err(err) => return Err(err),
         }
-    }
+    }};
+}
 
-    unreachable!("create_writer retry loop should always return or error")
+async fn create_writer(index: &Index) -> tantivy::Result<tantivy::IndexWriter> {
+    retry_open_writer!(index, |ms| std::thread::sleep(Duration::from_millis(ms)))
+}
+
+fn create_writer_blocking(index: &Index) -> tantivy::Result<tantivy::IndexWriter> {
+    retry_open_writer!(index, |ms| std::thread::sleep(Duration::from_millis(ms)))
 }
 
 fn open_writer(index: &Index) -> tantivy::Result<tantivy::IndexWriter> {
@@ -143,27 +155,6 @@ fn open_writer(index: &Index) -> tantivy::Result<tantivy::IndexWriter> {
     // 设置 merge policy，减少小 segment 数量
     writer.set_merge_policy(Box::new(LogMergePolicy::default()));
     Ok(writer)
-}
-
-fn create_writer_blocking(index: &Index) -> tantivy::Result<tantivy::IndexWriter> {
-    let mut delay_ms = INDEX_WRITER_LOCK_RETRY_BASE_MS;
-
-    for attempt in 1..=INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS {
-        match open_writer(index) {
-            Ok(writer) => return Ok(writer),
-            Err(err) if is_lock_busy_error(&err) && attempt < INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS => {
-                warn!(
-                    "Tantivy index writer lock busy (attempt {}/{}), retry in {}ms",
-                    attempt, INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS, delay_ms
-                );
-                thread::sleep(Duration::from_millis(delay_ms));
-                delay_ms = (delay_ms * 2).min(800);
-            }
-            Err(err) => return Err(err),
-        }
-    }
-
-    unreachable!("create_writer_blocking retry loop should always return or error")
 }
 
 pub async fn create_writer_with_timing(index: &Index, label: &str) -> tantivy::Result<tantivy::IndexWriter> {

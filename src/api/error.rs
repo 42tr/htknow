@@ -116,21 +116,6 @@ impl IntoResponse for ApiError {
 pub type ApiResult<T> = result::Result<T, ApiError>;
 
 impl ApiError {
-    // Helper to create a `BadRequest` error.
-    // pub fn bad_request<M: Into<String>>(msg: M) -> Self {
-    //     ApiError::BadRequest(msg.into())
-    // }
-
-    // Helper to create a `NotFound` error.
-    // pub fn not_found<M: Into<String>>(msg: M) -> Self {
-    //     ApiError::NotFound(msg.into())
-    // }
-
-    // /// Helper to create an `Unauthorized` error.
-    // pub fn unauthorized<M: Into<String>>(msg: M) -> Self {
-    //     ApiError::Unauthorized(msg.into())
-    // }
-
     /// Helper to create a generic internal error (also logs).
     pub fn internal<M: Into<String>>(msg: M) -> Self {
         let msg = msg.into();

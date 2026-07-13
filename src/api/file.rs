@@ -18,7 +18,9 @@ use tokio::{
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    AuthUser, api::error::{ApiError, ApiResult}, archive::{self, ArchiveEntry, ExtractResult}, config, pdf_highlight, processor, search::SearchEngine
+    AuthUser, api::{
+        common, error::{ApiError, ApiResult}
+    }, archive::{self, ArchiveEntry, ExtractResult}, config, pdf_highlight, processor, search::SearchEngine
 };
 
 /// 以流式方式打开文件，返回 (字节数, Body)。
@@ -177,6 +179,32 @@ enum FileStatsScope {
     Global { include_unassigned: bool },
     KnowledgeBase { kb_id: i64, include_descendants: bool },
     UnassignedOnly,
+}
+
+fn ensure_file_readable(file: &File, auth_user: &AuthUser) -> ApiResult<()> {
+    if auth_user.is_admin() || file.is_public || file.user_id == auth_user.user_id {
+        Ok(())
+    } else {
+        Err(ApiError::NotFound("File not found or permission denied".to_string()))
+    }
+}
+
+async fn ensure_file_writable(pool: &SqlitePool, file: &File, auth_user: &AuthUser) -> ApiResult<()> {
+    let is_admin = auth_user.is_admin();
+    match file.kb_id {
+        Some(kb_id) => {
+            let perm = super::knowledge_base::get_kb_permission(pool, kb_id, &auth_user.user_id, is_admin).await;
+            if !super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
+                return Err(ApiError::Forbidden("Permission denied. Requires editor or admin.".to_string()));
+            }
+        }
+        None => {
+            if !is_admin && file.user_id != auth_user.user_id {
+                return Err(ApiError::Forbidden("Permission denied.".to_string()));
+            }
+        }
+    }
+    Ok(())
 }
 
 const PARSE_ASSETS_META_KEY: &str = "_htknow_parse_assets";
@@ -711,9 +739,7 @@ pub async fn get(
     let query = "SELECT * FROM files WHERE id = ?";
     let file: File = sqlx::query_as(query).bind(id).fetch_one(&pool).await?;
 
-    if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
-        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
-    }
+    ensure_file_readable(&file, &auth_user)?;
 
     Ok(Json(file))
 }
@@ -820,33 +846,15 @@ pub async fn update(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
     Extension(auth_user): Extension<AuthUser>, Path(id): Path<i64>, Json(req): Json<UpdateFileReq>,
 ) -> ApiResult<Json<File>> {
-    let is_admin = auth_user.is_admin();
+    let file: File = sqlx::query_as::<_, File>("SELECT * FROM files WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&pool)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("File not found".to_string()))?;
+    ensure_file_writable(&pool, &file, &auth_user).await?;
 
-    // Check permission on the file's KB
-    let file_kb: Option<Option<i64>> =
-        sqlx::query_scalar("SELECT kb_id FROM files WHERE id = ?").bind(id).fetch_optional(&pool).await?;
-    let kb_id = file_kb.ok_or_else(|| ApiError::NotFound("File not found".to_string()))?;
-    match kb_id {
-        Some(kid) => {
-            let perm = super::knowledge_base::get_kb_permission(&pool, kid, &auth_user.user_id, is_admin).await;
-            if !super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
-                return Err(ApiError::Forbidden("Permission denied. Requires editor or admin.".to_string()));
-            }
-        }
-        None => {
-            // Unassigned file: only owner or admin can modify
-            if !is_admin {
-                let owner: Option<String> =
-                    sqlx::query_scalar("SELECT user_id FROM files WHERE id = ?").bind(id).fetch_optional(&pool).await?;
-                if owner.as_deref() != Some(&auth_user.user_id) {
-                    return Err(ApiError::Forbidden("Permission denied.".to_string()));
-                }
-            }
-        }
-    }
-
-    let mut has_updates = false;
     let update_is_public = req.is_public.is_some();
+    let mut has_updates = false;
     let mut reset_parse_data = false;
     let mut image_paths_to_remove = Vec::new();
     debug!("update_is_public: {}", update_is_public);
@@ -957,27 +965,13 @@ pub async fn move_to_kb(
         return Err(ApiError::BadRequest("Invalid target_kb_id".to_string()));
     }
 
-    let is_admin = auth_user.is_admin();
     let file: File = sqlx::query_as::<_, File>("SELECT * FROM files WHERE id = ?")
         .bind(id)
         .fetch_optional(&pool)
         .await?
         .ok_or_else(|| ApiError::NotFound("File not found".to_string()))?;
 
-    // Check source KB permission
-    match file.kb_id {
-        Some(src_kb_id) => {
-            let perm = super::knowledge_base::get_kb_permission(&pool, src_kb_id, &auth_user.user_id, is_admin).await;
-            if !super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
-                return Err(ApiError::Forbidden("Permission denied on source knowledge base.".to_string()));
-            }
-        }
-        None => {
-            if !is_admin && file.user_id != auth_user.user_id {
-                return Err(ApiError::Forbidden("Permission denied.".to_string()));
-            }
-        }
-    }
+    ensure_file_writable(&pool, &file, &auth_user).await?;
 
     if file.status == 2 {
         return Err(ApiError::BadRequest("File is processing, cannot move now".to_string()));
@@ -990,11 +984,7 @@ pub async fn move_to_kb(
     // Check target KB permission
     let target_kb_type: Option<String> = match req.target_kb_id {
         Some(target_kb_id) => {
-            let perm =
-                super::knowledge_base::get_kb_permission(&pool, target_kb_id, &auth_user.user_id, is_admin).await;
-            if !super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
-                return Err(ApiError::Forbidden("Permission denied on target knowledge base.".to_string()));
-            }
+            common::ensure_kb_editor_or_admin(&pool, target_kb_id, &auth_user).await?;
             let kb_type: Option<String> = sqlx::query_scalar("SELECT kb_type FROM knowledge_bases WHERE id = ?")
                 .bind(target_kb_id)
                 .fetch_optional(&pool)
@@ -1146,18 +1136,11 @@ fn normalize_batch_delete_ids(ids: Vec<i64>) -> ApiResult<Vec<i64>> {
     Ok(normalized)
 }
 
-fn push_i64_list(qb: &mut QueryBuilder<Sqlite>, ids: &[i64]) {
-    let mut separated = qb.separated(", ");
-    for id in ids {
-        separated.push_bind(*id);
-    }
-}
-
 async fn query_deletable_files(pool: &SqlitePool, ids: &[i64], auth_user: &AuthUser) -> Result<Vec<File>, sqlx::Error> {
     let is_admin = auth_user.is_admin();
     // Fetch all files by id first
     let mut qb = QueryBuilder::<Sqlite>::new(&format!("SELECT {} FROM files WHERE id IN (", FILE_COLS_NO_CONTENT));
-    push_i64_list(&mut qb, ids);
+    crate::db::push_i64_list(&mut qb, ids);
     qb.push(")");
     let all_files: Vec<File> = qb.build_query_as::<File>().fetch_all(pool).await?;
 
@@ -1204,7 +1187,7 @@ async fn clear_file_parse_rows_for_ids_in_tx(
         let mut mentions_qb = QueryBuilder::<Sqlite>::new(
             "DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id IN (",
         );
-        push_i64_list(&mut mentions_qb, chunk);
+        crate::db::push_i64_list(&mut mentions_qb, chunk);
         mentions_qb.push("))");
         mentions_qb.build().execute(&mut **tx).await?;
     }
@@ -1213,21 +1196,21 @@ async fn clear_file_parse_rows_for_ids_in_tx(
         let mut positions_qb = QueryBuilder::<Sqlite>::new(
             "DELETE FROM slice_positions WHERE slice_id IN (SELECT id FROM slices WHERE file_id IN (",
         );
-        push_i64_list(&mut positions_qb, chunk);
+        crate::db::push_i64_list(&mut positions_qb, chunk);
         positions_qb.push("))");
         positions_qb.build().execute(&mut **tx).await?;
     }
 
     for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
         let mut slices_qb = QueryBuilder::<Sqlite>::new("DELETE FROM slices WHERE file_id IN (");
-        push_i64_list(&mut slices_qb, chunk);
+        crate::db::push_i64_list(&mut slices_qb, chunk);
         slices_qb.push(")");
         slices_qb.build().execute(&mut **tx).await?;
     }
 
     for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
         let mut pdf_qb = QueryBuilder::<Sqlite>::new("DELETE FROM pdf_contents WHERE file_id IN (");
-        push_i64_list(&mut pdf_qb, chunk);
+        crate::db::push_i64_list(&mut pdf_qb, chunk);
         pdf_qb.push(")");
         pdf_qb.build().execute(&mut **tx).await?;
     }
@@ -1242,7 +1225,7 @@ pub(crate) async fn delete_file_rows_in_tx(
 
     for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
         let mut files_qb = QueryBuilder::<Sqlite>::new("DELETE FROM files WHERE id IN (");
-        push_i64_list(&mut files_qb, chunk);
+        crate::db::push_i64_list(&mut files_qb, chunk);
         files_qb.push(")");
         files_qb.build().execute(&mut **tx).await?;
     }
@@ -1268,14 +1251,6 @@ pub(crate) async fn delete_file_rows_batched(pool: &SqlitePool, file_ids: &[i64]
     Ok(())
 }
 
-async fn ensure_kb_editor_or_admin(pool: &SqlitePool, kb_id: i64, auth_user: &AuthUser) -> ApiResult<()> {
-    let perm = super::knowledge_base::get_kb_permission(pool, kb_id, &auth_user.user_id, auth_user.is_admin()).await;
-    if !super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
-        return Err(ApiError::Forbidden("Permission denied. Requires editor or admin.".to_string()));
-    }
-    Ok(())
-}
-
 async fn query_failed_file_ids_for_reparse(
     pool: &SqlitePool, auth_user: &AuthUser, req: &ReparseFailedFilesReq,
 ) -> ApiResult<Vec<i64>> {
@@ -1292,7 +1267,7 @@ async fn query_failed_file_ids_for_reparse(
     }
 
     if let Some(kb_id) = req.kb_id {
-        ensure_kb_editor_or_admin(pool, kb_id, auth_user).await?;
+        common::ensure_kb_editor_or_admin(pool, kb_id, auth_user).await?;
 
         if req.include_descendants {
             let mut qb = QueryBuilder::<Sqlite>::new(
@@ -1416,7 +1391,7 @@ async fn execute_reparse_failed(
     let mut qb = QueryBuilder::<Sqlite>::new(
         "UPDATE files SET status = 0, log = '', content = NULL, updated_at = strftime('%s','now') WHERE status = -1 AND id IN (",
     );
-    push_i64_list(&mut qb, &file_ids);
+    crate::db::push_i64_list(&mut qb, &file_ids);
     qb.push(")");
     let updated = qb.build().execute(&mut *tx).await?.rows_affected() as i64;
     tx.commit().await?;
@@ -1603,7 +1578,7 @@ pub(crate) async fn collect_image_raw_paths_for_files(
 
     for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
         let mut qb = QueryBuilder::<Sqlite>::new("SELECT file_id, img_path FROM pdf_contents WHERE file_id IN (");
-        push_i64_list(&mut qb, chunk);
+        crate::db::push_i64_list(&mut qb, chunk);
         qb.push(")");
         let rows: Vec<(i64, Option<String>)> = qb.build_query_as().fetch_all(pool).await?;
         for (file_id, img_path) in rows {
@@ -1623,7 +1598,7 @@ pub(crate) async fn collect_image_raw_paths_for_files(
         file_ids.iter().copied().filter(|id| !states.get(id).is_some_and(|state| state.has_pdf_contents)).collect();
     for chunk in meta_candidate_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
         let mut qb = QueryBuilder::<Sqlite>::new("SELECT id, meta FROM files WHERE id IN (");
-        push_i64_list(&mut qb, chunk);
+        crate::db::push_i64_list(&mut qb, chunk);
         qb.push(")");
         let rows: Vec<(i64, Option<String>)> = qb.build_query_as().fetch_all(pool).await?;
         for (file_id, meta) in rows {
@@ -1697,7 +1672,7 @@ pub(crate) async fn backfill_missing_image_meta_for_files(
     let mut candidate_ids = Vec::new();
     for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
         let mut qb = QueryBuilder::<Sqlite>::new("SELECT f.id, f.meta FROM files f WHERE f.id IN (");
-        push_i64_list(&mut qb, chunk);
+        crate::db::push_i64_list(&mut qb, chunk);
         qb.push(") AND NOT EXISTS (SELECT 1 FROM pdf_contents pc WHERE pc.file_id = f.id)");
         let rows: Vec<(i64, Option<String>)> = qb.build_query_as().fetch_all(pool).await?;
         for (file_id, meta) in rows {
@@ -1812,7 +1787,7 @@ async fn extract_slice_image_paths_by_file(
 
     for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
         let mut qb = QueryBuilder::<Sqlite>::new("SELECT file_id, content FROM slices WHERE file_id IN (");
-        push_i64_list(&mut qb, chunk);
+        crate::db::push_i64_list(&mut qb, chunk);
         qb.push(")");
         let rows: Vec<(i64, String)> = qb.build_query_as().fetch_all(pool).await?;
         for (file_id, content) in rows {
@@ -1986,59 +1961,26 @@ pub async fn list(
     State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Query(query): Query<ListQuery>,
 ) -> ApiResult<Json<Vec<File>>> {
     let is_admin = auth_user.is_admin();
-    let mut files = match query.kb_id.as_deref() {
-        // 明确指定查询未分配知识库的文件
+
+    let mut qb = QueryBuilder::<Sqlite>::new(&format!("SELECT {FILE_COLS_NO_CONTENT} FROM files f WHERE 1=1"));
+    match query.kb_id.as_deref() {
         Some("null") | Some("unassigned") => {
-            if is_admin {
-                sqlx::query_as(&format!(
-                    "SELECT {FILE_COLS_NO_CONTENT} FROM files WHERE kb_id IS NULL ORDER BY created_at DESC"
-                ))
-                .fetch_all(&pool)
-                .await?
-            } else {
-                sqlx::query_as(
-                    &format!("SELECT {FILE_COLS_NO_CONTENT} FROM files WHERE kb_id IS NULL AND (user_id = ? OR is_public = 1) ORDER BY created_at DESC"),
-                )
-                .bind(&auth_user.user_id)
-                .fetch_all(&pool)
-                .await?
-            }
+            qb.push(" AND f.kb_id IS NULL");
         }
-        // 查询特定知识库的文件
         Some(kb_id_str) => {
             let kb_id = kb_id_str.parse::<i64>().map_err(|_| ApiError::internal("Invalid kb_id format"))?;
-            ensure_kb_accessible(&pool, kb_id, &auth_user.user_id, is_admin).await?;
-            if is_admin {
-                sqlx::query_as(&format!(
-                    "SELECT {FILE_COLS_NO_CONTENT} FROM files WHERE kb_id = ? ORDER BY created_at DESC"
-                ))
-                .bind(kb_id)
-                .fetch_all(&pool)
-                .await?
-            } else {
-                sqlx::query_as(
-                    &format!("SELECT {FILE_COLS_NO_CONTENT} FROM files WHERE kb_id = ? AND (user_id = ? OR is_public = 1) ORDER BY created_at DESC"),
-                )
-                .bind(kb_id)
-                .bind(&auth_user.user_id)
-                .fetch_all(&pool)
-                .await?
-            }
+            common::ensure_kb_accessible(&pool, kb_id, &auth_user.user_id, is_admin).await?;
+            qb.push(" AND f.kb_id = ").push_bind(kb_id);
         }
-        // 不传参数，查询所有文件
-        None => {
-            if is_admin {
-                sqlx::query_as(&format!("SELECT {FILE_COLS_NO_CONTENT} FROM files ORDER BY created_at DESC"))
-                    .fetch_all(&pool)
-                    .await?
-            } else {
-                sqlx::query_as(&format!("SELECT {FILE_COLS_NO_CONTENT} FROM files WHERE (user_id = ? OR is_public = 1) ORDER BY created_at DESC"))
-                    .bind(&auth_user.user_id)
-                    .fetch_all(&pool)
-                    .await?
-            }
-        }
-    };
+        None => {}
+    }
+    if !is_admin {
+        qb.push(" AND ");
+        common::push_file_access_filter(&mut qb, &auth_user.user_id, Some("f"));
+    }
+    qb.push(" ORDER BY f.created_at DESC");
+
+    let mut files: Vec<File> = qb.build_query_as().fetch_all(&pool).await?;
 
     if let Some(tag) = &query.tag {
         files.retain(|file: &File| {
@@ -2082,33 +2024,13 @@ pub async fn stats(
         Some(kb_id_str) => {
             let kb_id =
                 kb_id_str.parse::<i64>().map_err(|_| ApiError::BadRequest("Invalid kb_id format".to_string()))?;
-            ensure_kb_accessible(&pool, kb_id, &auth_user.user_id, is_admin).await?;
+            common::ensure_kb_accessible(&pool, kb_id, &auth_user.user_id, is_admin).await?;
             get_file_status_breakdown_for_kb(&pool, kb_id, include_descendants, &auth_user.user_id, is_admin).await?
         }
         None => get_file_status_breakdown_for_all(&pool, include_unassigned, &auth_user.user_id, is_admin).await?,
     };
 
     Ok(Json(breakdown))
-}
-
-async fn ensure_kb_accessible(pool: &SqlitePool, kb_id: i64, user_id: &str, is_admin: bool) -> ApiResult<()> {
-    let exists = if is_admin {
-        sqlx::query_scalar::<_, i64>("SELECT id FROM knowledge_bases WHERE id = ?")
-            .bind(kb_id)
-            .fetch_optional(pool)
-            .await?
-    } else {
-        sqlx::query_scalar::<_, i64>("SELECT id FROM knowledge_bases WHERE id = ? AND (user_id = ? OR is_public = 1)")
-            .bind(kb_id)
-            .bind(user_id)
-            .fetch_optional(pool)
-            .await?
-    };
-
-    if exists.is_none() {
-        return Err(ApiError::NotFound("Knowledge base not found or permission denied".to_string()));
-    }
-    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow, ToSchema)]
@@ -2224,29 +2146,16 @@ pub async fn update_slices(
         .await?
         .ok_or_else(|| ApiError::NotFound("File not found".to_string()))?;
 
-    let is_admin = auth_user.is_admin();
-    match file.kb_id {
-        Some(kb_id) => {
-            let perm = super::knowledge_base::get_kb_permission(&pool, kb_id, &auth_user.user_id, is_admin).await;
-            if !super::knowledge_base::meets_requirement(perm.as_deref(), "editor") {
-                return Err(ApiError::Forbidden("Permission denied. Requires editor or admin.".to_string()));
-            }
+    ensure_file_writable(&pool, &file, &auth_user).await?;
 
-            // 校验知识库类型非 storage
-            let kb_type: Option<String> = sqlx::query_scalar("SELECT kb_type FROM knowledge_bases WHERE id = ?")
-                .bind(kb_id)
-                .fetch_optional(&pool)
-                .await?;
-            if matches!(kb_type.as_deref(), Some("storage")) {
-                return Err(ApiError::BadRequest(
-                    "Storage knowledge base files do not support slice editing.".to_string(),
-                ));
-            }
-        }
-        None => {
-            if !is_admin && file.user_id != auth_user.user_id {
-                return Err(ApiError::Forbidden("Permission denied.".to_string()));
-            }
+    // 校验知识库类型非 storage
+    if let Some(kb_id) = file.kb_id {
+        let kb_type: Option<String> = sqlx::query_scalar("SELECT kb_type FROM knowledge_bases WHERE id = ?")
+            .bind(kb_id)
+            .fetch_optional(&pool)
+            .await?;
+        if matches!(kb_type.as_deref(), Some("storage")) {
+            return Err(ApiError::BadRequest("Storage knowledge base files do not support slice editing.".to_string()));
         }
     }
 
@@ -2383,9 +2292,7 @@ pub async fn get_slice_highlight(
         .fetch_one(&pool)
         .await?;
 
-    if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
-        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
-    }
+    ensure_file_readable(&file, &auth_user)?;
 
     let slice: Option<(i64,)> =
         sqlx::query_as("SELECT file_id FROM slices WHERE id = ?").bind(slice_id).fetch_optional(&pool).await?;
@@ -2447,9 +2354,7 @@ pub async fn get_slice_highlight_page(
         .fetch_one(&pool)
         .await?;
 
-    if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
-        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
-    }
+    ensure_file_readable(&file, &auth_user)?;
 
     let slice: Option<(i64,)> =
         sqlx::query_as("SELECT file_id FROM slices WHERE id = ?").bind(slice_id).fetch_optional(&pool).await?;
@@ -2539,9 +2444,7 @@ pub async fn download(
         .fetch_one(&pool)
         .await?;
 
-    if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
-        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
-    }
+    ensure_file_readable(&file, &auth_user)?;
 
     let (len, body) = open_file_stream(std::path::Path::new(&file.path)).await?;
     let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().to_string();
@@ -2593,9 +2496,7 @@ pub async fn get_highlighted_pdf(
         .fetch_one(&pool)
         .await?;
 
-    if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
-        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
-    }
+    ensure_file_readable(&file, &auth_user)?;
 
     // 校验切片属于该文件
     let slice: Option<(i64,)> =
@@ -2757,9 +2658,7 @@ pub async fn excel_data(
         .fetch_one(&pool)
         .await?;
 
-    if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
-        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
-    }
+    ensure_file_readable(&file, &auth_user)?;
 
     let filename_lower = file.filename.to_lowercase();
     let is_excel = filename_lower.ends_with(".xls") || filename_lower.ends_with(".xlsx");
@@ -2871,9 +2770,7 @@ pub async fn archive_entries(
         .fetch_one(&pool)
         .await?;
 
-    if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
-        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
-    }
+    ensure_file_readable(&file, &auth_user)?;
 
     if !archive::is_archive_file(&file.filename) {
         return Err(ApiError::BadRequest("File is not an archive".to_string()));
@@ -2918,9 +2815,7 @@ pub async fn archive_extract(
         .fetch_one(&pool)
         .await?;
 
-    if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
-        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
-    }
+    ensure_file_readable(&file, &auth_user)?;
 
     if !archive::is_archive_file(&file.filename) {
         return Err(ApiError::BadRequest("File is not an archive".to_string()));
@@ -3037,9 +2932,7 @@ pub async fn archive_download(
         .fetch_one(&pool)
         .await?;
 
-    if !auth_user.is_admin() && !file.is_public && file.user_id != auth_user.user_id {
-        return Err(ApiError::NotFound("File not found or permission denied".to_string()));
-    }
+    ensure_file_readable(&file, &auth_user)?;
 
     if !archive::is_archive_file(&file.filename) {
         return Err(ApiError::BadRequest("File is not an archive".to_string()));

@@ -5,7 +5,7 @@ use std::{
 use anyhow::Context;
 use log::info;
 use sqlx::{
-    Row, SqlitePool, sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous}
+    QueryBuilder, Row, Sqlite, SqlitePool, sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous}
 };
 
 use crate::config;
@@ -463,4 +463,53 @@ fn ensure_db_file(path: &Path) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+/// 将 i64 ID 列表追加到 QueryBuilder 的 `IN (...)` 子句中。
+/// 调用方需自行在前后添加括号。
+pub fn push_i64_list(qb: &mut QueryBuilder<'_, Sqlite>, ids: &[i64]) {
+    let mut separated = qb.separated(", ");
+    for id in ids {
+        separated.push_bind(*id);
+    }
+}
+
+/// 批量 INSERT 并返回自增 id。
+///
+/// - `prefix_sql`: 形如 `INSERT INTO table (col1, col2) `（含末尾空格）
+/// - `bind`: 为每一行绑定列值，例如 `|qb, row| { qb.push_bind(row.0).push_bind(row.1); }`
+/// - `binds_per_row`: 每行绑定的变量数，用于按 SQLite 999 变量上限分块
+pub async fn batch_insert_with_returning<T, BindFn>(
+    tx: &mut sqlx::Transaction<'_, Sqlite>, prefix_sql: &str, rows: &[T], binds_per_row: usize, mut bind: BindFn,
+) -> anyhow::Result<Vec<i64>>
+where
+    BindFn: FnMut(&mut QueryBuilder<'_, Sqlite>, &T), {
+    if rows.is_empty() {
+        return Ok(Vec::new());
+    }
+    const MAX_VARS: usize = 999;
+    let batch_size = std::cmp::max(1, MAX_VARS / binds_per_row);
+    let mut ids = Vec::with_capacity(rows.len());
+    for chunk in rows.chunks(batch_size) {
+        let mut qb = QueryBuilder::<Sqlite>::new(prefix_sql);
+        qb.push("VALUES ");
+        for (i, row) in chunk.iter().enumerate() {
+            if i > 0 {
+                qb.push(", ");
+            }
+            qb.push("(");
+            bind(&mut qb, row);
+            qb.push(")");
+        }
+        qb.push(" RETURNING id");
+        let inserted: Vec<(i64,)> = qb.build_query_as().fetch_all(&mut **tx).await?;
+        anyhow::ensure!(
+            inserted.len() == chunk.len(),
+            "inserted row count mismatch: expected {}, got {}",
+            chunk.len(),
+            inserted.len()
+        );
+        ids.extend(inserted.into_iter().map(|(id,)| id));
+    }
+    Ok(ids)
 }

@@ -4,6 +4,7 @@ use axum::{
 use sqlx::SqlitePool;
 use utoipa::OpenApi;
 
+mod common;
 mod error;
 mod file;
 mod graph;

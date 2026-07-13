@@ -130,7 +130,7 @@ pub struct RebuildProgress {
 }
 
 /// 根据文件名后缀判断是否为图片文件。
-fn is_image_filename(filename: &str) -> bool {
+pub fn is_image_file(filename: &str) -> bool {
     let lower = filename.to_lowercase();
     lower.ends_with(".jpg")
         || lower.ends_with(".jpeg")
@@ -158,7 +158,7 @@ async fn rebuild_image_embeddings(pool: &SqlitePool) -> anyhow::Result<HashMap<i
     let mut failed = 0usize;
 
     for (file_id, filename, path) in rows {
-        if !is_image_filename(&filename) {
+        if !is_image_file(&filename) {
             continue;
         }
         match embedding::get_image_embedding_from_path(&path, Some(&filename)).await {

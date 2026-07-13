@@ -288,6 +288,22 @@ pub async fn search_image(
     Ok(search_results)
 }
 
+fn build_in_predicate(column: &str, ids: &[i64]) -> String {
+    if ids.len() == 1 {
+        format!("{column} = {}", ids[0])
+    } else {
+        let ids = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+        format!("{column} IN ({ids})")
+    }
+}
+
+async fn delete_by_predicate(predicate: String) -> Result<()> {
+    let table = get_table()?;
+    table.update().only_if(predicate).column(IS_DELETED_COLUMN, "true").execute().await?;
+    on_write_may_need_optimize();
+    Ok(())
+}
+
 pub async fn delete_by_file(file_id: i64) -> Result<()> {
     delete_by_files(&[file_id]).await
 }
@@ -296,34 +312,14 @@ pub async fn delete_by_files(file_ids: &[i64]) -> Result<()> {
     if file_ids.is_empty() {
         return Ok(());
     }
-
-    let table = get_table()?;
-    let predicate = if file_ids.len() == 1 {
-        format!("file_id = {}", file_ids[0])
-    } else {
-        let ids = file_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
-        format!("file_id IN ({})", ids)
-    };
-    table.update().only_if(predicate).column(IS_DELETED_COLUMN, "true").execute().await?;
-    on_write_may_need_optimize();
-    Ok(())
+    delete_by_predicate(build_in_predicate("file_id", file_ids)).await
 }
 
 pub async fn delete_by_slices(slice_ids: &[i64]) -> Result<()> {
     if slice_ids.is_empty() {
         return Ok(());
     }
-
-    let table = get_table()?;
-    let predicate = if slice_ids.len() == 1 {
-        format!("id = {}", slice_ids[0])
-    } else {
-        let ids = slice_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
-        format!("id IN ({})", ids)
-    };
-    table.update().only_if(predicate).column(IS_DELETED_COLUMN, "true").execute().await?;
-    on_write_may_need_optimize();
-    Ok(())
+    delete_by_predicate(build_in_predicate("id", slice_ids)).await
 }
 
 pub async fn delete_by_kb(kb_id: i64) -> Result<()> {
@@ -334,17 +330,7 @@ pub async fn delete_by_kbs(kb_ids: &[i64]) -> Result<()> {
     if kb_ids.is_empty() {
         return Ok(());
     }
-
-    let table = get_table()?;
-    let predicate = if kb_ids.len() == 1 {
-        format!("kb_id = {}", kb_ids[0])
-    } else {
-        let ids = kb_ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
-        format!("kb_id IN ({})", ids)
-    };
-    table.update().only_if(predicate).column(IS_DELETED_COLUMN, "true").execute().await?;
-    on_write_may_need_optimize();
-    Ok(())
+    delete_by_predicate(build_in_predicate("kb_id", kb_ids)).await
 }
 
 /// 清理已删除的记录，释放磁盘和内存空间
