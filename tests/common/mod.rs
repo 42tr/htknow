@@ -265,6 +265,7 @@ pub fn multipart_body(boundary: &str, fields: &[(&str, &str)]) -> Vec<u8> {
     body
 }
 
+#[allow(clippy::too_many_arguments)]
 // Helper: build multipart request that includes an actual file field
 pub fn authed_multipart_request_with_file(
     method: &str, uri: impl Into<String>, user: &TestUser, boundary: &str, extra_fields: &[(&str, &str)],

@@ -14,6 +14,7 @@ use crate::{AuthUser, api::error::ApiError};
 type EntityRow = (i64, String, String, Option<String>, Option<i64>, Option<i64>, i64);
 #[allow(clippy::type_complexity)]
 type NeighborRow = (i64, String, String, Option<String>, Option<i64>, Option<i64>, i64, String);
+type MentionRow = (i64, String, i64, String);
 
 /// 实体信息
 #[derive(Debug, Serialize, ToSchema)]
@@ -119,10 +120,11 @@ pub async fn search_entities(
         .into_iter()
         .filter_map(|(id, name, entity_type, properties_json, file_id, kb_id, created_at)| {
             // Filter by KB permission
-            if let Some(kid) = kb_id {
-                if !is_admin && !allowed_kb_ids.contains(&kid) {
-                    return None;
-                }
+            if let Some(kid) = kb_id
+                && !is_admin
+                && !allowed_kb_ids.contains(&kid)
+            {
+                return None;
             }
             let properties: HashMap<String, String> = if let Some(ref json) = properties_json {
                 serde_json::from_str(json).unwrap_or_default()
@@ -221,11 +223,7 @@ pub async fn get_entity(
                         INNER JOIN files f ON s.file_id = f.id \
                         WHERE m.node_id = ? LIMIT 20";
 
-    let (outgoing_rows, incoming_rows, mentions_rows): (
-        Vec<NeighborRow>,
-        Vec<NeighborRow>,
-        Vec<(i64, String, i64, String)>,
-    ) = tokio::try_join!(
+    let (outgoing_rows, incoming_rows, mentions_rows): (Vec<NeighborRow>, Vec<NeighborRow>, Vec<MentionRow>) = tokio::try_join!(
         sqlx::query_as(outgoing_sql).bind(id).fetch_all(&pool),
         sqlx::query_as(incoming_sql).bind(id).fetch_all(&pool),
         sqlx::query_as(mentions_sql).bind(id).fetch_all(&pool),

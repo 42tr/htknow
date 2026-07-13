@@ -632,20 +632,16 @@ pub async fn update(
 
     // Only admin-level can change sensitive fields: is_public, parent_id, kb_type
     let is_kb_admin = meets_requirement(Some(perm_str), "admin");
-    if let Some(ref _kb_type) = knowledge.kb_type {
-        if !is_kb_admin {
-            return Err(ApiError::Forbidden("Only admin can change kb_type.".to_string()));
-        }
+    if let Some(ref _kb_type) = knowledge.kb_type
+        && !is_kb_admin
+    {
+        return Err(ApiError::Forbidden("Only admin can change kb_type.".to_string()));
     }
-    if knowledge.parent_id.is_some() {
-        if !is_kb_admin {
-            return Err(ApiError::Forbidden("Only admin can change parent_id.".to_string()));
-        }
+    if knowledge.parent_id.is_some() && !is_kb_admin {
+        return Err(ApiError::Forbidden("Only admin can change parent_id.".to_string()));
     }
-    if knowledge.is_public.is_some() {
-        if !is_kb_admin {
-            return Err(ApiError::Forbidden("Only admin can change visibility.".to_string()));
-        }
+    if knowledge.is_public.is_some() && !is_kb_admin {
+        return Err(ApiError::Forbidden("Only admin can change visibility.".to_string()));
     }
 
     let mut qb = QueryBuilder::<Sqlite>::new("UPDATE knowledge_bases SET ");
