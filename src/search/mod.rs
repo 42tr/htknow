@@ -269,7 +269,8 @@ impl SearchEngine {
         let image_embeddings = rebuild_image_embeddings(pool).await?;
 
         // 只扫描一次 LanceDB；后续每批在内存中判断切片是否已存在。
-        let existing_ids = if lancedb_count > 0 { lancedb::load_existing_ids().await? } else { HashSet::new() };
+        let existing_ids =
+            if lancedb_count > 0 { lancedb::load_existing_ids(lancedb_count).await? } else { HashSet::new() };
         if lancedb_count == 0 {
             info!("LanceDB is empty; writing all SQLite slices without existence queries");
         }
@@ -279,6 +280,8 @@ impl SearchEngine {
             i64::try_from(cfg.search.lancedb_rebuild_batch_size).ok().filter(|value| *value > 0).unwrap_or(100_i64);
         let mut last_id = 0_i64;
         let mut processed = 0_i64;
+        let mut scanned = 0_i64;
+        let rebuild_started_at = Instant::now();
 
         loop {
             let rows: Vec<RebuildLanceDbSliceRow> = sqlx::query_as(
@@ -298,12 +301,20 @@ impl SearchEngine {
                 break;
             }
 
-            last_id = rows.last().map(|row| row.id).unwrap_or(last_id);
+            let batch_first_id = rows.first().map(|row| row.id).unwrap_or(last_id);
+            let batch_last_id = rows.last().map(|row| row.id).unwrap_or(last_id);
+            let batch_row_count = rows.len() as i64;
+            last_id = batch_last_id;
             let missing_rows: Vec<RebuildLanceDbSliceRow> =
                 rows.into_iter().filter(|row| !existing_ids.contains(&row.id)).collect();
 
             if !missing_rows.is_empty() {
                 let missing_count = missing_rows.len() as i64;
+                info!(
+                    "LanceDB rebuild batch: ids={}-{} rows={} missing={} scanned={}/{}",
+                    batch_first_id, batch_last_id, batch_row_count, missing_count, scanned, total_slices
+                );
+                let batch_started_at = Instant::now();
                 let docs: Vec<lancedb::Document> = missing_rows
                     .into_iter()
                     .map(|row| {
@@ -316,9 +327,23 @@ impl SearchEngine {
                     .collect();
                 lancedb::write_documents_batch(docs).await?;
                 processed += missing_count;
+                info!(
+                    "LanceDB rebuild batch written: ids={}-{} restored={} elapsed={}ms",
+                    batch_first_id,
+                    batch_last_id,
+                    missing_count,
+                    batch_started_at.elapsed().as_millis()
+                );
             }
 
-            info!("LanceDB incremental rebuild progress: {}/{}", processed.min(total_slices), total_slices);
+            scanned += batch_row_count;
+            info!(
+                "LanceDB incremental rebuild progress: scanned={}/{} restored={} elapsed={}s",
+                scanned.min(total_slices),
+                total_slices,
+                processed,
+                rebuild_started_at.elapsed().as_secs()
+            );
         }
 
         // 最终校验

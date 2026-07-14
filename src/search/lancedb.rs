@@ -391,10 +391,17 @@ pub async fn compact() -> Result<CompactStats> {
 pub async fn optimize_for_rebuild() -> Result<()> {
     let _guard = OPTIMIZE_LOCK.lock().await;
     let table = get_table()?;
+    let started_at = std::time::Instant::now();
 
     info!("Optimizing LanceDB table before rebuild: compact + index");
     table.optimize(OptimizeAction::Compact { options: CompactionOptions::default(), remap_options: None }).await?;
+    info!("LanceDB pre-rebuild optimize progress: compact completed in {}ms", started_at.elapsed().as_millis());
+
+    let index_started_at = std::time::Instant::now();
     table.optimize(OptimizeAction::Index(OptimizeOptions::default())).await?;
+    info!("LanceDB pre-rebuild optimize progress: index completed in {}ms", index_started_at.elapsed().as_millis());
+
+    let prune_started_at = std::time::Instant::now();
     table
         .optimize(OptimizeAction::Prune {
             older_than: Some(lancedb::table::Duration::minutes(10)),
@@ -402,10 +409,11 @@ pub async fn optimize_for_rebuild() -> Result<()> {
             error_if_tagged_old_versions: Some(true),
         })
         .await?;
+    info!("LanceDB pre-rebuild optimize progress: prune completed in {}ms", prune_started_at.elapsed().as_millis());
 
     refresh_fast_search_state_for_column(&table, "vector", &VECTOR_FAST_SEARCH_ENABLED).await?;
     refresh_fast_search_state_for_column(&table, "image_vector", &IMAGE_FAST_SEARCH_ENABLED).await?;
-    info!("LanceDB pre-rebuild optimization completed");
+    info!("LanceDB pre-rebuild optimization completed in {}ms", started_at.elapsed().as_millis());
     Ok(())
 }
 
@@ -434,13 +442,39 @@ pub async fn clear_all_documents() -> Result<()> {
 }
 
 /// 一次性加载 LanceDB 中所有未软删除的文档 id。
-pub async fn load_existing_ids() -> Result<HashSet<i64>> {
+pub async fn load_existing_ids(expected_count: u64) -> Result<HashSet<i64>> {
     let table = get_table()?;
     let predicate = format!("({} = false OR {} IS NULL)", IS_DELETED_COLUMN, IS_DELETED_COLUMN);
+    let started_at = std::time::Instant::now();
 
-    let mut existing = HashSet::new();
+    info!("Loading existing LanceDB document ids: expected={}", expected_count);
+    let capacity = usize::try_from(expected_count).unwrap_or(0);
+    let mut existing = HashSet::with_capacity(capacity);
     let mut stream = table.query().select(Select::columns(&["id"])).only_if(predicate).execute().await?;
-    while let Some(batch_result) = stream.next().await {
+    let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(10));
+    heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    heartbeat.tick().await;
+
+    loop {
+        let next_batch = stream.next();
+        tokio::pin!(next_batch);
+        let batch_result = loop {
+            tokio::select! {
+                batch_result = &mut next_batch => break batch_result,
+                _ = heartbeat.tick() => {
+                    info!(
+                        "Loading existing LanceDB document ids: loaded={}/{} elapsed={}s (waiting for next batch)",
+                        existing.len(),
+                        expected_count,
+                        started_at.elapsed().as_secs()
+                    );
+                }
+            }
+        };
+
+        let Some(batch_result) = batch_result else {
+            break;
+        };
         let batch = batch_result?;
         let id_array = batch
             .column_by_name("id")
@@ -449,8 +483,21 @@ pub async fn load_existing_ids() -> Result<HashSet<i64>> {
         for i in 0..batch.num_rows() {
             existing.insert(id_array.value(i));
         }
+        let percent = if expected_count == 0 { 100.0 } else { existing.len() as f64 * 100.0 / expected_count as f64 };
+        info!(
+            "Loading existing LanceDB document ids: loaded={}/{} ({:.1}%) elapsed={}s",
+            existing.len(),
+            expected_count,
+            percent,
+            started_at.elapsed().as_secs()
+        );
     }
 
+    info!(
+        "Loaded existing LanceDB document ids: count={} elapsed={}ms",
+        existing.len(),
+        started_at.elapsed().as_millis()
+    );
     Ok(existing)
 }
 

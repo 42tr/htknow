@@ -4,7 +4,7 @@ use log4rs::{
     append::console::ConsoleAppender, config::{Appender, Config, Logger, Root}, encode::pattern::PatternEncoder
 };
 
-fn parse_rust_log(rust_log: &str) -> (Option<log::LevelFilter>, Vec<Logger>) {
+fn parse_rust_log(rust_log: &str) -> (Option<log::LevelFilter>, Vec<(String, log::LevelFilter)>) {
     let mut default_level = None;
     let mut loggers = Vec::new();
 
@@ -25,7 +25,7 @@ fn parse_rust_log(rust_log: &str) -> (Option<log::LevelFilter>, Vec<Logger>) {
 
         match target {
             Some(target) if !target.is_empty() => {
-                loggers.push(Logger::builder().build(target, level));
+                loggers.push((target.to_string(), level));
             }
             _ => {
                 default_level = Some(level);
@@ -43,21 +43,28 @@ pub fn init() {
         .build();
 
     let mut root_level = log::LevelFilter::Info;
-    let mut loggers = Vec::new();
+    let mut logger_levels = Vec::new();
     if let Ok(rust_log) = env::var("RUST_LOG") {
         let (default_level, parsed_loggers) = parse_rust_log(&rust_log);
-        loggers = parsed_loggers;
+        logger_levels = parsed_loggers;
         if let Some(level) = default_level {
             root_level = level;
-        } else if !loggers.is_empty() {
+        } else if !logger_levels.is_empty() {
             root_level = log::LevelFilter::Off;
+        }
+    }
+
+    // Lance 的逐次 I/O span 在 INFO 级别会产生大量日志。显式配置相同 target 时仍允许覆盖。
+    for (target, level) in [("lance", log::LevelFilter::Warn), ("tracing::span", log::LevelFilter::Warn)] {
+        if !logger_levels.iter().any(|(configured_target, _)| configured_target == target) {
+            logger_levels.push((target.to_string(), level));
         }
     }
 
     // 构建 log4rs 配置，仅输出到控制台
     let mut config_builder = Config::builder().appender(Appender::builder().build("stdout", Box::new(stdout)));
-    for logger in loggers {
-        config_builder = config_builder.logger(logger);
+    for (target, level) in logger_levels {
+        config_builder = config_builder.logger(Logger::builder().build(target, level));
     }
     let config =
         config_builder.build(Root::builder().appender("stdout").build(root_level)).expect("构建 log4rs 配置失败");
