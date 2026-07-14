@@ -809,15 +809,23 @@ async fn ensure_is_deleted_column(table: &lancedb::Table) -> Result<()> {
 
 async fn ensure_search_indices(table: &Table) -> Result<()> {
     let existing_indices = table.list_indices().await?;
+    let row_count = table.count_rows(None).await?;
 
-    if !has_index_on_column(&existing_indices, "vector") {
-        info!("Creating LanceDB vector index on column=vector");
-        table.create_index(&["vector"], Index::Auto).replace(false).execute().await?;
-    }
+    // 空表时跳过向量索引创建：LanceDB 的 IVF/PQ 索引需要 KMeans 训练，
+    // 0 个向量会导致 `cannot train 1 centroids with 0 vectors` 报错。
+    // 后续写入数据后，optimize 流程会自动创建向量索引。
+    if row_count > 0 {
+        if !has_index_on_column(&existing_indices, "vector") {
+            info!("Creating LanceDB vector index on column=vector");
+            table.create_index(&["vector"], Index::Auto).replace(false).execute().await?;
+        }
 
-    if !has_index_on_column(&existing_indices, "image_vector") {
-        info!("Creating LanceDB vector index on column=image_vector");
-        table.create_index(&["image_vector"], Index::Auto).replace(false).execute().await?;
+        if !has_index_on_column(&existing_indices, "image_vector") {
+            info!("Creating LanceDB vector index on column=image_vector");
+            table.create_index(&["image_vector"], Index::Auto).replace(false).execute().await?;
+        }
+    } else {
+        info!("LanceDB table is empty, deferring vector index creation until data is written");
     }
 
     let scalar_indices = [
