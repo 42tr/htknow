@@ -317,9 +317,18 @@ fn build_in_predicate(column: &str, ids: &[i64]) -> String {
 }
 
 async fn delete_by_predicate(predicate: String) -> Result<()> {
+    delete_by_predicate_inner(predicate, true).await
+}
+
+async fn delete_by_predicate_inner(predicate: String, schedule_optimize: bool) -> Result<()> {
     let table = get_table()?;
     table.update().only_if(predicate).column(IS_DELETED_COLUMN, "true").execute().await?;
-    on_write_may_need_optimize();
+    if schedule_optimize {
+        on_write_may_need_optimize();
+    } else {
+        set_fast_search_enabled(false, &VECTOR_FAST_SEARCH_ENABLED);
+        set_fast_search_enabled(false, &IMAGE_FAST_SEARCH_ENABLED);
+    }
     Ok(())
 }
 
@@ -339,6 +348,14 @@ pub async fn delete_by_slices(slice_ids: &[i64]) -> Result<()> {
         return Ok(());
     }
     delete_by_predicate(build_in_predicate("id", slice_ids)).await
+}
+
+/// 重建期间批量软删除多余切片，由调用方在全部完成后统一刷新索引。
+pub async fn delete_by_slices_for_rebuild(slice_ids: &[i64]) -> Result<()> {
+    if slice_ids.is_empty() {
+        return Ok(());
+    }
+    delete_by_predicate_inner(build_in_predicate("id", slice_ids), false).await
 }
 
 pub async fn delete_by_kb(kb_id: i64) -> Result<()> {
@@ -412,14 +429,6 @@ fn get_connection() -> Result<Arc<Connection>> {
 
 fn get_table() -> Result<Arc<Table>> {
     LANCEDB_TABLE.get().cloned().ok_or_else(|| anyhow::anyhow!("LanceDB table not initialized"))
-}
-
-/// 统计 LanceDB 中未标记删除的文档数量。
-pub async fn count_valid_documents() -> Result<u64> {
-    let table = get_table()?;
-    let predicate = format!("({} = false OR {} IS NULL)", IS_DELETED_COLUMN, IS_DELETED_COLUMN);
-    let count = table.count_rows(Some(predicate)).await?;
-    Ok(count as u64)
 }
 
 /// 清空 LanceDB 中所有文档，用于从 SQLite 完全重建。

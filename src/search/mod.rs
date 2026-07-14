@@ -226,7 +226,13 @@ impl SearchEngine {
         };
 
         let total_slices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM slices").fetch_one(pool).await?;
-        let lancedb_count = lancedb::count_valid_documents().await?;
+        info!("Checking LanceDB document ids against {} SQLite slices...", total_slices);
+        let mut unmatched_lancedb_ids = if self.lancedb_recreated {
+            HashSet::new()
+        } else {
+            lancedb::load_existing_ids(total_slices as u64).await?
+        };
+        let lancedb_count = unmatched_lancedb_ids.len();
 
         if total_slices == 0 {
             if lancedb_count > 0 {
@@ -236,7 +242,24 @@ impl SearchEngine {
             return Ok(());
         }
 
-        if lancedb_count == total_slices as u64 {
+        let sqlite_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM slices ORDER BY id ASC").fetch_all(pool).await?;
+        let mut missing_ids = Vec::with_capacity(total_slices.saturating_sub(lancedb_count as i64).max(0) as usize);
+        for id in sqlite_ids {
+            if !unmatched_lancedb_ids.remove(&id) {
+                missing_ids.push(id);
+            }
+        }
+        let mut extra_ids: Vec<i64> = unmatched_lancedb_ids.into_iter().collect();
+        extra_ids.sort_unstable();
+        info!(
+            "LanceDB comparison completed: sqlite={} lancedb={} missing={} extra={}",
+            total_slices,
+            lancedb_count,
+            missing_ids.len(),
+            extra_ids.len()
+        );
+
+        if missing_ids.is_empty() && extra_ids.is_empty() {
             return Ok(());
         }
 
@@ -244,46 +267,44 @@ impl SearchEngine {
             info!("LanceDB was recreated; rebuilding vectors from SQLite slices...");
         } else {
             warn!(
-                "LanceDB document count ({}) does not match SQLite slice count ({}); incrementally filling missing slices...",
-                lancedb_count, total_slices
+                "LanceDB differs from SQLite; restoring {} missing slices and removing {} extra slices...",
+                missing_ids.len(),
+                extra_ids.len()
             );
         }
 
-        // 只扫描一次 LanceDB；后续每批在内存中判断切片是否已存在。
-        let existing_ids =
-            if lancedb_count > 0 { lancedb::load_existing_ids(lancedb_count).await? } else { HashSet::new() };
-        if lancedb_count == 0 {
-            info!("LanceDB is empty; writing all SQLite slices without existence queries");
-        }
+        let cfg = config::get();
+        let batch_size = cfg.search.lancedb_rebuild_batch_size.max(1);
+        let rebuild_started_at = Instant::now();
 
-        let sqlite_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM slices ORDER BY id ASC").fetch_all(pool).await?;
-        let missing_ids: Vec<i64> = sqlite_ids.into_iter().filter(|id| !existing_ids.contains(id)).collect();
-        info!(
-            "LanceDB rebuild comparison completed: sqlite={} existing={} missing={}",
-            total_slices,
-            existing_ids.len(),
-            missing_ids.len()
-        );
-
-        if missing_ids.is_empty() {
-            return Err(anyhow!(
-                "LanceDB count differs from SQLite but no missing SQLite slices were found: sqlite={}, lancedb={}",
-                total_slices,
-                lancedb_count
-            ));
+        let mut removed = 0usize;
+        for id_batch in extra_ids.chunks(batch_size) {
+            lancedb::delete_by_slices_for_rebuild(id_batch).await?;
+            removed += id_batch.len();
+            info!(
+                "LanceDB cleanup progress: removed={}/{} total={}s",
+                removed,
+                extra_ids.len(),
+                rebuild_started_at.elapsed().as_secs()
+            );
         }
 
         // 只为缺失切片所属的图片文件重建 image_embedding。
         let mut image_embeddings: HashMap<i64, Arc<Vec<f32>>> = HashMap::new();
         let mut attempted_image_embeddings = HashSet::new();
-
-        let cfg = config::get();
-        let batch_size = cfg.search.lancedb_rebuild_batch_size.max(1);
         let mut processed = 0usize;
-        let rebuild_started_at = Instant::now();
 
         for id_batch in missing_ids.chunks(batch_size) {
             let rows = fetch_rebuild_lancedb_rows(pool, id_batch).await?;
+            if rows.len() != id_batch.len() {
+                return Err(anyhow!(
+                    "Failed to load all missing SQLite slices: requested={}, loaded={}, ids={}-{}",
+                    id_batch.len(),
+                    rows.len(),
+                    id_batch.first().copied().unwrap_or_default(),
+                    id_batch.last().copied().unwrap_or_default()
+                ));
+            }
             let batch_first_id = id_batch.first().copied().unwrap_or_default();
             let batch_last_id = id_batch.last().copied().unwrap_or_default();
             let batch_started_at = Instant::now();
@@ -330,18 +351,12 @@ impl SearchEngine {
 
         // 全部批次写完后只触发一次索引刷新。
         lancedb::schedule_optimize_after_rebuild();
-
-        // 最终校验
-        let final_count = lancedb::count_valid_documents().await?;
-        if final_count != total_slices as u64 {
-            return Err(anyhow!(
-                "LanceDB rebuild incomplete: expected {} slices, got {}. Consider clearing lancedb_data manually and restart.",
-                total_slices,
-                final_count
-            ));
-        }
-
-        info!("LanceDB rebuild completed: {} slices restored", processed);
+        info!(
+            "LanceDB reconciliation completed: restored={} removed={} elapsed={}s",
+            processed,
+            removed,
+            rebuild_started_at.elapsed().as_secs()
+        );
         Ok(())
     }
 

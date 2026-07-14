@@ -27,8 +27,13 @@ async fn main() -> anyhow::Result<()> {
     log::info!("Configuration loaded: server={}:{}", cfg.server.host, cfg.server.port);
 
     let pool = db::init().await?;
+    log::info!("Initializing search engine...");
+    let search_init_started_at = std::time::Instant::now();
     let search_engine = search::SearchEngine::init().await.with_pool(pool.clone());
-    search_engine.maybe_rebuild_lancedb_from_db().await.expect("Failed to rebuild LanceDB from SQLite at startup");
+    log::info!("Search engine initialized in {}ms", search_init_started_at.elapsed().as_millis());
+    if let Err(err) = search_engine.maybe_rebuild_lancedb_from_db().await {
+        log::warn!("Failed to reconcile LanceDB from SQLite at startup; continuing with current index: {}", err);
+    }
     match search_engine.reload_lexicon().await {
         Ok(loaded) => log::info!("Search lexicon loaded: {} words", loaded),
         Err(e) => log::warn!("Failed to load search lexicon at startup: {}", e),
