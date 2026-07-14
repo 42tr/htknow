@@ -387,6 +387,28 @@ pub async fn compact() -> Result<CompactStats> {
     })
 }
 
+/// 从 SQLite 增量重建前合并 fragment 并刷新索引。
+pub async fn optimize_for_rebuild() -> Result<()> {
+    let _guard = OPTIMIZE_LOCK.lock().await;
+    let table = get_table()?;
+
+    info!("Optimizing LanceDB table before rebuild: compact + index");
+    table.optimize(OptimizeAction::Compact { options: CompactionOptions::default(), remap_options: None }).await?;
+    table.optimize(OptimizeAction::Index(OptimizeOptions::default())).await?;
+    table
+        .optimize(OptimizeAction::Prune {
+            older_than: Some(lancedb::table::Duration::minutes(10)),
+            delete_unverified: Some(false),
+            error_if_tagged_old_versions: Some(true),
+        })
+        .await?;
+
+    refresh_fast_search_state_for_column(&table, "vector", &VECTOR_FAST_SEARCH_ENABLED).await?;
+    refresh_fast_search_state_for_column(&table, "image_vector", &IMAGE_FAST_SEARCH_ENABLED).await?;
+    info!("LanceDB pre-rebuild optimization completed");
+    Ok(())
+}
+
 fn get_connection() -> Result<Arc<Connection>> {
     LANCEDB.get().cloned().ok_or_else(|| anyhow::anyhow!("LanceDB not initialized"))
 }
@@ -411,17 +433,12 @@ pub async fn clear_all_documents() -> Result<()> {
     Ok(())
 }
 
-/// 查询给定 id 列表中已经在 LanceDB 里有效存在的 id。
-pub async fn find_existing_ids(ids: &[i64]) -> Result<HashSet<i64>> {
-    if ids.is_empty() {
-        return Ok(HashSet::new());
-    }
-
+/// 一次性加载 LanceDB 中所有未软删除的文档 id。
+pub async fn load_existing_ids() -> Result<HashSet<i64>> {
     let table = get_table()?;
-    let ids_str = ids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
-    let predicate = format!("id IN ({}) AND ({} = false OR {} IS NULL)", ids_str, IS_DELETED_COLUMN, IS_DELETED_COLUMN);
+    let predicate = format!("({} = false OR {} IS NULL)", IS_DELETED_COLUMN, IS_DELETED_COLUMN);
 
-    let mut existing = HashSet::with_capacity(ids.len());
+    let mut existing = HashSet::new();
     let mut stream = table.query().select(Select::columns(&["id"])).only_if(predicate).execute().await?;
     while let Some(batch_result) = stream.next().await {
         let batch = batch_result?;

@@ -260,8 +260,19 @@ impl SearchEngine {
             );
         }
 
+        // 先合并小 fragment 并刷新索引，避免重建期间反复扫描未索引数据。
+        if let Err(err) = lancedb::optimize_for_rebuild().await {
+            warn!("LanceDB pre-rebuild optimize failed; continuing rebuild: {}", err);
+        }
+
         // 预加载图片文件的 image_embedding：一个图片文件的所有切片共用同一个向量。
         let image_embeddings = rebuild_image_embeddings(pool).await?;
+
+        // 只扫描一次 LanceDB；后续每批在内存中判断切片是否已存在。
+        let existing_ids = if lancedb_count > 0 { lancedb::load_existing_ids().await? } else { HashSet::new() };
+        if lancedb_count == 0 {
+            info!("LanceDB is empty; writing all SQLite slices without existence queries");
+        }
 
         let cfg = config::get();
         let batch_size =
@@ -288,9 +299,6 @@ impl SearchEngine {
             }
 
             last_id = rows.last().map(|row| row.id).unwrap_or(last_id);
-            let ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
-            let existing_ids = lancedb::find_existing_ids(&ids).await?;
-
             let missing_rows: Vec<RebuildLanceDbSliceRow> =
                 rows.into_iter().filter(|row| !existing_ids.contains(&row.id)).collect();
 
