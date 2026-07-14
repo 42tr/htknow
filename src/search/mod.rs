@@ -113,6 +113,8 @@ struct RebuildLanceDbSliceRow {
     file_id: i64,
     kb_id: Option<i64>,
     content: String,
+    filename: String,
+    path: String,
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -146,35 +148,22 @@ pub fn is_image_file(filename: &str) -> bool {
         || lower.ends_with(".heif")
 }
 
-/// 为所有已完成的图片文件重新生成 image_embedding，按 file_id 缓存。
-async fn rebuild_image_embeddings(pool: &SqlitePool) -> anyhow::Result<HashMap<i64, Arc<Vec<f32>>>> {
-    info!("Preloading image embeddings for LanceDB rebuild...");
-
-    let rows: Vec<(i64, String, String)> =
-        sqlx::query_as("SELECT id, filename, path FROM files WHERE status = 1").fetch_all(pool).await?;
-
-    let mut embeddings = HashMap::new();
-    let mut processed = 0usize;
-    let mut failed = 0usize;
-
-    for (file_id, filename, path) in rows {
-        if !is_image_file(&filename) {
-            continue;
-        }
-        match embedding::get_image_embedding_from_path(&path, Some(&filename)).await {
-            Ok(embedding) => {
-                embeddings.insert(file_id, Arc::new(embedding));
-                processed += 1;
-            }
-            Err(err) => {
-                failed += 1;
-                warn!("Failed to get image embedding for file {} ({} at {}): {}", file_id, filename, path, err);
-            }
-        }
+async fn fetch_rebuild_lancedb_rows(
+    pool: &SqlitePool, slice_ids: &[i64],
+) -> anyhow::Result<Vec<RebuildLanceDbSliceRow>> {
+    if slice_ids.is_empty() {
+        return Ok(Vec::new());
     }
 
-    info!("Image embedding preload completed: {} succeeded, {} failed", processed, failed);
-    Ok(embeddings)
+    let mut query_builder: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
+        "SELECT s.id, s.file_id, f.kb_id, s.content, f.filename, f.path FROM slices s JOIN files f ON f.id = s.file_id WHERE s.id IN (",
+    );
+    let mut separated = query_builder.separated(", ");
+    for slice_id in slice_ids {
+        separated.push_bind(slice_id);
+    }
+    separated.push_unseparated(") ORDER BY s.id ASC");
+    Ok(query_builder.build_query_as().fetch_all(pool).await?)
 }
 
 #[derive(Clone)]
@@ -260,14 +249,6 @@ impl SearchEngine {
             );
         }
 
-        // 先合并小 fragment 并刷新索引，避免重建期间反复扫描未索引数据。
-        if let Err(err) = lancedb::optimize_for_rebuild().await {
-            warn!("LanceDB pre-rebuild optimize failed; continuing rebuild: {}", err);
-        }
-
-        // 预加载图片文件的 image_embedding：一个图片文件的所有切片共用同一个向量。
-        let image_embeddings = rebuild_image_embeddings(pool).await?;
-
         // 只扫描一次 LanceDB；后续每批在内存中判断切片是否已存在。
         let existing_ids =
             if lancedb_count > 0 { lancedb::load_existing_ids(lancedb_count).await? } else { HashSet::new() };
@@ -275,76 +256,80 @@ impl SearchEngine {
             info!("LanceDB is empty; writing all SQLite slices without existence queries");
         }
 
+        let sqlite_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM slices ORDER BY id ASC").fetch_all(pool).await?;
+        let missing_ids: Vec<i64> = sqlite_ids.into_iter().filter(|id| !existing_ids.contains(id)).collect();
+        info!(
+            "LanceDB rebuild comparison completed: sqlite={} existing={} missing={}",
+            total_slices,
+            existing_ids.len(),
+            missing_ids.len()
+        );
+
+        if missing_ids.is_empty() {
+            return Err(anyhow!(
+                "LanceDB count differs from SQLite but no missing SQLite slices were found: sqlite={}, lancedb={}",
+                total_slices,
+                lancedb_count
+            ));
+        }
+
+        // 只为缺失切片所属的图片文件重建 image_embedding。
+        let mut image_embeddings: HashMap<i64, Arc<Vec<f32>>> = HashMap::new();
+        let mut attempted_image_embeddings = HashSet::new();
+
         let cfg = config::get();
-        let batch_size =
-            i64::try_from(cfg.search.lancedb_rebuild_batch_size).ok().filter(|value| *value > 0).unwrap_or(100_i64);
-        let mut last_id = 0_i64;
-        let mut processed = 0_i64;
-        let mut scanned = 0_i64;
+        let batch_size = cfg.search.lancedb_rebuild_batch_size.max(1);
+        let mut processed = 0usize;
         let rebuild_started_at = Instant::now();
 
-        loop {
-            let rows: Vec<RebuildLanceDbSliceRow> = sqlx::query_as(
-                "SELECT s.id, s.file_id, f.kb_id, s.content \
-                 FROM slices s \
-                 JOIN files f ON f.id = s.file_id \
-                 WHERE s.id > ? \
-                 ORDER BY s.id ASC \
-                 LIMIT ?",
-            )
-            .bind(last_id)
-            .bind(batch_size)
-            .fetch_all(pool)
-            .await?;
+        for id_batch in missing_ids.chunks(batch_size) {
+            let rows = fetch_rebuild_lancedb_rows(pool, id_batch).await?;
+            let batch_first_id = id_batch.first().copied().unwrap_or_default();
+            let batch_last_id = id_batch.last().copied().unwrap_or_default();
+            let batch_started_at = Instant::now();
 
-            if rows.is_empty() {
-                break;
-            }
-
-            let batch_first_id = rows.first().map(|row| row.id).unwrap_or(last_id);
-            let batch_last_id = rows.last().map(|row| row.id).unwrap_or(last_id);
-            let batch_row_count = rows.len() as i64;
-            last_id = batch_last_id;
-            let missing_rows: Vec<RebuildLanceDbSliceRow> =
-                rows.into_iter().filter(|row| !existing_ids.contains(&row.id)).collect();
-
-            if !missing_rows.is_empty() {
-                let missing_count = missing_rows.len() as i64;
-                info!(
-                    "LanceDB rebuild batch: ids={}-{} rows={} missing={} scanned={}/{}",
-                    batch_first_id, batch_last_id, batch_row_count, missing_count, scanned, total_slices
-                );
-                let batch_started_at = Instant::now();
-                let docs: Vec<lancedb::Document> = missing_rows
-                    .into_iter()
-                    .map(|row| {
-                        let mut doc = lancedb::Document::new(row.id, row.file_id, row.kb_id, row.content);
-                        if let Some(embedding) = image_embeddings.get(&row.file_id) {
-                            doc = doc.with_image_embedding(embedding.clone());
+            for row in &rows {
+                if attempted_image_embeddings.insert(row.file_id) && is_image_file(&row.filename) {
+                    match embedding::get_image_embedding_from_path(&row.path, Some(&row.filename)).await {
+                        Ok(image_embedding) => {
+                            image_embeddings.insert(row.file_id, Arc::new(image_embedding));
                         }
-                        doc
-                    })
-                    .collect();
-                lancedb::write_documents_batch(docs).await?;
-                processed += missing_count;
-                info!(
-                    "LanceDB rebuild batch written: ids={}-{} restored={} elapsed={}ms",
-                    batch_first_id,
-                    batch_last_id,
-                    missing_count,
-                    batch_started_at.elapsed().as_millis()
-                );
+                        Err(err) => {
+                            warn!(
+                                "Failed to rebuild image embedding for file {} ({} at {}): {}",
+                                row.file_id, row.filename, row.path, err
+                            );
+                        }
+                    }
+                }
             }
 
-            scanned += batch_row_count;
+            let docs: Vec<lancedb::Document> = rows
+                .into_iter()
+                .map(|row| {
+                    let mut doc = lancedb::Document::new(row.id, row.file_id, row.kb_id, row.content);
+                    if let Some(image_embedding) = image_embeddings.get(&row.file_id) {
+                        doc = doc.with_image_embedding(image_embedding.clone());
+                    }
+                    doc
+                })
+                .collect();
+            let restored = docs.len();
+            lancedb::write_documents_batch_for_rebuild(docs).await?;
+            processed += restored;
             info!(
-                "LanceDB incremental rebuild progress: scanned={}/{} restored={} elapsed={}s",
-                scanned.min(total_slices),
-                total_slices,
+                "LanceDB rebuild progress: restored={}/{} ids={}-{} batch={}ms total={}s",
                 processed,
+                missing_ids.len(),
+                batch_first_id,
+                batch_last_id,
+                batch_started_at.elapsed().as_millis(),
                 rebuild_started_at.elapsed().as_secs()
             );
         }
+
+        // 全部批次写完后只触发一次索引刷新。
+        lancedb::schedule_optimize_after_rebuild();
 
         // 最终校验
         let final_count = lancedb::count_valid_documents().await?;
@@ -356,7 +341,7 @@ impl SearchEngine {
             ));
         }
 
-        info!("LanceDB rebuild completed: {} slices restored", processed.min(total_slices));
+        info!("LanceDB rebuild completed: {} slices restored", processed);
         Ok(())
     }
 

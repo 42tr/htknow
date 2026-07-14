@@ -168,6 +168,15 @@ pub async fn write_documents(doc: Document) -> Result<()> {
 
 /// 批量写入文档，一次性获取 embeddings 并写入
 pub async fn write_documents_batch(docs: Vec<Document>) -> Result<()> {
+    write_documents_batch_inner(docs, true).await
+}
+
+/// 重建期间批量写入，由调用方在全部完成后统一触发索引刷新。
+pub async fn write_documents_batch_for_rebuild(docs: Vec<Document>) -> Result<()> {
+    write_documents_batch_inner(docs, false).await
+}
+
+async fn write_documents_batch_inner(docs: Vec<Document>, schedule_optimize: bool) -> Result<()> {
     if docs.is_empty() {
         return Ok(());
     }
@@ -175,8 +184,18 @@ pub async fn write_documents_batch(docs: Vec<Document>) -> Result<()> {
     let schema = create_schema();
     let batch = create_record_batch(docs, &schema).await?;
     table.add(batch).execute().await?;
-    on_write_may_need_optimize();
+    if schedule_optimize {
+        on_write_may_need_optimize();
+    } else {
+        set_fast_search_enabled(false, &VECTOR_FAST_SEARCH_ENABLED);
+        set_fast_search_enabled(false, &IMAGE_FAST_SEARCH_ENABLED);
+    }
     Ok(())
+}
+
+/// 重建写入完成后触发一次防抖索引刷新。
+pub fn schedule_optimize_after_rebuild() {
+    on_write_may_need_optimize();
 }
 
 pub async fn search(
@@ -385,36 +404,6 @@ pub async fn compact() -> Result<CompactStats> {
         size_before_bytes,
         size_after_bytes,
     })
-}
-
-/// 从 SQLite 增量重建前合并 fragment 并刷新索引。
-pub async fn optimize_for_rebuild() -> Result<()> {
-    let _guard = OPTIMIZE_LOCK.lock().await;
-    let table = get_table()?;
-    let started_at = std::time::Instant::now();
-
-    info!("Optimizing LanceDB table before rebuild: compact + index");
-    table.optimize(OptimizeAction::Compact { options: CompactionOptions::default(), remap_options: None }).await?;
-    info!("LanceDB pre-rebuild optimize progress: compact completed in {}ms", started_at.elapsed().as_millis());
-
-    let index_started_at = std::time::Instant::now();
-    table.optimize(OptimizeAction::Index(OptimizeOptions::default())).await?;
-    info!("LanceDB pre-rebuild optimize progress: index completed in {}ms", index_started_at.elapsed().as_millis());
-
-    let prune_started_at = std::time::Instant::now();
-    table
-        .optimize(OptimizeAction::Prune {
-            older_than: Some(lancedb::table::Duration::minutes(10)),
-            delete_unverified: Some(false),
-            error_if_tagged_old_versions: Some(true),
-        })
-        .await?;
-    info!("LanceDB pre-rebuild optimize progress: prune completed in {}ms", prune_started_at.elapsed().as_millis());
-
-    refresh_fast_search_state_for_column(&table, "vector", &VECTOR_FAST_SEARCH_ENABLED).await?;
-    refresh_fast_search_state_for_column(&table, "image_vector", &IMAGE_FAST_SEARCH_ENABLED).await?;
-    info!("LanceDB pre-rebuild optimization completed in {}ms", started_at.elapsed().as_millis());
-    Ok(())
 }
 
 fn get_connection() -> Result<Arc<Connection>> {
