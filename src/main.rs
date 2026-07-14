@@ -72,6 +72,21 @@ async fn main() -> anyhow::Result<()> {
                             stats.size_before_bytes,
                             stats.size_after_bytes,
                         );
+
+                        match search_engine.force_merge_tantivy_indexes().await {
+                            Ok((index_stats, full_index_stats)) => {
+                                log::info!(
+                                    "Tantivy auto force-merge done: index_segments={}->{}, full_index_segments={}->{}",
+                                    index_stats.before_segments,
+                                    index_stats.after_segments,
+                                    full_index_stats.before_segments,
+                                    full_index_stats.after_segments,
+                                );
+                            }
+                            Err(e) => {
+                                log::error!("Tantivy auto force-merge failed: {}", e);
+                            }
+                        }
                     }
                     Err(e) => {
                         log::error!("LanceDB auto-compact failed: {}", e);
