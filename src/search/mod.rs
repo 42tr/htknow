@@ -19,6 +19,7 @@ pub mod embedding;
 mod lancedb;
 pub mod tantivy_engine;
 
+pub use lancedb::schedule_startup_index_maintenance;
 pub use tantivy_engine::{FullSearchResultItem, SearchResultItem};
 
 const FULL_SNIPPET_MAX_CHARS: usize = 400;

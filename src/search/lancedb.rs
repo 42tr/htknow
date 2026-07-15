@@ -29,6 +29,10 @@ static SEARCH_SELECT_COLUMNS: &[&str] = &["id", "file_id", "kb_id", "content", "
 static VECTOR_FAST_SEARCH_ENABLED: AtomicBool = AtomicBool::new(false);
 static IMAGE_FAST_SEARCH_ENABLED: AtomicBool = AtomicBool::new(false);
 
+/// IVF-PQ uses 256 centroids for its 8-bit product quantizer.  Tiny datasets
+/// are both faster with exact search and cannot provide enough training data.
+const MIN_VECTORS_FOR_INDEX: usize = 512;
+
 /// 增量索引优化与 compact 之间的互斥锁。
 static OPTIMIZE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 /// 单调递增版本号，用于防抖：只有最新版本才实际执行优化。
@@ -119,29 +123,26 @@ pub async fn init() -> Result<bool> {
     ensure_is_deleted_column(&table).await?;
     info!("LanceDB init substep: ensure_is_deleted_column() took {}ms", t3.elapsed().as_millis());
 
-    let t4 = Instant::now();
-    if let Err(err) = ensure_search_indices(&table).await {
-        warn!("LanceDB ensure indices failed: {}", err);
-    }
-    info!("LanceDB init substep: ensure_search_indices() took {}ms", t4.elapsed().as_millis());
-
-    let t5 = Instant::now();
-    if let Err(err) = refresh_fast_search_state_for_column(&table, "vector", &VECTOR_FAST_SEARCH_ENABLED).await {
-        warn!("LanceDB refresh vector fast-search state failed: {}", err);
-        VECTOR_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
-    }
-    info!("LanceDB init substep: refresh_fast_search_state(vector) took {}ms", t5.elapsed().as_millis());
-
-    let t6 = Instant::now();
-    if let Err(err) = refresh_fast_search_state_for_column(&table, "image_vector", &IMAGE_FAST_SEARCH_ENABLED).await {
-        warn!("LanceDB refresh image_vector fast-search state failed: {}", err);
-        IMAGE_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
-    }
-    info!("LanceDB init substep: refresh_fast_search_state(image_vector) took {}ms", t6.elapsed().as_millis());
-
     LANCEDB_TABLE.set(Arc::new(table)).map_err(|_| anyhow::anyhow!("Failed to cache LanceDB table"))?;
 
     Ok(was_recreated)
+}
+
+/// Reconcile must finish before this is called so index construction cannot
+/// race startup repairs. Searches use exact search while maintenance runs.
+pub fn schedule_startup_index_maintenance() {
+    tokio::spawn(async move {
+        let _guard = OPTIMIZE_LOCK.lock().await;
+        let started_at = Instant::now();
+        let result = match get_table() {
+            Ok(table) => maintain_search_indices(&table).await,
+            Err(err) => Err(err),
+        };
+        if let Err(err) = result {
+            warn!("LanceDB background index initialization failed: {}", err);
+        }
+        info!("LanceDB background index initialization took {}ms", started_at.elapsed().as_millis());
+    });
 }
 
 async fn create_empty_table(schema: &Arc<ArrowSchema>) -> Result<Table> {
@@ -564,17 +565,42 @@ async fn run_debounced_optimize(version: u64) {
         }
     };
 
+    let indices_after_ensure = match ensure_search_indices(&table).await {
+        Ok(indices) => Some(indices),
+        Err(e) => {
+            warn!("LanceDB ensure indices after write failed: {}", e);
+            None
+        }
+    };
+
     let optimize_start = std::time::Instant::now();
     match table.optimize(OptimizeAction::Index(OptimizeOptions::default())).await {
         Ok(stats) => {
             debug!("LanceDB debounced optimize_index done in {}ms: {:?}", optimize_start.elapsed().as_millis(), stats);
-            if let Err(e) = refresh_fast_search_state_for_column(&table, "vector", &VECTOR_FAST_SEARCH_ENABLED).await {
-                warn!("LanceDB refresh vector fast_search after optimize failed: {}", e);
-            }
-            if let Err(e) =
-                refresh_fast_search_state_for_column(&table, "image_vector", &IMAGE_FAST_SEARCH_ENABLED).await
-            {
-                warn!("LanceDB refresh image_vector fast_search after optimize failed: {}", e);
+            let indices = match indices_after_ensure {
+                Some(indices) => Ok(indices),
+                None => table.list_indices().await,
+            };
+            match indices {
+                Ok(indices) => {
+                    if let Err(e) =
+                        refresh_fast_search_state_from_indices(&table, &indices, "vector", &VECTOR_FAST_SEARCH_ENABLED)
+                            .await
+                    {
+                        warn!("LanceDB refresh vector fast_search after optimize failed: {}", e);
+                    }
+                    if let Err(e) = refresh_fast_search_state_from_indices(
+                        &table,
+                        &indices,
+                        "image_vector",
+                        &IMAGE_FAST_SEARCH_ENABLED,
+                    )
+                    .await
+                    {
+                        warn!("LanceDB refresh image_vector fast_search after optimize failed: {}", e);
+                    }
+                }
+                Err(e) => warn!("LanceDB list indices after optimize failed: {}", e),
             }
         }
         Err(e) => {
@@ -585,6 +611,12 @@ async fn run_debounced_optimize(version: u64) {
 
 async fn refresh_fast_search_state_for_column(table: &Table, column: &str, flag: &AtomicBool) -> Result<()> {
     let indices = table.list_indices().await?;
+    refresh_fast_search_state_from_indices(table, &indices, column, flag).await
+}
+
+async fn refresh_fast_search_state_from_indices(
+    table: &Table, indices: &[lancedb::index::IndexConfig], column: &str, flag: &AtomicBool,
+) -> Result<()> {
     let Some(index_config) = indices.iter().find(|idx| idx.columns.iter().any(|c| c == column)) else {
         set_fast_search_enabled(false, flag);
         warn!("LanceDB index missing on column={}; fast_search disabled", column);
@@ -604,6 +636,13 @@ async fn refresh_fast_search_state_for_column(table: &Table, column: &str, flag:
         column, index_config.name, stats.index_type, stats.num_indexed_rows, stats.num_unindexed_rows, fast_search
     );
 
+    Ok(())
+}
+
+async fn maintain_search_indices(table: &Table) -> Result<()> {
+    let indices = ensure_search_indices(table).await?;
+    refresh_fast_search_state_from_indices(table, &indices, "vector", &VECTOR_FAST_SEARCH_ENABLED).await?;
+    refresh_fast_search_state_from_indices(table, &indices, "image_vector", &IMAGE_FAST_SEARCH_ENABLED).await?;
     Ok(())
 }
 
@@ -827,25 +866,22 @@ async fn ensure_is_deleted_column(table: &lancedb::Table) -> Result<()> {
     Ok(())
 }
 
-async fn ensure_search_indices(table: &Table) -> Result<()> {
+async fn ensure_search_indices(table: &Table) -> Result<Vec<lancedb::index::IndexConfig>> {
     let existing_indices = table.list_indices().await?;
     let row_count = table.count_rows(None).await?;
+    let mut created_index = false;
 
-    // 空表时跳过向量索引创建：LanceDB 的 IVF/PQ 索引需要 KMeans 训练，
-    // 0 个向量会导致 `cannot train 1 centroids with 0 vectors` 报错。
-    // 后续写入数据后，optimize 流程会自动创建向量索引。
-    if row_count > 0 {
+    if row_count >= MIN_VECTORS_FOR_INDEX {
         if !has_index_on_column(&existing_indices, "vector") {
-            info!("Creating LanceDB vector index on column=vector");
+            info!("Creating LanceDB vector index on column=vector (vectors={})", row_count);
             table.create_index(&["vector"], Index::Auto).replace(false).execute().await?;
-        }
-
-        if !has_index_on_column(&existing_indices, "image_vector") {
-            info!("Creating LanceDB vector index on column=image_vector");
-            table.create_index(&["image_vector"], Index::Auto).replace(false).execute().await?;
+            created_index = true;
         }
     } else {
-        info!("LanceDB table is empty, deferring vector index creation until data is written");
+        info!(
+            "Deferring LanceDB text vector index: vectors={} minimum={} (exact search remains enabled)",
+            row_count, MIN_VECTORS_FOR_INDEX
+        );
     }
 
     let scalar_indices = [
@@ -859,10 +895,30 @@ async fn ensure_search_indices(table: &Table) -> Result<()> {
         if !has_index_on_column(&existing_indices, column) {
             info!("Creating LanceDB scalar index on column={}", column);
             table.create_index(&[column], index).replace(false).execute().await?;
+            created_index = true;
         }
     }
 
-    let refreshed_indices = table.list_indices().await?;
+    if row_count > 0 && !has_index_on_column(&existing_indices, "image_vector") {
+        let image_count = table
+            .count_rows(Some(format!(
+                "is_image = true AND image_vector IS NOT NULL AND ({} = false OR {} IS NULL)",
+                IS_DELETED_COLUMN, IS_DELETED_COLUMN
+            )))
+            .await?;
+        if image_count >= MIN_VECTORS_FOR_INDEX {
+            info!("Creating LanceDB vector index on column=image_vector (vectors={})", image_count);
+            table.create_index(&["image_vector"], Index::Auto).replace(false).execute().await?;
+            created_index = true;
+        } else {
+            info!(
+                "Deferring LanceDB image vector index: vectors={} minimum={} (exact search remains enabled)",
+                image_count, MIN_VECTORS_FOR_INDEX
+            );
+        }
+    }
+
+    let refreshed_indices = if created_index { table.list_indices().await? } else { existing_indices };
     debug!(
         "LanceDB indices: {}",
         refreshed_indices
@@ -872,7 +928,7 @@ async fn ensure_search_indices(table: &Table) -> Result<()> {
             .join(", ")
     );
 
-    Ok(())
+    Ok(refreshed_indices)
 }
 
 fn has_index_on_column(indices: &[lancedb::index::IndexConfig], column: &str) -> bool {
