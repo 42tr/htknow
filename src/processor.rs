@@ -1047,7 +1047,7 @@ impl FileProcessor {
         let parse_data =
             timed_step_opt(timing.as_deref_mut(), "custom_parse_api", self.call_custom_parse_api(file, custom_url))
                 .await?;
-        let normalized = Self::normalize_custom_parse_data(file.id, parse_data)?;
+        let normalized = Self::normalize_custom_parse_data(parse_data)?;
 
         if let Some(content_list) = normalized.content_list.as_ref() {
             self.insert_custom_pdf_contents(file.id, content_list, timing.as_deref_mut()).await?;
@@ -1133,14 +1133,13 @@ impl FileProcessor {
         Ok(true)
     }
 
-    fn normalize_custom_parse_data(file_id: i64, data: CustomParseData) -> anyhow::Result<NormalizedCustomParseData> {
+    fn normalize_custom_parse_data(data: CustomParseData) -> anyhow::Result<NormalizedCustomParseData> {
         let mut image_mapping: HashMap<String, String> = HashMap::new();
-        let prefix = format!("f{}_", file_id);
         let images = data.images.unwrap_or_default();
 
         for image_name in images.keys() {
             Self::ensure_safe_image_name(image_name)?;
-            image_mapping.entry(image_name.clone()).or_insert_with(|| Self::prefix_image_path(image_name, &prefix));
+            image_mapping.entry(image_name.clone()).or_insert_with(|| image_name.clone());
         }
 
         if let Some(content_list) = data.content_list.as_ref() {
@@ -1150,7 +1149,7 @@ impl FileProcessor {
                     let mapped_path = image_mapping.get(img_path).cloned().or_else(|| {
                         Self::basename_for_path(img_path).and_then(|basename| image_mapping.get(&basename).cloned())
                     });
-                    let mapped_path = mapped_path.unwrap_or_else(|| Self::prefix_image_path(img_path, &prefix));
+                    let mapped_path = mapped_path.unwrap_or_else(|| img_path.to_string());
                     image_mapping.entry(img_path.to_string()).or_insert(mapped_path);
                 }
             }
@@ -1185,7 +1184,7 @@ impl FileProcessor {
                 .get(&image_name)
                 .cloned()
                 .or_else(|| Self::basename_for_path(&image_name).and_then(|name| image_mapping.get(&name).cloned()))
-                .unwrap_or_else(|| Self::prefix_image_path(&image_name, &prefix));
+                .unwrap_or_else(|| image_name.clone());
             normalized_images.insert(new_name, image_base64);
         }
 
@@ -1328,10 +1327,7 @@ impl FileProcessor {
     async fn call_custom_parse_api(&self, file: &File, custom_url: &str) -> anyhow::Result<CustomParseData> {
         let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string();
         let file_part = stream_file_part(&file.path, &file.filename, &mime_type).await?;
-        // 告诉外部解析服务：返回切片时图片链接应该使用哪个前缀。
-        // 默认前缀是 /api/v1/knowledge/files/images/，后面再拼上当前文件的 f{file_id}_ 前缀。
-        let image_prefix = format!("/api/v1/knowledge/files/images/f{}_", file.id);
-        let form = multipart::Form::new().text("image_prefix", image_prefix).part("file", file_part);
+        let form = multipart::Form::new().part("file", file_part);
 
         let client = self.services_http_client()?;
         let response = client.post(custom_url).multipart(form).send().await?;
@@ -1723,7 +1719,7 @@ impl FileProcessor {
             })
             .await?;
 
-        let mut content_list: Vec<ContentItem>;
+        let content_list: Vec<ContentItem>;
 
         if count.0 > 0 && bbox_count.0 > 0 {
             // 已有数据，直接从数据库读取
@@ -1773,13 +1769,11 @@ impl FileProcessor {
             .await?;
         } else {
             // 没有数据，调用 MinerU API
-            let mut mineru_result = self.call_mineru_api(file, is_image, timing.as_deref_mut()).await?;
+            let mineru_result = self.call_mineru_api(file, is_image, timing.as_deref_mut()).await?;
             content_list = timed_step_opt(timing.as_deref_mut(), "parse_mineru_content_list", async {
                 Ok(serde_json::from_str(&mineru_result.content_list)?)
             })
             .await?;
-            Self::prefix_images_for_file(file.id, &mut content_list, &mut mineru_result.images);
-
             if !self.ensure_file_exists(file.id, "before writing pdf contents").await? {
                 return Ok(());
             }
@@ -1991,28 +1985,6 @@ impl FileProcessor {
             Some((dir, name)) => format!("{}/{}{}", dir, prefix, name),
             None => format!("{}{}", prefix, img_path),
         }
-    }
-
-    fn prefix_images_for_file(file_id: i64, content_list: &mut [ContentItem], images: &mut HashMap<String, String>) {
-        if images.is_empty() {
-            return;
-        }
-        let prefix = format!("f{}_", file_id);
-        let mut renamed: HashMap<String, String> = HashMap::new();
-        for item in content_list.iter_mut() {
-            let Some(img_path) = item.img_path.as_deref() else { continue };
-            let new_name =
-                renamed.entry(img_path.to_string()).or_insert_with(|| Self::prefix_image_path(img_path, &prefix));
-            item.img_path = Some(new_name.clone());
-        }
-
-        let mut new_images = HashMap::new();
-        for (img_name, img_base64) in images.drain() {
-            let new_name =
-                renamed.get(&img_name).cloned().unwrap_or_else(|| Self::prefix_image_path(&img_name, &prefix));
-            new_images.insert(new_name, img_base64);
-        }
-        *images = new_images;
     }
 
     async fn call_mineru_api_with_path(
@@ -3114,17 +3086,16 @@ impl FileProcessor {
         let mut slice_rows = self.fetch_slice_rows(source.id).await?;
         let slice_ids: Vec<i64> = slice_rows.iter().map(|row| row.id).collect();
         let slice_positions = self.fetch_slice_position_rows(&slice_ids).await?;
-        let (image_jobs, image_mapping) = self.prepare_image_jobs(&pdf_rows, source.id, target.id);
+        let (image_jobs, image_mapping) = self.prepare_image_jobs(&pdf_rows, source.id);
         let meta_image_paths = if pdf_rows.is_empty() {
             collect_image_raw_paths_for_files(&self.pool, &[source.id]).await?
         } else {
             Vec::new()
         };
         let (meta_image_jobs, meta_image_mapping, target_meta_image_paths) =
-            Self::prepare_raw_image_jobs(&meta_image_paths, source.id, target.id);
+            Self::prepare_raw_image_jobs(&meta_image_paths, source.id);
 
-        // pdf_contents 里的 img_path 会被 insert_pdf_rows 重写成目标文件前缀，但切片文本和
-        // 全文索引里还引用着源文件前缀的图片名，需要一起重写，否则目标文件会找不到图片。
+        // 兼容历史数据：复用时剥离旧的 f{file_id}_ 图片前缀，并同步重写内容中的引用。
         let mut combined_image_mapping = image_mapping.clone();
         combined_image_mapping.extend(meta_image_mapping.clone());
         if !combined_image_mapping.is_empty() {
@@ -3209,7 +3180,7 @@ impl FileProcessor {
     }
 
     fn prepare_image_jobs(
-        &self, rows: &[PdfContentRow], source_id: i64, target_id: i64,
+        &self, rows: &[PdfContentRow], source_id: i64,
     ) -> (Vec<(String, String)>, HashMap<String, String>) {
         let mut jobs = Vec::new();
         let mut mapping = HashMap::new();
@@ -3218,15 +3189,17 @@ impl FileProcessor {
                 if mapping.contains_key(path) {
                     continue;
                 }
-                let new_path = Self::remap_image_name(path, source_id, target_id);
-                jobs.push((path.clone(), new_path.clone()));
-                mapping.insert(path.clone(), new_path);
+                let new_path = Self::remove_image_id_prefix(path, source_id);
+                if new_path != *path {
+                    jobs.push((path.clone(), new_path.clone()));
+                    mapping.insert(path.clone(), new_path);
+                }
             }
         }
         (jobs, mapping)
     }
 
-    fn prepare_raw_image_jobs(paths: &[String], source_id: i64, target_id: i64) -> RawImageJobs {
+    fn prepare_raw_image_jobs(paths: &[String], source_id: i64) -> RawImageJobs {
         let mut jobs = Vec::new();
         let mut mapping = HashMap::new();
         let mut target_paths = Vec::new();
@@ -3236,9 +3209,11 @@ impl FileProcessor {
             if trimmed.is_empty() || !seen.insert(trimmed.to_string()) {
                 continue;
             }
-            let new_path = Self::remap_image_name(trimmed, source_id, target_id);
-            mapping.insert(trimmed.to_string(), new_path.clone());
-            jobs.push((trimmed.to_string(), new_path.clone()));
+            let new_path = Self::remove_image_id_prefix(trimmed, source_id);
+            if new_path != trimmed {
+                mapping.insert(trimmed.to_string(), new_path.clone());
+                jobs.push((trimmed.to_string(), new_path.clone()));
+            }
             target_paths.push(new_path);
         }
         (jobs, mapping, target_paths)
@@ -3434,18 +3409,16 @@ impl FileProcessor {
         Ok(full_content)
     }
 
-    fn remap_image_name(original: &str, source_id: i64, target_id: i64) -> String {
+    fn remove_image_id_prefix(original: &str, source_id: i64) -> String {
         let path = std::path::Path::new(original);
         let filename = path.file_name().and_then(|name| name.to_str()).unwrap_or(original);
         let prefix = format!("f{}_", source_id);
-        let replacement = format!("f{}_", target_id);
         let stripped = if filename.starts_with(&prefix) {
             filename.trim_start_matches(&prefix).to_string()
         } else {
             filename.to_string()
         };
-        let new_name = format!("{}{}", replacement, stripped);
-        if let Some(parent) = path.parent() { parent.join(new_name).to_string_lossy().to_string() } else { new_name }
+        if let Some(parent) = path.parent() { parent.join(stripped).to_string_lossy().to_string() } else { stripped }
     }
 
     async fn maybe_build_knowledge_graph(&self, file: &File) {
@@ -3669,7 +3642,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_parse_normalization_rewrites_known_image_refs() -> anyhow::Result<()> {
+    fn custom_parse_normalization_preserves_image_names() -> anyhow::Result<()> {
         let mut images = HashMap::new();
         images.insert("img.png".to_string(), "raw-base64".to_string());
         let data = CustomParseData {
@@ -3682,13 +3655,13 @@ mod tests {
             content_list: Some(vec![image_content_item("images/img.png")]),
         };
 
-        let normalized = FileProcessor::normalize_custom_parse_data(42, data)?;
+        let normalized = FileProcessor::normalize_custom_parse_data(data)?;
 
-        assert!(normalized.images.contains_key("f42_img.png"));
-        assert_eq!(normalized.content_list.as_ref().unwrap()[0].img_path.as_deref(), Some("f42_img.png"));
-        assert!(normalized.slices[0].content.contains("/api/v1/knowledge/files/f42_img.png"));
-        assert!(normalized.full_content.as_ref().unwrap().contains("/api/v1/knowledge/files/f42_img.png"));
-        assert_eq!(normalized.image_paths, vec!["f42_img.png".to_string()]);
+        assert!(normalized.images.contains_key("img.png"));
+        assert_eq!(normalized.content_list.as_ref().unwrap()[0].img_path.as_deref(), Some("img.png"));
+        assert!(normalized.slices[0].content.contains("/api/v1/knowledge/files/img.png"));
+        assert!(normalized.full_content.as_ref().unwrap().contains("/api/v1/knowledge/files/img.png"));
+        assert_eq!(normalized.image_paths, vec!["img.png".to_string()]);
         Ok(())
     }
 
@@ -3704,11 +3677,19 @@ mod tests {
             content_list: None,
         };
 
-        let normalized = FileProcessor::normalize_custom_parse_data(7, data)?;
+        let normalized = FileProcessor::normalize_custom_parse_data(data)?;
 
         assert!(normalized.images.is_empty());
         assert!(normalized.slices[0].content.contains("/api/v1/knowledge/files/legacy.png"));
         assert_eq!(normalized.image_paths, vec!["legacy.png".to_string()]);
         Ok(())
+    }
+
+    #[test]
+    fn reuse_removes_legacy_image_id_prefix() {
+        assert_eq!(FileProcessor::remove_image_id_prefix("f42_img.png", 42), "img.png");
+        assert_eq!(FileProcessor::remove_image_id_prefix("images/f42_img.png", 42), "images/img.png");
+        assert_eq!(FileProcessor::remove_image_id_prefix("img.png", 42), "img.png");
+        assert_eq!(FileProcessor::remove_image_id_prefix("f7_img.png", 42), "f7_img.png");
     }
 }
