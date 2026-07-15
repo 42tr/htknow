@@ -82,6 +82,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     ensure_file_size_column(&pool).await?;
     ensure_pdf_contents_bbox_column(&pool).await?;
     ensure_slice_positions_excel_columns(&pool).await?;
+    create_indexes(&pool).await?;
     if cfg.database.init_default_kbs {
         ensure_default_knowledge_bases(&pool).await?;
     } else {
@@ -212,7 +213,7 @@ async fn create_tables(pool: &SqlitePool) -> anyhow::Result<()> {
     let init_sql = include_str!("init.sql");
     for (idx, sql) in init_sql.split(";").enumerate() {
         let sql = sql.trim();
-        if sql.is_empty() {
+        if sql.is_empty() || is_index_statement(sql) {
             continue;
         }
         sqlx::query(sql)
@@ -224,6 +225,31 @@ async fn create_tables(pool: &SqlitePool) -> anyhow::Result<()> {
     info!("Tables created successfully");
 
     Ok(())
+}
+
+async fn create_indexes(pool: &SqlitePool) -> anyhow::Result<()> {
+    info!("Creating indexes if not exists...");
+
+    let init_sql = include_str!("init.sql");
+    for (idx, sql) in init_sql.split(";").enumerate() {
+        let sql = sql.trim();
+        if !is_index_statement(sql) {
+            continue;
+        }
+        sqlx::query(sql)
+            .execute(pool)
+            .await
+            .with_context(|| format!("failed to execute init.sql index statement {}", idx + 1))?;
+    }
+
+    info!("Indexes created successfully");
+    Ok(())
+}
+
+fn is_index_statement(sql: &str) -> bool {
+    let statement =
+        sql.lines().map(str::trim).find(|line| !line.is_empty() && !line.starts_with("--")).unwrap_or_default();
+    statement.starts_with("CREATE INDEX") || statement.starts_with("CREATE UNIQUE INDEX")
 }
 
 async fn ensure_default_knowledge_bases(pool: &SqlitePool) -> anyhow::Result<()> {
@@ -663,6 +689,59 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn legacy_schema_adds_columns_before_creating_indexes() -> anyhow::Result<()> {
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await?;
+        sqlx::query(
+            "CREATE TABLE files (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT,
+                user_name TEXT,
+                hash TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                path TEXT NOT NULL,
+                size INTEGER NOT NULL DEFAULT 0,
+                tags TEXT NOT NULL DEFAULT '',
+                status INTEGER NOT NULL DEFAULT 0,
+                log TEXT DEFAULT '',
+                slice_type TEXT DEFAULT '',
+                kb_id INTEGER DEFAULT NULL,
+                parse_priority INTEGER NOT NULL DEFAULT 50,
+                is_public INTEGER NOT NULL DEFAULT 0,
+                meta TEXT DEFAULT NULL,
+                created_at INTEGER,
+                updated_at INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "CREATE TABLE slices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER,
+                updated_at INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        create_tables(&pool).await?;
+        run_schema_migrations(&pool).await?;
+        create_indexes(&pool).await?;
+
+        let columns = sqlx::query("PRAGMA table_info(files)").fetch_all(&pool).await?;
+        assert!(columns.iter().any(|row| row.get::<String, _>("name") == "artifact_id"));
+        let artifact_index: Option<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_files_artifact_id'",
+        )
+        .fetch_optional(&pool)
+        .await?;
+        assert_eq!(artifact_index.as_deref(), Some("idx_files_artifact_id"));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn parse_run_migration_upgrades_legacy_schema_idempotently() -> anyhow::Result<()> {
