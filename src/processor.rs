@@ -1252,7 +1252,10 @@ impl FileProcessor {
     async fn call_custom_parse_api(&self, file: &File, custom_url: &str) -> anyhow::Result<CustomParseData> {
         let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string();
         let file_part = stream_file_part(&file.path, &file.filename, &mime_type).await?;
-        let form = multipart::Form::new().part("file", file_part);
+        // 告诉外部解析服务：返回切片时图片链接应该使用哪个前缀。
+        // 默认前缀是 /api/v1/knowledge/files/images/，后面再拼上当前文件的 f{file_id}_ 前缀。
+        let image_prefix = format!("/api/v1/knowledge/files/images/f{}_", file.id);
+        let form = multipart::Form::new().text("image_prefix", image_prefix).part("file", file_part);
 
         let client = self.services_http_client()?;
         let response = client.post(custom_url).multipart(form).send().await?;
@@ -2972,16 +2975,21 @@ impl FileProcessor {
         };
         let (meta_image_jobs, meta_image_mapping, target_meta_image_paths) =
             Self::prepare_raw_image_jobs(&meta_image_paths, source.id, target.id);
-        if !meta_image_mapping.is_empty() {
+
+        // pdf_contents 里的 img_path 会被 insert_pdf_rows 重写成目标文件前缀，但切片文本和
+        // 全文索引里还引用着源文件前缀的图片名，需要一起重写，否则目标文件会找不到图片。
+        let mut combined_image_mapping = image_mapping.clone();
+        combined_image_mapping.extend(meta_image_mapping.clone());
+        if !combined_image_mapping.is_empty() {
             for row in &mut slice_rows {
-                row.content = Self::rewrite_custom_image_refs(&row.content, &meta_image_mapping);
+                row.content = Self::rewrite_custom_image_refs(&row.content, &combined_image_mapping);
             }
         }
         let mut source_for_reindex = source.clone();
-        if !meta_image_mapping.is_empty()
-            && let Some(content) = source_for_reindex.content.clone()
-        {
-            source_for_reindex.content = Some(Self::rewrite_custom_image_refs(&content, &meta_image_mapping));
+        if !combined_image_mapping.is_empty() {
+            if let Some(content) = source_for_reindex.content.clone() {
+                source_for_reindex.content = Some(Self::rewrite_custom_image_refs(&content, &combined_image_mapping));
+            }
         }
 
         let mut tx = self.pool.begin().await?;
