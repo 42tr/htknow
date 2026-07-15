@@ -185,18 +185,39 @@ pub struct SearchEngine {
 
 impl SearchEngine {
     pub async fn init() -> Self {
+        let t0 = Instant::now();
         let lancedb_recreated = lancedb::init().await.expect("init lancedb failed");
+        info!("Search init substep: lancedb::init() took {}ms", t0.elapsed().as_millis());
+
+        let t1 = Instant::now();
         let (schema, index) = tantivy_engine::init().unwrap();
+        info!("Search init substep: tantivy_engine::init() took {}ms", t1.elapsed().as_millis());
+
+        let t2 = Instant::now();
         let (full_schema, full_index) = tantivy_engine::init_full().unwrap();
+        info!("Search init substep: tantivy_engine::init_full() took {}ms", t2.elapsed().as_millis());
+
+        let t3 = Instant::now();
         let index_reader = build_reader(&index, "index");
+        info!("Search init substep: build_reader(index) took {}ms", t3.elapsed().as_millis());
+
+        let t4 = Instant::now();
         let full_index_reader = build_reader(&full_index, "full_index");
+        info!("Search init substep: build_reader(full_index) took {}ms", t4.elapsed().as_millis());
+
+        let t5 = Instant::now();
         let index_writer = tantivy_engine::IndexWriterHandle::open(index, schema.clone(), "index".to_string())
             .await
             .expect("open tantivy index writer failed");
+        info!("Search init substep: open index writer took {}ms", t5.elapsed().as_millis());
+
+        let t6 = Instant::now();
         let full_index_writer =
             tantivy_engine::IndexWriterHandle::open(full_index, full_schema.clone(), "full_index".to_string())
                 .await
                 .expect("open tantivy full index writer failed");
+        info!("Search init substep: open full index writer took {}ms", t6.elapsed().as_millis());
+
         Self {
             schema,
             index_reader,
@@ -227,11 +248,13 @@ impl SearchEngine {
 
         let total_slices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM slices").fetch_one(pool).await?;
         info!("Checking LanceDB document ids against {} SQLite slices...", total_slices);
+        let t_load_ids = Instant::now();
         let mut unmatched_lancedb_ids = if self.lancedb_recreated {
             HashSet::new()
         } else {
             lancedb::load_existing_ids(total_slices as u64).await?
         };
+        info!("LanceDB rebuild substep: load_existing_ids() took {}ms", t_load_ids.elapsed().as_millis());
         let lancedb_count = unmatched_lancedb_ids.len();
 
         if total_slices == 0 {
@@ -295,7 +318,14 @@ impl SearchEngine {
         let mut processed = 0usize;
 
         for id_batch in missing_ids.chunks(batch_size) {
+            let t_fetch = Instant::now();
             let rows = fetch_rebuild_lancedb_rows(pool, id_batch).await?;
+            info!(
+                "LanceDB rebuild substep: fetch_rebuild_lancedb_rows(ids={}-{}) took {}ms",
+                id_batch.first().copied().unwrap_or_default(),
+                id_batch.last().copied().unwrap_or_default(),
+                t_fetch.elapsed().as_millis()
+            );
             if rows.len() != id_batch.len() {
                 return Err(anyhow!(
                     "Failed to load all missing SQLite slices: requested={}, loaded={}, ids={}-{}",

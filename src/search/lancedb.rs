@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet, path::Path, sync::{
         Arc, atomic::{AtomicBool, AtomicU64, Ordering}
-    }, time::{SystemTime, UNIX_EPOCH}
+    }, time::{Instant, SystemTime, UNIX_EPOCH}
 };
 
 use anyhow::{Context, Result};
@@ -75,7 +75,9 @@ pub async fn init() -> Result<bool> {
     let storage_path = &cfg.storage.lancedb_path;
     tokio::fs::create_dir_all(storage_path).await?;
 
+    let t0 = Instant::now();
     let db = connect(storage_path).execute().await?;
+    info!("LanceDB init substep: connect() took {}ms", t0.elapsed().as_millis());
     LANCEDB.set(Arc::new(db)).map_err(|_| anyhow::anyhow!("Failed to initialize LanceDB"))?;
 
     // 创建表的 schema
@@ -83,13 +85,16 @@ pub async fn init() -> Result<bool> {
 
     // 检查表是否存在
     let conn = get_connection()?;
+    let t1 = Instant::now();
     let table_exists = conn
         .table_names()
         .execute()
         .await
         .map(|table_names| table_names.contains(&TABLE_NAME.to_string()))
         .unwrap_or(false);
+    info!("LanceDB init substep: table_names() took {}ms", t1.elapsed().as_millis());
 
+    let t2 = Instant::now();
     let (table, was_recreated) = if table_exists {
         match conn.open_table(TABLE_NAME).execute().await {
             Ok(table) => (table, false),
@@ -104,20 +109,35 @@ pub async fn init() -> Result<bool> {
     } else {
         (create_empty_table(&schema).await?, true)
     };
+    info!(
+        "LanceDB init substep: open/create/recover table took {}ms (recreated={})",
+        t2.elapsed().as_millis(),
+        was_recreated
+    );
 
+    let t3 = Instant::now();
     ensure_is_deleted_column(&table).await?;
+    info!("LanceDB init substep: ensure_is_deleted_column() took {}ms", t3.elapsed().as_millis());
 
+    let t4 = Instant::now();
     if let Err(err) = ensure_search_indices(&table).await {
         warn!("LanceDB ensure indices failed: {}", err);
     }
+    info!("LanceDB init substep: ensure_search_indices() took {}ms", t4.elapsed().as_millis());
+
+    let t5 = Instant::now();
     if let Err(err) = refresh_fast_search_state_for_column(&table, "vector", &VECTOR_FAST_SEARCH_ENABLED).await {
         warn!("LanceDB refresh vector fast-search state failed: {}", err);
         VECTOR_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
     }
+    info!("LanceDB init substep: refresh_fast_search_state(vector) took {}ms", t5.elapsed().as_millis());
+
+    let t6 = Instant::now();
     if let Err(err) = refresh_fast_search_state_for_column(&table, "image_vector", &IMAGE_FAST_SEARCH_ENABLED).await {
         warn!("LanceDB refresh image_vector fast-search state failed: {}", err);
         IMAGE_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
     }
+    info!("LanceDB init substep: refresh_fast_search_state(image_vector) took {}ms", t6.elapsed().as_millis());
 
     LANCEDB_TABLE.set(Arc::new(table)).map_err(|_| anyhow::anyhow!("Failed to cache LanceDB table"))?;
 

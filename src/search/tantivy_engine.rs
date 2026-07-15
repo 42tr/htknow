@@ -5,7 +5,7 @@ use std::{
 };
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use serde::Serialize;
 use tantivy::{
     Index, IndexReader, Result, TantivyDocument, TantivyError, Term, collector::TopDocs, directory::error::LockError, doc, merge_policy::LogMergePolicy, query::{BooleanQuery, BoostQuery, Occur, Query, TermQuery}, schema::{FAST, Field, INDEXED, IndexRecordOption, STORED, Schema, TextFieldIndexing, TextOptions, Value as _}
@@ -87,8 +87,12 @@ pub fn init_full() -> Result<(Schema, Index)> {
 }
 
 pub fn init_with_path(path: &str) -> Result<(Schema, Index)> {
+    let t0 = Instant::now();
     let schema = build_schema();
+    info!("Tantivy init substep: build_schema() took {}ms", t0.elapsed().as_millis());
+
     let path = Path::new(path);
+    let t1 = Instant::now();
     let index = if path.exists() {
         match Index::open_in_dir(path) {
             Ok(idx) => idx,
@@ -107,7 +111,12 @@ pub fn init_with_path(path: &str) -> Result<(Schema, Index)> {
         std::fs::create_dir_all(path)?;
         Index::create_in_dir(path, schema.clone())?
     };
+    info!("Tantivy init substep: open/create index at '{}' took {}ms", path.display(), t1.elapsed().as_millis());
+
+    let t2 = Instant::now();
     register_tokenizers(&index);
+    info!("Tantivy init substep: register_tokenizers() took {}ms", t2.elapsed().as_millis());
+
     Ok((schema, index))
 }
 
