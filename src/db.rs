@@ -80,7 +80,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     ensure_file_parse_priority_column(&pool).await?;
     ensure_user_name_columns(&pool).await?;
     ensure_file_size_column(&pool).await?;
-    ensure_pdf_contents_bbox_column(&pool).await?;
+    ensure_pdf_contents_externalized(&pool).await?;
     ensure_slice_positions_excel_columns(&pool).await?;
     create_indexes(&pool).await?;
     if cfg.database.init_default_kbs {
@@ -515,13 +515,46 @@ async fn ensure_user_name_column(pool: &SqlitePool, table: &str) -> anyhow::Resu
     Ok(())
 }
 
-async fn ensure_pdf_contents_bbox_column(pool: &SqlitePool) -> anyhow::Result<()> {
+async fn ensure_pdf_contents_externalized(pool: &SqlitePool) -> anyhow::Result<()> {
+    let table_exists: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'pdf_contents'")
+            .fetch_one(pool)
+            .await?;
+    if table_exists == 0 {
+        return Ok(());
+    }
+
     let columns = sqlx::query("PRAGMA table_info(pdf_contents);").fetch_all(pool).await?;
     let has_bbox = columns.iter().any(|row| row.get::<String, _>("name") == "bbox");
-
     if !has_bbox {
         sqlx::query("ALTER TABLE pdf_contents ADD COLUMN bbox TEXT DEFAULT NULL").execute(pool).await?;
     }
+
+    info!("Detected legacy `pdf_contents` table, migrating to JSON files...");
+    let file_ids: Vec<i64> =
+        sqlx::query_scalar("SELECT DISTINCT file_id FROM pdf_contents ORDER BY file_id").fetch_all(pool).await?;
+    for file_id in &file_ids {
+        let rows = sqlx::query(
+            "SELECT page_idx, bbox, text, text_level, img_path, table_body FROM pdf_contents WHERE file_id = ? ORDER BY page_idx, id",
+        )
+        .bind(file_id)
+        .fetch_all(pool)
+        .await?;
+        let contents = rows
+            .into_iter()
+            .map(|row| crate::pdf_content::PdfContent {
+                page_idx: row.get("page_idx"),
+                bbox: row.get("bbox"),
+                text: row.get("text"),
+                text_level: row.get("text_level"),
+                img_path: row.get("img_path"),
+                table_body: row.get("table_body"),
+            })
+            .collect::<Vec<_>>();
+        crate::pdf_content::write(*file_id, &contents).await?;
+    }
+    sqlx::query("DROP TABLE pdf_contents").execute(pool).await?;
+    info!("`pdf_contents` migration completed, {} files migrated", file_ids.len());
 
     Ok(())
 }

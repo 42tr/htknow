@@ -65,19 +65,6 @@ CREATE TABLE IF NOT EXISTS parse_artifacts (
 );
 CREATE INDEX IF NOT EXISTS idx_files_artifact_id ON files(artifact_id);
 
-CREATE TABLE IF NOT EXISTS pdf_contents (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    file_id INTEGER NOT NULL, -- 文件ID
-    page_idx INTEGER NOT NULL, -- 所在页码
-    bbox TEXT DEFAULT NULL, -- 位置坐标 (JSON)
-    text TEXT DEFAULT NULL, -- 文本内容
-    text_level INTEGER DEFAULT NULL, -- 文本级别
-    img_path TEXT DEFAULT NULL, -- 图片路径
-    table_body TEXT DEFAULT NULL, -- 表格内容
-    created_at INTEGER DEFAULT (strftime('%s','now')),
-    updated_at INTEGER DEFAULT (strftime('%s','now'))
-);
-
 CREATE TABLE IF NOT EXISTS slice_positions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     slice_id INTEGER NOT NULL, -- 切片ID
@@ -166,8 +153,6 @@ CREATE INDEX IF NOT EXISTS idx_slices_file_id_id ON slices(file_id, id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_slices_file_run_ordinal
 ON slices(file_id, parse_run_id, ordinal)
 WHERE parse_run_id IS NOT NULL AND ordinal IS NOT NULL;
-CREATE INDEX IF NOT EXISTS idx_pdf_contents_file_id_id ON pdf_contents(file_id, id);
-CREATE INDEX IF NOT EXISTS idx_pdf_contents_file_id_page_id ON pdf_contents(file_id, page_idx, id);
 CREATE INDEX IF NOT EXISTS idx_nodes_type ON graph_nodes(entity_type);
 CREATE INDEX IF NOT EXISTS idx_nodes_kb ON graph_nodes(kb_id);
 CREATE INDEX IF NOT EXISTS idx_nodes_file ON graph_nodes(file_id);

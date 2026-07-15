@@ -938,6 +938,9 @@ pub async fn update(
         if let Err(e) = crate::file_content::delete(id).await {
             warn!("Failed to delete content file for updated file {}: {}", id, e);
         }
+        if let Err(e) = crate::pdf_content::delete(id).await {
+            warn!("Failed to delete PDF content file for updated file {}: {}", id, e);
+        }
     } else {
         qb.build().execute(&pool).await?;
     }
@@ -1042,6 +1045,9 @@ pub async fn move_to_kb(
     }
     if let Err(e) = crate::file_content::delete(id).await {
         warn!("Failed to delete content file after file move for file {}: {}", id, e);
+    }
+    if let Err(e) = crate::pdf_content::delete(id).await {
+        warn!("Failed to delete PDF content file after file move for file {}: {}", id, e);
     }
 
     let moved: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
@@ -1221,13 +1227,6 @@ async fn clear_file_parse_rows_for_ids_in_tx(
         crate::db::push_i64_list(&mut slices_qb, chunk);
         slices_qb.push(")");
         slices_qb.build().execute(&mut **tx).await?;
-    }
-
-    for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
-        let mut pdf_qb = QueryBuilder::<Sqlite>::new("DELETE FROM pdf_contents WHERE file_id IN (");
-        crate::db::push_i64_list(&mut pdf_qb, chunk);
-        pdf_qb.push(")");
-        pdf_qb.build().execute(&mut **tx).await?;
     }
 
     Ok(())
@@ -1446,6 +1445,9 @@ async fn execute_reparse_failed(
         if let Err(e) = crate::file_content::delete(*file_id).await {
             warn!("Failed to delete content file for reparse-failed file {}: {}", file_id, e);
         }
+        if let Err(e) = crate::pdf_content::delete(*file_id).await {
+            warn!("Failed to delete PDF content file for reparse-failed file {}: {}", file_id, e);
+        }
     }
 
     Ok(ReparseFailedFilesResp { file_count: updated })
@@ -1494,6 +1496,18 @@ pub(crate) async fn cleanup_deleted_files(
                 failed.push(BatchDeleteCleanupFailedItem {
                     id: file.id,
                     stage: "content".to_string(),
+                    error: e.to_string(),
+                });
+            }
+
+            let pdf_content_path = std::path::Path::new(&cfg.storage.contents_path).join(format!("{}.json", file.id));
+            if let Err(e) = fs::remove_file(&pdf_content_path).await
+                && !matches!(e.kind(), std::io::ErrorKind::NotFound)
+            {
+                warn!("Failed to delete PDF content file {}: {}", pdf_content_path.display(), e);
+                failed.push(BatchDeleteCleanupFailedItem {
+                    id: file.id,
+                    stage: "pdf_content".to_string(),
                     error: e.to_string(),
                 });
             }
@@ -1628,9 +1642,7 @@ struct FileImagePathState {
     paths: Vec<String>,
 }
 
-pub(crate) async fn collect_image_raw_paths_for_files(
-    pool: &SqlitePool, file_ids: &[i64],
-) -> Result<Vec<String>, sqlx::Error> {
+pub(crate) async fn collect_image_raw_paths_for_files(pool: &SqlitePool, file_ids: &[i64]) -> AnyResult<Vec<String>> {
     if file_ids.is_empty() {
         return Ok(Vec::new());
     }
@@ -1638,15 +1650,14 @@ pub(crate) async fn collect_image_raw_paths_for_files(
     let mut states: HashMap<i64, FileImagePathState> =
         file_ids.iter().copied().map(|file_id| (file_id, FileImagePathState::default())).collect();
 
-    for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
-        let mut qb = QueryBuilder::<Sqlite>::new("SELECT file_id, img_path FROM pdf_contents WHERE file_id IN (");
-        crate::db::push_i64_list(&mut qb, chunk);
-        qb.push(")");
-        let rows: Vec<(i64, Option<String>)> = qb.build_query_as().fetch_all(pool).await?;
-        for (file_id, img_path) in rows {
-            if let Some(state) = states.get_mut(&file_id) {
-                state.has_pdf_contents = true;
-                if let Some(path) = img_path {
+    for file_id in file_ids {
+        let rows = crate::pdf_content::read(*file_id).await?;
+        if !rows.is_empty()
+            && let Some(state) = states.get_mut(file_id)
+        {
+            state.has_pdf_contents = true;
+            for row in rows {
+                if let Some(path) = row.img_path {
                     let trimmed = path.trim();
                     if !trimmed.is_empty() {
                         state.paths.push(trimmed.to_string());
@@ -1701,9 +1712,7 @@ pub(crate) async fn collect_image_raw_paths_for_files(
     Ok(raw_paths)
 }
 
-pub(crate) async fn collect_image_paths_for_files(
-    pool: &SqlitePool, file_ids: &[i64],
-) -> Result<Vec<String>, sqlx::Error> {
+pub(crate) async fn collect_image_paths_for_files(pool: &SqlitePool, file_ids: &[i64]) -> AnyResult<Vec<String>> {
     let raw_paths = collect_image_raw_paths_for_files(pool, file_ids).await?;
     let mut resolved = Vec::new();
     for raw in raw_paths {
@@ -1735,10 +1744,12 @@ pub(crate) async fn backfill_missing_image_meta_for_files(
     for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
         let mut qb = QueryBuilder::<Sqlite>::new("SELECT f.id, f.meta FROM files f WHERE f.id IN (");
         crate::db::push_i64_list(&mut qb, chunk);
-        qb.push(") AND NOT EXISTS (SELECT 1 FROM pdf_contents pc WHERE pc.file_id = f.id)");
+        qb.push(")");
         let rows: Vec<(i64, Option<String>)> = qb.build_query_as().fetch_all(pool).await?;
         for (file_id, meta) in rows {
-            if extract_custom_image_paths_from_meta(meta.as_deref()).is_none() {
+            if crate::pdf_content::read(file_id).await?.is_empty()
+                && extract_custom_image_paths_from_meta(meta.as_deref()).is_none()
+            {
                 candidate_ids.push(file_id);
             }
         }
@@ -2156,12 +2167,6 @@ struct SlicePositionRow {
     y2: i32,
     sheet_name: Option<String>,
     row_num: Option<i32>,
-}
-
-#[derive(Debug, sqlx::FromRow)]
-struct PageBBoxRow {
-    page_idx: i32,
-    bbox: String,
 }
 
 /// 获取文件的所有切片
@@ -2605,16 +2610,12 @@ pub async fn get_highlighted_pdf(
     let coord_bounds_by_page = if positions.is_empty() {
         None
     } else {
-        let rows: Vec<PageBBoxRow> = sqlx::query_as(
-            "SELECT page_idx, bbox FROM pdf_contents WHERE file_id = ? AND bbox IS NOT NULL AND bbox != ''",
-        )
-        .bind(parse_file_id)
-        .fetch_all(&pool)
-        .await?;
+        let rows = crate::pdf_content::read(parse_file_id).await?;
 
         let mut bounds: HashMap<i32, pdf_highlight::PageCoordBounds> = HashMap::new();
         for row in rows {
-            if let Ok(bbox) = serde_json::from_str::<Vec<f32>>(&row.bbox)
+            if let Some(raw_bbox) = row.bbox
+                && let Ok(bbox) = serde_json::from_str::<Vec<f32>>(&raw_bbox)
                 && bbox.len() == 4
             {
                 let x1 = bbox[0];

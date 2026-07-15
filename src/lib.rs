@@ -12,6 +12,7 @@ pub mod file_content;
 pub mod frontend;
 pub mod graph;
 pub mod log4rs;
+pub mod pdf_content;
 pub mod pdf_highlight;
 pub mod processor;
 pub mod search;

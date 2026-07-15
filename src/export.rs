@@ -45,8 +45,6 @@ type FileRow = (
     i64,
 );
 #[allow(clippy::type_complexity)]
-type PdfContentRow = (i64, i32, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>, i64, i64);
-#[allow(clippy::type_complexity)]
 type EntityRow = (i64, String, String, Option<String>, Option<Vec<u8>>, Option<i64>, Option<i64>, i32, i64, i64);
 #[allow(clippy::type_complexity)]
 type RelationRow = (i64, i64, i64, String, Option<String>, Option<f64>, Option<i64>, i64);
@@ -486,7 +484,6 @@ async fn export_sqlite_data(
     // 共享 artifact 导出必须先物化切片并生成 ID 映射，后续位置与 mention 再消费映射。
     export_slices(src_pool, dst_pool, &file_ids).await.context("export materialized slices")?;
     export_slice_positions(src_pool, dst_pool).await.context("export materialized slice positions")?;
-    export_pdf_contents(src_pool, dst_pool, &file_ids).await.context("export materialized pdf contents")?;
     export_graph_nodes(src_pool, dst_pool, target_kb_ids, &file_ids).await.context("export graph nodes")?;
     export_graph_edges(src_pool, dst_pool).await.context("export graph edges")?;
     export_entity_mentions(src_pool, dst_pool).await.context("export remapped entity mentions")?;
@@ -840,86 +837,6 @@ async fn export_slice_positions(src_pool: &SqlitePool, dst_pool: &SqlitePool) ->
             .await?;
         }
     }
-    Ok(())
-}
-
-async fn export_pdf_contents(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &[i64]) -> anyhow::Result<()> {
-    if file_ids.is_empty() {
-        return Ok(());
-    }
-    let cfg = config::get();
-    let images_path_prefix = format!("{}/", cfg.storage.images_path);
-
-    for chunk in file_ids.chunks(SQLITE_BATCH_SIZE) {
-        let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT f.id AS target_file_id, pc.page_idx, pc.bbox, pc.text, pc.text_level, pc.img_path, \
-                    pc.table_body, pc.created_at, pc.updated_at \
-             FROM files f LEFT JOIN parse_artifacts pa ON pa.id = f.artifact_id \
-             JOIN pdf_contents pc ON pc.file_id = COALESCE(pa.source_file_id, f.id) WHERE f.id IN (",
-        );
-        let mut separated = qb.separated(", ");
-        for id in chunk {
-            separated.push_bind(id);
-        }
-        qb.push(")");
-
-        let rows = qb.build().fetch_all(src_pool).await?;
-        if rows.is_empty() {
-            continue;
-        }
-
-        let values: Vec<PdfContentRow> = rows
-            .iter()
-            .map(|row| {
-                let img_path: Option<String> = row.get("img_path");
-                let relative_img_path = img_path.map(|p| {
-                    if p.starts_with(&images_path_prefix) { p[images_path_prefix.len()..].to_string() } else { p }
-                });
-                (
-                    row.get::<i64, _>("target_file_id"),
-                    row.get::<i32, _>("page_idx"),
-                    row.get::<Option<String>, _>("bbox"),
-                    row.get::<Option<String>, _>("text"),
-                    row.get::<Option<i32>, _>("text_level"),
-                    relative_img_path,
-                    row.get::<Option<String>, _>("table_body"),
-                    row.get::<i64, _>("created_at"),
-                    row.get::<i64, _>("updated_at"),
-                )
-            })
-            .collect();
-
-        batch_insert_rows(
-            dst_pool,
-            "pdf_contents",
-            &[
-                "file_id",
-                "page_idx",
-                "bbox",
-                "text",
-                "text_level",
-                "img_path",
-                "table_body",
-                "created_at",
-                "updated_at",
-            ],
-            &values,
-            |b, (file_id, page_idx, bbox, text, text_level, img_path, table_body, created_at, updated_at)| {
-                b.push_bind(file_id)
-                    .push_bind(page_idx)
-                    .push_bind(bbox)
-                    .push_bind(text)
-                    .push_bind(text_level)
-                    .push_bind(img_path)
-                    .push_bind(table_body)
-                    .push_bind(created_at)
-                    .push_bind(updated_at);
-            },
-            false,
-        )
-        .await?;
-    }
-
     Ok(())
 }
 
@@ -1375,13 +1292,14 @@ async fn copy_files(
         .collect();
     futures::future::join_all(pdf_handles).await;
 
-    // Copy content files concurrently via spawn_blocking
+    // Copy content and PDF content files concurrently via spawn_blocking
     let content_handles: Vec<_> = file_paths
         .iter()
         .cloned()
         .map(|(file_id, _src_path, parse_source_id)| {
             let contents_dir = contents_dir.to_path_buf();
             let cfg_contents_path = cfg.storage.contents_path.clone();
+            let cfg_images_path = cfg.storage.images_path.clone();
             tokio::task::spawn_blocking(move || {
                 let src_content = Path::new(&cfg_contents_path).join(format!("{}.txt", parse_source_id));
                 if src_content.exists() {
@@ -1395,6 +1313,32 @@ async fn copy_files(
                         );
                     }
                 }
+                let src_pdf_content = Path::new(&cfg_contents_path).join(format!("{}.json", parse_source_id));
+                if src_pdf_content.exists() {
+                    let dst_pdf_content = contents_dir.join(format!("{}.json", file_id));
+                    let result = (|| -> anyhow::Result<()> {
+                        let bytes = std::fs::read(&src_pdf_content)?;
+                        let mut rows: Vec<crate::pdf_content::PdfContent> = serde_json::from_slice(&bytes)?;
+                        let images_prefix = format!("{}/", cfg_images_path);
+                        for row in &mut rows {
+                            if let Some(path) = row.img_path.as_mut()
+                                && path.starts_with(&images_prefix)
+                            {
+                                *path = path[images_prefix.len()..].to_string();
+                            }
+                        }
+                        std::fs::write(&dst_pdf_content, serde_json::to_vec(&rows)?)?;
+                        Ok(())
+                    })();
+                    if let Err(e) = result {
+                        warn!(
+                            "Failed to copy PDF content file {} to {}: {}",
+                            src_pdf_content.display(),
+                            dst_pdf_content.display(),
+                            e
+                        );
+                    }
+                }
             })
         })
         .collect();
@@ -1404,7 +1348,7 @@ async fn copy_files(
     let skipped = skipped_count.load(std::sync::atomic::Ordering::Relaxed);
     info!("Copied {}/{} original files, skipped {}", copied, total_files, skipped);
 
-    // Copy images referenced by pdf_contents
+    // Copy images referenced by PDF content JSON
     let s = std::time::Instant::now();
     copy_images(pool, images_dir, file_ids).await?;
     info!("  [files] Copy images: {}ms", s.elapsed().as_millis());
@@ -1791,7 +1735,6 @@ mod tests {
             .execute(&src)
             .await
             .context("insert position")?;
-        sqlx::query("INSERT INTO pdf_contents(file_id,page_idx,text) VALUES(1,0,'pdf')").execute(&src).await?;
         let node_id: i64 = sqlx::query_scalar(
             "INSERT INTO graph_nodes(name,entity_type,file_id,kb_id) VALUES('e','t',2,1) RETURNING id",
         )
@@ -1811,7 +1754,6 @@ mod tests {
         assert_eq!(slices.iter().map(|(_, file_id)| *file_id).collect::<Vec<_>>(), vec![1, 2]);
         assert_ne!(slices[0].0, slices[1].0);
         assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM slice_positions").fetch_one(&dst).await?, 2);
-        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pdf_contents").fetch_one(&dst).await?, 2);
         let mention_file: i64 =
             sqlx::query_scalar("SELECT s.file_id FROM entity_mentions m JOIN slices s ON s.id=m.slice_id LIMIT 1")
                 .fetch_one(&dst)

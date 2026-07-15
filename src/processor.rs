@@ -75,9 +75,6 @@ struct Result {
     images: HashMap<String, String>,
 }
 
-// Type aliases for complex SQL / return types
-#[allow(clippy::type_complexity)]
-type PdfContentDbRow = (i32, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>);
 #[allow(clippy::type_complexity)]
 type RawImageJobs = (Vec<(String, String)>, HashMap<String, String>, Vec<String>);
 
@@ -261,15 +258,7 @@ struct Segment {
     positions: Vec<SlicePosition>,
 }
 
-#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
-struct PdfContentRow {
-    page_idx: i32,
-    bbox: Option<String>,
-    text: Option<String>,
-    text_level: Option<i32>,
-    img_path: Option<String>,
-    table_body: Option<String>,
-}
+type PdfContentRow = crate::pdf_content::PdfContent;
 
 #[derive(Debug, Clone, sqlx::FromRow)]
 struct SliceRow {
@@ -722,7 +711,7 @@ impl FileProcessor {
             .execute(&mut **tx)
             .await?;
         sqlx::query("DELETE FROM slices WHERE file_id = ?").bind(file_id).execute(&mut **tx).await?;
-        sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(file_id).execute(&mut **tx).await?;
+        crate::pdf_content::delete(file_id).await?;
         if let Err(e) = crate::file_content::delete(file_id).await {
             warn!("Failed to delete content file for processing cleanup of file {}: {}", file_id, e);
         }
@@ -1420,37 +1409,24 @@ impl FileProcessor {
         let valid_content_items: Vec<ContentItem> =
             content_list.iter().filter(|item| item.typ != "discarded").cloned().collect();
         timed_step_opt(timing, "custom_write_pdf_contents", async {
-            sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(file_id).execute(&self.pool).await?;
-            if valid_content_items.is_empty() {
-                return Ok(());
-            }
-
-            let binds_per_row = 7_usize;
-            let max_vars = 999_usize;
-            let batch_size = std::cmp::max(1, max_vars / binds_per_row);
-            for chunk in valid_content_items.chunks(batch_size) {
-                let mut pdf_sql = QueryBuilder::<Sqlite>::new(
-                    "insert into pdf_contents(file_id, page_idx, bbox, text, text_level, img_path, table_body) ",
-                );
-                pdf_sql.push_values(chunk.iter(), |mut b, item| {
-                    let bbox = if item.bbox.is_empty() {
-                        None
-                    } else {
-                        Some(serde_json::to_string(&item.bbox).unwrap_or_default())
-                    };
-                    b.push_bind(file_id)
-                        .push_bind(item.page_idx)
-                        .push_bind(bbox)
-                        .push_bind(&item.text)
-                        .push_bind(item.text_level)
-                        .push_bind(&item.img_path)
-                        .push_bind(&item.table_body);
-                });
-                pdf_sql.build().execute(&self.pool).await?;
-            }
-            Ok(())
+            let rows = Self::content_items_to_pdf_rows(&valid_content_items);
+            crate::pdf_content::write(file_id, &rows).await
         })
         .await
+    }
+
+    fn content_items_to_pdf_rows(items: &[ContentItem]) -> Vec<PdfContentRow> {
+        items
+            .iter()
+            .map(|item| PdfContentRow {
+                page_idx: item.page_idx,
+                bbox: if item.bbox.is_empty() { None } else { serde_json::to_string(&item.bbox).ok() },
+                text: item.text.clone(),
+                text_level: item.text_level,
+                img_path: item.img_path.clone(),
+                table_body: item.table_body.clone(),
+            })
+            .collect()
     }
 
     async fn save_custom_images(
@@ -1707,45 +1683,34 @@ impl FileProcessor {
         }
         info!("Processing PDF file: {}", file.filename);
 
-        // 先检查 pdf_contents 表中是否已有该文件的数据
-        let (count, bbox_count): ((i64,), (i64,)) =
-            timed_step_opt(timing.as_deref_mut(), "pdf_existing_content_check", async {
-                let check_sql = "SELECT COUNT(*) as count FROM pdf_contents WHERE file_id = ?";
-                let count: (i64,) = sqlx::query_as(check_sql).bind(file.id).fetch_one(&self.pool).await?;
-                let bbox_sql =
-                    "SELECT COUNT(*) as count FROM pdf_contents WHERE file_id = ? AND bbox IS NOT NULL AND bbox != ''";
-                let bbox_count: (i64,) = sqlx::query_as(bbox_sql).bind(file.id).fetch_one(&self.pool).await?;
-                Ok((count, bbox_count))
-            })
-            .await?;
+        let existing_rows = timed_step_opt(timing.as_deref_mut(), "pdf_existing_content_check", async {
+            crate::pdf_content::read(file.id).await
+        })
+        .await?;
 
         let content_list: Vec<ContentItem>;
 
-        if count.0 > 0 && bbox_count.0 > 0 {
-            // 已有数据，直接从数据库读取
-            info!("Found existing PDF contents in database for file {}, skipping MinerU API call", file.id);
+        if !existing_rows.is_empty()
+            && existing_rows.iter().any(|row| row.bbox.as_deref().is_some_and(|v| !v.is_empty()))
+        {
+            info!("Found existing PDF contents for file {}, skipping MinerU API call", file.id);
 
             content_list = timed_step_opt(timing.as_deref_mut(), "load_existing_pdf_content", async {
-                let fetch_sql = "SELECT page_idx, bbox, text, text_level, img_path, table_body FROM pdf_contents WHERE file_id = ? ORDER BY page_idx, id";
-                let rows: Vec<PdfContentDbRow> =
-                    sqlx::query_as(fetch_sql).bind(file.id).fetch_all(&self.pool).await?;
-
-                // 将数据库记录转换为 ContentItem
-                let content_list = rows
+                let content_list = existing_rows
                     .iter()
                     .map(|row| {
-                        let typ = if row.2.is_some() {
+                        let typ = if row.text.is_some() {
                             "text".to_string()
-                        } else if row.4.is_some() {
+                        } else if row.img_path.is_some() {
                             "image".to_string()
-                        } else if row.5.is_some() {
+                        } else if row.table_body.is_some() {
                             "table".to_string()
                         } else {
                             "unknown".to_string()
                         };
 
                         let bbox = row
-                            .1
+                            .bbox
                             .as_ref()
                             .and_then(|bbox| serde_json::from_str::<Vec<i32>>(bbox).ok())
                             .unwrap_or_default();
@@ -1753,13 +1718,13 @@ impl FileProcessor {
                         ContentItem {
                             typ,
                             bbox,
-                            page_idx: row.0,
-                            text: row.2.clone(),
-                            text_level: row.3,
+                            page_idx: row.page_idx,
+                            text: row.text.clone(),
+                            text_level: row.text_level,
                             text_format: None,
-                            img_path: row.4.clone(),
+                            img_path: row.img_path.clone(),
                             image_caption: None,
-                            table_body: row.5.clone(),
+                            table_body: row.table_body.clone(),
                             table_caption: None,
                         }
                     })
@@ -1785,33 +1750,8 @@ impl FileProcessor {
             // 只有在有有效内容时才插入数据库
             if !valid_content_items.is_empty() {
                 timed_step_opt(timing.as_deref_mut(), "write_pdf_contents", async {
-                    if count.0 > 0 {
-                        sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(file.id).execute(&self.pool).await?;
-                    }
-                    let binds_per_row = 7_usize;
-                    let max_vars = 999_usize;
-                    let batch_size = std::cmp::max(1, max_vars / binds_per_row);
-                    for chunk in valid_content_items.chunks(batch_size) {
-                        let mut pdf_sql = QueryBuilder::<Sqlite>::new(
-                            "insert into pdf_contents(file_id, page_idx, bbox, text, text_level, img_path, table_body) ",
-                        );
-                        pdf_sql.push_values(chunk.iter(), |mut b, item| {
-                            let bbox = if item.bbox.is_empty() {
-                                None
-                            } else {
-                                Some(serde_json::to_string(&item.bbox).unwrap_or_default())
-                            };
-                            b.push_bind(file.id)
-                                .push_bind(item.page_idx)
-                                .push_bind(bbox)
-                                .push_bind(&item.text)
-                                .push_bind(item.text_level)
-                                .push_bind(&item.img_path)
-                                .push_bind(&item.table_body);
-                        });
-                        pdf_sql.build().execute(&self.pool).await?;
-                    }
-                    Ok(())
+                    let rows = Self::content_items_to_pdf_rows(&valid_content_items);
+                    crate::pdf_content::write(file.id, &rows).await
                 })
                 .await?;
             }
@@ -3147,9 +3087,7 @@ impl FileProcessor {
     }
 
     async fn fetch_pdf_content_rows(&self, file_id: i64) -> anyhow::Result<Vec<PdfContentRow>> {
-        let sql = "SELECT page_idx, bbox, text, text_level, img_path, table_body FROM pdf_contents WHERE file_id = ? ORDER BY id";
-        let rows = sqlx::query_as::<_, PdfContentRow>(sql).bind(file_id).fetch_all(&self.pool).await?;
-        Ok(rows)
+        crate::pdf_content::read(file_id).await
     }
 
     async fn fetch_slice_rows(&self, file_id: i64) -> anyhow::Result<Vec<SliceRow>> {
@@ -3220,36 +3158,22 @@ impl FileProcessor {
     }
 
     async fn insert_pdf_rows(
-        &self, tx: &mut sqlx::Transaction<'_, Sqlite>, target_file_id: i64, rows: &[PdfContentRow],
+        &self, _tx: &mut sqlx::Transaction<'_, Sqlite>, target_file_id: i64, rows: &[PdfContentRow],
         image_mapping: &HashMap<String, String>,
     ) -> anyhow::Result<()> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let binds_per_row = 7;
-        let batch_size = std::cmp::max(1, 999 / binds_per_row);
-        for chunk in rows.chunks(batch_size) {
-            let mut qb = QueryBuilder::<Sqlite>::new(
-                "INSERT INTO pdf_contents(file_id, page_idx, bbox, text, text_level, img_path, table_body) ",
-            );
-            qb.push_values(chunk.iter(), |mut b, row| {
+        let rows = rows
+            .iter()
+            .map(|row| {
                 let new_img_path = row
                     .img_path
                     .as_ref()
                     .and_then(|path| image_mapping.get(path))
                     .cloned()
                     .or_else(|| row.img_path.clone());
-                b.push_bind(target_file_id)
-                    .push_bind(row.page_idx)
-                    .push_bind(row.bbox.clone())
-                    .push_bind(row.text.clone())
-                    .push_bind(row.text_level)
-                    .push_bind(new_img_path)
-                    .push_bind(row.table_body.clone());
-            });
-            qb.build().execute(&mut **tx).await?;
-        }
-        Ok(())
+                PdfContentRow { img_path: new_img_path, ..row.clone() }
+            })
+            .collect::<Vec<_>>();
+        crate::pdf_content::write(target_file_id, &rows).await
     }
 
     async fn insert_slice_rows(
