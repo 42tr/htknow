@@ -2638,7 +2638,13 @@ async fn get_full_files_by_ids(pool: &SqlitePool, file_ids: &[i64]) -> Result<Ha
         q = q.bind(id);
     }
 
-    let files: Vec<File> = q.fetch_all(pool).await?;
+    let mut files: Vec<File> = q.fetch_all(pool).await?;
+    for file in &mut files {
+        match crate::file_content::read(file.id).await {
+            Ok(content) => file.content = content,
+            Err(e) => warn!("Failed to read content file for file {}: {}", file.id, e),
+        }
+    }
     Ok(files.into_iter().map(|f| (f.id, f)).collect())
 }
 

@@ -68,9 +68,9 @@ fn stream_from_std_file(mut file: std::fs::File) -> Result<(u64, Body), ApiError
     Ok((len, Body::from_stream(stream)))
 }
 
-/// `files` 表去掉大字段 `content` 的列清单（content 以 NULL 占位）。
+/// `files` 表查询列清单，其中 `content` 以 NULL 占位。
 ///
-/// 列表类查询不需要全文 content，用此清单避免把可能很大的 content 列从 SQLite 读进内存。
+/// 列表类查询不需要全文 content，用此清单避免把可能很大的文本从 SQLite/文件系统读进内存。
 pub(crate) const FILE_COLS_NO_CONTENT: &str = "id, user_id, user_name, hash, filename, path, size, NULL as content, \
      tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at";
 
@@ -119,6 +119,11 @@ pub struct File {
     pub filename: String,
     pub path: String,
     pub size: i64,
+    /// 文件解析后的完整文本。
+    ///
+    /// 该字段已从 SQLite 迁移到 `contents/` 目录下的独立文件。`#[sqlx(default)]`
+    /// 保证在新 schema（无 `content` 列）下 `SELECT *` 仍能正常映射。
+    #[sqlx(default)]
     pub content: Option<String>,
     pub tags: String,
     pub status: i32,
@@ -737,10 +742,11 @@ pub async fn get(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<File>> {
     let query = "SELECT * FROM files WHERE id = ?";
-    let file: File = sqlx::query_as(query).bind(id).fetch_one(&pool).await?;
+    let mut file: File = sqlx::query_as(query).bind(id).fetch_one(&pool).await?;
 
     ensure_file_readable(&file, &auth_user)?;
 
+    file.content = crate::file_content::read(id).await?;
     Ok(Json(file))
 }
 
@@ -878,7 +884,6 @@ pub async fn update(
         separated.push("slice_type = ").push_bind_unseparated(slice_type);
         separated.push("status = ").push_bind_unseparated(0);
         separated.push("log = ").push_bind_unseparated("");
-        separated.push("content = NULL");
         has_updates = true;
     }
 
@@ -926,6 +931,9 @@ pub async fn update(
         }
         remove_image_files(image_paths_to_remove).await;
         remove_converted_pdfs(&[id]).await;
+        if let Err(e) = crate::file_content::delete(id).await {
+            warn!("Failed to delete content file for updated file {}: {}", id, e);
+        }
     } else {
         qb.build().execute(&pool).await?;
     }
@@ -1001,7 +1009,7 @@ pub async fn move_to_kb(
 
     let mut tx = pool.begin().await?;
     let update_result = sqlx::query(
-        "UPDATE files SET kb_id = ?, status = ?, log = ?, content = NULL, updated_at = strftime('%s','now') WHERE id = ? AND status != 2 AND updated_at = ?",
+        "UPDATE files SET kb_id = ?, status = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ? AND status != 2 AND updated_at = ?",
     )
     .bind(req.target_kb_id)
     .bind(next_status)
@@ -1027,6 +1035,9 @@ pub async fn move_to_kb(
         && !matches!(e.kind(), std::io::ErrorKind::NotFound)
     {
         warn!("Failed to delete converted pdf {} after file move: {}", pdf_path.display(), e);
+    }
+    if let Err(e) = crate::file_content::delete(id).await {
+        warn!("Failed to delete content file after file move for file {}: {}", id, e);
     }
 
     let moved: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
@@ -1389,7 +1400,7 @@ async fn execute_reparse_failed(
     clear_file_parse_rows_for_ids_in_tx(&mut tx, &file_ids).await?;
 
     let mut qb = QueryBuilder::<Sqlite>::new(
-        "UPDATE files SET status = 0, log = '', content = NULL, updated_at = strftime('%s','now') WHERE status = -1 AND id IN (",
+        "UPDATE files SET status = 0, log = '', updated_at = strftime('%s','now') WHERE status = -1 AND id IN (",
     );
     crate::db::push_i64_list(&mut qb, &file_ids);
     qb.push(")");
@@ -1398,6 +1409,11 @@ async fn execute_reparse_failed(
 
     remove_image_files(image_paths).await;
     remove_converted_pdfs(&file_ids).await;
+    for file_id in &file_ids {
+        if let Err(e) = crate::file_content::delete(*file_id).await {
+            warn!("Failed to delete content file for reparse-failed file {}: {}", file_id, e);
+        }
+    }
 
     Ok(ReparseFailedFilesResp { file_count: updated })
 }
@@ -1432,6 +1448,19 @@ pub(crate) async fn cleanup_deleted_files(
                 failed.push(BatchDeleteCleanupFailedItem {
                     id: file.id,
                     stage: "pdf".to_string(),
+                    error: e.to_string(),
+                });
+            }
+
+            // 清理解析后的完整文本文件
+            let content_path = std::path::Path::new(&cfg.storage.contents_path).join(format!("{}.txt", file.id));
+            if let Err(e) = fs::remove_file(&content_path).await
+                && !matches!(e.kind(), std::io::ErrorKind::NotFound)
+            {
+                warn!("Failed to delete content file {}: {}", content_path.display(), e);
+                failed.push(BatchDeleteCleanupFailedItem {
+                    id: file.id,
+                    stage: "content".to_string(),
                     error: e.to_string(),
                 });
             }
@@ -2190,7 +2219,7 @@ pub async fn update_slices(
     let mut content_map: std::collections::HashMap<i64, String> =
         req.slices.into_iter().map(|s| (s.id, s.content)).collect();
 
-    // 6. SQLite 事务：批量更新 slices 并重建 files.content
+    // 6. SQLite 事务：批量更新 slices 并同步 content 文件
     let mut tx = pool.begin().await?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 
@@ -2231,14 +2260,9 @@ pub async fn update_slices(
         .collect::<Vec<_>>()
         .join("\n\n");
 
-    sqlx::query("UPDATE files SET content = ?, updated_at = ? WHERE id = ?")
-        .bind(&full_content)
-        .bind(now)
-        .bind(id)
-        .execute(&mut *tx)
-        .await?;
-
+    sqlx::query("UPDATE files SET updated_at = ? WHERE id = ?").bind(now).bind(id).execute(&mut *tx).await?;
     tx.commit().await?;
+    crate::file_content::write(id, &full_content).await?;
 
     // 7. 同步搜索索引（事务外，失败仅记录 warning）
     let updates: Vec<(i64, String)> = requested_ids

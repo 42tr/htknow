@@ -651,6 +651,9 @@ impl FileProcessor {
             .await?;
         sqlx::query("DELETE FROM slices WHERE file_id = ?").bind(file_id).execute(&mut **tx).await?;
         sqlx::query("DELETE FROM pdf_contents WHERE file_id = ?").bind(file_id).execute(&mut **tx).await?;
+        if let Err(e) = crate::file_content::delete(file_id).await {
+            warn!("Failed to delete content file for processing cleanup of file {}: {}", file_id, e);
+        }
         Ok(())
     }
 
@@ -1526,14 +1529,9 @@ impl FileProcessor {
 
         if slices.is_empty() {
             timed_step_opt(timing.as_deref_mut(), "finalize_empty_excel", async {
-                let sql =
-                    "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
-                sqlx::query(sql)
-                    .bind("")
-                    .bind("Excel processed successfully (empty)")
-                    .bind(file.id)
-                    .execute(&self.pool)
-                    .await?;
+                let sql = "UPDATE files SET status = 1, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
+                sqlx::query(sql).bind("Excel processed successfully (empty)").bind(file.id).execute(&self.pool).await?;
+                crate::file_content::delete(file.id).await?;
                 Ok(())
             })
             .await?;
@@ -2398,9 +2396,9 @@ impl FileProcessor {
             return Ok(());
         }
         timed_step_opt(timing.as_deref_mut(), "finalize_file_status", async {
-            let sql =
-                "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
-            sqlx::query(sql).bind(full_content).bind(log_message).bind(file.id).execute(&self.pool).await?;
+            let sql = "UPDATE files SET status = 1, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
+            sqlx::query(sql).bind(log_message).bind(file.id).execute(&self.pool).await?;
+            crate::file_content::write(file.id, full_content).await?;
             Ok(())
         })
         .await?;
@@ -2987,7 +2985,7 @@ impl FileProcessor {
         }
         let mut source_for_reindex = source.clone();
         if !combined_image_mapping.is_empty() {
-            if let Some(content) = source_for_reindex.content.clone() {
+            if let Some(content) = crate::file_content::read(source.id).await? {
                 source_for_reindex.content = Some(Self::rewrite_custom_image_refs(&content, &combined_image_mapping));
             }
         }
@@ -3012,14 +3010,12 @@ impl FileProcessor {
         self.search_engine.reload_readers()?;
 
         let final_log = format!("Reused parsed data from file {}", source.id);
-        sqlx::query(
-            "UPDATE files SET status = 1, content = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?",
-        )
-        .bind(&full_content)
-        .bind(&final_log)
-        .bind(target.id)
-        .execute(&self.pool)
-        .await?;
+        sqlx::query("UPDATE files SET status = 1, log = ?, updated_at = strftime('%s','now') WHERE id = ?")
+            .bind(&final_log)
+            .bind(target.id)
+            .execute(&self.pool)
+            .await?;
+        crate::file_content::write(target.id, &full_content).await?;
 
         let mut updated_file = target.clone();
         updated_file.content = Some(full_content.clone());

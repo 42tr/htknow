@@ -8,6 +8,7 @@ pub mod archive;
 pub mod config;
 pub mod db;
 pub mod export;
+pub mod file_content;
 pub mod frontend;
 pub mod graph;
 pub mod log4rs;

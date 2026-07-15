@@ -73,6 +73,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
 
     // 自动创建表
     create_tables(&pool).await?;
+    ensure_file_content_externalized(&pool).await?;
     ensure_kb_type_column(&pool).await?;
     ensure_parse_priority_column(&pool).await?;
     ensure_file_parse_priority_column(&pool).await?;
@@ -324,6 +325,54 @@ async fn ensure_file_size_column(pool: &SqlitePool) -> anyhow::Result<()> {
         sqlx::query("ALTER TABLE files ADD COLUMN size INTEGER NOT NULL DEFAULT 0").execute(pool).await?;
     }
 
+    Ok(())
+}
+
+/// 若 `files` 表仍存在旧版的 `content` 列，则把内容迁移到 `contents/` 目录并删除该列。
+async fn ensure_file_content_externalized(pool: &SqlitePool) -> anyhow::Result<()> {
+    let columns = sqlx::query("PRAGMA table_info(files);").fetch_all(pool).await?;
+    let has_content = columns.iter().any(|row| row.get::<String, _>("name") == "content");
+
+    if !has_content {
+        return Ok(());
+    }
+
+    info!("Detected legacy `files.content` column, migrating to filesystem...");
+
+    let contents_path = &config::get().storage.contents_path;
+    let contents_dir = std::path::Path::new(contents_path);
+    tokio::fs::create_dir_all(contents_dir)
+        .await
+        .with_context(|| format!("failed to create contents directory {}", contents_dir.display()))?;
+
+    const BATCH: i64 = 100;
+    let mut offset = 0i64;
+    let mut migrated = 0usize;
+    loop {
+        let rows: Vec<(i64, Option<String>)> =
+            sqlx::query_as("SELECT id, content FROM files WHERE content IS NOT NULL ORDER BY id LIMIT ? OFFSET ?")
+                .bind(BATCH)
+                .bind(offset)
+                .fetch_all(pool)
+                .await?;
+
+        if rows.is_empty() {
+            break;
+        }
+
+        for (id, content) in rows {
+            if let Some(content) = content {
+                crate::file_content::write(id, &content).await?;
+                migrated += 1;
+            }
+        }
+
+        offset += BATCH;
+    }
+
+    sqlx::query("ALTER TABLE files DROP COLUMN content").execute(pool).await?;
+
+    info!("`files.content` migration completed, {} files migrated", migrated);
     Ok(())
 }
 

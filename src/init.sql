@@ -6,7 +6,6 @@ CREATE TABLE IF NOT EXISTS files (
     filename TEXT NOT NULL, -- 文件名称
     path TEXT NOT NULL, -- 文件路径
     size INTEGER NOT NULL DEFAULT 0, -- 文件大小(字节)
-    content TEXT, -- 内容
     tags TEXT NOT NULL DEFAULT '', -- 标签
     status INTEGER NOT NULL DEFAULT 0, -- 状态: 0-未处理, 1-已处理, 2-处理中, 3-不解析, -1-处理失败
     log TEXT DEFAULT '', -- 日志

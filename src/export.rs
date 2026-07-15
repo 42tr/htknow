@@ -33,7 +33,6 @@ type FileRow = (
     String,
     String,
     i64,
-    Option<String>,
     String,
     i32,
     String,
@@ -159,6 +158,7 @@ pub async fn export_knowledge_bases(
     let files_dir = export_dir.join("files");
     let pdfs_dir = export_dir.join("pdfs");
     let images_dir = export_dir.join("images");
+    let contents_dir = export_dir.join("contents");
     let tantivy_dir = export_dir.join("tantivy_index");
     let tantivy_full_dir = export_dir.join("tantivy_full_index");
     let lancedb_dir = export_dir.join("lancedb_data");
@@ -166,6 +166,7 @@ pub async fn export_knowledge_bases(
     tokio::fs::create_dir_all(&files_dir).await?;
     tokio::fs::create_dir_all(&pdfs_dir).await?;
     tokio::fs::create_dir_all(&images_dir).await?;
+    tokio::fs::create_dir_all(&contents_dir).await?;
     tokio::fs::create_dir_all(&tantivy_dir).await?;
     tokio::fs::create_dir_all(&tantivy_full_dir).await?;
     tokio::fs::create_dir_all(&lancedb_dir).await?;
@@ -211,7 +212,8 @@ pub async fn export_knowledge_bases(
 
     let copy_files_future = async move {
         let s = std::time::Instant::now();
-        let result = copy_files(&file_ids_for_copy, &files_dir, &pdfs_dir, &images_dir, &pool_clone).await;
+        let result =
+            copy_files(&file_ids_for_copy, &files_dir, &pdfs_dir, &images_dir, &contents_dir, &pool_clone).await;
         info!("[step] Copy files: {}ms", s.elapsed().as_millis());
         result
     };
@@ -626,7 +628,9 @@ async fn export_files(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i6
     let mut file_ids = Vec::new();
 
     for chunk in kb_ids.chunks(SQLITE_BATCH_SIZE) {
-        let mut qb = QueryBuilder::<Sqlite>::new("SELECT * FROM files WHERE kb_id IN (");
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, parse_priority, is_public, meta, created_at, updated_at FROM files WHERE kb_id IN (",
+        );
         let mut separated = qb.separated(", ");
         for id in chunk {
             separated.push_bind(id);
@@ -659,7 +663,6 @@ async fn export_files(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i6
                     row.get::<String, _>("filename"),
                     relative_path,
                     row.get::<i64, _>("size"),
-                    row.get::<Option<String>, _>("content"),
                     row.get::<String, _>("tags"),
                     row.get::<i32, _>("status"),
                     row.get::<String, _>("log"),
@@ -685,7 +688,6 @@ async fn export_files(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i6
                 "filename",
                 "path",
                 "size",
-                "content",
                 "tags",
                 "status",
                 "log",
@@ -707,7 +709,6 @@ async fn export_files(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i6
                 filename,
                 path,
                 size,
-                content,
                 tags,
                 status,
                 log,
@@ -726,7 +727,6 @@ async fn export_files(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i6
                     .push_bind(filename)
                     .push_bind(path)
                     .push_bind(size)
-                    .push_bind(content)
                     .push_bind(tags)
                     .push_bind(status)
                     .push_bind(log)
@@ -1315,7 +1315,7 @@ async fn export_graph_snapshots(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb
 }
 
 async fn copy_files(
-    file_ids: &[i64], files_dir: &Path, pdfs_dir: &Path, images_dir: &Path, pool: &SqlitePool,
+    file_ids: &[i64], files_dir: &Path, pdfs_dir: &Path, images_dir: &Path, contents_dir: &Path, pool: &SqlitePool,
 ) -> anyhow::Result<()> {
     let cfg = config::get();
 
@@ -1389,6 +1389,31 @@ async fn copy_files(
         })
         .collect();
     futures::future::join_all(pdf_handles).await;
+
+    // Copy content files concurrently via spawn_blocking
+    let content_handles: Vec<_> = file_paths
+        .iter()
+        .cloned()
+        .map(|(file_id, _src_path)| {
+            let contents_dir = contents_dir.to_path_buf();
+            let cfg_contents_path = cfg.storage.contents_path.clone();
+            tokio::task::spawn_blocking(move || {
+                let src_content = Path::new(&cfg_contents_path).join(format!("{}.txt", file_id));
+                if src_content.exists() {
+                    let dst_content = contents_dir.join(format!("{}.txt", file_id));
+                    if let Err(e) = std::fs::copy(&src_content, &dst_content) {
+                        warn!(
+                            "Failed to copy content file {} to {}: {}",
+                            src_content.display(),
+                            dst_content.display(),
+                            e
+                        );
+                    }
+                }
+            })
+        })
+        .collect();
+    futures::future::join_all(content_handles).await;
 
     let copied = copied_count.load(std::sync::atomic::Ordering::Relaxed);
     let skipped = skipped_count.load(std::sync::atomic::Ordering::Relaxed);

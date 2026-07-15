@@ -1369,20 +1369,18 @@ impl SearchEngine {
     }
 }
 
-async fn fetch_file_contents_by_ids(pool: &SqlitePool, ids: &[i64]) -> anyhow::Result<HashMap<i64, String>> {
+async fn fetch_file_contents_by_ids(_pool: &SqlitePool, ids: &[i64]) -> anyhow::Result<HashMap<i64, String>> {
     if ids.is_empty() {
         return Ok(HashMap::new());
     }
 
-    let mut query_builder: QueryBuilder<'_, Sqlite> = QueryBuilder::new("SELECT id, content FROM files WHERE id IN (");
-    let mut separated = query_builder.separated(", ");
+    let mut map = HashMap::with_capacity(ids.len());
     for id in ids {
-        separated.push_bind(id);
+        if let Some(content) = crate::file_content::read(*id).await? {
+            map.insert(*id, content);
+        }
     }
-    separated.push_unseparated(")");
-
-    let rows: Vec<(i64, Option<String>)> = query_builder.build_query_as().fetch_all(pool).await?;
-    Ok(rows.into_iter().map(|(id, content)| (id, content.unwrap_or_default())).collect())
+    Ok(map)
 }
 
 fn sanitize_job_tag(input: &str) -> String {

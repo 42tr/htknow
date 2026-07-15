@@ -117,6 +117,7 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | `HTKNOW_PDF_PATH` | `data/pdfs` | PDF 目录 |
 | `HTKNOW_FILES_PATH` | `data/files` | 文件目录 |
 | `HTKNOW_ARCHIVES_PATH` | `data/archives` | 压缩文件解压目录 |
+| `HTKNOW_CONTENTS_PATH` | `data/contents` | 文件解析后完整文本目录 |
 
 ### 搜索
 | 环境变量 | 默认值 | 说明 |
