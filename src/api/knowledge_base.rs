@@ -1056,6 +1056,11 @@ async fn reset_reparse_scope(
         crate::db::push_i64_list(&mut del_slices_qb, file_ids);
         del_slices_qb.push(")");
         del_slices_qb.build().execute(pool).await?;
+        for file_id in file_ids {
+            if let Err(e) = crate::slice_content::delete(*file_id).await {
+                warn!("Failed to delete slice content file for knowledge base reparse file {}: {}", file_id, e);
+            }
+        }
 
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
         let mut update_qb =

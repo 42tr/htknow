@@ -103,14 +103,15 @@ struct LexiconRow {
 #[derive(Debug, sqlx::FromRow)]
 struct RebuildSliceRow {
     id: i64,
+    source_file_id: i64,
     file_id: i64,
     kb_id: Option<i64>,
-    content: String,
 }
 
 #[derive(Debug, sqlx::FromRow)]
 struct RebuildLanceDbSliceRow {
     id: i64,
+    source_file_id: i64,
     file_id: i64,
     kb_id: Option<i64>,
     content: String,
@@ -157,8 +158,8 @@ async fn fetch_rebuild_lancedb_rows(
     }
 
     let mut query_builder: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
-        "SELECT s.id, COALESCE(ref.id, source.id) AS file_id, COALESCE(ref.kb_id, source.kb_id) AS kb_id, \
-         s.content, COALESCE(ref.filename, source.filename) AS filename, \
+        "SELECT s.id, s.file_id AS source_file_id, COALESCE(ref.id, source.id) AS file_id, COALESCE(ref.kb_id, source.kb_id) AS kb_id, \
+         COALESCE(ref.filename, source.filename) AS filename, \
          COALESCE(ref.path, source.path) AS path \
          FROM slices s JOIN files source ON source.id = s.file_id \
          LEFT JOIN parse_artifacts pa ON pa.source_file_id = source.id \
@@ -169,7 +170,13 @@ async fn fetch_rebuild_lancedb_rows(
         separated.push_bind(slice_id);
     }
     separated.push_unseparated(") ORDER BY s.id ASC");
-    Ok(query_builder.build_query_as().fetch_all(pool).await?)
+    let mut rows: Vec<RebuildLanceDbSliceRow> = query_builder.build_query_as().fetch_all(pool).await?;
+    let mut contents = HashMap::new();
+    for source_file_id in rows.iter().map(|row| row.source_file_id).collect::<HashSet<_>>() {
+        contents.insert(source_file_id, crate::slice_content::read_all(source_file_id).await?);
+    }
+    for row in &mut rows { row.content = contents.get(&row.source_file_id).and_then(|v| v.get(&row.id)).cloned().unwrap_or_default(); }
+    Ok(rows)
 }
 
 #[derive(Clone)]
@@ -470,8 +477,8 @@ impl SearchEngine {
             let mut last_slice_id = 0_i64;
             loop {
                 let rows: Vec<RebuildSliceRow> = sqlx::query_as(
-                    "SELECT s.id, COALESCE(ref.id, source.id) AS file_id, \
-                            COALESCE(ref.kb_id, source.kb_id) AS kb_id, s.content \
+                    "SELECT s.id, s.file_id AS source_file_id, COALESCE(ref.id, source.id) AS file_id, \
+                            COALESCE(ref.kb_id, source.kb_id) AS kb_id \
                      FROM slices s JOIN files source ON source.id = s.file_id \
                      LEFT JOIN parse_artifacts pa ON pa.source_file_id = source.id \
                      LEFT JOIN files ref ON ref.artifact_id = pa.id \
@@ -488,10 +495,14 @@ impl SearchEngine {
                 }
                 last_slice_id = rows.last().map(|row| row.id).unwrap_or(last_slice_id);
                 let batch_size = rows.len() as i64;
-                let docs: Vec<tantivy_engine::Document> = rows
-                    .into_iter()
-                    .map(|row| tantivy_engine::Document::new(row.id, row.file_id, row.kb_id, row.content))
-                    .collect();
+                let mut contents = HashMap::new();
+                for source_file_id in rows.iter().map(|row| row.source_file_id).collect::<HashSet<_>>() {
+                    contents.insert(source_file_id, crate::slice_content::read_all(source_file_id).await?);
+                }
+                let docs: Vec<tantivy_engine::Document> = rows.into_iter().map(|row| tantivy_engine::Document::new(
+                    row.id, row.file_id, row.kb_id,
+                    contents.get(&row.source_file_id).and_then(|v| v.get(&row.id)).cloned().unwrap_or_default(),
+                )).collect();
                 total_slice_docs += tantivy_engine::add_documents(&mut slice_writer, &slice_schema, docs)?;
                 processed_docs += batch_size;
                 on_progress(RebuildProgress { phase: "build_slice".to_string(), total_docs, processed_docs }).await;

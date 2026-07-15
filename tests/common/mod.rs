@@ -10,7 +10,7 @@ use axum::{Router, extract::DefaultBodyLimit, middleware};
 pub use axum::{
     body::Body, http::{Request, Response, StatusCode, header}
 };
-use htknow::{api, auth, db, search::SearchEngine};
+use htknow::{api, auth, db, search::SearchEngine, slice_content};
 pub use http_body_util::BodyExt;
 pub use serde_json::Value;
 use sqlx::SqlitePool;
@@ -176,13 +176,14 @@ pub async fn insert_file(
 }
 
 pub async fn insert_slice(pool: &SqlitePool, file_id: i64, content: &str) -> i64 {
-    sqlx::query("INSERT INTO slices (file_id, content) VALUES (?, ?)")
+    let id = sqlx::query("INSERT INTO slices (file_id) VALUES (?)")
         .bind(file_id)
-        .bind(content)
         .execute(pool)
         .await
         .unwrap()
-        .last_insert_rowid()
+        .last_insert_rowid();
+    slice_content::upsert_many(file_id, &[(id, content.to_string())]).await.unwrap();
+    id
 }
 
 pub async fn insert_slice_position(pool: &SqlitePool, slice_id: i64, page_idx: i32, bbox: [i32; 4]) {

@@ -154,6 +154,7 @@ pub async fn export_knowledge_bases(
     let pdfs_dir = export_dir.join("pdfs");
     let images_dir = export_dir.join("images");
     let contents_dir = export_dir.join("contents");
+    let slice_contents_dir = export_dir.join("slice_contents");
     let tantivy_dir = export_dir.join("tantivy_index");
     let tantivy_full_dir = export_dir.join("tantivy_full_index");
     let lancedb_dir = export_dir.join("lancedb_data");
@@ -162,6 +163,7 @@ pub async fn export_knowledge_bases(
     tokio::fs::create_dir_all(&pdfs_dir).await?;
     tokio::fs::create_dir_all(&images_dir).await?;
     tokio::fs::create_dir_all(&contents_dir).await?;
+    tokio::fs::create_dir_all(&slice_contents_dir).await?;
     tokio::fs::create_dir_all(&tantivy_dir).await?;
     tokio::fs::create_dir_all(&tantivy_full_dir).await?;
     tokio::fs::create_dir_all(&lancedb_dir).await?;
@@ -182,7 +184,7 @@ pub async fn export_knowledge_bases(
         info!("Backfilled image meta for {} files before export", meta_backfilled);
     }
 
-    let file_ids = export_sqlite_data(pool, &export_pool, &target_kb_ids, &all_kb_ids).await?;
+    let file_ids = export_sqlite_data(pool, &export_pool, &target_kb_ids, &all_kb_ids, Some(&slice_contents_dir)).await?;
     info!("Exported {} files to SQLite in {}ms", file_ids.len(), step_start.elapsed().as_millis());
 
     // Re-enable foreign keys and close export pool before writing manifest
@@ -447,7 +449,7 @@ async fn init_export_schema(pool: &SqlitePool) -> anyhow::Result<()> {
 /// Export SQLite data. Returns the list of exported file IDs.
 /// `target_kb_ids` are used for data export; `all_kb_ids` includes ancestors for hierarchy preservation.
 async fn export_sqlite_data(
-    src_pool: &SqlitePool, dst_pool: &SqlitePool, target_kb_ids: &[i64], all_kb_ids: &[i64],
+    src_pool: &SqlitePool, dst_pool: &SqlitePool, target_kb_ids: &[i64], all_kb_ids: &[i64], slice_contents_dir: Option<&Path>,
 ) -> anyhow::Result<Vec<i64>> {
     let step_start = std::time::Instant::now();
 
@@ -482,7 +484,7 @@ async fn export_sqlite_data(
     }
 
     // 共享 artifact 导出必须先物化切片并生成 ID 映射，后续位置与 mention 再消费映射。
-    export_slices(src_pool, dst_pool, &file_ids).await.context("export materialized slices")?;
+    export_slices(src_pool, dst_pool, &file_ids, slice_contents_dir).await.context("export materialized slices")?;
     export_slice_positions(src_pool, dst_pool).await.context("export materialized slice positions")?;
     export_graph_nodes(src_pool, dst_pool, target_kb_ids, &file_ids).await.context("export graph nodes")?;
     export_graph_edges(src_pool, dst_pool).await.context("export graph edges")?;
@@ -751,7 +753,9 @@ where
     Ok(())
 }
 
-async fn export_slices(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &[i64]) -> anyhow::Result<()> {
+async fn export_slices(
+    src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &[i64], slice_contents_dir: Option<&Path>,
+) -> anyhow::Result<()> {
     if file_ids.is_empty() {
         return Ok(());
     }
@@ -767,7 +771,7 @@ async fn export_slices(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &
     .await?;
     for chunk in file_ids.chunks(SQLITE_BATCH_SIZE) {
         let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT f.id AS target_file_id, s.id AS source_slice_id, s.content, s.created_at, s.updated_at \
+            "SELECT f.id AS target_file_id, s.id AS source_slice_id, s.file_id AS source_file_id, s.created_at, s.updated_at \
              FROM files f LEFT JOIN parse_artifacts pa ON pa.id = f.artifact_id \
              JOIN slices s ON s.file_id = COALESCE(pa.source_file_id, f.id) WHERE f.id IN (",
         );
@@ -782,18 +786,25 @@ async fn export_slices(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &
         }
 
         let mut tx = dst_pool.begin().await?;
+        let mut exported_contents: std::collections::HashMap<i64, Vec<(i64, String)>> = std::collections::HashMap::new();
+        let mut source_contents = std::collections::HashMap::new();
         for row in rows {
             let target_file_id: i64 = row.get("target_file_id");
             let source_slice_id: i64 = row.get("source_slice_id");
+            let source_file_id: i64 = row.get("source_file_id");
+            if !source_contents.contains_key(&source_file_id) {
+                source_contents.insert(source_file_id, crate::slice_content::read_all(source_file_id).await?);
+            }
             let export_slice_id: i64 = sqlx::query_scalar(
-                "INSERT INTO slices(file_id, content, created_at, updated_at) VALUES (?, ?, ?, ?) RETURNING id",
+                "INSERT INTO slices(file_id, created_at, updated_at) VALUES (?, ?, ?) RETURNING id",
             )
             .bind(target_file_id)
-            .bind(row.get::<String, _>("content"))
             .bind(row.get::<i64, _>("created_at"))
             .bind(row.get::<i64, _>("updated_at"))
             .fetch_one(&mut *tx)
             .await?;
+            let content = source_contents.get(&source_file_id).and_then(|v| v.get(&source_slice_id)).cloned().unwrap_or_default();
+            exported_contents.entry(target_file_id).or_default().push((export_slice_id, content));
             sqlx::query(
                 "INSERT INTO export_slice_id_map(target_file_id, source_slice_id, export_slice_id) VALUES (?, ?, ?)",
             )
@@ -804,6 +815,12 @@ async fn export_slices(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &
             .await?;
         }
         tx.commit().await?;
+        if let Some(dir) = slice_contents_dir {
+            for (file_id, contents) in exported_contents {
+                let content_map: std::collections::HashMap<i64, String> = contents.into_iter().collect();
+                tokio::fs::write(dir.join(format!("{}.json", file_id)), serde_json::to_vec(&content_map)?).await?;
+            }
+        }
     }
     Ok(())
 }
@@ -1724,7 +1741,7 @@ mod tests {
         .await
         .context("insert artifact")?;
         let source_slice: i64 =
-            sqlx::query_scalar("INSERT INTO slices(file_id,content) VALUES(1,'shared slice') RETURNING id")
+            sqlx::query_scalar("INSERT INTO slices(file_id) VALUES(1) RETURNING id")
                 .fetch_one(&src)
                 .await
                 .context("insert slice")?;
@@ -1744,7 +1761,7 @@ mod tests {
             .execute(&src)
             .await?;
 
-        export_sqlite_data(&src, &dst, &[1], &[1]).await.context("export sqlite")?;
+        export_sqlite_data(&src, &dst, &[1], &[1], None).await.context("export sqlite")?;
 
         let slices: Vec<(i64, i64)> =
             sqlx::query_as("SELECT id,file_id FROM slices ORDER BY file_id").fetch_all(&dst).await?;

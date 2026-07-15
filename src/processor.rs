@@ -711,6 +711,7 @@ impl FileProcessor {
             .execute(&mut **tx)
             .await?;
         sqlx::query("DELETE FROM slices WHERE file_id = ?").bind(file_id).execute(&mut **tx).await?;
+        crate::slice_content::delete(file_id).await?;
         crate::pdf_content::delete(file_id).await?;
         if let Err(e) = crate::file_content::delete(file_id).await {
             warn!("Failed to delete content file for processing cleanup of file {}: {}", file_id, e);
@@ -2437,20 +2438,19 @@ impl FileProcessor {
             let mut tx = self.pool.begin().await?;
             let mut chunk_persisted: Vec<(i64, String)> = Vec::with_capacity(slice_chunk.len());
             let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
-            let binds_per_row = 4_usize;
+            let binds_per_row = 3_usize;
             let max_vars = 999_usize;
             let batch_size = std::cmp::max(1, max_vars / binds_per_row);
             for (insert_chunk_idx, insert_chunk) in slice_chunk.chunks(batch_size).enumerate() {
                 let insert_offset = insert_chunk_idx * batch_size;
-                let mut slice_sql =
-                    QueryBuilder::<Sqlite>::new("INSERT INTO slices (file_id, content, parse_run_id, ordinal) ");
-                slice_sql.push_values(insert_chunk.iter().enumerate(), |mut b, (idx, slice)| {
+                let mut slice_sql = QueryBuilder::<Sqlite>::new("INSERT INTO slices (file_id, parse_run_id, ordinal) ");
+                slice_sql.push_values(insert_chunk.iter().enumerate(), |mut b, (idx, _slice)| {
                     let ordinal = chunk_idx * SLICE_TX_BATCH + insert_offset + idx;
-                    b.push_bind(file_id).push_bind(&slice.content).push_bind(parse_run_id).push_bind(ordinal as i64);
+                    b.push_bind(file_id).push_bind(parse_run_id).push_bind(ordinal as i64);
                 });
                 slice_sql.push(
                     " ON CONFLICT(file_id, parse_run_id, ordinal) WHERE parse_run_id IS NOT NULL AND ordinal IS NOT NULL \
-                      DO UPDATE SET content = excluded.content, updated_at = strftime('%s','now') RETURNING id",
+                      DO UPDATE SET updated_at = strftime('%s','now') RETURNING id",
                 );
 
                 let inserted_ids: Vec<(i64,)> = slice_sql.build_query_as().fetch_all(&mut *tx).await?;
@@ -2490,6 +2490,7 @@ impl FileProcessor {
                 }
             }
             tx.commit().await?;
+            crate::slice_content::upsert_many(file_id, &chunk_persisted).await?;
             persisted.extend(chunk_persisted);
         }
         Ok(persisted)
@@ -3091,9 +3092,10 @@ impl FileProcessor {
     }
 
     async fn fetch_slice_rows(&self, file_id: i64) -> anyhow::Result<Vec<SliceRow>> {
-        let sql = "SELECT id, content FROM slices WHERE file_id = ? ORDER BY id";
-        let rows = sqlx::query_as::<_, SliceRow>(sql).bind(file_id).fetch_all(&self.pool).await?;
-        Ok(rows)
+        let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM slices WHERE file_id = ? ORDER BY id")
+            .bind(file_id).fetch_all(&self.pool).await?;
+        let contents = crate::slice_content::read_all(file_id).await?;
+        Ok(ids.into_iter().map(|id| SliceRow { id, content: contents.get(&id).cloned().unwrap_or_default() }).collect())
     }
 
     async fn fetch_slice_position_rows(&self, slice_ids: &[i64]) -> anyhow::Result<Vec<SlicePositionRecord>> {
@@ -3188,9 +3190,9 @@ impl FileProcessor {
         let batch_size = std::cmp::max(1, max_vars / binds_per_row);
         let mut cloned = Vec::with_capacity(rows.len());
         for chunk in rows.chunks(batch_size) {
-            let mut qb = QueryBuilder::<Sqlite>::new("INSERT INTO slices (file_id, content) ");
-            qb.push_values(chunk.iter(), |mut b, row| {
-                b.push_bind(target_file_id).push_bind(&row.content);
+            let mut qb = QueryBuilder::<Sqlite>::new("INSERT INTO slices (file_id) ");
+            qb.push_values(chunk.iter(), |mut b, _row| {
+                b.push_bind(target_file_id);
             });
             qb.push(" RETURNING id");
 
@@ -3207,6 +3209,10 @@ impl FileProcessor {
             }
         }
 
+        crate::slice_content::upsert_many(
+            target_file_id,
+            &cloned.iter().map(|row| (row.new_id, row.content.clone())).collect::<Vec<_>>(),
+        ).await?;
         Ok(cloned)
     }
 
@@ -3373,8 +3379,8 @@ impl FileProcessor {
 
         // 2. 获取文件的所有切片
         let source_file_id = effective_parse_file_id(&self.pool, file.id).await?;
-        let slices_sql = "SELECT id, content FROM slices WHERE file_id = ? ORDER BY id";
-        let slices: Vec<(i64, String)> = sqlx::query_as(slices_sql).bind(source_file_id).fetch_all(&self.pool).await?;
+        let slices = self.fetch_slice_rows(source_file_id).await?
+            .into_iter().map(|row| (row.id, row.content)).collect::<Vec<_>>();
 
         if slices.is_empty() {
             debug!("No slices found for file {}, skipping graph building", file.id);
