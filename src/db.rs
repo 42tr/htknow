@@ -75,6 +75,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     create_tables(&pool).await?;
     run_schema_migrations(&pool).await?;
     ensure_file_content_externalized(&pool).await?;
+    ensure_slice_content_externalized(&pool).await?;
     ensure_kb_type_column(&pool).await?;
     ensure_parse_priority_column(&pool).await?;
     ensure_file_parse_priority_column(&pool).await?;
@@ -496,6 +497,30 @@ async fn ensure_file_content_externalized(pool: &SqlitePool) -> anyhow::Result<(
     sqlx::query("ALTER TABLE files DROP COLUMN content").execute(pool).await?;
 
     info!("`files.content` migration completed, {} files migrated", migrated);
+    Ok(())
+}
+
+/// 将旧版 `slices.content` 聚合迁移到每个源文件一个 JSON 内容包后删除大文本列。
+async fn ensure_slice_content_externalized(pool: &SqlitePool) -> anyhow::Result<()> {
+    let columns = sqlx::query("PRAGMA table_info(slices)").fetch_all(pool).await?;
+    if !columns.iter().any(|row| row.get::<String, _>("name") == "content") { return Ok(()); }
+    info!("Detected legacy `slices.content` column, migrating to slice content files...");
+    const BATCH: i64 = 100;
+    let mut last_file_id = 0_i64;
+    loop {
+        let file_ids: Vec<i64> = sqlx::query_scalar(
+            "SELECT DISTINCT file_id FROM slices WHERE file_id > ? ORDER BY file_id LIMIT ?",
+        ).bind(last_file_id).bind(BATCH).fetch_all(pool).await?;
+        if file_ids.is_empty() { break; }
+        for file_id in &file_ids {
+            let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, content FROM slices WHERE file_id = ?")
+                .bind(file_id).fetch_all(pool).await?;
+            crate::slice_content::write_all(*file_id, &rows.into_iter().collect()).await?;
+        }
+        last_file_id = *file_ids.last().unwrap();
+    }
+    sqlx::query("ALTER TABLE slices DROP COLUMN content").execute(pool).await?;
+    info!("`slices.content` migration completed");
     Ok(())
 }
 

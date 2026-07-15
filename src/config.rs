@@ -144,6 +144,8 @@ pub struct StorageConfig {
     pub archives_path: String,
     /// 文件解析后完整文本的保存路径
     pub contents_path: String,
+    /// 文件切片正文（按源文件聚合）的保存路径
+    pub slice_contents_path: String,
 }
 
 /// 搜索配置
@@ -288,6 +290,7 @@ impl StorageConfig {
             files_path: env_or("HTKNOW_FILES_PATH", &format!("{}/files", data_dir)),
             archives_path: env_or("HTKNOW_ARCHIVES_PATH", &format!("{}/archives", data_dir)),
             contents_path: env_or("HTKNOW_CONTENTS_PATH", &format!("{}/contents", data_dir)),
+            slice_contents_path: env_or("HTKNOW_SLICE_CONTENTS_PATH", &format!("{}/slice_contents", data_dir)),
         }
     }
 }

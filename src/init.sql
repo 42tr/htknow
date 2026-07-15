@@ -38,7 +38,6 @@ CREATE TABLE IF NOT EXISTS knowledge_bases (
 CREATE TABLE IF NOT EXISTS slices (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id INTEGER NOT NULL, -- 文件ID
-    content TEXT NOT NULL, -- 切片内容
     parse_run_id TEXT DEFAULT NULL, -- 生成该切片的解析批次；历史数据为空
     ordinal INTEGER DEFAULT NULL, -- 切片在本次解析中的稳定顺序
     created_at INTEGER DEFAULT (strftime('%s','now')),

@@ -941,6 +941,9 @@ pub async fn update(
         if let Err(e) = crate::pdf_content::delete(id).await {
             warn!("Failed to delete PDF content file for updated file {}: {}", id, e);
         }
+        if let Err(e) = crate::slice_content::delete(id).await {
+            warn!("Failed to delete slice content file for updated file {}: {}", id, e);
+        }
     } else {
         qb.build().execute(&pool).await?;
     }
@@ -1048,6 +1051,9 @@ pub async fn move_to_kb(
     }
     if let Err(e) = crate::pdf_content::delete(id).await {
         warn!("Failed to delete PDF content file after file move for file {}: {}", id, e);
+    }
+    if let Err(e) = crate::slice_content::delete(id).await {
+        warn!("Failed to delete slice content file after file move for file {}: {}", id, e);
     }
 
     let moved: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
@@ -1448,6 +1454,9 @@ async fn execute_reparse_failed(
         if let Err(e) = crate::pdf_content::delete(*file_id).await {
             warn!("Failed to delete PDF content file for reparse-failed file {}: {}", file_id, e);
         }
+        if let Err(e) = crate::slice_content::delete(*file_id).await {
+            warn!("Failed to delete slice content file for reparse-failed file {}: {}", file_id, e);
+        }
     }
 
     Ok(ReparseFailedFilesResp { file_count: updated })
@@ -1510,6 +1519,14 @@ pub(crate) async fn cleanup_deleted_files(
                     stage: "pdf_content".to_string(),
                     error: e.to_string(),
                 });
+            }
+
+            let slice_content_path = std::path::Path::new(&cfg.storage.slice_contents_path).join(format!("{}.json", file.id));
+            if let Err(e) = fs::remove_file(&slice_content_path).await
+                && !matches!(e.kind(), std::io::ErrorKind::NotFound)
+            {
+                warn!("Failed to delete slice content file {}: {}", slice_content_path.display(), e);
+                failed.push(BatchDeleteCleanupFailedItem { id: file.id, stage: "slice_content".to_string(), error: e.to_string() });
             }
 
             // 清理压缩文件解压目录
@@ -1859,15 +1876,20 @@ async fn extract_slice_image_paths_by_file(
     }
 
     for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
-        let mut qb = QueryBuilder::<Sqlite>::new("SELECT file_id, content FROM slices WHERE file_id IN (");
+        let mut qb = QueryBuilder::<Sqlite>::new("SELECT DISTINCT file_id FROM slices WHERE file_id IN (");
         crate::db::push_i64_list(&mut qb, chunk);
         qb.push(")");
-        let rows: Vec<(i64, String)> = qb.build_query_as().fetch_all(pool).await?;
-        for (file_id, content) in rows {
+        let rows: Vec<i64> = qb.build_query_scalar().fetch_all(pool).await?;
+        for file_id in rows {
+            let contents = crate::slice_content::read_all(file_id)
+                .await
+                .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
             let file_seen = seen.entry(file_id).or_default();
-            for path in extract_image_paths_from_text(&content) {
-                if file_seen.insert(path.clone()) {
-                    result.entry(file_id).or_default().push(path);
+            for content in contents.values() {
+                for path in extract_image_paths_from_text(content) {
+                    if file_seen.insert(path.clone()) {
+                        result.entry(file_id).or_default().push(path);
+                    }
                 }
             }
         }
@@ -2185,13 +2207,13 @@ struct SlicePositionRow {
 )]
 pub async fn get_slices(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> ApiResult<Json<Vec<Slice>>> {
     let source_id = effective_parse_file_id(&pool, id).await?;
-    let slices: Vec<Slice> = sqlx::query_as(
-        "SELECT id, ? AS file_id, content, created_at, updated_at FROM slices WHERE file_id = ? ORDER BY id",
-    )
-    .bind(id)
-    .bind(source_id)
-    .fetch_all(&pool)
-    .await?;
+    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
+        "SELECT id, created_at, updated_at FROM slices WHERE file_id = ? ORDER BY id",
+    ).bind(source_id).fetch_all(&pool).await?;
+    let contents = crate::slice_content::read_all(source_id).await?;
+    let slices = rows.into_iter().map(|(slice_id, created_at, updated_at)| Slice {
+        id: slice_id, file_id: id, content: contents.get(&slice_id).cloned().unwrap_or_default(), created_at, updated_at,
+    }).collect();
     Ok(Json(slices))
 }
 
@@ -2263,11 +2285,11 @@ pub async fn update_slices(
 
     // 4. 校验 slice id 存在且属于该文件
     let requested_ids: Vec<i64> = req.slices.iter().map(|s| s.id).collect();
-    let existing_slices: Vec<(i64, String)> =
-        sqlx::query_as("SELECT id, content FROM slices WHERE file_id = ? ORDER BY id")
-            .bind(id)
-            .fetch_all(&pool)
-            .await?;
+    let existing_ids_ordered: Vec<i64> = sqlx::query_scalar("SELECT id FROM slices WHERE file_id = ? ORDER BY id")
+        .bind(id).fetch_all(&pool).await?;
+    let existing_contents = crate::slice_content::read_all(id).await?;
+    let existing_slices: Vec<(i64, String)> = existing_ids_ordered.iter()
+        .map(|slice_id| (*slice_id, existing_contents.get(slice_id).cloned().unwrap_or_default())).collect();
     let existing_ids: std::collections::HashSet<i64> = existing_slices.iter().map(|(id, _)| *id).collect();
 
     for item in &req.slices {
@@ -2280,38 +2302,18 @@ pub async fn update_slices(
     let mut content_map: std::collections::HashMap<i64, String> =
         req.slices.into_iter().map(|s| (s.id, s.content)).collect();
 
-    // 6. SQLite 事务：批量更新 slices 并同步 content 文件
+    // 6. 正文包使用原子 rename 更新，数据库只更新时间戳。
     let mut tx = pool.begin().await?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 
+    let changed: Vec<(i64, String)> = requested_ids.iter()
+        .map(|slice_id| (*slice_id, content_map.get(slice_id).cloned().unwrap_or_default())).collect();
+    crate::slice_content::upsert_many(id, &changed).await?;
     if !requested_ids.is_empty() {
-        // SQLite 变量上限约 999；每对 id/content 占 2 个变量，再留 updated_at + id IN + file_id。
-        let max_pairs = 450;
-        for chunk in requested_ids.chunks(max_pairs) {
-            let mut sql = String::from("UPDATE slices SET content = CASE id ");
-            for _ in chunk {
-                sql.push_str("WHEN ? THEN ? ");
-            }
-            sql.push_str("END, updated_at = ? WHERE id IN (");
-            for (i, _) in chunk.iter().enumerate() {
-                if i > 0 {
-                    sql.push(',');
-                }
-                sql.push('?');
-            }
-            sql.push_str(") AND file_id = ?");
-
-            let mut q = sqlx::query(&sql);
-            for item_id in chunk {
-                q = q.bind(item_id).bind(content_map.get(item_id).unwrap());
-            }
-            q = q.bind(now);
-            for item_id in chunk {
-                q = q.bind(item_id);
-            }
-            q = q.bind(id);
-            q.execute(&mut *tx).await?;
-        }
+        let mut qb = QueryBuilder::<Sqlite>::new("UPDATE slices SET updated_at = ");
+        qb.push_bind(now).push(" WHERE file_id = ").push_bind(id).push(" AND id IN (");
+        crate::db::push_i64_list(&mut qb, &requested_ids); qb.push(")");
+        qb.build().execute(&mut *tx).await?;
     }
 
     // 重新拼接完整内容：使用最新切片内容
@@ -2344,9 +2346,7 @@ pub async fn update_slices(
     }
 
     // 8. 返回更新后的切片列表
-    let slices: Vec<Slice> =
-        sqlx::query_as("SELECT * FROM slices WHERE file_id = ? ORDER BY id").bind(id).fetch_all(&pool).await?;
-    Ok(Json(slices))
+    get_slices(State(pool), Path(id)).await
 }
 
 /// 获取单个切片的高亮位置信息
