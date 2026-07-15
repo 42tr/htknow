@@ -1116,8 +1116,8 @@ async fn export_entity_mentions(src_pool: &SqlitePool, dst_pool: &SqlitePool) ->
                         .and_then(|file_id| entries.iter().find(|(target, _)| *target == file_id).map(|(_, id)| *id))
                         .or_else(|| entries.first().map(|(_, id)| *id))
                 });
-                if let Some(mapped_slice_id) = mapped_slice_id {
-                    Some((
+                mapped_slice_id.map(|mapped_slice_id| {
+                    (
                         row.get::<i64, _>("id"),
                         row.get::<i64, _>("node_id"),
                         mapped_slice_id,
@@ -1125,10 +1125,8 @@ async fn export_entity_mentions(src_pool: &SqlitePool, dst_pool: &SqlitePool) ->
                         row.get::<Option<i64>, _>("end_offset"),
                         row.get::<Option<String>, _>("context"),
                         row.get::<i64, _>("created_at"),
-                    ))
-                } else {
-                    None
-                }
+                    )
+                })
             })
             .collect();
 

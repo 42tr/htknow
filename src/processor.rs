@@ -3044,10 +3044,10 @@ impl FileProcessor {
             }
         }
         let mut source_for_reindex = source.clone();
-        if !combined_image_mapping.is_empty() {
-            if let Some(content) = crate::file_content::read(source.id).await? {
-                source_for_reindex.content = Some(Self::rewrite_custom_image_refs(&content, &combined_image_mapping));
-            }
+        if !combined_image_mapping.is_empty()
+            && let Some(content) = crate::file_content::read(source.id).await?
+        {
+            source_for_reindex.content = Some(Self::rewrite_custom_image_refs(&content, &combined_image_mapping));
         }
 
         let mut tx = self.pool.begin().await?;
