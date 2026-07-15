@@ -72,7 +72,7 @@ fn stream_from_std_file(mut file: std::fs::File) -> Result<(u64, Body), ApiError
 ///
 /// 列表类查询不需要全文 content，用此清单避免把可能很大的文本从 SQLite/文件系统读进内存。
 pub(crate) const FILE_COLS_NO_CONTENT: &str = "id, user_id, user_name, hash, filename, path, size, NULL as content, \
-     tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at";
+     tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at, artifact_id";
 
 /// Excel 单 sheet 数据
 #[derive(Debug, Serialize, ToSchema)]
@@ -134,6 +134,10 @@ pub struct File {
     pub meta: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+    /// 共享解析产物内部引用，不作为对外 API 字段返回。
+    #[serde(skip)]
+    #[sqlx(default)]
+    pub artifact_id: Option<i64>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, ToSchema)]
@@ -1232,7 +1236,36 @@ async fn clear_file_parse_rows_for_ids_in_tx(
 pub(crate) async fn delete_file_rows_in_tx(
     tx: &mut sqlx::Transaction<'_, Sqlite>, file_ids: &[i64],
 ) -> Result<(), sqlx::Error> {
+    if !file_ids.is_empty() {
+        // 先取得 SQLite 写锁，避免 deferred transaction 在并发读后升级写锁时返回 SQLITE_BUSY。
+        let mut lock_qb = QueryBuilder::<Sqlite>::new("UPDATE files SET updated_at = updated_at WHERE id IN (");
+        crate::db::push_i64_list(&mut lock_qb, file_ids);
+        lock_qb.push(")");
+        lock_qb.build().execute(&mut **tx).await?;
+
+        let mut refs_qb = QueryBuilder::<Sqlite>::new(
+            "SELECT COUNT(*) FROM parse_artifacts pa JOIN files ref ON ref.artifact_id = pa.id \
+             WHERE pa.source_file_id IN (",
+        );
+        crate::db::push_i64_list(&mut refs_qb, file_ids);
+        refs_qb.push(") AND ref.id NOT IN (");
+        crate::db::push_i64_list(&mut refs_qb, file_ids);
+        refs_qb.push(")");
+        let external_refs: i64 = refs_qb.build_query_scalar().fetch_one(&mut **tx).await?;
+        if external_refs > 0 {
+            return Err(sqlx::Error::Protocol(
+                "cannot delete a parse artifact source while other files still reference it".to_string(),
+            ));
+        }
+    }
     clear_file_parse_rows_for_ids_in_tx(tx, file_ids).await?;
+
+    for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
+        let mut artifacts_qb = QueryBuilder::<Sqlite>::new("DELETE FROM parse_artifacts WHERE source_file_id IN (");
+        crate::db::push_i64_list(&mut artifacts_qb, chunk);
+        artifacts_qb.push(")");
+        artifacts_qb.build().execute(&mut **tx).await?;
+    }
 
     for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
         let mut files_qb = QueryBuilder::<Sqlite>::new("DELETE FROM files WHERE id IN (");
@@ -1400,7 +1433,7 @@ async fn execute_reparse_failed(
     clear_file_parse_rows_for_ids_in_tx(&mut tx, &file_ids).await?;
 
     let mut qb = QueryBuilder::<Sqlite>::new(
-        "UPDATE files SET status = 0, log = '', updated_at = strftime('%s','now') WHERE status = -1 AND id IN (",
+        "UPDATE files SET status = 0, parse_run_id = NULL, log = '', updated_at = strftime('%s','now') WHERE status = -1 AND id IN (",
     );
     crate::db::push_i64_list(&mut qb, &file_ids);
     qb.push(")");
@@ -1901,6 +1934,18 @@ pub(crate) async fn find_reusable_parsed_file(
     query.fetch_optional(pool).await
 }
 
+pub(crate) async fn effective_parse_file_id(pool: &SqlitePool, file_id: i64) -> Result<i64, sqlx::Error> {
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE(pa.source_file_id, f.id)
+         FROM files f LEFT JOIN parse_artifacts pa ON pa.id = f.artifact_id
+         WHERE f.id = ?",
+    )
+    .bind(file_id)
+    .fetch_optional(pool)
+    .await?
+    .unwrap_or(file_id))
+}
+
 pub(crate) async fn remove_image_files(image_paths: Vec<String>) {
     info!("Removing image files: {:?}", image_paths);
     if image_paths.is_empty() {
@@ -2134,8 +2179,14 @@ struct PageBBoxRow {
     )
 )]
 pub async fn get_slices(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> ApiResult<Json<Vec<Slice>>> {
-    let slices: Vec<Slice> =
-        sqlx::query_as("SELECT * FROM slices WHERE file_id = ? ORDER BY id").bind(id).fetch_all(&pool).await?;
+    let source_id = effective_parse_file_id(&pool, id).await?;
+    let slices: Vec<Slice> = sqlx::query_as(
+        "SELECT id, ? AS file_id, content, created_at, updated_at FROM slices WHERE file_id = ? ORDER BY id",
+    )
+    .bind(id)
+    .bind(source_id)
+    .fetch_all(&pool)
+    .await?;
     Ok(Json(slices))
 }
 
@@ -2191,6 +2242,11 @@ pub async fn update_slices(
     // 2. 校验文件状态
     if file.status != 1 {
         return Err(ApiError::BadRequest("File is not processed".to_string()));
+    }
+    if file.artifact_id.is_some() && effective_parse_file_id(&pool, id).await? != id {
+        return Err(ApiError::BadRequest(
+            "Shared parsed slices are read-only; detach the artifact before editing".to_string(),
+        ));
     }
 
     // 3. 校验 content 非空
@@ -2318,11 +2374,12 @@ pub async fn get_slice_highlight(
 
     ensure_file_readable(&file, &auth_user)?;
 
+    let parse_file_id = effective_parse_file_id(&pool, id).await?;
     let slice: Option<(i64,)> =
         sqlx::query_as("SELECT file_id FROM slices WHERE id = ?").bind(slice_id).fetch_optional(&pool).await?;
 
     match slice {
-        Some((file_id,)) if file_id == id => {}
+        Some((file_id,)) if file_id == parse_file_id => {}
         Some(_) => return Err(ApiError::BadRequest("Slice does not belong to the file".to_string())),
         None => return Err(ApiError::NotFound("Slice not found".to_string())),
     }
@@ -2380,11 +2437,12 @@ pub async fn get_slice_highlight_page(
 
     ensure_file_readable(&file, &auth_user)?;
 
+    let parse_file_id = effective_parse_file_id(&pool, id).await?;
     let slice: Option<(i64,)> =
         sqlx::query_as("SELECT file_id FROM slices WHERE id = ?").bind(slice_id).fetch_optional(&pool).await?;
 
     match slice {
-        Some((file_id,)) if file_id == id => {}
+        Some((file_id,)) if file_id == parse_file_id => {}
         Some(_) => return Err(ApiError::BadRequest("Slice does not belong to the file".to_string())),
         None => return Err(ApiError::NotFound("Slice not found".to_string())),
     }
@@ -2469,7 +2527,6 @@ pub async fn download(
         .await?;
 
     ensure_file_readable(&file, &auth_user)?;
-
     let (len, body) = open_file_stream(std::path::Path::new(&file.path)).await?;
     let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().to_string();
     let content_disposition = format!("attachment; filename=\"{}\"", file.filename);
@@ -2523,10 +2580,11 @@ pub async fn get_highlighted_pdf(
     ensure_file_readable(&file, &auth_user)?;
 
     // 校验切片属于该文件
+    let parse_file_id = effective_parse_file_id(&pool, id).await?;
     let slice: Option<(i64,)> =
         sqlx::query_as("SELECT file_id FROM slices WHERE id = ?").bind(params.slice_id).fetch_optional(&pool).await?;
     match slice {
-        Some((file_id,)) if file_id == id => {}
+        Some((file_id,)) if file_id == parse_file_id => {}
         Some(_) => return Err(ApiError::BadRequest("Slice does not belong to the file".to_string())),
         None => return Err(ApiError::NotFound("Slice not found".to_string())),
     }
@@ -2550,7 +2608,7 @@ pub async fn get_highlighted_pdf(
         let rows: Vec<PageBBoxRow> = sqlx::query_as(
             "SELECT page_idx, bbox FROM pdf_contents WHERE file_id = ? AND bbox IS NOT NULL AND bbox != ''",
         )
-        .bind(file.id)
+        .bind(parse_file_id)
         .fetch_all(&pool)
         .await?;
 
@@ -2602,7 +2660,7 @@ pub async fn get_highlighted_pdf(
         || filename_lower.ends_with(".xlsx")
     {
         let cfg = config::get();
-        let path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", file.id));
+        let path = std::path::Path::new(&cfg.storage.pdf_path).join(format!("{}.pdf", parse_file_id));
         if !tokio::fs::try_exists(&path).await? {
             return Err(ApiError::NotFound("Converted PDF not found".to_string()));
         }

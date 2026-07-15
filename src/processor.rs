@@ -18,7 +18,7 @@ use tokio::{
 
 use crate::{
     api::{
-        FILE_COLS_NO_CONTENT, File, collect_image_paths_for_files, collect_image_raw_paths_for_files, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta
+        FILE_COLS_NO_CONTENT, File, collect_image_paths_for_files, collect_image_raw_paths_for_files, effective_parse_file_id, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta
     }, archive, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, SearchEngine, tantivy_engine}
 };
 
@@ -80,6 +80,16 @@ struct Result {
 type PdfContentDbRow = (i32, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>);
 #[allow(clippy::type_complexity)]
 type RawImageJobs = (Vec<(String, String)>, HashMap<String, String>, Vec<String>);
+
+async fn claim_pending_file_by_id(pool: &SqlitePool, file_id: i64) -> anyhow::Result<Option<File>> {
+    let sql = format!(
+        "UPDATE files
+         SET status = 2, parse_run_id = lower(hex(randomblob(16))), updated_at = strftime('%s','now')
+         WHERE id = ? AND status = 0
+         RETURNING {FILE_COLS_NO_CONTENT}"
+    );
+    Ok(sqlx::query_as::<_, File>(&sql).bind(file_id).fetch_optional(pool).await?)
+}
 
 /// MinerU API 返回的结果结构
 #[derive(Debug, Deserialize)]
@@ -478,6 +488,66 @@ pub fn is_parse_paused() -> bool {
 }
 
 impl FileProcessor {
+    fn artifact_key(file: &File) -> String {
+        let cfg = config::get();
+        format!(
+            "{}:{}:builtin-v1:{}:{}",
+            file.hash, file.slice_type, cfg.slice.smart_slice_max_chars, cfg.slice.fixed_slice_overlap_chars
+        )
+    }
+
+    async fn ensure_parse_artifact(&self, file: &File, full_content: &str) -> anyhow::Result<i64> {
+        let key = Self::artifact_key(file);
+        let cfg = config::get();
+        let config_hash = format!("{}:{}", cfg.slice.smart_slice_max_chars, cfg.slice.fixed_slice_overlap_chars);
+        sqlx::query(
+            "INSERT OR IGNORE INTO parse_artifacts
+             (artifact_key, content_hash, slice_type, parser_version, config_hash, source_file_id, full_content)
+             VALUES (?, ?, ?, 'builtin-v1', ?, ?, ?)",
+        )
+        .bind(&key)
+        .bind(&file.hash)
+        .bind(&file.slice_type)
+        .bind(config_hash)
+        .bind(file.id)
+        .bind(full_content)
+        .execute(&self.pool)
+        .await?;
+        let artifact_id: i64 = sqlx::query_scalar("SELECT id FROM parse_artifacts WHERE artifact_key = ?")
+            .bind(key)
+            .fetch_one(&self.pool)
+            .await?;
+        sqlx::query("UPDATE files SET artifact_id = ? WHERE id = ?")
+            .bind(artifact_id)
+            .bind(file.id)
+            .execute(&self.pool)
+            .await?;
+        Ok(artifact_id)
+    }
+
+    async fn adopt_existing_artifact_if_needed(
+        &self, file: &File, artifact_id: i64, full_content: &str,
+    ) -> anyhow::Result<()> {
+        let source_file_id: i64 = sqlx::query_scalar("SELECT source_file_id FROM parse_artifacts WHERE id = ?")
+            .bind(artifact_id)
+            .fetch_one(&self.pool)
+            .await?;
+        if source_file_id == file.id {
+            return Ok(());
+        }
+
+        // 两个相同内容的文件并发完成时，artifact 唯一键只允许一个源文件。
+        // 丢弃当前批次的重复持久化数据，并把搜索投影切换到共享源切片。
+        self.cleanup_processing_file_data_with_retry(file.id, 3).await?;
+        let rows = self.fetch_slice_rows(source_file_id).await?;
+        let shared: Vec<ClonedSlice> =
+            rows.into_iter().map(|row| ClonedSlice { old_id: row.id, new_id: row.id, content: row.content }).collect();
+        let mut source = file.clone();
+        source.id = source_file_id;
+        source.content = Some(full_content.to_string());
+        self.reindex_cloned_slices(file, &shared, &source).await?;
+        Ok(())
+    }
     /// 创建新的文件处理器
     ///
     /// # Arguments
@@ -577,7 +647,9 @@ impl FileProcessor {
         let mut tx = self.pool.begin().await?;
 
         self.delete_processing_file_data(&mut tx, file_id).await?;
-        sqlx::query("UPDATE files SET status = 0, log = '', updated_at = strftime('%s','now') WHERE id = ?")
+        sqlx::query(
+            "UPDATE files SET status = 0, parse_run_id = NULL, log = '', updated_at = strftime('%s','now') WHERE id = ?",
+        )
             .bind(file_id)
             .execute(&mut *tx)
             .await?;
@@ -724,7 +796,7 @@ impl FileProcessor {
     async fn claim_next_pending_file(&self) -> anyhow::Result<Option<File>> {
         let sql = format!(
             "UPDATE files
-             SET status = 2, updated_at = strftime('%s','now')
+             SET status = 2, parse_run_id = lower(hex(randomblob(16))), updated_at = strftime('%s','now')
              WHERE id = (
                  SELECT id
                  FROM files
@@ -737,6 +809,12 @@ impl FileProcessor {
         );
         let file = sqlx::query_as::<_, File>(&sql).fetch_optional(&self.pool).await?;
         Ok(file)
+    }
+
+    /// 所有指定文件的即时解析也必须经过同一个 compare-and-set 领取入口。
+    /// 返回 `None` 表示该文件已经被后台 worker 或另一个请求领取。
+    async fn claim_file_by_id(&self, file_id: i64) -> anyhow::Result<Option<File>> {
+        claim_pending_file_by_id(&self.pool, file_id).await
     }
 
     async fn try_reuse_existing_data(&self, file: &File) -> anyhow::Result<bool> {
@@ -758,7 +836,7 @@ impl FileProcessor {
                 if let Err(clean_err) = self.cleanup_processing_file_data_with_retry(file.id, 3).await {
                     warn!("Failed to cleanup file {} after reuse error: {}", file.id, clean_err);
                 }
-                sqlx::query("UPDATE files SET status = 0, log = ?, updated_at = strftime('%s','now') WHERE id = ?")
+                sqlx::query("UPDATE files SET log = ?, updated_at = strftime('%s','now') WHERE id = ? AND status = 2")
                     .bind(format!("Reuse failed: {}", err))
                     .bind(file.id)
                     .execute(&self.pool)
@@ -768,17 +846,12 @@ impl FileProcessor {
         }
     }
 
-    /// 处理单个文件
-    async fn process_file(&self, file: &File) -> anyhow::Result<()> {
-        self.process_file_inner(file, false, false).await
-    }
-
     async fn process_file_claimed(&self, file: &File) -> anyhow::Result<()> {
         self.process_file_inner(file, true, false).await
     }
 
-    async fn process_file_skip_reuse(&self, file: &File) -> anyhow::Result<()> {
-        self.process_file_inner(file, false, true).await
+    async fn process_file_claimed_skip_reuse(&self, file: &File) -> anyhow::Result<()> {
+        self.process_file_inner(file, true, true).await
     }
 
     async fn process_file_inner(&self, file: &File, already_claimed: bool, skip_reuse: bool) -> anyhow::Result<()> {
@@ -906,7 +979,7 @@ impl FileProcessor {
                 timing
                     .step("mark_archive_skipped", async {
                         let sql =
-                            "UPDATE files SET status = 3, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
+                            "UPDATE files SET status = 3, parse_run_id = NULL, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
                         sqlx::query(sql).bind("Archive file: not parsed").bind(file.id).execute(&self.pool).await?;
                         Ok(())
                     })
@@ -1529,7 +1602,7 @@ impl FileProcessor {
 
         if slices.is_empty() {
             timed_step_opt(timing.as_deref_mut(), "finalize_empty_excel", async {
-                let sql = "UPDATE files SET status = 1, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
+                let sql = "UPDATE files SET status = 1, parse_run_id = NULL, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
                 sqlx::query(sql).bind("Excel processed successfully (empty)").bind(file.id).execute(&self.pool).await?;
                 crate::file_content::delete(file.id).await?;
                 Ok(())
@@ -2331,13 +2404,14 @@ impl FileProcessor {
 
     /// 标记文件处理失败
     async fn mark_file_failed(&self, file_id: i64, error_msg: &str) -> anyhow::Result<()> {
-        let sql = "UPDATE files SET status = -1, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
+        let sql = "UPDATE files SET status = -1, parse_run_id = NULL, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
         sqlx::query(sql).bind(error_msg).bind(file_id).execute(&self.pool).await?;
         Ok(())
     }
 
     async fn mark_file_storage_skipped(&self, file_id: i64) -> anyhow::Result<()> {
-        let sql = "UPDATE files SET status = 3, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
+        let sql =
+            "UPDATE files SET status = 3, parse_run_id = NULL, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
         sqlx::query(sql).bind("Storage mode: not parsed").bind(file_id).execute(&self.pool).await?;
         Ok(())
     }
@@ -2359,8 +2433,15 @@ impl FileProcessor {
             slice_count
         );
 
+        let parse_run_id: String = sqlx::query_scalar(
+            "SELECT parse_run_id FROM files WHERE id = ? AND status = 2 AND parse_run_id IS NOT NULL",
+        )
+        .bind(file.id)
+        .fetch_one(&self.pool)
+        .await?;
+
         let (search_docs, search_embeddings) = timed_step_opt(timing.as_deref_mut(), "insert_slices", async {
-            let persisted = self.insert_slices_and_positions(file.id, slices).await?;
+            let persisted = self.insert_slices_and_positions(file.id, &parse_run_id, slices).await?;
             let mut docs = Vec::with_capacity(persisted.len());
             let mut embs = Vec::with_capacity(persisted.len());
             for (idx, (id, content)) in persisted.into_iter().enumerate() {
@@ -2395,9 +2476,23 @@ impl FileProcessor {
         if !self.ensure_file_exists(file.id, "before updating status").await? {
             return Ok(());
         }
+        timed_step_opt(timing.as_deref_mut(), "publish_parse_artifact", async {
+            let artifact_id = self.ensure_parse_artifact(file, full_content).await?;
+            self.adopt_existing_artifact_if_needed(file, artifact_id, full_content).await?;
+            Ok(())
+        })
+        .await?;
         timed_step_opt(timing.as_deref_mut(), "finalize_file_status", async {
-            let sql = "UPDATE files SET status = 1, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
-            sqlx::query(sql).bind(log_message).bind(file.id).execute(&self.pool).await?;
+            let sql = "UPDATE files SET status = 1, parse_run_id = NULL, log = ?, updated_at = strftime('%s','now') \
+                       WHERE id = ? AND status = 2 AND parse_run_id = ?";
+            let updated = sqlx::query(sql)
+                .bind(log_message)
+                .bind(file.id)
+                .bind(&parse_run_id)
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+            anyhow::ensure!(updated == 1, "parse run for file {} is no longer current", file.id);
             crate::file_content::write(file.id, full_content).await?;
             Ok(())
         })
@@ -2418,7 +2513,7 @@ impl FileProcessor {
 
     /// 返回每个 slice 的 (id, content) 供后续构建搜索文档使用。
     async fn insert_slices_and_positions(
-        &self, file_id: i64, slices: Vec<SliceWithPositions>,
+        &self, file_id: i64, parse_run_id: &str, slices: Vec<SliceWithPositions>,
     ) -> anyhow::Result<Vec<(i64, String)>> {
         if slices.is_empty() {
             return Ok(Vec::new());
@@ -2426,19 +2521,25 @@ impl FileProcessor {
         // 每批最多 500 条 slice 一个事务，避免长时间持有 SQLite 写锁阻塞其他写操作
         const SLICE_TX_BATCH: usize = 500;
         let mut persisted: Vec<(i64, String)> = Vec::with_capacity(slices.len());
-        for slice_chunk in slices.chunks(SLICE_TX_BATCH) {
+        for (chunk_idx, slice_chunk) in slices.chunks(SLICE_TX_BATCH).enumerate() {
             let mut tx = self.pool.begin().await?;
             let mut chunk_persisted: Vec<(i64, String)> = Vec::with_capacity(slice_chunk.len());
             let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
-            let binds_per_row = 2_usize;
+            let binds_per_row = 4_usize;
             let max_vars = 999_usize;
             let batch_size = std::cmp::max(1, max_vars / binds_per_row);
-            for insert_chunk in slice_chunk.chunks(batch_size) {
-                let mut slice_sql = QueryBuilder::<Sqlite>::new("INSERT INTO slices (file_id, content) ");
-                slice_sql.push_values(insert_chunk.iter(), |mut b, slice| {
-                    b.push_bind(file_id).push_bind(&slice.content);
+            for (insert_chunk_idx, insert_chunk) in slice_chunk.chunks(batch_size).enumerate() {
+                let insert_offset = insert_chunk_idx * batch_size;
+                let mut slice_sql =
+                    QueryBuilder::<Sqlite>::new("INSERT INTO slices (file_id, content, parse_run_id, ordinal) ");
+                slice_sql.push_values(insert_chunk.iter().enumerate(), |mut b, (idx, slice)| {
+                    let ordinal = chunk_idx * SLICE_TX_BATCH + insert_offset + idx;
+                    b.push_bind(file_id).push_bind(&slice.content).push_bind(parse_run_id).push_bind(ordinal as i64);
                 });
-                slice_sql.push(" RETURNING id");
+                slice_sql.push(
+                    " ON CONFLICT(file_id, parse_run_id, ordinal) WHERE parse_run_id IS NOT NULL AND ordinal IS NOT NULL \
+                      DO UPDATE SET content = excluded.content, updated_at = strftime('%s','now') RETURNING id",
+                );
 
                 let inserted_ids: Vec<(i64,)> = slice_sql.build_query_as().fetch_all(&mut *tx).await?;
                 anyhow::ensure!(
@@ -2952,6 +3053,54 @@ impl FileProcessor {
             anyhow::bail!("Source file {} is not processed", source.id);
         }
 
+        // 新结构只复制搜索投影，SQLite 中的切片/PDF 解析结果由 artifact 共享。
+        if config::get().server.reuse_duplicate_files {
+            let source_file_id = effective_parse_file_id(&self.pool, source.id).await?;
+            let mut source_for_reindex = source.clone();
+            let full_content = if let Some(artifact_id) = source.artifact_id {
+                sqlx::query_scalar::<_, Option<String>>("SELECT full_content FROM parse_artifacts WHERE id = ?")
+                    .bind(artifact_id)
+                    .fetch_optional(&self.pool)
+                    .await?
+                    .flatten()
+                    .unwrap_or_default()
+            } else {
+                crate::file_content::read(source_file_id).await?.unwrap_or_default()
+            };
+            source_for_reindex.content = Some(full_content.clone());
+            let artifact_id = self.ensure_parse_artifact(&source_for_reindex, &full_content).await?;
+            let rows = self.fetch_slice_rows(source_file_id).await?;
+            let shared_slices: Vec<ClonedSlice> = rows
+                .into_iter()
+                .map(|row| ClonedSlice { old_id: row.id, new_id: row.id, content: row.content })
+                .collect();
+
+            sqlx::query(
+                "UPDATE files SET status = 2, artifact_id = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ?",
+            )
+            .bind(artifact_id)
+            .bind(format!("Reusing shared parse artifact {}", artifact_id))
+            .bind(target.id)
+            .execute(&self.pool)
+            .await?;
+            let indexed_content = self.reindex_cloned_slices(target, &shared_slices, &source_for_reindex).await?;
+            sqlx::query(
+                "UPDATE files SET status = 1, parse_run_id = NULL, artifact_id = ?, log = ?, \
+                 updated_at = strftime('%s','now') WHERE id = ?",
+            )
+            .bind(artifact_id)
+            .bind(format!("Reused shared parse artifact {} from file {}", artifact_id, source_file_id))
+            .bind(target.id)
+            .execute(&self.pool)
+            .await?;
+            crate::file_content::write(target.id, &indexed_content).await?;
+            let mut updated_file = target.clone();
+            updated_file.artifact_id = Some(artifact_id);
+            updated_file.content = Some(indexed_content);
+            self.maybe_build_knowledge_graph(&updated_file).await;
+            return Ok(());
+        }
+
         let reuse_log = format!("Reusing parsed data from file {}", source.id);
         sqlx::query("UPDATE files SET status = 2, log = ?, updated_at = strftime('%s','now') WHERE id = ?")
             .bind(&reuse_log)
@@ -3010,11 +3159,13 @@ impl FileProcessor {
         self.search_engine.reload_readers()?;
 
         let final_log = format!("Reused parsed data from file {}", source.id);
-        sqlx::query("UPDATE files SET status = 1, log = ?, updated_at = strftime('%s','now') WHERE id = ?")
-            .bind(&final_log)
-            .bind(target.id)
-            .execute(&self.pool)
-            .await?;
+        sqlx::query(
+            "UPDATE files SET status = 1, parse_run_id = NULL, log = ?, updated_at = strftime('%s','now') WHERE id = ?",
+        )
+        .bind(&final_log)
+        .bind(target.id)
+        .execute(&self.pool)
+        .await?;
         crate::file_content::write(target.id, &full_content).await?;
 
         let mut updated_file = target.clone();
@@ -3324,8 +3475,9 @@ impl FileProcessor {
         info!("Using LLM to generate knowledge graph for file {}", file.id);
 
         // 2. 获取文件的所有切片
+        let source_file_id = effective_parse_file_id(&self.pool, file.id).await?;
         let slices_sql = "SELECT id, content FROM slices WHERE file_id = ? ORDER BY id";
-        let slices: Vec<(i64, String)> = sqlx::query_as(slices_sql).bind(file.id).fetch_all(&self.pool).await?;
+        let slices: Vec<(i64, String)> = sqlx::query_as(slices_sql).bind(source_file_id).fetch_all(&self.pool).await?;
 
         if slices.is_empty() {
             debug!("No slices found for file {}, skipping graph building", file.id);
@@ -3389,11 +3541,19 @@ pub async fn process_file_immediate(pool: SqlitePool, search_engine: SearchEngin
     if is_parse_paused() {
         anyhow::bail!("parse is paused for index maintenance");
     }
-    let sql = "SELECT * FROM files WHERE id = ?";
-    let file: File = sqlx::query_as(sql).bind(file_id).fetch_one(&pool).await?;
-
     let processor = FileProcessor::new(pool, search_engine, 0);
-    processor.process_file(&file).await
+    let Some(file) = processor.claim_file_by_id(file_id).await? else {
+        info!("File {} is not pending; immediate parse claim skipped", file_id);
+        return Ok(());
+    };
+    let result = processor.process_file_claimed(&file).await;
+    if let Err(err) = &result {
+        if let Err(cleanup_err) = processor.cleanup_processing_file_data_with_retry(file_id, 3).await {
+            error!("Failed to cleanup immediate parse data for file {}: {}", file_id, cleanup_err);
+        }
+        processor.mark_file_failed(file_id, &err.to_string()).await?;
+    }
+    result
 }
 
 pub async fn process_file_immediate_skip_reuse(
@@ -3402,11 +3562,19 @@ pub async fn process_file_immediate_skip_reuse(
     if is_parse_paused() {
         anyhow::bail!("parse is paused for index maintenance");
     }
-    let sql = "SELECT * FROM files WHERE id = ?";
-    let file: File = sqlx::query_as(sql).bind(file_id).fetch_one(&pool).await?;
-
     let processor = FileProcessor::new(pool, search_engine, 0);
-    processor.process_file_skip_reuse(&file).await
+    let Some(file) = processor.claim_file_by_id(file_id).await? else {
+        info!("File {} is not pending; immediate parse claim skipped", file_id);
+        return Ok(());
+    };
+    let result = processor.process_file_claimed_skip_reuse(&file).await;
+    if let Err(err) = &result {
+        if let Err(cleanup_err) = processor.cleanup_processing_file_data_with_retry(file_id, 3).await {
+            error!("Failed to cleanup immediate parse data for file {}: {}", file_id, cleanup_err);
+        }
+        processor.mark_file_failed(file_id, &err.to_string()).await?;
+    }
+    result
 }
 
 pub async fn try_reuse_file_with_file(
@@ -3416,12 +3584,74 @@ pub async fn try_reuse_file_with_file(
         return Ok(false);
     }
     let processor = FileProcessor::new(pool, search_engine, 0);
-    processor.try_reuse_existing_data(&file).await
+    let Some(claimed_file) = processor.claim_file_by_id(file.id).await? else {
+        return Ok(false);
+    };
+    let result = processor.try_reuse_existing_data(&claimed_file).await;
+    match result {
+        Ok(true) => Ok(true),
+        Ok(false) => {
+            sqlx::query(
+                "UPDATE files SET status = 0, parse_run_id = NULL, updated_at = strftime('%s','now') \
+                 WHERE id = ? AND status = 2",
+            )
+            .bind(file.id)
+            .execute(&processor.pool)
+            .await?;
+            Ok(false)
+        }
+        Err(err) => {
+            sqlx::query(
+                "UPDATE files SET status = 0, parse_run_id = NULL, log = ?, updated_at = strftime('%s','now') \
+                 WHERE id = ? AND status = 2",
+            )
+            .bind(format!("Reuse failed: {}", err))
+            .bind(file.id)
+            .execute(&processor.pool)
+            .await?;
+            Err(err)
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn immediate_parse_claim_is_atomic() -> anyhow::Result<()> {
+        let temp = tempfile::NamedTempFile::new()?;
+        let url = format!("sqlite://{}", temp.path().display());
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(4).connect(&url).await?;
+        sqlx::query(
+            "CREATE TABLE files (
+                id INTEGER PRIMARY KEY,
+                user_id TEXT NOT NULL, user_name TEXT NOT NULL, hash TEXT NOT NULL,
+                filename TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL,
+                tags TEXT NOT NULL, status INTEGER NOT NULL, log TEXT NOT NULL,
+                slice_type TEXT NOT NULL, kb_id INTEGER, is_public INTEGER NOT NULL,
+                meta TEXT, parse_priority INTEGER NOT NULL, parse_run_id TEXT, artifact_id INTEGER,
+                created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+            )",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO files VALUES (1, 'u', 'n', 'h', 'f.txt', '/tmp/f', 1, '', 0, '', 'text', NULL, 0, NULL, 50, NULL, NULL, 1, 1)",
+        )
+        .execute(&pool)
+        .await?;
+
+        let (first, second) = tokio::join!(claim_pending_file_by_id(&pool, 1), claim_pending_file_by_id(&pool, 1));
+        let claimed = usize::from(first?.is_some()) + usize::from(second?.is_some());
+        assert_eq!(claimed, 1);
+
+        let (status, run_id): (i32, Option<String>) =
+            sqlx::query_as("SELECT status, parse_run_id FROM files WHERE id = 1").fetch_one(&pool).await?;
+        assert_eq!(status, 2);
+        assert!(run_id.is_some());
+        Ok(())
+    }
 
     fn image_content_item(img_path: &str) -> ContentItem {
         ContentItem {

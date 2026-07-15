@@ -73,6 +73,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
 
     // 自动创建表
     create_tables(&pool).await?;
+    run_schema_migrations(&pool).await?;
     ensure_file_content_externalized(&pool).await?;
     ensure_kb_type_column(&pool).await?;
     ensure_parse_priority_column(&pool).await?;
@@ -90,6 +91,102 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     info!("Database initialized successfully");
 
     Ok(pool)
+}
+
+/// 对已有数据库执行只增不减的版本化迁移。
+///
+/// `init.sql` 只负责全新数据库；已有表不会因为 `CREATE TABLE IF NOT EXISTS`
+/// 自动增加列，因此升级必须在这里显式处理。
+async fn run_schema_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS schema_migrations (
+            version INTEGER PRIMARY KEY,
+            name TEXT NOT NULL,
+            applied_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        )",
+    )
+    .execute(pool)
+    .await?;
+
+    const VERSION: i64 = 1;
+    let mut tx = pool.begin().await?;
+    // 先在同一事务中抢占版本号。多实例同时升级时，只有一个实例执行 DDL；
+    // DDL 失败会连同版本记录一起回滚。
+    let claimed = sqlx::query("INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (?, ?)")
+        .bind(VERSION)
+        .bind("parse_run_id_and_slice_ordinal")
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if claimed == 0 {
+        tx.rollback().await?;
+        return run_parse_artifact_migration(pool).await;
+    }
+
+    let file_columns = sqlx::query("PRAGMA table_info(files)").fetch_all(&mut *tx).await?;
+    if !file_columns.iter().any(|row| row.get::<String, _>("name") == "parse_run_id") {
+        sqlx::query("ALTER TABLE files ADD COLUMN parse_run_id TEXT DEFAULT NULL").execute(&mut *tx).await?;
+    }
+
+    let slice_columns = sqlx::query("PRAGMA table_info(slices)").fetch_all(&mut *tx).await?;
+    if !slice_columns.iter().any(|row| row.get::<String, _>("name") == "parse_run_id") {
+        sqlx::query("ALTER TABLE slices ADD COLUMN parse_run_id TEXT DEFAULT NULL").execute(&mut *tx).await?;
+    }
+    if !slice_columns.iter().any(|row| row.get::<String, _>("name") == "ordinal") {
+        sqlx::query("ALTER TABLE slices ADD COLUMN ordinal INTEGER DEFAULT NULL").execute(&mut *tx).await?;
+    }
+
+    sqlx::query(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_slices_file_run_ordinal
+         ON slices(file_id, parse_run_id, ordinal)
+         WHERE parse_run_id IS NOT NULL AND ordinal IS NOT NULL",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    info!("Applied schema migration {}: parse_run_id_and_slice_ordinal", VERSION);
+
+    run_parse_artifact_migration(pool).await?;
+    Ok(())
+}
+
+async fn run_parse_artifact_migration(pool: &SqlitePool) -> anyhow::Result<()> {
+    const VERSION: i64 = 2;
+    let mut tx = pool.begin().await?;
+    let claimed = sqlx::query("INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (?, ?)")
+        .bind(VERSION)
+        .bind("shared_parse_artifacts")
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if claimed == 0 {
+        tx.rollback().await?;
+        return Ok(());
+    }
+    let columns = sqlx::query("PRAGMA table_info(files)").fetch_all(&mut *tx).await?;
+    if !columns.iter().any(|row| row.get::<String, _>("name") == "artifact_id") {
+        sqlx::query("ALTER TABLE files ADD COLUMN artifact_id INTEGER DEFAULT NULL").execute(&mut *tx).await?;
+    }
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS parse_artifacts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            artifact_key TEXT NOT NULL UNIQUE,
+            content_hash TEXT NOT NULL,
+            slice_type TEXT NOT NULL,
+            parser_version TEXT NOT NULL,
+            config_hash TEXT NOT NULL,
+            source_file_id INTEGER NOT NULL,
+            full_content TEXT DEFAULT NULL,
+            created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+            updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+        )",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_artifact_id ON files(artifact_id)").execute(&mut *tx).await?;
+    tx.commit().await?;
+    info!("Applied schema migration {}: shared_parse_artifacts", VERSION);
+    Ok(())
 }
 
 const DEFAULT_KNOWLEDGE_BASES: &[(i64, &str, &str, &str, i32)] = &[
@@ -561,4 +658,53 @@ where
         ids.extend(inserted.into_iter().map(|(id,)| id));
     }
     Ok(ids)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn parse_run_migration_upgrades_legacy_schema_idempotently() -> anyhow::Result<()> {
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await?;
+        sqlx::query("CREATE TABLE files (id INTEGER PRIMARY KEY, status INTEGER NOT NULL)").execute(&pool).await?;
+        sqlx::query(
+            "CREATE TABLE slices (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                created_at INTEGER,
+                updated_at INTEGER
+            )",
+        )
+        .execute(&pool)
+        .await?;
+
+        run_schema_migrations(&pool).await?;
+        run_schema_migrations(&pool).await?;
+
+        let file_columns = sqlx::query("PRAGMA table_info(files)").fetch_all(&pool).await?;
+        assert!(file_columns.iter().any(|row| row.get::<String, _>("name") == "parse_run_id"));
+        let slice_columns = sqlx::query("PRAGMA table_info(slices)").fetch_all(&pool).await?;
+        assert!(slice_columns.iter().any(|row| row.get::<String, _>("name") == "parse_run_id"));
+        assert!(slice_columns.iter().any(|row| row.get::<String, _>("name") == "ordinal"));
+
+        sqlx::query("INSERT INTO slices(file_id, content, parse_run_id, ordinal) VALUES (1, 'a', 'run', 0)")
+            .execute(&pool)
+            .await?;
+        let duplicate =
+            sqlx::query("INSERT INTO slices(file_id, content, parse_run_id, ordinal) VALUES (1, 'b', 'run', 0)")
+                .execute(&pool)
+                .await;
+        assert!(duplicate.is_err());
+        let migration_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 1").fetch_one(&pool).await?;
+        assert_eq!(migration_count, 1);
+        let artifact_migration_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM schema_migrations WHERE version = 2").fetch_one(&pool).await?;
+        assert_eq!(artifact_migration_count, 1);
+        let artifact_column = sqlx::query("PRAGMA table_info(files)").fetch_all(&pool).await?;
+        assert!(artifact_column.iter().any(|row| row.get::<String, _>("name") == "artifact_id"));
+        Ok(())
+    }
 }

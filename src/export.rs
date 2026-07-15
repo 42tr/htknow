@@ -1,4 +1,4 @@
-use std::{path::Path, sync::Arc};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::Context;
 use arrow_array::{
@@ -8,7 +8,7 @@ use arrow_schema::{DataType, Schema as ArrowSchema};
 use futures::stream::StreamExt;
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
-use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool, sqlite::SqlitePoolOptions};
+use sqlx::{Encode, QueryBuilder, Row, Sqlite, SqlitePool, Type, sqlite::SqlitePoolOptions};
 use tantivy::{
     TantivyDocument, Term, collector::TopDocs, doc, query::{BooleanQuery, Occur, Query, TermQuery}, schema::{IndexRecordOption, Value as _}
 };
@@ -45,10 +45,7 @@ type FileRow = (
     i64,
 );
 #[allow(clippy::type_complexity)]
-type SlicePosRow = (i64, i64, i32, i32, i32, i32, i32, Option<String>, Option<i32>, i64);
-#[allow(clippy::type_complexity)]
-type PdfContentRow =
-    (i64, i64, i32, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>, i64, i64);
+type PdfContentRow = (i64, i32, Option<String>, Option<String>, Option<i32>, Option<String>, Option<String>, i64, i64);
 #[allow(clippy::type_complexity)]
 type EntityRow = (i64, String, String, Option<String>, Option<Vec<u8>>, Option<i64>, Option<i64>, i32, i64, i64);
 #[allow(clippy::type_complexity)]
@@ -457,12 +454,12 @@ async fn export_sqlite_data(
     let step_start = std::time::Instant::now();
 
     // Export knowledge_bases (including ancestors to preserve hierarchy)
-    do_export_knowledge_bases(src_pool, dst_pool, all_kb_ids).await?;
+    do_export_knowledge_bases(src_pool, dst_pool, all_kb_ids).await.context("export knowledge bases")?;
     info!("  [sqlite] knowledge_bases: {}ms", step_start.elapsed().as_millis());
 
     // Export files (with path rewritten to relative)
     let s = std::time::Instant::now();
-    let file_ids = export_files(src_pool, dst_pool, target_kb_ids).await?;
+    let file_ids = export_files(src_pool, dst_pool, target_kb_ids).await.context("export files")?;
     info!("  [sqlite] files ({} ids): {}ms", file_ids.len(), s.elapsed().as_millis());
 
     if file_ids.is_empty() {
@@ -486,58 +483,14 @@ async fn export_sqlite_data(
         return Ok(file_ids);
     }
 
-    // Parallel export of independent tables that depend on file_ids
-    let file_ids_clone1 = file_ids.clone();
-    let file_ids_clone2 = file_ids.clone();
-    let file_ids_clone3 = file_ids.clone();
-    let target_kb_ids_clone = target_kb_ids.to_vec();
-
-    let slices_future = async {
-        let s = std::time::Instant::now();
-        export_slices(src_pool, dst_pool, &file_ids).await?;
-        info!("  [sqlite] slices: {}ms", s.elapsed().as_millis());
-        anyhow::Ok(())
-    };
-
-    let slice_positions_future = async {
-        let s = std::time::Instant::now();
-        export_slice_positions(src_pool, dst_pool, &file_ids_clone1).await?;
-        info!("  [sqlite] slice_positions: {}ms", s.elapsed().as_millis());
-        anyhow::Ok(())
-    };
-
-    let pdf_contents_future = async {
-        let s = std::time::Instant::now();
-        export_pdf_contents(src_pool, dst_pool, &file_ids_clone2).await?;
-        info!("  [sqlite] pdf_contents: {}ms", s.elapsed().as_millis());
-        anyhow::Ok(())
-    };
-
-    let graph_future = async {
-        let s = std::time::Instant::now();
-        export_graph_nodes(src_pool, dst_pool, &target_kb_ids_clone, &file_ids_clone3).await?;
-        info!("  [sqlite] graph_nodes: {}ms", s.elapsed().as_millis());
-
-        let s = std::time::Instant::now();
-        export_graph_edges(src_pool, dst_pool).await?;
-        info!("  [sqlite] graph_edges: {}ms", s.elapsed().as_millis());
-
-        let s = std::time::Instant::now();
-        export_entity_mentions(src_pool, dst_pool).await?;
-        info!("  [sqlite] entity_mentions: {}ms", s.elapsed().as_millis());
-
-        let s = std::time::Instant::now();
-        export_graph_snapshots(src_pool, dst_pool, &target_kb_ids_clone).await?;
-        info!("  [sqlite] graph_snapshots: {}ms", s.elapsed().as_millis());
-
-        anyhow::Ok(())
-    };
-
-    let (r1, r2, r3, r4) = tokio::join!(slices_future, slice_positions_future, pdf_contents_future, graph_future);
-    r1?;
-    r2?;
-    r3?;
-    r4?;
+    // 共享 artifact 导出必须先物化切片并生成 ID 映射，后续位置与 mention 再消费映射。
+    export_slices(src_pool, dst_pool, &file_ids).await.context("export materialized slices")?;
+    export_slice_positions(src_pool, dst_pool).await.context("export materialized slice positions")?;
+    export_pdf_contents(src_pool, dst_pool, &file_ids).await.context("export materialized pdf contents")?;
+    export_graph_nodes(src_pool, dst_pool, target_kb_ids, &file_ids).await.context("export graph nodes")?;
+    export_graph_edges(src_pool, dst_pool).await.context("export graph edges")?;
+    export_entity_mentions(src_pool, dst_pool).await.context("export remapped entity mentions")?;
+    export_graph_snapshots(src_pool, dst_pool, target_kb_ids).await.context("export graph snapshots")?;
 
     info!("  [sqlite] all tables total: {}ms", step_start.elapsed().as_millis());
     Ok(file_ids)
@@ -557,7 +510,8 @@ async fn do_export_knowledge_bases(src_pool: &SqlitePool, dst_pool: &SqlitePool,
             separated.push_bind(id);
         }
         qb.push(")");
-        let rows = qb.build().fetch_all(src_pool).await?;
+        let debug_sql = qb.sql().to_string();
+        let rows = qb.build().fetch_all(src_pool).await.with_context(|| debug_sql)?;
         if rows.is_empty() {
             continue;
         }
@@ -751,9 +705,27 @@ const SQLITE_BATCH_SIZE: usize = 900;
 /// files table has 18 columns => 999/18 = 55; use 50 to be safe.
 const INSERT_BATCH_SIZE: usize = 50;
 
+struct RowBinder<'qb, 'args> {
+    qb: &'qb mut QueryBuilder<'args, Sqlite>,
+    first: bool,
+}
+
+impl<'qb, 'args> RowBinder<'qb, 'args> {
+    fn push_bind<T>(&mut self, value: T) -> &mut Self
+    where
+        T: 'args+Send+Encode<'args, Sqlite>+Type<Sqlite>, {
+        if !self.first {
+            self.qb.push(", ");
+        }
+        self.first = false;
+        self.qb.push_bind(value);
+        self
+    }
+}
+
 async fn batch_insert_rows<Src>(
-    dst_pool: &SqlitePool, table: &str, columns: &[&str], rows: &[Src],
-    bind_row: impl Fn(&mut QueryBuilder<'_, Sqlite>, Src), insert_or_ignore: bool,
+    dst_pool: &SqlitePool, table: &str, columns: &[&str], rows: &[Src], bind_row: impl Fn(&mut RowBinder<'_, '_>, Src),
+    insert_or_ignore: bool,
 ) -> Result<(), sqlx::Error>
 where
     Src: Clone, {
@@ -773,10 +745,11 @@ where
                 qb.push(", ");
             }
             qb.push("(");
-            bind_row(&mut qb, row.clone());
+            bind_row(&mut RowBinder { qb: &mut qb, first: true }, row.clone());
             qb.push(")");
         }
-        qb.build().execute(dst_pool).await?;
+        let debug_sql = qb.sql().to_string();
+        qb.build().execute(dst_pool).await.map_err(|err| sqlx::Error::Protocol(format!("{debug_sql}: {err}")))?;
     }
     Ok(())
 }
@@ -785,9 +758,21 @@ async fn export_slices(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &
     if file_ids.is_empty() {
         return Ok(());
     }
+    sqlx::query(
+        "CREATE TEMP TABLE IF NOT EXISTS export_slice_id_map (
+            target_file_id INTEGER NOT NULL,
+            source_slice_id INTEGER NOT NULL,
+            export_slice_id INTEGER NOT NULL,
+            PRIMARY KEY(target_file_id, source_slice_id)
+        )",
+    )
+    .execute(dst_pool)
+    .await?;
     for chunk in file_ids.chunks(SQLITE_BATCH_SIZE) {
         let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT id, file_id, content, created_at, updated_at FROM slices WHERE file_id IN (",
+            "SELECT f.id AS target_file_id, s.id AS source_slice_id, s.content, s.created_at, s.updated_at \
+             FROM files f LEFT JOIN parse_artifacts pa ON pa.id = f.artifact_id \
+             JOIN slices s ON s.file_id = COALESCE(pa.source_file_id, f.id) WHERE f.id IN (",
         );
         let mut separated = qb.separated(", ");
         for id in chunk {
@@ -799,93 +784,61 @@ async fn export_slices(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &
             continue;
         }
 
-        let values: Vec<(i64, i64, String, i64, i64)> = rows
-            .iter()
-            .map(|row| {
-                (
-                    row.get::<i64, _>("id"),
-                    row.get::<i64, _>("file_id"),
-                    row.get::<String, _>("content"),
-                    row.get::<i64, _>("created_at"),
-                    row.get::<i64, _>("updated_at"),
-                )
-            })
-            .collect();
-
-        batch_insert_rows(
-            dst_pool,
-            "slices",
-            &["id", "file_id", "content", "created_at", "updated_at"],
-            &values,
-            |b, (id, file_id, content, created_at, updated_at)| {
-                b.push_bind(id).push_bind(file_id).push_bind(content).push_bind(created_at).push_bind(updated_at);
-            },
-            false,
-        )
-        .await?;
+        let mut tx = dst_pool.begin().await?;
+        for row in rows {
+            let target_file_id: i64 = row.get("target_file_id");
+            let source_slice_id: i64 = row.get("source_slice_id");
+            let export_slice_id: i64 = sqlx::query_scalar(
+                "INSERT INTO slices(file_id, content, created_at, updated_at) VALUES (?, ?, ?, ?) RETURNING id",
+            )
+            .bind(target_file_id)
+            .bind(row.get::<String, _>("content"))
+            .bind(row.get::<i64, _>("created_at"))
+            .bind(row.get::<i64, _>("updated_at"))
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query(
+                "INSERT INTO export_slice_id_map(target_file_id, source_slice_id, export_slice_id) VALUES (?, ?, ?)",
+            )
+            .bind(target_file_id)
+            .bind(source_slice_id)
+            .bind(export_slice_id)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
     }
     Ok(())
 }
 
-async fn export_slice_positions(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_ids: &[i64]) -> anyhow::Result<()> {
-    if file_ids.is_empty() {
-        return Ok(());
-    }
-    for chunk in file_ids.chunks(SQLITE_BATCH_SIZE) {
-        let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT sp.id, sp.slice_id, sp.page_idx, sp.x1, sp.y1, sp.x2, sp.y2, sp.sheet_name, sp.row_num, sp.created_at \
-             FROM slice_positions sp \
-             JOIN slices s ON s.id = sp.slice_id \
-             WHERE s.file_id IN (",
-        );
-        let mut separated = qb.separated(", ");
-        for id in chunk {
-            separated.push_bind(id);
-        }
-        qb.push(")");
-        let rows = qb.build().fetch_all(src_pool).await?;
-        if rows.is_empty() {
-            continue;
-        }
-
-        let values: Vec<SlicePosRow> = rows
-            .iter()
-            .map(|row| {
-                (
-                    row.get::<i64, _>("id"),
-                    row.get::<i64, _>("slice_id"),
-                    row.get::<i32, _>("page_idx"),
-                    row.get::<i32, _>("x1"),
-                    row.get::<i32, _>("y1"),
-                    row.get::<i32, _>("x2"),
-                    row.get::<i32, _>("y2"),
-                    row.get::<Option<String>, _>("sheet_name"),
-                    row.get::<Option<i32>, _>("row_num"),
-                    row.get::<i64, _>("created_at"),
-                )
-            })
-            .collect();
-
-        batch_insert_rows(
-            dst_pool,
-            "slice_positions",
-            &["id", "slice_id", "page_idx", "x1", "y1", "x2", "y2", "sheet_name", "row_num", "created_at"],
-            &values,
-            |b, (id, slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num, created_at)| {
-                b.push_bind(id)
-                    .push_bind(slice_id)
-                    .push_bind(page_idx)
-                    .push_bind(x1)
-                    .push_bind(y1)
-                    .push_bind(x2)
-                    .push_bind(y2)
-                    .push_bind(sheet_name)
-                    .push_bind(row_num)
-                    .push_bind(created_at);
-            },
-            false,
+async fn export_slice_positions(src_pool: &SqlitePool, dst_pool: &SqlitePool) -> anyhow::Result<()> {
+    let mappings: Vec<(i64, i64)> =
+        sqlx::query_as("SELECT source_slice_id, export_slice_id FROM export_slice_id_map").fetch_all(dst_pool).await?;
+    for (source_slice_id, export_slice_id) in mappings {
+        let rows = sqlx::query(
+            "SELECT page_idx, x1, y1, x2, y2, sheet_name, row_num, created_at \
+             FROM slice_positions WHERE slice_id = ? ORDER BY id",
         )
+        .bind(source_slice_id)
+        .fetch_all(src_pool)
         .await?;
+        for row in rows {
+            sqlx::query(
+                "INSERT INTO slice_positions(slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num, created_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(export_slice_id)
+            .bind(row.get::<i32, _>("page_idx"))
+            .bind(row.get::<i32, _>("x1"))
+            .bind(row.get::<i32, _>("y1"))
+            .bind(row.get::<i32, _>("x2"))
+            .bind(row.get::<i32, _>("y2"))
+            .bind(row.get::<Option<String>, _>("sheet_name"))
+            .bind(row.get::<Option<i32>, _>("row_num"))
+            .bind(row.get::<i64, _>("created_at"))
+            .execute(dst_pool)
+            .await?;
+        }
     }
     Ok(())
 }
@@ -898,7 +851,12 @@ async fn export_pdf_contents(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_
     let images_path_prefix = format!("{}/", cfg.storage.images_path);
 
     for chunk in file_ids.chunks(SQLITE_BATCH_SIZE) {
-        let mut qb = QueryBuilder::<Sqlite>::new("SELECT * FROM pdf_contents WHERE file_id IN (");
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT f.id AS target_file_id, pc.page_idx, pc.bbox, pc.text, pc.text_level, pc.img_path, \
+                    pc.table_body, pc.created_at, pc.updated_at \
+             FROM files f LEFT JOIN parse_artifacts pa ON pa.id = f.artifact_id \
+             JOIN pdf_contents pc ON pc.file_id = COALESCE(pa.source_file_id, f.id) WHERE f.id IN (",
+        );
         let mut separated = qb.separated(", ");
         for id in chunk {
             separated.push_bind(id);
@@ -918,8 +876,7 @@ async fn export_pdf_contents(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_
                     if p.starts_with(&images_path_prefix) { p[images_path_prefix.len()..].to_string() } else { p }
                 });
                 (
-                    row.get::<i64, _>("id"),
-                    row.get::<i64, _>("file_id"),
+                    row.get::<i64, _>("target_file_id"),
                     row.get::<i32, _>("page_idx"),
                     row.get::<Option<String>, _>("bbox"),
                     row.get::<Option<String>, _>("text"),
@@ -936,7 +893,6 @@ async fn export_pdf_contents(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_
             dst_pool,
             "pdf_contents",
             &[
-                "id",
                 "file_id",
                 "page_idx",
                 "bbox",
@@ -948,9 +904,8 @@ async fn export_pdf_contents(src_pool: &SqlitePool, dst_pool: &SqlitePool, file_
                 "updated_at",
             ],
             &values,
-            |b, (id, file_id, page_idx, bbox, text, text_level, img_path, table_body, created_at, updated_at)| {
-                b.push_bind(id)
-                    .push_bind(file_id)
+            |b, (file_id, page_idx, bbox, text, text_level, img_path, table_body, created_at, updated_at)| {
+                b.push_bind(file_id)
                     .push_bind(page_idx)
                     .push_bind(bbox)
                     .push_bind(text)
@@ -1191,13 +1146,33 @@ async fn export_graph_edges(src_pool: &SqlitePool, dst_pool: &SqlitePool) -> any
 }
 
 async fn export_entity_mentions(src_pool: &SqlitePool, dst_pool: &SqlitePool) -> anyhow::Result<()> {
-    // Get exported node IDs and slice IDs from dst_pool
+    // Get exported node IDs and materialized slice mappings from dst_pool.
+    sqlx::query(
+        "CREATE TEMP TABLE IF NOT EXISTS export_slice_id_map (
+            target_file_id INTEGER NOT NULL, source_slice_id INTEGER NOT NULL, export_slice_id INTEGER NOT NULL,
+            PRIMARY KEY(target_file_id, source_slice_id)
+        )",
+    )
+    .execute(dst_pool)
+    .await?;
     let node_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM graph_nodes").fetch_all(dst_pool).await?;
-    let slice_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM slices").fetch_all(dst_pool).await?;
-    if node_ids.is_empty() || slice_ids.is_empty() {
+    let mappings: Vec<(i64, i64, i64)> =
+        sqlx::query_as("SELECT target_file_id, source_slice_id, export_slice_id FROM export_slice_id_map")
+            .fetch_all(dst_pool)
+            .await?;
+    if node_ids.is_empty() || mappings.is_empty() {
         return Ok(());
     }
-    let slice_set: std::collections::HashSet<i64> = slice_ids.iter().copied().collect();
+    let mut slice_map: HashMap<i64, Vec<(i64, i64)>> = HashMap::new();
+    for (target_file_id, source_slice_id, export_slice_id) in mappings {
+        slice_map.entry(source_slice_id).or_default().push((target_file_id, export_slice_id));
+    }
+    let node_files: HashMap<i64, Option<i64>> =
+        sqlx::query_as::<_, (i64, Option<i64>)>("SELECT id, file_id FROM graph_nodes")
+            .fetch_all(dst_pool)
+            .await?
+            .into_iter()
+            .collect();
 
     for chunk in node_ids.chunks(SQLITE_BATCH_SIZE) {
         let mut qb = QueryBuilder::<Sqlite>::new(
@@ -1218,11 +1193,17 @@ async fn export_entity_mentions(src_pool: &SqlitePool, dst_pool: &SqlitePool) ->
             .iter()
             .filter_map(|row| {
                 let slice_id: i64 = row.get("slice_id");
-                if slice_set.contains(&slice_id) {
+                let target_file_id = node_files.get(&row.get::<i64, _>("node_id")).copied().flatten();
+                let mapped_slice_id = slice_map.get(&slice_id).and_then(|entries| {
+                    target_file_id
+                        .and_then(|file_id| entries.iter().find(|(target, _)| *target == file_id).map(|(_, id)| *id))
+                        .or_else(|| entries.first().map(|(_, id)| *id))
+                });
+                if let Some(mapped_slice_id) = mapped_slice_id {
                     Some((
                         row.get::<i64, _>("id"),
                         row.get::<i64, _>("node_id"),
-                        slice_id,
+                        mapped_slice_id,
                         row.get::<Option<i64>, _>("start_offset"),
                         row.get::<Option<i64>, _>("end_offset"),
                         row.get::<Option<String>, _>("context"),
@@ -1323,7 +1304,10 @@ async fn copy_files(
     let mut file_paths = Vec::new();
 
     for chunk in file_ids.chunks(1000) {
-        let mut qb = QueryBuilder::<Sqlite>::new("SELECT id, path FROM files WHERE id IN (");
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT f.id, f.path, COALESCE(pa.source_file_id, f.id) AS parse_source_id \
+             FROM files f LEFT JOIN parse_artifacts pa ON pa.id = f.artifact_id WHERE f.id IN (",
+        );
         let mut separated = qb.separated(", ");
         for id in chunk {
             separated.push_bind(id);
@@ -1333,7 +1317,8 @@ async fn copy_files(
         for row in rows {
             let id: i64 = row.get("id");
             let path: String = row.get("path");
-            file_paths.push((id, path));
+            let parse_source_id: i64 = row.get("parse_source_id");
+            file_paths.push((id, path, parse_source_id));
         }
     }
 
@@ -1345,7 +1330,7 @@ async fn copy_files(
     let file_handles: Vec<_> = file_paths
         .iter()
         .cloned()
-        .map(|(_file_id, src_path)| {
+        .map(|(_file_id, src_path, _parse_source_id)| {
             let files_dir = files_dir.to_path_buf();
             let copied = copied_count.clone();
             let skipped = skipped_count.clone();
@@ -1374,11 +1359,11 @@ async fn copy_files(
     let pdf_handles: Vec<_> = file_paths
         .iter()
         .cloned()
-        .map(|(file_id, _src_path)| {
+        .map(|(file_id, _src_path, parse_source_id)| {
             let pdfs_dir = pdfs_dir.to_path_buf();
             let cfg_pdf_path = cfg.storage.pdf_path.clone();
             tokio::task::spawn_blocking(move || {
-                let src_pdf = Path::new(&cfg_pdf_path).join(format!("{}.pdf", file_id));
+                let src_pdf = Path::new(&cfg_pdf_path).join(format!("{}.pdf", parse_source_id));
                 if src_pdf.exists() {
                     let dst_pdf = pdfs_dir.join(format!("{}.pdf", file_id));
                     if let Err(e) = std::fs::copy(&src_pdf, &dst_pdf) {
@@ -1394,11 +1379,11 @@ async fn copy_files(
     let content_handles: Vec<_> = file_paths
         .iter()
         .cloned()
-        .map(|(file_id, _src_path)| {
+        .map(|(file_id, _src_path, parse_source_id)| {
             let contents_dir = contents_dir.to_path_buf();
             let cfg_contents_path = cfg.storage.contents_path.clone();
             tokio::task::spawn_blocking(move || {
-                let src_content = Path::new(&cfg_contents_path).join(format!("{}.txt", file_id));
+                let src_content = Path::new(&cfg_contents_path).join(format!("{}.txt", parse_source_id));
                 if src_content.exists() {
                     let dst_content = contents_dir.join(format!("{}.txt", file_id));
                     if let Err(e) = std::fs::copy(&src_content, &dst_content) {
@@ -1435,7 +1420,19 @@ async fn copy_images(pool: &SqlitePool, images_dir: &Path, file_ids: &[i64]) -> 
     let cfg = config::get();
     let data_root = Path::new(&cfg.storage.images_path).parent();
 
-    let all_img_paths = collect_image_raw_paths_for_files(pool, file_ids).await?;
+    let mut effective_ids = file_ids.to_vec();
+    for chunk in file_ids.chunks(SQLITE_BATCH_SIZE) {
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT DISTINCT pa.source_file_id FROM files f JOIN parse_artifacts pa ON pa.id = f.artifact_id \
+             WHERE f.id IN (",
+        );
+        crate::db::push_i64_list(&mut qb, chunk);
+        qb.push(")");
+        effective_ids.extend(qb.build_query_scalar::<i64>().fetch_all(pool).await?);
+    }
+    effective_ids.sort_unstable();
+    effective_ids.dedup();
+    let all_img_paths = collect_image_raw_paths_for_files(pool, &effective_ids).await?;
 
     if all_img_paths.is_empty() {
         return Ok(());
@@ -1747,4 +1744,79 @@ async fn count_graph_data(pool: &SqlitePool, kb_ids: &[i64]) -> anyhow::Result<(
     }
 
     Ok((node_count as usize, edge_count as usize, mention_count as usize, snapshot_count as usize))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn memory_db() -> anyhow::Result<SqlitePool> {
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await?;
+        init_export_schema(&pool).await?;
+        Ok(pool)
+    }
+
+    #[tokio::test]
+    async fn shared_artifact_is_materialized_during_export() -> anyhow::Result<()> {
+        let src = memory_db().await.context("source schema")?;
+        let dst = memory_db().await.context("destination schema")?;
+        sqlx::query("INSERT INTO knowledge_bases(id,user_id,user_name,name,kb_type) VALUES(1,'u','n','kb','analysis')")
+            .execute(&src)
+            .await
+            .context("insert kb")?;
+        for id in [1_i64, 2] {
+            sqlx::query(
+                "INSERT INTO files(id,user_id,user_name,hash,filename,path,size,tags,status,log,slice_type,kb_id,
+                 is_public,artifact_id) VALUES(?,'u','n','hash','a.txt','/tmp/a',1,'',1,'','text',1,0,1)",
+            )
+            .bind(id)
+            .execute(&src)
+            .await
+            .context("insert file")?;
+        }
+        sqlx::query(
+            "INSERT INTO parse_artifacts(id,artifact_key,content_hash,slice_type,parser_version,config_hash,
+             source_file_id,full_content) VALUES(1,'key','hash','text','v1','cfg',1,'shared')",
+        )
+        .execute(&src)
+        .await
+        .context("insert artifact")?;
+        let source_slice: i64 =
+            sqlx::query_scalar("INSERT INTO slices(file_id,content) VALUES(1,'shared slice') RETURNING id")
+                .fetch_one(&src)
+                .await
+                .context("insert slice")?;
+        sqlx::query("INSERT INTO slice_positions(slice_id,page_idx,x1,y1,x2,y2) VALUES(?,0,1,2,3,4)")
+            .bind(source_slice)
+            .execute(&src)
+            .await
+            .context("insert position")?;
+        sqlx::query("INSERT INTO pdf_contents(file_id,page_idx,text) VALUES(1,0,'pdf')").execute(&src).await?;
+        let node_id: i64 = sqlx::query_scalar(
+            "INSERT INTO graph_nodes(name,entity_type,file_id,kb_id) VALUES('e','t',2,1) RETURNING id",
+        )
+        .fetch_one(&src)
+        .await?;
+        sqlx::query("INSERT INTO entity_mentions(node_id,slice_id,context) VALUES(?,?,'ctx')")
+            .bind(node_id)
+            .bind(source_slice)
+            .execute(&src)
+            .await?;
+
+        export_sqlite_data(&src, &dst, &[1], &[1]).await.context("export sqlite")?;
+
+        let slices: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT id,file_id FROM slices ORDER BY file_id").fetch_all(&dst).await?;
+        assert_eq!(slices.len(), 2);
+        assert_eq!(slices.iter().map(|(_, file_id)| *file_id).collect::<Vec<_>>(), vec![1, 2]);
+        assert_ne!(slices[0].0, slices[1].0);
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM slice_positions").fetch_one(&dst).await?, 2);
+        assert_eq!(sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM pdf_contents").fetch_one(&dst).await?, 2);
+        let mention_file: i64 =
+            sqlx::query_scalar("SELECT s.file_id FROM entity_mentions m JOIN slices s ON s.id=m.slice_id LIMIT 1")
+                .fetch_one(&dst)
+                .await?;
+        assert_eq!(mention_file, 2);
+        Ok(())
+    }
 }

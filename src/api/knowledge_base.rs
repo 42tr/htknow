@@ -1000,6 +1000,36 @@ async fn reset_reparse_scope(
     pool: &SqlitePool, search_engine: &SearchEngine, analysis_kb_ids: &[i64], unassigned_file_ids: &[i64],
     file_ids: &[i64], clear_unassigned_graph: bool,
 ) -> ApiResult<()> {
+    // 不能在解析 worker 写入切片/索引时清空同一文件，否则旧批次的失败清理可能误删新数据。
+    // 调用方可在当前解析完成后安全重试。
+    if !file_ids.is_empty() {
+        let mut processing_qb = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM files WHERE status = 2 AND id IN (");
+        crate::db::push_i64_list(&mut processing_qb, file_ids);
+        processing_qb.push(")");
+        let processing_count: i64 = processing_qb.build_query_scalar().fetch_one(pool).await?;
+        if processing_count > 0 {
+            return Err(ApiError::BadRequest(format!(
+                "{} file(s) are currently being parsed; retry reparse after they finish",
+                processing_count
+            )));
+        }
+
+        let mut refs_qb = QueryBuilder::<Sqlite>::new(
+            "SELECT COUNT(*) FROM parse_artifacts pa JOIN files ref ON ref.artifact_id = pa.id \
+             WHERE pa.source_file_id IN (",
+        );
+        crate::db::push_i64_list(&mut refs_qb, file_ids);
+        refs_qb.push(") AND ref.id NOT IN (");
+        crate::db::push_i64_list(&mut refs_qb, file_ids);
+        refs_qb.push(")");
+        let external_refs: i64 = refs_qb.build_query_scalar().fetch_one(pool).await?;
+        if external_refs > 0 {
+            return Err(ApiError::BadRequest(
+                "Cannot reparse an artifact source while files outside this scope still reference it".to_string(),
+            ));
+        }
+    }
+
     // 清理搜索索引
     search_engine.delete_batch(None, Some(analysis_kb_ids)).await?;
     search_engine.delete_batch(Some(unassigned_file_ids), None).await?;
@@ -1028,7 +1058,8 @@ async fn reset_reparse_scope(
         del_slices_qb.build().execute(pool).await?;
 
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-        let mut update_qb = QueryBuilder::<Sqlite>::new("UPDATE files SET status = 0, log = '', updated_at = ");
+        let mut update_qb =
+            QueryBuilder::<Sqlite>::new("UPDATE files SET status = 0, parse_run_id = NULL, log = '', updated_at = ");
         update_qb.push_bind(now);
         update_qb.push(" WHERE id IN (");
         crate::db::push_i64_list(&mut update_qb, file_ids);

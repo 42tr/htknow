@@ -8,6 +8,8 @@ CREATE TABLE IF NOT EXISTS files (
     size INTEGER NOT NULL DEFAULT 0, -- 文件大小(字节)
     tags TEXT NOT NULL DEFAULT '', -- 标签
     status INTEGER NOT NULL DEFAULT 0, -- 状态: 0-未处理, 1-已处理, 2-处理中, 3-不解析, -1-处理失败
+    parse_run_id TEXT DEFAULT NULL, -- 当前解析批次，防止并发解析和旧任务提交结果
+    artifact_id INTEGER DEFAULT NULL, -- 共享解析产物
     log TEXT DEFAULT '', -- 日志
     slice_type TEXT DEFAULT '', -- 切片类型
     kb_id INTEGER DEFAULT NULL, -- 知识库ID
@@ -37,9 +39,31 @@ CREATE TABLE IF NOT EXISTS slices (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     file_id INTEGER NOT NULL, -- 文件ID
     content TEXT NOT NULL, -- 切片内容
+    parse_run_id TEXT DEFAULT NULL, -- 生成该切片的解析批次；历史数据为空
+    ordinal INTEGER DEFAULT NULL, -- 切片在本次解析中的稳定顺序
     created_at INTEGER DEFAULT (strftime('%s','now')),
     updated_at INTEGER DEFAULT (strftime('%s','now'))
 );
+
+CREATE TABLE IF NOT EXISTS schema_migrations (
+    version INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    applied_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+
+CREATE TABLE IF NOT EXISTS parse_artifacts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    artifact_key TEXT NOT NULL UNIQUE,
+    content_hash TEXT NOT NULL,
+    slice_type TEXT NOT NULL,
+    parser_version TEXT NOT NULL,
+    config_hash TEXT NOT NULL,
+    source_file_id INTEGER NOT NULL,
+    full_content TEXT DEFAULT NULL,
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
+    updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
+);
+CREATE INDEX IF NOT EXISTS idx_files_artifact_id ON files(artifact_id);
 
 CREATE TABLE IF NOT EXISTS pdf_contents (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -139,6 +163,9 @@ CREATE INDEX IF NOT EXISTS idx_files_pending_created_at ON files(created_at) WHE
 CREATE INDEX IF NOT EXISTS idx_files_user_id_created_at ON files(user_id, created_at DESC);
 CREATE INDEX IF NOT EXISTS idx_files_hash_slice_type_status_updated_at ON files(hash, slice_type, status, updated_at DESC);
 CREATE INDEX IF NOT EXISTS idx_slices_file_id_id ON slices(file_id, id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_slices_file_run_ordinal
+ON slices(file_id, parse_run_id, ordinal)
+WHERE parse_run_id IS NOT NULL AND ordinal IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_pdf_contents_file_id_id ON pdf_contents(file_id, id);
 CREATE INDEX IF NOT EXISTS idx_pdf_contents_file_id_page_id ON pdf_contents(file_id, page_idx, id);
 CREATE INDEX IF NOT EXISTS idx_nodes_type ON graph_nodes(entity_type);

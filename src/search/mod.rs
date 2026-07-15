@@ -156,7 +156,12 @@ async fn fetch_rebuild_lancedb_rows(
     }
 
     let mut query_builder: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
-        "SELECT s.id, s.file_id, f.kb_id, s.content, f.filename, f.path FROM slices s JOIN files f ON f.id = s.file_id WHERE s.id IN (",
+        "SELECT s.id, COALESCE(ref.id, source.id) AS file_id, COALESCE(ref.kb_id, source.kb_id) AS kb_id, \
+         s.content, COALESCE(ref.filename, source.filename) AS filename, \
+         COALESCE(ref.path, source.path) AS path \
+         FROM slices s JOIN files source ON source.id = s.file_id \
+         LEFT JOIN parse_artifacts pa ON pa.source_file_id = source.id \
+         LEFT JOIN files ref ON ref.artifact_id = pa.id WHERE s.id IN (",
     );
     let mut separated = query_builder.separated(", ");
     for slice_id in slice_ids {
@@ -464,9 +469,11 @@ impl SearchEngine {
             let mut last_slice_id = 0_i64;
             loop {
                 let rows: Vec<RebuildSliceRow> = sqlx::query_as(
-                    "SELECT s.id, s.file_id, f.kb_id, s.content \
-                     FROM slices s \
-                     JOIN files f ON f.id = s.file_id \
+                    "SELECT s.id, COALESCE(ref.id, source.id) AS file_id, \
+                            COALESCE(ref.kb_id, source.kb_id) AS kb_id, s.content \
+                     FROM slices s JOIN files source ON source.id = s.file_id \
+                     LEFT JOIN parse_artifacts pa ON pa.source_file_id = source.id \
+                     LEFT JOIN files ref ON ref.artifact_id = pa.id \
                      WHERE s.id > ? \
                      ORDER BY s.id ASC \
                      LIMIT ?",
