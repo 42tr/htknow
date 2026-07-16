@@ -36,7 +36,7 @@ const props = defineProps({
   },
 })
 
-const emit = defineEmits(['retry', 'reparse-failed'])
+const emit = defineEmits(['retry', 'reparse-failed', 'locate-file'])
 
 const normalizedStats = computed(() => ({
   total: props.stats?.total ?? 0,
@@ -175,16 +175,26 @@ const formatTimestamp = (timestamp) => {
         <span>{{ previewTitle }}</span>
         <span>最近 {{ previewFiles.length }} 项</span>
       </div>
-      <ul class="space-y-1 max-h-60 overflow-auto pr-1">
+      <ul class="space-y-1">
         <li
           v-for="file in previewFiles"
           :key="file.id"
-          class="flex flex-col gap-0.5 border-b border-slate-100 last:border-0 pb-1 last:pb-0"
+          class="border-b border-slate-100 last:border-0"
         >
-          <span class="font-medium text-slate-800 truncate">{{ file.filename }}</span>
-          <span class="text-[11px] text-slate-400">
-            位置：{{ file.kb_path || file.kb_name || '未分配知识库' }} · {{ activePreviewCard === 'failed' ? '失败时间' : '更新时间' }} {{ formatTimestamp(file.updated_at) }}
-          </span>
+          <button
+            type="button"
+            class="group flex w-full items-center justify-between gap-3 rounded-md px-1 py-1.5 text-left hover:bg-blue-50 focus:outline-none focus:ring-2 focus:ring-blue-300"
+            :title="`前往 ${file.kb_path || file.kb_name || '未分配知识库'} 定位文件`"
+            @click="emit('locate-file', file)"
+          >
+            <span class="min-w-0 flex-1">
+              <span class="block font-medium text-slate-800 truncate group-hover:text-blue-700">{{ file.filename }}</span>
+              <span class="block text-[11px] text-slate-400 group-hover:text-blue-500">
+                位置：{{ file.kb_path || file.kb_name || '未分配知识库' }} · {{ activePreviewCard === 'failed' ? '失败时间' : '更新时间' }} {{ formatTimestamp(file.updated_at) }}
+              </span>
+            </span>
+            <span class="shrink-0 text-slate-300 group-hover:text-blue-500" aria-hidden="true">›</span>
+          </button>
         </li>
       </ul>
     </div>

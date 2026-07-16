@@ -14,6 +14,10 @@ const props = defineProps({
   kbType: {
     type: String,
     default: null
+  },
+  highlighted: {
+    type: Boolean,
+    default: false
   }
 })
 
@@ -221,7 +225,14 @@ const handleMoveToKb = async (kb) => {
 </script>
 
 <template>
-  <div class="bg-white rounded-xl border border-slate-200 hover:border-slate-300 transition-all duration-200">
+  <div
+    :class="[
+      'bg-white rounded-xl border transition-all duration-300',
+      highlighted
+        ? 'border-blue-500 ring-4 ring-blue-100 shadow-md'
+        : 'border-slate-200 hover:border-slate-300'
+    ]"
+  >
     <!-- File Info -->
     <div class="p-4">
       <div class="flex items-start gap-4">

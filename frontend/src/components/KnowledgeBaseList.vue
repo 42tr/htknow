@@ -1,5 +1,5 @@
 <script setup>
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, nextTick } from 'vue'
 import { api } from '../api'
 import FileCard from './FileCard.vue'
 import CreateKnowledgeBase from './CreateKnowledgeBase.vue'
@@ -21,6 +21,7 @@ const currentKbReparseLoading = ref(false)
 const childKbReparseLoading = ref({})
 const priorityDrafts = ref({})
 const prioritySaving = ref({})
+const locatedFileId = ref(null)
 
 // Permission modal state
 const showPermissionModal = ref(false)
@@ -221,6 +222,26 @@ const loadKbContent = async (kbId) => {
 // --- Navigation ---
 const navigateToKb = (kbId) => {
   loadKbContent(kbId)
+}
+
+const handleLocateFile = async (file) => {
+  if (!file?.id) return
+
+  locatedFileId.value = null
+  await loadKbContent(file.kb_id ?? null)
+  await nextTick()
+
+  const target = document.getElementById(`file-card-${file.id}`)
+  if (!target) {
+    alert('文件所在知识库已打开，但未找到该文件，文件可能已被移动或删除')
+    return
+  }
+
+  locatedFileId.value = file.id
+  target.scrollIntoView({ behavior: 'smooth', block: 'center' })
+  window.setTimeout(() => {
+    if (locatedFileId.value === file.id) locatedFileId.value = null
+  }, 3000)
 }
 
 // --- Event Handlers ---
@@ -523,6 +544,7 @@ onMounted(() => {
       :subtitle="statsSubtitle"
       @retry="fetchStats(getCurrentKbId())"
       @reparse-failed="handleReparseFailedFiles"
+      @locate-file="handleLocateFile"
     />
 
     <!-- Loading -->
@@ -682,8 +704,10 @@ onMounted(() => {
         <FileCard
             v-for="file in files"
             :key="`file-${file.id}`"
+            :id="`file-card-${file.id}`"
             :file="file"
             :kb-type="currentKb?.kb_type"
+            :highlighted="locatedFileId === file.id"
             @updated="handleFileAction"
             @deleted="handleFileAction"
         />
