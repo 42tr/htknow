@@ -175,8 +175,8 @@ pub struct SearchConfig {
     pub max_synonyms_per_term: usize,
     /// 单次查询最多扩展的同义词总数
     pub max_total_synonyms: usize,
-    /// 高亮页码选择阈值：首选页的位置数量少于该值时，优先使用第二页（如果存在）
-    pub highlight_page_min_positions: usize,
+    /// 高亮页码选择阈值：首选页的内容字数（按 pdf_content 中文本长度计算）少于该值时，优先使用第二页（如果存在）
+    pub highlight_page_min_chars: usize,
 }
 
 /// 切片配置
@@ -314,7 +314,11 @@ impl SearchConfig {
             synonym_boost: env_or_parse("HTKNOW_SEARCH_SYNONYM_BOOST", 0.7),
             max_synonyms_per_term: env_or_parse("HTKNOW_SEARCH_MAX_SYNONYMS_PER_TERM", 5),
             max_total_synonyms: env_or_parse("HTKNOW_SEARCH_MAX_TOTAL_SYNONYMS", 30),
-            highlight_page_min_positions: env_or_parse("HTKNOW_HIGHLIGHT_PAGE_MIN_POSITIONS", 20),
+            highlight_page_min_chars: std::env::var("HTKNOW_HIGHLIGHT_PAGE_MIN_CHARS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .or_else(|| std::env::var("HTKNOW_HIGHLIGHT_PAGE_MIN_POSITIONS").ok().and_then(|v| v.parse().ok()))
+                .unwrap_or(20),
         }
     }
 }
@@ -453,7 +457,7 @@ mod tests {
         assert_eq!(config.search.rerank_timeout_secs, 20);
         assert!(config.server.parse_enabled);
         assert!(!config.server.build_knowledge_graph);
-        assert_eq!(config.search.highlight_page_min_positions, 20);
+        assert_eq!(config.search.highlight_page_min_chars, 20);
     }
 
     #[test]

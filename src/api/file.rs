@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet}, io::{Seek, Write}, path::Component, sync::{Arc, OnceLock}, time::Instant
+    collections::{BTreeMap, HashMap, HashSet}, io::{Seek, Write}, path::Component, sync::{Arc, OnceLock}, time::Instant
 };
 
 use anyhow::Result as AnyResult;
@@ -1535,12 +1535,17 @@ pub(crate) async fn cleanup_deleted_files(
                 });
             }
 
-            let slice_content_path = std::path::Path::new(&cfg.storage.slice_contents_path).join(format!("{}.json", file.id));
+            let slice_content_path =
+                std::path::Path::new(&cfg.storage.slice_contents_path).join(format!("{}.json", file.id));
             if let Err(e) = fs::remove_file(&slice_content_path).await
                 && !matches!(e.kind(), std::io::ErrorKind::NotFound)
             {
                 warn!("Failed to delete slice content file {}: {}", slice_content_path.display(), e);
-                failed.push(BatchDeleteCleanupFailedItem { id: file.id, stage: "slice_content".to_string(), error: e.to_string() });
+                failed.push(BatchDeleteCleanupFailedItem {
+                    id: file.id,
+                    stage: "slice_content".to_string(),
+                    error: e.to_string(),
+                });
             }
 
             // 清理压缩文件解压目录
@@ -1895,9 +1900,8 @@ async fn extract_slice_image_paths_by_file(
         qb.push(")");
         let rows: Vec<i64> = qb.build_query_scalar().fetch_all(pool).await?;
         for file_id in rows {
-            let contents = crate::slice_content::read_all(file_id)
-                .await
-                .map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
+            let contents =
+                crate::slice_content::read_all(file_id).await.map_err(|e| sqlx::Error::Protocol(e.to_string()))?;
             let file_seen = seen.entry(file_id).or_default();
             for content in contents.values() {
                 for path in extract_image_paths_from_text(content) {
@@ -2221,13 +2225,22 @@ struct SlicePositionRow {
 )]
 pub async fn get_slices(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> ApiResult<Json<Vec<Slice>>> {
     let source_id = effective_parse_file_id(&pool, id).await?;
-    let rows: Vec<(i64, i64, i64)> = sqlx::query_as(
-        "SELECT id, created_at, updated_at FROM slices WHERE file_id = ? ORDER BY id",
-    ).bind(source_id).fetch_all(&pool).await?;
+    let rows: Vec<(i64, i64, i64)> =
+        sqlx::query_as("SELECT id, created_at, updated_at FROM slices WHERE file_id = ? ORDER BY id")
+            .bind(source_id)
+            .fetch_all(&pool)
+            .await?;
     let contents = crate::slice_content::read_all(source_id).await?;
-    let slices = rows.into_iter().map(|(slice_id, created_at, updated_at)| Slice {
-        id: slice_id, file_id: id, content: contents.get(&slice_id).cloned().unwrap_or_default(), created_at, updated_at,
-    }).collect();
+    let slices = rows
+        .into_iter()
+        .map(|(slice_id, created_at, updated_at)| Slice {
+            id: slice_id,
+            file_id: id,
+            content: contents.get(&slice_id).cloned().unwrap_or_default(),
+            created_at,
+            updated_at,
+        })
+        .collect();
     Ok(Json(slices))
 }
 
@@ -2299,11 +2312,13 @@ pub async fn update_slices(
 
     // 4. 校验 slice id 存在且属于该文件
     let requested_ids: Vec<i64> = req.slices.iter().map(|s| s.id).collect();
-    let existing_ids_ordered: Vec<i64> = sqlx::query_scalar("SELECT id FROM slices WHERE file_id = ? ORDER BY id")
-        .bind(id).fetch_all(&pool).await?;
+    let existing_ids_ordered: Vec<i64> =
+        sqlx::query_scalar("SELECT id FROM slices WHERE file_id = ? ORDER BY id").bind(id).fetch_all(&pool).await?;
     let existing_contents = crate::slice_content::read_all(id).await?;
-    let existing_slices: Vec<(i64, String)> = existing_ids_ordered.iter()
-        .map(|slice_id| (*slice_id, existing_contents.get(slice_id).cloned().unwrap_or_default())).collect();
+    let existing_slices: Vec<(i64, String)> = existing_ids_ordered
+        .iter()
+        .map(|slice_id| (*slice_id, existing_contents.get(slice_id).cloned().unwrap_or_default()))
+        .collect();
     let existing_ids: std::collections::HashSet<i64> = existing_slices.iter().map(|(id, _)| *id).collect();
 
     for item in &req.slices {
@@ -2320,13 +2335,16 @@ pub async fn update_slices(
     let mut tx = pool.begin().await?;
     let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
 
-    let changed: Vec<(i64, String)> = requested_ids.iter()
-        .map(|slice_id| (*slice_id, content_map.get(slice_id).cloned().unwrap_or_default())).collect();
+    let changed: Vec<(i64, String)> = requested_ids
+        .iter()
+        .map(|slice_id| (*slice_id, content_map.get(slice_id).cloned().unwrap_or_default()))
+        .collect();
     crate::slice_content::upsert_many(id, &changed).await?;
     if !requested_ids.is_empty() {
         let mut qb = QueryBuilder::<Sqlite>::new("UPDATE slices SET updated_at = ");
         qb.push_bind(now).push(" WHERE file_id = ").push_bind(id).push(" AND id IN (");
-        crate::db::push_i64_list(&mut qb, &requested_ids); qb.push(")");
+        crate::db::push_i64_list(&mut qb, &requested_ids);
+        qb.push(")");
         qb.build().execute(&mut *tx).await?;
     }
 
@@ -2425,7 +2443,9 @@ pub async fn get_slice_highlight(
 
 /// 获取切片推荐高亮页码
 ///
-/// 优先返回 positions 数量最多的首页；如果第一页位置数量少于配置阈值且存在第二页，则返回第二页。
+/// 优先返回首页；如果第一页的内容字数（按 pdf_content 中对应位置的内容文本长度计算）
+/// 少于配置阈值且存在第二页，则返回第二页。若 pdf_content 不存在或找不到匹配位置，
+/// 则退化为按位置数量计数。
 /// 返回的 `page_idx` 为 0-based，前端展示时需自行 +1。
 #[utoipa::path(
     get,
@@ -2466,19 +2486,48 @@ pub async fn get_slice_highlight_page(
         None => return Err(ApiError::NotFound("Slice not found".to_string())),
     }
 
-    let rows: Vec<(i32, i64)> = sqlx::query_as(
-        "SELECT page_idx, COUNT(*) as cnt FROM slice_positions WHERE slice_id = ? GROUP BY page_idx ORDER BY page_idx",
-    )
-    .bind(slice_id)
-    .fetch_all(&pool)
-    .await?;
+    let rows: Vec<(i32, i32, i32, i32, i32)> =
+        sqlx::query_as("SELECT page_idx, x1, y1, x2, y2 FROM slice_positions WHERE slice_id = ? ORDER BY page_idx, id")
+            .bind(slice_id)
+            .fetch_all(&pool)
+            .await?;
 
     if rows.is_empty() {
         return Err(ApiError::NotFound("Slice has no highlight positions".to_string()));
     }
 
-    let threshold = config::get().search.highlight_page_min_positions as i64;
-    let page_idx = if rows[0].1 < threshold && rows.len() > 1 { rows[1].0 } else { rows[0].0 };
+    // 按 page_idx + bbox 去 pdf_content 里匹配内容长度；匹配不到时退化为 1（保持原“位置数量”语义）
+    let pdf_contents = crate::pdf_content::read(parse_file_id).await.unwrap_or_default();
+    let mut content_len_by_bbox: HashMap<(i32, [i32; 4]), i64> = HashMap::new();
+    for row in &pdf_contents {
+        let Some(raw_bbox) = &row.bbox else { continue };
+        let Ok(bbox) = serde_json::from_str::<Vec<i32>>(raw_bbox) else { continue };
+        if bbox.len() != 4 {
+            continue;
+        }
+        let mut len = 0i64;
+        if let Some(text) = &row.text {
+            len += text.chars().count() as i64;
+        }
+        if let Some(body) = &row.table_body {
+            len += body.chars().count() as i64;
+        }
+        let key = (row.page_idx, [bbox[0], bbox[1], bbox[2], bbox[3]]);
+        content_len_by_bbox.insert(key, len);
+    }
+
+    let mut page_counts: BTreeMap<i32, i64> = BTreeMap::new();
+    for (page_idx, x1, y1, x2, y2) in rows {
+        let bbox = [x1, y1, x2, y2];
+        let len = content_len_by_bbox.get(&(page_idx, bbox)).copied().unwrap_or(1);
+        *page_counts.entry(page_idx).or_insert(0) += len;
+    }
+
+    let threshold = config::get().search.highlight_page_min_chars as i64;
+    let mut iter = page_counts.iter();
+    let first = iter.next().expect("page_counts not empty");
+    let page_idx =
+        if *first.1 < threshold && page_counts.len() > 1 { *iter.next().expect("has second page").0 } else { *first.0 };
 
     Ok(Json(SliceHighlightPage { page_idx }))
 }

@@ -303,7 +303,28 @@ async fn slice_highlight_page_by_id() {
 
     let file_id = insert_file(&pool, &user, "highlight-page.txt", &file_path, Some(kb_id), Vec::new(), false).await;
 
-    // 场景 1：第一页位置数量少于阈值（默认 20）且存在第二页，应返回第二页
+    // 为文件写入 pdf_content，使 highlight-page 能按内容字数判断
+    let pdf_rows = vec![
+        htknow::pdf_content::PdfContent {
+            page_idx: 0,
+            bbox: Some("[10,20,100,30]".to_string()),
+            text: Some("a".to_string()),
+            text_level: None,
+            img_path: None,
+            table_body: None,
+        },
+        htknow::pdf_content::PdfContent {
+            page_idx: 1,
+            bbox: Some("[10,20,100,30]".to_string()),
+            text: Some("a".to_string()),
+            text_level: None,
+            img_path: None,
+            table_body: None,
+        },
+    ];
+    htknow::pdf_content::write(file_id, &pdf_rows).await.unwrap();
+
+    // 场景 1：第一页内容字数少于阈值（19 * 1 = 19 < 20）且存在第二页，应返回第二页
     let slice_id_a = insert_slice(&pool, file_id, "slice a").await;
     for _ in 0..19 {
         insert_slice_position(&pool, slice_id_a, 0, [10, 20, 100, 30]).await;
@@ -320,7 +341,7 @@ async fn slice_highlight_page_by_id() {
     let json_a = response_json(res_a).await;
     assert_eq!(json_a["page_idx"].as_i64(), Some(1));
 
-    // 场景 2：第一页位置数量达到阈值，应返回第一页
+    // 场景 2：第一页内容字数达到阈值（21 * 1 = 21 >= 20），应返回第一页
     let slice_id_b = insert_slice(&pool, file_id, "slice b").await;
     for _ in 0..21 {
         insert_slice_position(&pool, slice_id_b, 0, [10, 20, 100, 30]).await;
@@ -337,7 +358,7 @@ async fn slice_highlight_page_by_id() {
     let json_b = response_json(res_b).await;
     assert_eq!(json_b["page_idx"].as_i64(), Some(0));
 
-    // 场景 3：只有一页且数量少于阈值，仍返回第一页
+    // 场景 3：只有一页且内容字数少于阈值（无 pdf_content 匹配，按位置数量兜底为 1），仍返回第一页
     let slice_id_c = insert_slice(&pool, file_id, "slice c").await;
     insert_slice_position(&pool, slice_id_c, 2, [10, 20, 100, 30]).await;
 
