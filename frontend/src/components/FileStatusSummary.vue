@@ -67,7 +67,29 @@ const cards = computed(() => {
 const hasData = computed(() => normalizedStats.value.total > 0)
 const hasFailedFiles = computed(() => normalizedStats.value.failed > 0)
 const processingFiles = computed(() => props.stats?.processing_files ?? [])
+const failedFiles = computed(() => props.stats?.failed_files ?? [])
 const hoveredCard = ref(null)
+const selectedCard = ref(null)
+
+const previewFiles = computed(() => {
+  const key = hoveredCard.value || selectedCard.value
+  if (key === 'processing') return processingFiles.value
+  if (key === 'failed') return failedFiles.value
+  return []
+})
+
+const activePreviewCard = computed(() => hoveredCard.value || selectedCard.value)
+const previewTitle = computed(() => activePreviewCard.value === 'failed' ? '最近处理失败的文件' : '正在处理的文件')
+
+const canPreview = (card) => {
+  return (card.key === 'processing' && processingFiles.value.length > 0)
+    || (card.key === 'failed' && failedFiles.value.length > 0)
+}
+
+const togglePreview = (card) => {
+  if (!canPreview(card)) return
+  selectedCard.value = selectedCard.value === card.key ? null : card.key
+}
 
 const getPercent = (value) => {
   if (!normalizedStats.value.total) return 0
@@ -122,10 +144,13 @@ const formatTimestamp = (timestamp) => {
               :key="card.key"
               :class="[
                 'shrink-0 px-3 py-2 rounded-2xl border border-slate-100 bg-slate-50 text-xs flex flex-col gap-0.5',
-                card.key === 'processing' && processingFiles.length ? 'cursor-pointer' : ''
+                canPreview(card)
+                  ? 'cursor-pointer'
+                  : ''
               ]"
               @mouseenter="hoveredCard = card.key"
               @mouseleave="hoveredCard = null"
+              @click="togglePreview(card)"
             >
               <span class="text-[11px] text-slate-500 font-medium">{{ card.label }}</span>
               <span class="text-base font-semibold text-slate-900 leading-none">
@@ -142,24 +167,23 @@ const formatTimestamp = (timestamp) => {
       </div>
     </div>
     <div
-      v-if="hoveredCard === 'processing' && processingFiles.length"
+      v-if="previewFiles.length"
       class="mt-3 bg-white border border-slate-200 rounded-2xl shadow-sm p-3 text-xs text-slate-600 w-full"
-      @mouseenter="hoveredCard = 'processing'"
       @mouseleave="hoveredCard = null"
     >
       <div class="flex items-center justify-between text-[11px] uppercase tracking-wide text-slate-400 mb-2">
-        <span>正在处理的文件</span>
-        <span>{{ processingFiles.length }} 项</span>
+        <span>{{ previewTitle }}</span>
+        <span>最近 {{ previewFiles.length }} 项</span>
       </div>
       <ul class="space-y-1 max-h-60 overflow-auto pr-1">
         <li
-          v-for="file in processingFiles"
+          v-for="file in previewFiles"
           :key="file.id"
           class="flex flex-col gap-0.5 border-b border-slate-100 last:border-0 pb-1 last:pb-0"
         >
           <span class="font-medium text-slate-800 truncate">{{ file.filename }}</span>
           <span class="text-[11px] text-slate-400">
-            {{ file.kb_name || '未分配知识库' }} · 更新时间 {{ formatTimestamp(file.updated_at) }}
+            位置：{{ file.kb_path || file.kb_name || '未分配知识库' }} · {{ activePreviewCard === 'failed' ? '失败时间' : '更新时间' }} {{ formatTimestamp(file.updated_at) }}
           </span>
         </li>
       </ul>

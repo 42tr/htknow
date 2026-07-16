@@ -142,6 +142,8 @@ const createEmptyStats = () => ({
   skipped: 0,
   failed: 0,
   unknown: 0,
+  processing_files: [],
+  failed_files: [],
 })
 const stats = ref(createEmptyStats())
 const statsLoading = ref(true)

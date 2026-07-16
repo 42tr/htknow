@@ -158,6 +158,8 @@ pub struct FileStatusBreakdown {
     pub unknown: i64,
     /// 当前正在处理的文件（按更新时间倒序，最多10条）
     pub processing_files: Vec<FileStatusPreview>,
+    /// 最近处理失败的文件（按更新时间倒序，最多10条）
+    pub failed_files: Vec<FileStatusPreview>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
@@ -166,6 +168,7 @@ pub struct FileStatusPreview {
     pub filename: String,
     pub kb_id: Option<i64>,
     pub kb_name: Option<String>,
+    pub kb_path: Option<String>,
     pub updated_at: i64,
 }
 
@@ -265,23 +268,34 @@ async fn query_file_status_breakdown(
     qb.push(" GROUP BY f.status");
 
     let rows = qb.build().fetch_all(pool).await?;
-    let mut breakdown = FileStatusBreakdown { processing_files: Vec::new(), ..Default::default() };
+    let mut breakdown = FileStatusBreakdown::default();
     for row in rows {
         let status: i32 = row.get("status");
         let cnt: i64 = row.get("cnt");
         breakdown.add(status, cnt);
     }
-    breakdown.processing_files = fetch_processing_files_for_scope(pool, scope, user_id, is_admin).await?;
+    breakdown.processing_files = fetch_status_files_for_scope(pool, scope, user_id, is_admin, 2).await?;
+    breakdown.failed_files = fetch_status_files_for_scope(pool, scope, user_id, is_admin, -1).await?;
     Ok(breakdown)
 }
 
-async fn fetch_processing_files_for_scope(
-    pool: &SqlitePool, scope: FileStatsScope, user_id: &str, is_admin: bool,
+async fn fetch_status_files_for_scope(
+    pool: &SqlitePool, scope: FileStatsScope, user_id: &str, is_admin: bool, status: i32,
 ) -> AnyResult<Vec<FileStatusPreview>> {
     let mut qb = QueryBuilder::<Sqlite>::new(
-        "SELECT f.id, f.filename, f.kb_id, kb.name AS kb_name, f.updated_at FROM files f \
-         LEFT JOIN knowledge_bases kb ON kb.id = f.kb_id WHERE f.status = 2",
+        "WITH RECURSIVE kb_paths(id, path) AS ( \
+             SELECT id, name FROM knowledge_bases WHERE parent_id IS NULL \
+             UNION ALL \
+             SELECT kb.id, kb_paths.path || ' / ' || kb.name \
+             FROM knowledge_bases kb JOIN kb_paths ON kb.parent_id = kb_paths.id \
+         ) \
+         SELECT f.id, f.filename, f.kb_id, kb.name AS kb_name, kb_paths.path AS kb_path, f.updated_at \
+         FROM files f \
+         LEFT JOIN knowledge_bases kb ON kb.id = f.kb_id \
+         LEFT JOIN kb_paths ON kb_paths.id = f.kb_id \
+         WHERE f.status = ",
     );
+    qb.push_bind(status);
 
     match scope {
         FileStatsScope::Global { include_unassigned } => {
