@@ -2668,8 +2668,8 @@ pub async fn download(
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct HighlightQuery {
-    /// 切片 ID
-    pub slice_id: i64,
+    /// 切片 ID，不传则只返回原 PDF 不做高亮
+    pub slice_id: Option<i64>,
 }
 
 /// 获取带高亮标注的 PDF
@@ -2703,28 +2703,32 @@ pub async fn get_highlighted_pdf(
 
     ensure_file_readable(&file, &auth_user)?;
 
-    // 校验切片属于该文件
     let parse_file_id = effective_parse_file_id(&pool, id).await?;
-    let slice: Option<(i64,)> =
-        sqlx::query_as("SELECT file_id FROM slices WHERE id = ?").bind(params.slice_id).fetch_optional(&pool).await?;
-    match slice {
-        Some((file_id,)) if file_id == parse_file_id => {}
-        Some(_) => return Err(ApiError::BadRequest("Slice does not belong to the file".to_string())),
-        None => return Err(ApiError::NotFound("Slice not found".to_string())),
-    }
 
-    // 从数据库查询 slice 的 positions
-    let rows: Vec<SlicePositionRow> = sqlx::query_as(
-        "SELECT page_idx, x1, y1, x2, y2, sheet_name, row_num FROM slice_positions WHERE slice_id = ? ORDER BY page_idx, id",
-    )
-    .bind(params.slice_id)
-    .fetch_all(&pool)
-    .await?;
+    let positions: Vec<pdf_highlight::HighlightPosition> = if let Some(slice_id) = params.slice_id {
+        // 校验切片属于该文件
+        let slice: Option<(i64,)> =
+            sqlx::query_as("SELECT file_id FROM slices WHERE id = ?").bind(slice_id).fetch_optional(&pool).await?;
+        match slice {
+            Some((file_id,)) if file_id == parse_file_id => {}
+            Some(_) => return Err(ApiError::BadRequest("Slice does not belong to the file".to_string())),
+            None => return Err(ApiError::NotFound("Slice not found".to_string())),
+        }
 
-    let positions: Vec<pdf_highlight::HighlightPosition> = rows
-        .iter()
-        .map(|row| pdf_highlight::HighlightPosition { page_idx: row.page_idx, bbox: [row.x1, row.y1, row.x2, row.y2] })
-        .collect();
+        // 从数据库查询 slice 的 positions
+        let rows: Vec<SlicePositionRow> = sqlx::query_as(
+            "SELECT page_idx, x1, y1, x2, y2, sheet_name, row_num FROM slice_positions WHERE slice_id = ? ORDER BY page_idx, id",
+        )
+        .bind(slice_id)
+        .fetch_all(&pool)
+        .await?;
+
+        rows.iter()
+            .map(|row| pdf_highlight::HighlightPosition { page_idx: row.page_idx, bbox: [row.x1, row.y1, row.x2, row.y2] })
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let coord_bounds_by_page = if positions.is_empty() {
         None
