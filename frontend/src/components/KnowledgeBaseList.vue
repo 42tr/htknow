@@ -6,6 +6,7 @@ import CreateKnowledgeBase from './CreateKnowledgeBase.vue'
 import FileStatusSummary from './FileStatusSummary.vue'
 import ExportRecordPanel from './ExportRecordPanel.vue'
 import KbPermissionModal from './KbPermissionModal.vue'
+import Pagination from './Pagination.vue'
 import { setCurrentKb } from '../store'
 
 // Reactive state for the current view
@@ -22,6 +23,13 @@ const childKbReparseLoading = ref({})
 const priorityDrafts = ref({})
 const prioritySaving = ref({})
 const locatedFileId = ref(null)
+
+// Pagination / filter state for KB file list
+const currentPage = ref(1)
+const pageSize = ref(10)
+const totalFiles = ref(0)
+const fileFilterName = ref('')
+const fileFilterTag = ref('')
 
 // Permission modal state
 const showPermissionModal = ref(false)
@@ -190,17 +198,27 @@ const loadKbContent = async (kbId) => {
       // Root view: fetch top-level KBs and unassigned files
       const [topLevelKbs, unassignedFiles] = await Promise.all([
         api.getKnowledgeBases(null),
-        api.getFiles(null)
+        api.getFiles(null, null, { page: currentPage.value, size: pageSize.value })
       ]);
       childrenKbs.value = topLevelKbs
-      files.value = unassignedFiles
+      files.value = unassignedFiles.items || []
+      totalFiles.value = unassignedFiles.total || 0
       newCurrentKb = { id: null, name: '所有知识库', kb_type: null }
       breadcrumbs.value = []
     } else {
       // Inside a specific KB
-      const data = await api.getKnowledgeBase(targetId)
+      const [data, filesData] = await Promise.all([
+        api.getKnowledgeBase(targetId),
+        api.getKnowledgeBaseFiles(targetId, {
+          page: currentPage.value,
+          size: pageSize.value,
+          filename: fileFilterName.value || undefined,
+          tag: fileFilterTag.value || undefined,
+        })
+      ])
       childrenKbs.value = data.children_kbs || []
-      files.value = data.files || []
+      files.value = filesData.items || []
+      totalFiles.value = filesData.total || 0
       newCurrentKb = { id: data.id, name: data.name, description: data.description, kb_type: data.kb_type }
       breadcrumbs.value = data.path || []
     }
@@ -221,13 +239,24 @@ const loadKbContent = async (kbId) => {
 
 // --- Navigation ---
 const navigateToKb = (kbId) => {
+  currentPage.value = 1
+  fileFilterName.value = ''
+  fileFilterTag.value = ''
   loadKbContent(kbId)
+}
+
+const applyFileFilters = () => {
+  currentPage.value = 1
+  loadKbContent(getCurrentKbId())
 }
 
 const handleLocateFile = async (file) => {
   if (!file?.id) return
 
   locatedFileId.value = null
+  currentPage.value = 1
+  fileFilterName.value = ''
+  fileFilterTag.value = ''
   await loadKbContent(file.kb_id ?? null)
   await nextTick()
 
@@ -699,8 +728,34 @@ onMounted(() => {
       </div>
 
       <!-- Files -->
-      <div class="mt-6 space-y-3" v-if="files.length > 0">
-        <h3 class="text-lg font-semibold text-slate-700 mb-4" v-if="childrenKbs.length > 0">文件</h3>
+      <div class="mt-6 space-y-3" v-if="files.length > 0 || currentKb?.id !== null">
+        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
+          <h3 class="text-lg font-semibold text-slate-700">文件 <span class="text-sm font-normal text-slate-500">（共 {{ totalFiles }} 个）</span></h3>
+          <div v-if="currentKb?.id !== null" class="flex items-center gap-2">
+            <input
+              v-model="fileFilterName"
+              type="text"
+              placeholder="文件名搜索"
+              @keyup.enter="applyFileFilters"
+              class="px-2.5 py-1.5 text-sm border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 w-40"
+            />
+            <input
+              v-model="fileFilterTag"
+              type="text"
+              placeholder="标签筛选"
+              @keyup.enter="applyFileFilters"
+              class="px-2.5 py-1.5 text-sm border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 w-32"
+            />
+            <button
+              type="button"
+              @click="applyFileFilters"
+              class="px-3 py-1.5 text-sm font-medium rounded-md bg-blue-600 text-white hover:bg-blue-700"
+            >
+              搜索
+            </button>
+          </div>
+        </div>
+
         <FileCard
             v-for="file in files"
             :key="`file-${file.id}`"
@@ -710,6 +765,14 @@ onMounted(() => {
             :highlighted="locatedFileId === file.id"
             @updated="handleFileAction"
             @deleted="handleFileAction"
+        />
+
+        <Pagination
+          v-if="totalFiles > 0"
+          v-model:page="currentPage"
+          v-model:size="pageSize"
+          :total="totalFiles"
+          @change="loadKbContent(currentKb?.id ?? null)"
         />
       </div>
     </div>

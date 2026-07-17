@@ -369,6 +369,21 @@ export const api = {
     return response.json();
   },
 
+  async getKnowledgeBaseFiles(id, params = {}) {
+    const searchParams = new URLSearchParams()
+    if (params.page) searchParams.set('page', String(params.page))
+    if (params.size) searchParams.set('size', String(params.size))
+    if (params.filename) searchParams.set('filename', params.filename)
+    if (params.tag) searchParams.set('tag', params.tag)
+    const query = searchParams.toString()
+    const response = await fetch(
+      `${API_BASE}/knowledge_base/${id}/files${query ? `?${query}` : ''}`,
+      { headers: getHeaders() }
+    )
+    if (!response.ok) throw new Error(await readErrorMessage(response, '获取知识库文件失败'))
+    return response.json()
+  },
+
   async createKnowledgeBase(data) { // data may include { name, description, parent_id }
     const response = await fetch(`${API_BASE}/knowledge_base/`, {
       method: 'POST',
@@ -506,7 +521,7 @@ export const api = {
     return response.json()
   },
 
-  async getFiles(kbId, tag = null) {
+  async getFiles(kbId, tag = null, pagination = {}) {
     let url = `${API_BASE}/files/`
     const params = []
     if (kbId === null) {
@@ -519,6 +534,8 @@ export const api = {
     if (tag) {
       params.push(`tag=${encodeURIComponent(tag)}`)
     }
+    if (pagination.page) params.push(`page=${pagination.page}`)
+    if (pagination.size) params.push(`size=${pagination.size}`)
     if (params.length > 0) {
       url += `?${params.join('&')}`
     }

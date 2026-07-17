@@ -237,10 +237,27 @@ pub struct KnowledgeDetailResponse {
     pub file_count: i64,
     pub children_kb_count: i64,
     pub children_kbs: Vec<KnowledgeResponse>,
-    pub files: Vec<FileWithoutContent>,
     pub path: Vec<Knowledge>, // For breadcrumbs
     pub status_breakdown: FileStatusBreakdown,
     pub current_user_permission: String,
+}
+
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct KnowledgeBaseFilesQuery {
+    /// 页码，从1开始
+    pub page: Option<i64>,
+    /// 每页条数
+    pub size: Option<i64>,
+    /// 文件名模糊搜索（%filename%）
+    pub filename: Option<String>,
+    /// 根据标签筛选
+    pub tag: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct KnowledgeBaseFilesResponse {
+    pub total: i64,
+    pub items: Vec<FileWithoutContent>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
@@ -305,14 +322,6 @@ pub struct ListQuery {
 pub struct TreeQuery {
     /// 知识库 ID（可选），传入则返回该知识库的子树，不传则返回完整树
     pub kb_id: Option<i64>,
-}
-
-#[derive(Debug, Deserialize, IntoParams)]
-pub struct KnowledgeDetailQuery {
-    /// 文件名模糊搜索（%filename%）
-    pub filename: Option<String>,
-    /// 根据标签筛选
-    pub tag: Option<String>,
 }
 
 /// 获取知识库列表
@@ -721,8 +730,7 @@ pub async fn update(
     operation_id = "knowledge_base_get",
     tag = "knowledge_base",
     params(
-        ("id" = i64, Path, description = "知识库 ID"),
-        KnowledgeDetailQuery
+        ("id" = i64, Path, description = "知识库 ID")
     ),
     responses(
         (status = 200, description = "成功返回知识库详情", body = KnowledgeDetailResponse),
@@ -735,8 +743,7 @@ pub async fn update(
     )
 )]
 pub async fn get(
-    State(pool): State<SqlitePool>, Path(id): Path<i64>, Query(query): Query<KnowledgeDetailQuery>,
-    Extension(auth_user): Extension<AuthUser>,
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<KnowledgeDetailResponse>> {
     let is_admin = auth_user.is_admin();
     let user_id = auth_user.user_id.clone();
@@ -756,7 +763,7 @@ pub async fn get(
     .fetch_one(&pool)
     .await?;
 
-    // 2. Fetch children KBs and files in parallel
+    // 2. Fetch children KBs
     let children_future = async {
         let mut qb = QueryBuilder::<Sqlite>::new(
             "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority \
@@ -775,24 +782,7 @@ pub async fn get(
         qb.build_query_as::<Knowledge>().fetch_all(&pool).await
     };
 
-    let files_future = async {
-        let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at FROM files WHERE kb_id = ",
-        );
-        qb.push_bind(id);
-        if !is_admin {
-            qb.push(" AND (user_id = ").push_bind(user_id.clone()).push(" OR is_public = 1)");
-        }
-        if let Some(filename) = query.filename.as_deref() {
-            qb.push(" AND filename LIKE ").push_bind(format!("%{}%", filename));
-        }
-        qb.push(" ORDER BY updated_at DESC");
-        qb.build_query_as::<FileWithoutContent>().fetch_all(&pool).await
-    };
-
-    let (children_kbs_res, files_res) = tokio::join!(children_future, files_future);
-    let children_kbs: Vec<Knowledge> = children_kbs_res?;
-    let mut files: Vec<FileWithoutContent> = files_res?;
+    let children_kbs: Vec<Knowledge> = children_future.await?;
     let mut count_ids = Vec::with_capacity(children_kbs.len() + 1);
     count_ids.push(id);
     count_ids.extend(children_kbs.iter().map(|kb| kb.id));
@@ -829,12 +819,6 @@ pub async fn get(
         })
         .collect();
 
-    if let Some(tag) = &query.tag {
-        files.retain(|file| {
-            if let Ok(tags) = serde_json::from_str::<Vec<String>>(&file.tags) { tags.contains(tag) } else { false }
-        });
-    }
-
     // 3. Fetch the breadcrumb path in a single recursive CTE query (root -> parent),
     //    avoiding one round-trip per ancestor level.
     let path: Vec<Knowledge> = sqlx::query_as(
@@ -866,13 +850,104 @@ pub async fn get(
         file_count,
         children_kb_count,
         children_kbs,
-        files,
         path,
         status_breakdown,
         current_user_permission,
     };
 
     Ok(Json(response))
+}
+
+/// 获取知识库文件列表（分页）
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/knowledge_base/{id}/files",
+    operation_id = "knowledge_base_files",
+    tag = "knowledge_base",
+    params(
+        ("id" = i64, Path, description = "知识库 ID"),
+        KnowledgeBaseFilesQuery
+    ),
+    responses(
+        (status = 200, description = "成功返回知识库文件列表", body = KnowledgeBaseFilesResponse),
+        (status = 401, description = "未授权"),
+        (status = 404, description = "知识库不存在或无权限")
+    ),
+    security(("x-user-id" = []), ("x-role" = []))
+)]
+pub async fn get_files(
+    State(pool): State<SqlitePool>,
+    Path(id): Path<i64>,
+    Query(params): Query<KnowledgeBaseFilesQuery>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<KnowledgeBaseFilesResponse>> {
+    let is_admin = auth_user.is_admin();
+    let user_id = auth_user.user_id.clone();
+
+    let user_perm = get_kb_permission(&pool, id, &user_id, is_admin).await;
+    if user_perm.is_none() {
+        return Err(ApiError::NotFound("Knowledge base not found or permission denied.".to_string()));
+    }
+
+    let size = params.size.unwrap_or(10).clamp(1, 200);
+    let page = params.page.unwrap_or(1).max(1);
+    let limit = size;
+    let offset = (page - 1) * size;
+
+    let filename = params.filename.as_deref().filter(|s| !s.is_empty());
+    let tag = params.tag.as_deref().filter(|s| !s.is_empty());
+
+    let push_filters = |qb: &mut QueryBuilder<Sqlite>| {
+        if !is_admin {
+            qb.push(" AND (user_id = ")
+                .push_bind(user_id.clone())
+                .push(" OR is_public = 1)");
+        }
+        if let Some(name) = filename {
+            qb.push(" AND filename LIKE ").push_bind(format!("%{}%", name));
+        }
+    };
+
+    if let Some(tag) = tag {
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at FROM files WHERE kb_id = "
+        );
+        qb.push_bind(id);
+        push_filters(&mut qb);
+        qb.push(" ORDER BY updated_at DESC");
+        let rows: Vec<FileWithoutContent> = qb.build_query_as().fetch_all(&pool).await?;
+        let filtered: Vec<FileWithoutContent> = rows
+            .into_iter()
+            .filter(|f| {
+                serde_json::from_str::<Vec<String>>(&f.tags)
+                    .map(|tags| tags.contains(&tag.to_string()))
+                    .unwrap_or(false)
+            })
+            .collect();
+        let total = filtered.len() as i64;
+        let items = filtered
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .collect();
+        return Ok(Json(KnowledgeBaseFilesResponse { total, items }));
+    }
+
+    let mut count_qb = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM files WHERE kb_id = ");
+    count_qb.push_bind(id);
+    push_filters(&mut count_qb);
+    let total: i64 = count_qb.build_query_scalar().fetch_one(&pool).await?;
+
+    let mut list_qb = QueryBuilder::<Sqlite>::new(
+        "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at FROM files WHERE kb_id = "
+    );
+    list_qb.push_bind(id);
+    push_filters(&mut list_qb);
+    list_qb.push(" ORDER BY updated_at DESC LIMIT ").push_bind(limit);
+    list_qb.push(" OFFSET ").push_bind(offset);
+    let items: Vec<FileWithoutContent> = list_qb.build_query_as().fetch_all(&pool).await?;
+
+    Ok(Json(KnowledgeBaseFilesResponse { total, items }))
 }
 
 /// 删除知识库

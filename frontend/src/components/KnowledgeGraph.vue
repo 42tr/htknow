@@ -65,7 +65,8 @@ const loadKnowledgeBases = async () => {
 // 加载文件列表
 const loadFiles = async () => {
   try {
-    files.value = await api.getFiles()
+    const result = await api.getFiles(undefined, null, { size: 10000 })
+    files.value = result.items || []
   } catch (error) {
     console.error('加载文件列表失败:', error)
   }

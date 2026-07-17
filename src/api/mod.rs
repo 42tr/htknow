@@ -27,6 +27,7 @@ use crate::search::SearchEngine;
         knowledge_base::list,
         knowledge_base::create,
         knowledge_base::get,
+        knowledge_base::get_files,
         knowledge_base::update,
         knowledge_base::reparse,
         knowledge_base::reparse_by_id,
@@ -91,6 +92,7 @@ use crate::search::SearchEngine;
             knowledge_base::Knowledge,
             knowledge_base::KnowledgeResponse,
             knowledge_base::KnowledgeDetailResponse,
+            knowledge_base::KnowledgeBaseFilesResponse,
             knowledge_base::KnowledgeTreeFile,
             knowledge_base::KnowledgeTreeNode,
             knowledge_base::KnowledgeCreateReq,
@@ -102,6 +104,7 @@ use crate::search::SearchEngine;
             knowledge_base::KbPermissionCreateReq,
             crate::export::ExportManifest,
             file::File,
+            file::FileListResponse,
             file::UpdateFileReq,
             file::MoveFileReq,
             file::BatchDeleteFilesReq,
@@ -179,6 +182,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/", get(knowledge_base::list).post(knowledge_base::create))
         .route("/reparse", post(knowledge_base::reparse))
         .route("/{id}/reparse", post(knowledge_base::reparse_by_id))
+        .route("/{id}/files", get(knowledge_base::get_files))
         .route("/export", post(knowledge_base::batch_export_kb))
         .route("/tree", get(knowledge_base::tree))
         .route("/{id}", get(knowledge_base::get).put(knowledge_base::update).delete(knowledge_base::delete))

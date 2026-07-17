@@ -125,17 +125,50 @@ async fn knowledge_base_tree_and_detail_flow() {
             && child["files"].as_array().unwrap().iter().any(|file| file["id"].as_i64() == Some(child_file_id))
     }));
 
-    let detail_req = authed_empty_request(
-        "GET",
-        format!("/api/v1/knowledge/knowledge_base/{}?filename=root-file", root_kb_id),
-        &user,
-    );
+    let detail_req = authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}", root_kb_id), &user);
     let detail_res = app.clone().oneshot(detail_req).await.unwrap();
     assert_eq!(detail_res.status(), StatusCode::OK);
     let detail_json = response_json(detail_res).await;
     assert_eq!(detail_json["id"].as_i64(), Some(root_kb_id));
-    let detail_files = detail_json["files"].as_array().expect("detail files");
-    assert!(detail_files.iter().any(|file| file["id"].as_i64() == Some(root_file_id)));
+    assert!(detail_json["files"].is_null(), "detail should no longer return files");
+
+    // New paginated files endpoint
+    let kb_files_req = authed_empty_request(
+        "GET",
+        format!("/api/v1/knowledge/knowledge_base/{}/files?filename=root-file", root_kb_id),
+        &user,
+    );
+    let kb_files_res = app.clone().oneshot(kb_files_req).await.unwrap();
+    assert_eq!(kb_files_res.status(), StatusCode::OK);
+    let kb_files_json = response_json(kb_files_res).await;
+    let kb_files_items = kb_files_json["items"].as_array().expect("kb files items");
+    assert!(kb_files_items.iter().any(|file| file["id"].as_i64() == Some(root_file_id)));
+    assert!(kb_files_json["total"].as_i64().unwrap_or(0) >= 1);
+
+    // Pagination
+    let kb_files_page_req = authed_empty_request(
+        "GET",
+        format!("/api/v1/knowledge/knowledge_base/{}/files?size=1&page=1", root_kb_id),
+        &user,
+    );
+    let kb_files_page_res = app.clone().oneshot(kb_files_page_req).await.unwrap();
+    assert_eq!(kb_files_page_res.status(), StatusCode::OK);
+    let kb_files_page_json = response_json(kb_files_page_res).await;
+    assert!(kb_files_page_json["total"].as_i64().unwrap_or(0) >= 1);
+    assert!(kb_files_page_json["items"].as_array().expect("items").len() <= 1);
+
+    // Tag filter
+    let kb_files_tag_req = authed_empty_request(
+        "GET",
+        format!("/api/v1/knowledge/knowledge_base/{}/files?tag=root", root_kb_id),
+        &user,
+    );
+    let kb_files_tag_res = app.clone().oneshot(kb_files_tag_req).await.unwrap();
+    assert_eq!(kb_files_tag_res.status(), StatusCode::OK);
+    let kb_files_tag_json = response_json(kb_files_tag_res).await;
+    assert!(kb_files_tag_json["items"].as_array().expect("tag items").iter().all(|file| {
+        file["id"].as_i64() == Some(root_file_id)
+    }));
 }
 
 #[tokio::test]
@@ -172,21 +205,22 @@ async fn file_endpoints_flow() {
     let list_res = app.clone().oneshot(list_req).await.unwrap();
     assert_eq!(list_res.status(), StatusCode::OK);
     let list_json = response_json(list_res).await;
-    let list = list_json.as_array().expect("file list");
+    let list = list_json["items"].as_array().expect("file list items");
+    assert!(list_json["total"].as_i64().unwrap_or(0) >= 1);
     assert!(list.iter().any(|f| f["id"].as_i64() == Some(file_id)));
 
     let list_tag_req = authed_empty_request("GET", "/api/v1/knowledge/files/?tag=tag1", &user);
     let list_tag_res = app.clone().oneshot(list_tag_req).await.unwrap();
     assert_eq!(list_tag_res.status(), StatusCode::OK);
     let list_tag_json = response_json(list_tag_res).await;
-    let list_tag = list_tag_json.as_array().expect("file list");
+    let list_tag = list_tag_json["items"].as_array().expect("file list items");
     assert!(list_tag.iter().any(|f| f["id"].as_i64() == Some(file_id)));
 
     let list_kb_req = authed_empty_request("GET", format!("/api/v1/knowledge/files/?kb_id={}", kb_id), &user);
     let list_kb_res = app.clone().oneshot(list_kb_req).await.unwrap();
     assert_eq!(list_kb_res.status(), StatusCode::OK);
     let list_kb_json = response_json(list_kb_res).await;
-    let list_kb = list_kb_json.as_array().expect("file list");
+    let list_kb = list_kb_json["items"].as_array().expect("file list items");
     assert!(list_kb.iter().any(|f| f["id"].as_i64() == Some(file_id)));
 
     let get_req = authed_empty_request("GET", format!("/api/v1/knowledge/files/{}", file_id), &user);

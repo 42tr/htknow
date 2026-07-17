@@ -2054,6 +2054,16 @@ pub(crate) async fn remove_image_files(image_paths: Vec<String>) {
 pub struct ListQuery {
     pub kb_id: Option<String>,
     pub tag: Option<String>,
+    /// 页码，从1开始
+    pub page: Option<i64>,
+    /// 每页条数
+    pub size: Option<i64>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct FileListResponse {
+    pub total: i64,
+    pub items: Vec<File>,
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -2074,7 +2084,7 @@ pub struct FileStatsQuery {
     tag = "file",
     params(ListQuery),
     responses(
-        (status = 200, description = "成功返回文件列表", body = Vec<File>),
+        (status = 200, description = "成功返回文件列表", body = FileListResponse),
         (status = 401, description = "未授权")
     ),
     security(
@@ -2084,40 +2094,86 @@ pub struct FileStatsQuery {
 )]
 pub async fn list(
     State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Query(query): Query<ListQuery>,
-) -> ApiResult<Json<Vec<File>>> {
+) -> ApiResult<Json<FileListResponse>> {
     let is_admin = auth_user.is_admin();
+    let user_id = auth_user.user_id.clone();
+    let size = query.size.unwrap_or(10).clamp(1, 200);
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = size;
+    let offset = (page - 1) * size;
 
-    let mut qb = QueryBuilder::<Sqlite>::new(&format!("SELECT {FILE_COLS_NO_CONTENT} FROM files f WHERE 1=1"));
-    match query.kb_id.as_deref() {
-        Some("null") | Some("unassigned") => {
-            qb.push(" AND f.kb_id IS NULL");
-        }
+    let kb_filter = match query.kb_id.as_deref() {
+        Some("null") | Some("unassigned") => Some(None),
         Some(kb_id_str) => {
             let kb_id = kb_id_str.parse::<i64>().map_err(|_| ApiError::internal("Invalid kb_id format"))?;
-            common::ensure_kb_accessible(&pool, kb_id, &auth_user.user_id, is_admin).await?;
-            qb.push(" AND f.kb_id = ").push_bind(kb_id);
+            common::ensure_kb_accessible(&pool, kb_id, &user_id, is_admin).await?;
+            Some(Some(kb_id))
         }
+        None => None,
+    };
+
+    let tag = query.tag.as_deref().filter(|s| !s.is_empty());
+
+    if let Some(tag) = tag {
+        let mut qb = QueryBuilder::<Sqlite>::new(&format!("SELECT {FILE_COLS_NO_CONTENT} FROM files f WHERE 1=1"));
+        match kb_filter {
+            Some(None) => { qb.push(" AND f.kb_id IS NULL"); }
+            Some(Some(kb_id)) => { qb.push(" AND f.kb_id = ").push_bind(kb_id); }
+            None => {}
+        }
+        if !is_admin {
+            qb.push(" AND ");
+            common::push_file_access_filter(&mut qb, &user_id, Some("f"));
+        }
+        qb.push(" ORDER BY f.created_at DESC");
+        let mut files: Vec<File> = qb.build_query_as().fetch_all(&pool).await?;
+        files.retain(|file: &File| {
+            if let Ok(tags) = serde_json::from_str::<Vec<String>>(&file.tags) { tags.contains(&tag.to_string()) } else { false }
+        });
+        let total = files.len() as i64;
+        let items = files
+            .into_iter()
+            .skip(offset as usize)
+            .take(limit as usize)
+            .map(|mut file| {
+                file.content = None;
+                file
+            })
+            .collect();
+        return Ok(Json(FileListResponse { total, items }));
+    }
+
+    let mut count_qb = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM files f WHERE 1=1");
+    match kb_filter {
+        Some(None) => { count_qb.push(" AND f.kb_id IS NULL"); }
+        Some(Some(kb_id)) => { count_qb.push(" AND f.kb_id = ").push_bind(kb_id); }
         None => {}
     }
     if !is_admin {
-        qb.push(" AND ");
-        common::push_file_access_filter(&mut qb, &auth_user.user_id, Some("f"));
+        count_qb.push(" AND ");
+        common::push_file_access_filter(&mut count_qb, &user_id, Some("f"));
     }
-    qb.push(" ORDER BY f.created_at DESC");
+    let total: i64 = count_qb.build_query_scalar().fetch_one(&pool).await?;
 
-    let mut files: Vec<File> = qb.build_query_as().fetch_all(&pool).await?;
-
-    if let Some(tag) = &query.tag {
-        files.retain(|file: &File| {
-            if let Ok(tags) = serde_json::from_str::<Vec<String>>(&file.tags) { tags.contains(tag) } else { false }
-        });
+    let mut list_qb = QueryBuilder::<Sqlite>::new(&format!("SELECT {FILE_COLS_NO_CONTENT} FROM files f WHERE 1=1"));
+    match kb_filter {
+        Some(None) => { list_qb.push(" AND f.kb_id IS NULL"); }
+        Some(Some(kb_id)) => { list_qb.push(" AND f.kb_id = ").push_bind(kb_id); }
+        None => {}
     }
+    if !is_admin {
+        list_qb.push(" AND ");
+        common::push_file_access_filter(&mut list_qb, &user_id, Some("f"));
+    }
+    list_qb.push(" ORDER BY f.created_at DESC LIMIT ").push_bind(limit);
+    list_qb.push(" OFFSET ").push_bind(offset);
+    let mut items: Vec<File> = list_qb.build_query_as().fetch_all(&pool).await?;
 
-    for file in &mut files {
+    for file in &mut items {
         file.content = None;
     }
 
-    Ok(Json(files))
+    Ok(Json(FileListResponse { total, items }))
 }
 
 #[utoipa::path(

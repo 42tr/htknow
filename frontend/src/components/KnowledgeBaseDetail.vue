@@ -2,6 +2,7 @@
 import { ref, onMounted, watch } from 'vue'
 import { api } from '../api'
 import FileCard from './FileCard.vue'
+import Pagination from './Pagination.vue'
 
 const props = defineProps({
   kb: {
@@ -13,6 +14,9 @@ const props = defineProps({
 const emit = defineEmits(['back'])
 
 const files = ref([])
+const totalFiles = ref(0)
+const currentPage = ref(1)
+const pageSize = ref(10)
 const loading = ref(true)
 const error = ref('')
 
@@ -20,7 +24,12 @@ const loadFiles = async () => {
   loading.value = true
   error.value = ''
   try {
-    files.value = await api.getFiles(props.kb.id)
+    const result = await api.getKnowledgeBaseFiles(props.kb.id, {
+      page: currentPage.value,
+      size: pageSize.value,
+    })
+    files.value = result.items || []
+    totalFiles.value = result.total || 0
   } catch (e) {
     error.value = e.message
   } finally {
@@ -41,6 +50,7 @@ onMounted(() => {
 })
 
 watch(() => props.kb.id, () => {
+  currentPage.value = 1
   loadFiles()
 })
 </script>
@@ -124,7 +134,7 @@ watch(() => props.kb.id, () => {
     <!-- File List -->
     <div v-else class="space-y-3">
       <div class="flex items-center justify-between mb-4">
-        <p class="text-sm text-slate-500">共 {{ files.length }} 个文件</p>
+        <p class="text-sm text-slate-500">共 {{ totalFiles }} 个文件</p>
         <button @click="loadFiles" class="text-sm text-blue-500 hover:text-blue-600 flex items-center gap-1">
           <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
@@ -140,6 +150,14 @@ watch(() => props.kb.id, () => {
         :kb-type="kb.kb_type"
         @updated="handleFileUpdated"
         @deleted="handleFileDeleted"
+      />
+
+      <Pagination
+        v-if="totalFiles > 0"
+        v-model:page="currentPage"
+        v-model:size="pageSize"
+        :total="totalFiles"
+        @change="loadFiles"
       />
     </div>
   </div>
