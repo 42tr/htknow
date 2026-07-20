@@ -7,6 +7,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::config;
 
+/// 判断图片 embedding 服务是否已配置（非空字符串视为已配置）。
+pub fn image_embedding_enabled() -> bool {
+    let cfg = config::get();
+    let url = cfg.services.image_embedding_url.trim();
+    !url.is_empty()
+}
+
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(Client::new);
 
 #[derive(Debug, Serialize)]

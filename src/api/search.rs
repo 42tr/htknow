@@ -1756,6 +1756,10 @@ pub async fn search_image(
         return Ok(Json(SearchResult { results: vec![] }));
     }
 
+    if !crate::search::embedding::image_embedding_enabled() {
+        return Err(ApiError::BadRequest("Image embedding service is not configured".to_string()));
+    }
+
     let image_embedding = crate::search::embedding::get_image_embedding_from_bytes(
         &file_name,
         content_type.as_deref(),

@@ -83,6 +83,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     ensure_file_size_column(&pool).await?;
     ensure_pdf_contents_externalized(&pool).await?;
     ensure_slice_positions_excel_columns(&pool).await?;
+    ensure_image_description_support(&pool).await?;
     create_indexes(&pool).await?;
     if cfg.database.init_default_kbs {
         ensure_default_knowledge_bases(&pool).await?;
@@ -652,6 +653,42 @@ async fn ensure_slice_positions_excel_columns(pool: &SqlitePool) -> anyhow::Resu
         sqlx::query("ALTER TABLE slice_positions ADD COLUMN row_num INTEGER DEFAULT NULL").execute(pool).await?;
     }
 
+    Ok(())
+}
+
+/// 兜底修复：确保图片文本化相关的表/列存在。
+///
+/// 用于处理早期版本迁移标记已写入但列未成功添加的异常场景。
+async fn ensure_image_description_support(pool: &SqlitePool) -> anyhow::Result<()> {
+    let columns = sqlx::query("PRAGMA table_info(slices);").fetch_all(pool).await?;
+    if !columns.iter().any(|row| row.get::<String, _>("name") == "is_image") {
+        sqlx::query("ALTER TABLE slices ADD COLUMN is_image INTEGER NOT NULL DEFAULT 0").execute(pool).await?;
+        info!("Repaired slices table: added is_image column");
+    }
+
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS image_descriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            image_filename TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            raw_response TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            created_at INTEGER DEFAULT (strftime('%s','now')),
+            updated_at INTEGER DEFAULT (strftime('%s','now')),
+            UNIQUE(file_id, image_filename)
+        )",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_image_descriptions_file_id ON image_descriptions(file_id)")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_image_descriptions_file_filename ON image_descriptions(file_id, image_filename)",
+    )
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

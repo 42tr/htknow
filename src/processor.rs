@@ -1122,13 +1122,20 @@ impl FileProcessor {
                 if !self.ensure_file_exists(file.id, "before image embedding").await? {
                     return Ok(());
                 }
-                let image_embedding = timing
-                    .step(
-                        "get_image_embedding",
-                        search::embedding::get_image_embedding_from_path(&file.path, Some(&file.filename)),
-                    )
-                    .await?;
-                self.process_pdf_file(file, Some(Arc::new(image_embedding)), true, None, Some(&mut timing)).await?;
+                let image_embedding = if search::embedding::image_embedding_enabled() {
+                    Some(Arc::new(
+                        timing
+                            .step(
+                                "get_image_embedding",
+                                search::embedding::get_image_embedding_from_path(&file.path, Some(&file.filename)),
+                            )
+                            .await?,
+                    ))
+                } else {
+                    info!("Image embedding URL not configured, skipping image embedding for file {}", file.id);
+                    None
+                };
+                self.process_pdf_file(file, image_embedding, true, None, Some(&mut timing)).await?;
             } else if is_audio {
                 timing.set_pipeline("audio");
                 if !self.ensure_file_exists(file.id, "before audio processing").await? {
@@ -3538,13 +3545,16 @@ impl FileProcessor {
 
         if !search_docs.is_empty() {
             let filename_lower = target.filename.to_lowercase();
-            let is_image = crate::search::is_image_file(&filename_lower);
-            let embeddings = if is_image {
+            let is_image_file = crate::search::is_image_file(&filename_lower);
+            let embeddings = if is_image_file && search::embedding::image_embedding_enabled() {
                 let embedding =
                     search::embedding::get_image_embedding_from_path(&target.path, Some(&target.filename)).await?;
                 let arc_embedding = Arc::new(embedding);
                 (0..search_docs.len()).map(|_| Some(Arc::clone(&arc_embedding))).collect()
             } else {
+                if is_image_file {
+                    info!("Image embedding URL not configured, skipping image embedding for reused file {}", target.id);
+                }
                 vec![None; search_docs.len()]
             };
             self.search_engine.write_batch(search_docs, embeddings).await?;

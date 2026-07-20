@@ -360,7 +360,10 @@ impl SearchEngine {
             let batch_started_at = Instant::now();
 
             for row in &rows {
-                if attempted_image_embeddings.insert(row.file_id) && is_image_file(&row.filename) {
+                if embedding::image_embedding_enabled()
+                    && attempted_image_embeddings.insert(row.file_id)
+                    && is_image_file(&row.filename)
+                {
                     match embedding::get_image_embedding_from_path(&row.path, Some(&row.filename)).await {
                         Ok(image_embedding) => {
                             image_embeddings.insert(row.file_id, Arc::new(image_embedding));
