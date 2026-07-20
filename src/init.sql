@@ -42,7 +42,8 @@ CREATE TABLE IF NOT EXISTS slices (
     ordinal INTEGER DEFAULT NULL, -- 切片在本次解析中的稳定顺序
     is_image INTEGER NOT NULL DEFAULT 0, -- 是否为图片切片: 0-否, 1-是
     created_at INTEGER DEFAULT (strftime('%s','now')),
-    updated_at INTEGER DEFAULT (strftime('%s','now'))
+    updated_at INTEGER DEFAULT (strftime('%s','now')),
+    FOREIGN KEY(file_id) REFERENCES files(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS schema_migrations (

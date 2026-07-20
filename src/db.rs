@@ -85,6 +85,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     ensure_slice_positions_excel_columns(&pool).await?;
     ensure_image_description_support(&pool).await?;
     create_indexes(&pool).await?;
+    ensure_orphan_slices_cleaned(&pool).await?;
     if cfg.database.init_default_kbs {
         ensure_default_knowledge_bases(&pool).await?;
     } else {
@@ -692,7 +693,63 @@ async fn ensure_image_description_support(pool: &SqlitePool) -> anyhow::Result<(
     Ok(())
 }
 
-/// 如果给出的 sqlite URL 指向一个文件式数据库，返回对应的文件系统路径。
+/// 清理 slices 表中 file_id 已不在 files 表的孤儿切片。
+///
+/// slices 表没有外键约束到 files，历史删除可能遗留孤儿行；这会导致 Tantivy/LanceDB
+/// 与 SQLite 的计数口径不一致，从而每次启动都触发重建。该 helper 在启动时兜底清理。
+async fn ensure_orphan_slices_cleaned(pool: &SqlitePool) -> anyhow::Result<()> {
+    const BATCH: usize = 900;
+
+    let orphan_file_ids: Vec<i64> = sqlx::query_scalar(
+        "SELECT DISTINCT s.file_id FROM slices s LEFT JOIN files f ON f.id = s.file_id WHERE f.id IS NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    if orphan_file_ids.is_empty() {
+        return Ok(());
+    }
+
+    info!("Found {} orphan file ids with slices to clean up", orphan_file_ids.len());
+
+    // 分批收集孤儿 slice id 并清理关联数据。
+    let mut total_slices_removed = 0usize;
+    for chunk in orphan_file_ids.chunks(BATCH) {
+        let slice_ids: Vec<i64> = {
+            let mut qb = QueryBuilder::<Sqlite>::new(
+                "SELECT s.id FROM slices s LEFT JOIN files f ON f.id = s.file_id WHERE f.id IS NULL AND s.file_id IN (",
+            );
+            push_i64_list(&mut qb, chunk);
+            qb.push(")");
+            qb.build_query_scalar().fetch_all(pool).await?
+        };
+
+        if slice_ids.is_empty() {
+            continue;
+        }
+
+        for slice_chunk in slice_ids.chunks(BATCH) {
+            let mut mentions_qb = QueryBuilder::<Sqlite>::new("DELETE FROM entity_mentions WHERE slice_id IN (");
+            push_i64_list(&mut mentions_qb, slice_chunk);
+            mentions_qb.push(")");
+            mentions_qb.build().execute(pool).await?;
+
+            let mut positions_qb = QueryBuilder::<Sqlite>::new("DELETE FROM slice_positions WHERE slice_id IN (");
+            push_i64_list(&mut positions_qb, slice_chunk);
+            positions_qb.push(")");
+            positions_qb.build().execute(pool).await?;
+
+            let mut slices_qb = QueryBuilder::<Sqlite>::new("DELETE FROM slices WHERE id IN (");
+            push_i64_list(&mut slices_qb, slice_chunk);
+            slices_qb.push(")");
+            slices_qb.build().execute(pool).await?;
+        }
+
+        total_slices_removed += slice_ids.len();
+    }
+
+    info!("Cleaned up {} orphan slices for {} orphan files", total_slices_removed, orphan_file_ids.len());
+    Ok(())
+}
 /// 支持的形式（常见）：
 /// - sqlite://path/to/db.sqlite
 /// - sqlite:////absolute/path/to/db.sqlite

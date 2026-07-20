@@ -266,8 +266,13 @@ impl SearchEngine {
             return Err(anyhow!("search engine db pool not set"));
         };
 
-        let total_slices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM slices").fetch_one(pool).await?;
-        info!("Checking LanceDB document ids against {} SQLite slices...", total_slices);
+        // 只统计仍有对应 file 的有效 slice；孤儿切片会在后续被清理出 LanceDB。
+        let total_slices: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM slices s WHERE EXISTS (SELECT 1 FROM files f WHERE f.id = s.file_id)",
+        )
+        .fetch_one(pool)
+        .await?;
+        info!("Checking LanceDB document ids against {} valid SQLite slices...", total_slices);
         let t_load_ids = Instant::now();
         let mut unmatched_lancedb_ids = if self.lancedb_recreated {
             HashSet::new()
@@ -279,30 +284,66 @@ impl SearchEngine {
 
         if total_slices == 0 {
             if lancedb_count > 0 {
-                warn!("SQLite has no slices but LanceDB has {} documents; clearing LanceDB", lancedb_count);
+                warn!("SQLite has no valid slices but LanceDB has {} documents; clearing LanceDB", lancedb_count);
                 lancedb::clear_all_documents().await?;
             }
             return Ok(());
         }
 
-        let sqlite_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM slices ORDER BY id ASC").fetch_all(pool).await?;
+        // 加载所有 slice id 并分离出孤儿切片，确保 LanceDB 不保留无效向量。
+        let all_slice_rows: Vec<(i64, i64)> =
+            sqlx::query_as("SELECT s.id, s.file_id FROM slices s ORDER BY s.id ASC").fetch_all(pool).await?;
+        let valid_file_ids: HashSet<i64> =
+            sqlx::query_scalar("SELECT id FROM files").fetch_all(pool).await?.into_iter().collect();
+        let mut sqlite_ids = Vec::with_capacity(all_slice_rows.len());
+        let mut orphan_ids = Vec::new();
+        for (slice_id, file_id) in all_slice_rows {
+            if valid_file_ids.contains(&file_id) {
+                sqlite_ids.push(slice_id);
+            } else {
+                orphan_ids.push(slice_id);
+            }
+        }
+
         let mut missing_ids = Vec::with_capacity(total_slices.saturating_sub(lancedb_count as i64).max(0) as usize);
         for id in sqlite_ids {
             if !unmatched_lancedb_ids.remove(&id) {
                 missing_ids.push(id);
             }
         }
+        // LanceDB 中多出的 id 包括：历史遗留向量、以及本次识别出的孤儿切片向量。
         let mut extra_ids: Vec<i64> = unmatched_lancedb_ids.into_iter().collect();
         extra_ids.sort_unstable();
         info!(
-            "LanceDB comparison completed: sqlite={} lancedb={} missing={} extra={}",
+            "LanceDB comparison completed: sqlite_valid={} lancedb={} missing={} extra={} orphan={}",
             total_slices,
             lancedb_count,
             missing_ids.len(),
-            extra_ids.len()
+            extra_ids.len(),
+            orphan_ids.len()
         );
 
-        if missing_ids.is_empty() && extra_ids.is_empty() {
+        let cfg = config::get();
+        let batch_size = cfg.search.lancedb_rebuild_batch_size.max(1);
+        let rebuild_started_at = Instant::now();
+
+        // 先把孤儿切片向量标记为删除，避免它们继续占用索引并干扰后续比较。
+        let mut orphan_removed = 0usize;
+        for id_batch in orphan_ids.chunks(batch_size) {
+            lancedb::delete_by_slices_for_rebuild(id_batch).await?;
+            orphan_removed += id_batch.len();
+            info!(
+                "LanceDB orphan cleanup progress: removed={}/{} total={}s",
+                orphan_removed,
+                orphan_ids.len(),
+                rebuild_started_at.elapsed().as_secs()
+            );
+        }
+
+        if missing_ids.is_empty() && extra_ids.is_empty() && orphan_ids.is_empty() {
+            if !orphan_ids.is_empty() {
+                lancedb::schedule_optimize_after_rebuild();
+            }
             return Ok(());
         }
 
@@ -422,15 +463,20 @@ impl SearchEngine {
             return Err(anyhow!("search engine db pool not set"));
         };
 
-        let total_slices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM slices").fetch_one(pool).await?;
+        // 只统计仍有对应 file 的有效 slice，避免孤儿切片导致无限重建。
+        let total_slices: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM slices s WHERE EXISTS (SELECT 1 FROM files f WHERE f.id = s.file_id)",
+        )
+        .fetch_one(pool)
+        .await?;
         let index_docs = self.index_reader.searcher().num_docs() as i64;
         if total_slices == index_docs {
-            info!("Tantivy default index is consistent with SQLite: {} docs", total_slices);
+            info!("Tantivy default index is consistent with SQLite: {} valid docs", total_slices);
             return Ok(());
         }
 
         info!(
-            "Tantivy default index mismatch: sqlite_slices={} index_docs={}, rebuilding...",
+            "Tantivy default index mismatch: sqlite_valid_slices={} index_docs={}, rebuilding...",
             total_slices, index_docs
         );
 
@@ -518,7 +564,11 @@ impl SearchEngine {
         };
         let _rebuild_guard = self.rebuild_lock.lock().await;
 
-        let total_slices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM slices").fetch_one(pool).await?;
+        let total_slices: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM slices s WHERE EXISTS (SELECT 1 FROM files f WHERE f.id = s.file_id)",
+        )
+        .fetch_one(pool)
+        .await?;
         let total_full_docs: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE status = 1").fetch_one(pool).await?;
         let total_docs = total_slices + total_full_docs;
