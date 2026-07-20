@@ -109,7 +109,6 @@ pub fn init_with_path(path: &str) -> Result<(Schema, Index)> {
                         path.display()
                     );
                     backup_index_dir(path)?;
-                    std::fs::remove_dir_all(path)?;
                     std::fs::create_dir_all(path)?;
                     Index::create_in_dir(path, schema.clone())?
                 } else {

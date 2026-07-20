@@ -444,11 +444,8 @@ impl SearchEngine {
         }
 
         let rows: Vec<SliceMeta> = sqlx::query_as(
-            "SELECT s.id, s.file_id AS source_file_id, COALESCE(ref.id, source.id) AS file_id, \
-                    COALESCE(ref.kb_id, source.kb_id) AS kb_id, s.is_image \
-             FROM slices s JOIN files source ON source.id = s.file_id \
-             LEFT JOIN parse_artifacts pa ON pa.source_file_id = source.id \
-             LEFT JOIN files ref ON ref.artifact_id = pa.id \
+            "SELECT s.id, s.file_id AS source_file_id, f.id AS file_id, f.kb_id, s.is_image \
+             FROM slices s JOIN files f ON f.id = s.file_id \
              ORDER BY s.id ASC",
         )
         .fetch_all(pool)
