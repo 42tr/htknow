@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS slices (
     file_id INTEGER NOT NULL, -- 文件ID
     parse_run_id TEXT DEFAULT NULL, -- 生成该切片的解析批次；历史数据为空
     ordinal INTEGER DEFAULT NULL, -- 切片在本次解析中的稳定顺序
+    is_image INTEGER NOT NULL DEFAULT 0, -- 是否为图片切片: 0-否, 1-是
     created_at INTEGER DEFAULT (strftime('%s','now')),
     updated_at INTEGER DEFAULT (strftime('%s','now'))
 );
@@ -49,6 +50,20 @@ CREATE TABLE IF NOT EXISTS schema_migrations (
     name TEXT NOT NULL,
     applied_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
+
+CREATE TABLE IF NOT EXISTS image_descriptions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    file_id INTEGER NOT NULL,
+    image_filename TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    raw_response TEXT NOT NULL DEFAULT '',
+    source TEXT NOT NULL DEFAULT '',
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    updated_at INTEGER DEFAULT (strftime('%s','now')),
+    UNIQUE(file_id, image_filename)
+);
+CREATE INDEX IF NOT EXISTS idx_image_descriptions_file_id ON image_descriptions(file_id);
+CREATE INDEX IF NOT EXISTS idx_image_descriptions_file_filename ON image_descriptions(file_id, image_filename);
 
 CREATE TABLE IF NOT EXISTS parse_artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,

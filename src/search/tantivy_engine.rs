@@ -1,7 +1,7 @@
 use std::{
     collections::{HashMap, HashSet}, path::Path, sync::{
         Arc, mpsc::{self, Sender}
-    }, thread, time::{Duration, Instant}
+    }, thread, time::{Duration, Instant, SystemTime, UNIX_EPOCH}
 };
 
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
@@ -32,6 +32,7 @@ pub struct Document {
     pub file_id: i64,       // 文件 ID
     pub kb_id: Option<i64>, // 知识库 ID
     pub content: String,    // 内容
+    pub is_image: bool,     // 是否为图片切片
 }
 
 /// 搜索结果项
@@ -69,7 +70,12 @@ pub struct ForceMergeStats {
 
 impl Document {
     pub fn new(id: i64, file_id: i64, kb_id: Option<i64>, content: String) -> Self {
-        Document { id, file_id, kb_id, content }
+        Document { id, file_id, kb_id, content, is_image: false }
+    }
+
+    pub fn with_is_image(mut self, is_image: bool) -> Self {
+        self.is_image = is_image;
+        self
     }
 }
 
@@ -95,7 +101,21 @@ pub fn init_with_path(path: &str) -> Result<(Schema, Index)> {
     let t1 = Instant::now();
     let index = if path.exists() {
         match Index::open_in_dir(path) {
-            Ok(idx) => idx,
+            Ok(idx) => {
+                // 如果 schema 缺少 is_image 字段，按时间戳备份旧索引并重建
+                if !schema_has_is_image(idx.schema()) {
+                    warn!(
+                        "Tantivy index at '{}' is missing is_image field; backing up and creating fresh index.",
+                        path.display()
+                    );
+                    backup_index_dir(path)?;
+                    std::fs::remove_dir_all(path)?;
+                    std::fs::create_dir_all(path)?;
+                    Index::create_in_dir(path, schema.clone())?
+                } else {
+                    idx
+                }
+            }
             Err(e) => {
                 warn!(
                     "Tantivy index at '{}' is corrupted or unreadable: {}. Removing and creating fresh index.",
@@ -118,6 +138,22 @@ pub fn init_with_path(path: &str) -> Result<(Schema, Index)> {
     info!("Tantivy init substep: register_tokenizers() took {}ms", t2.elapsed().as_millis());
 
     Ok((schema, index))
+}
+
+fn schema_has_is_image(schema: Schema) -> bool {
+    schema.get_field("is_image").is_ok()
+}
+
+fn backup_index_dir(path: &Path) -> std::io::Result<()> {
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let backup_path = path.with_file_name(format!(
+        "{}.backup.{}",
+        path.file_name().and_then(|n| n.to_str()).unwrap_or("tantivy_index"),
+        timestamp
+    ));
+    warn!("Backing up old Tantivy index from {} to {}", path.display(), backup_path.display());
+    std::fs::rename(path, &backup_path)?;
+    Ok(())
 }
 
 fn is_lock_busy_error(err: &TantivyError) -> bool {
@@ -435,11 +471,11 @@ pub fn commit_writer(index_writer: &mut tantivy::IndexWriter, label: &str, doc_c
 
 pub fn search_sync(
     reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
-    synonym_map: Option<&SynonymMap>,
+    filter_is_image: Option<bool>, synonym_map: Option<&SynonymMap>,
 ) -> anyhow::Result<Vec<SearchResultItem>> {
     let cfg = config::get();
     let searcher = reader.searcher();
-    let tantivy_query = build_query(query, file_ids, kb_ids, schema, synonym_map)?;
+    let tantivy_query = build_query(query, file_ids, kb_ids, filter_is_image, schema, synonym_map)?;
     let search_start = Instant::now();
     let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(cfg.search.limit))?;
     debug!("Tantivy searcher.search {}ms", search_start.elapsed().as_millis());
@@ -474,18 +510,19 @@ pub fn search_sync(
 
 pub async fn search(
     reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
-    synonym_map: Option<&SynonymMap>,
+    filter_is_image: Option<bool>, synonym_map: Option<&SynonymMap>,
 ) -> anyhow::Result<Vec<SearchResultItem>> {
-    search_sync(reader, schema, query, file_ids, kb_ids, synonym_map)
+    search_sync(reader, schema, query, file_ids, kb_ids, filter_is_image, synonym_map)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn search_with_snippet_sync(
     reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
-    max_chars: usize, synonym_map: Option<&SynonymMap>,
+    filter_is_image: Option<bool>, max_chars: usize, synonym_map: Option<&SynonymMap>,
 ) -> anyhow::Result<Vec<FullSearchResultItem>> {
     let cfg = config::get();
     let searcher = reader.searcher();
-    let tantivy_query = build_query(query, file_ids, kb_ids, schema, synonym_map)?;
+    let tantivy_query = build_query(query, file_ids, kb_ids, filter_is_image, schema, synonym_map)?;
     let search_start = Instant::now();
     let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(cfg.search.limit))?;
     debug!("Tantivy full searcher.search {}ms", search_start.elapsed().as_millis());
@@ -517,9 +554,10 @@ pub fn search_with_snippet_sync(
     Ok(results)
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn search_with_snippet(
     reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
-    max_chars: usize, synonym_map: Option<&SynonymMap>,
+    filter_is_image: Option<bool>, max_chars: usize, synonym_map: Option<&SynonymMap>,
 ) -> anyhow::Result<Vec<FullSearchResultItem>> {
     // 搜索 + 取文档 + 生成 snippet 均为 CPU 密集的同步操作，放到阻塞线程池执行，避免阻塞异步运行时。
     let reader = reader.clone();
@@ -535,6 +573,7 @@ pub async fn search_with_snippet(
             &query,
             file_ids.as_ref(),
             kb_ids.as_ref(),
+            filter_is_image,
             max_chars,
             synonym_map.as_ref(),
         )
@@ -577,8 +616,8 @@ fn segment_deleted_docs(metas: &[tantivy::SegmentMeta]) -> u64 {
 }
 
 fn build_query(
-    input: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>, schema: &Schema,
-    synonym_map: Option<&SynonymMap>,
+    input: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>, filter_is_image: Option<bool>,
+    schema: &Schema, synonym_map: Option<&SynonymMap>,
 ) -> tantivy::Result<Box<dyn Query>> {
     let mut subqueries: Vec<(Occur, Box<dyn Query>)> = Vec::new();
     let query_terms = build_query_terms(input, synonym_map);
@@ -629,6 +668,13 @@ fn build_query(
             subqueries.push((Occur::Must, Box::new(kb_ids_bool_query)));
         }
     }
+
+    if let Some(is_image) = filter_is_image {
+        let is_image_field = get_field(schema, "is_image");
+        let term = Term::from_field_i64(is_image_field, i64::from(is_image));
+        subqueries.push((Occur::Must, Box::new(TermQuery::new(term, IndexRecordOption::Basic)) as Box<dyn Query>));
+    }
+
     Ok(Box::new(BooleanQuery::new(subqueries)))
 }
 
@@ -637,6 +683,7 @@ fn create_document(doc: Document, schema: &Schema) -> TantivyDocument {
         get_field(schema, "id") => doc.id,
         get_field(schema, "file_id") => doc.file_id,
         get_field(schema, "content") => doc.content,
+        get_field(schema, "is_image") => i64::from(doc.is_image),
     };
     if let Some(kb_id) = doc.kb_id {
         document.add_i64(get_field(schema, "kb_id"), kb_id);
@@ -662,6 +709,7 @@ fn build_schema() -> Schema {
     schema_builder.add_i64_field("id", INDEXED | STORED | FAST); // 切片 id
     schema_builder.add_i64_field("file_id", INDEXED | STORED | FAST); // 文件 id
     schema_builder.add_i64_field("kb_id", INDEXED | STORED | FAST); // 知识库 id
+    schema_builder.add_i64_field("is_image", INDEXED | FAST); // 是否为图片切片
 
     let text_options = TextOptions::default()
         .set_indexing_options(

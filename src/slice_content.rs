@@ -12,22 +12,30 @@ fn content_path(file_id: i64) -> PathBuf {
 pub async fn read_all(file_id: i64) -> anyhow::Result<HashMap<i64, String>> {
     let path = content_path(file_id);
     match tokio::fs::read(&path).await {
-        Ok(bytes) => serde_json::from_slice(&bytes).with_context(|| format!("invalid slice content file {}", path.display())),
+        Ok(bytes) => {
+            serde_json::from_slice(&bytes).with_context(|| format!("invalid slice content file {}", path.display()))
+        }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
         Err(e) => Err(e).with_context(|| format!("failed to read slice content file {}", path.display())),
     }
 }
 
 pub async fn upsert_many(file_id: i64, rows: &[(i64, String)]) -> anyhow::Result<()> {
-    if rows.is_empty() { return Ok(()); }
+    if rows.is_empty() {
+        return Ok(());
+    }
     let mut contents = read_all(file_id).await?;
-    for (id, content) in rows { contents.insert(*id, content.clone()); }
+    for (id, content) in rows {
+        contents.insert(*id, content.clone());
+    }
     write_all(file_id, &contents).await
 }
 
 pub async fn write_all(file_id: i64, contents: &HashMap<i64, String>) -> anyhow::Result<()> {
     let path = content_path(file_id);
-    if contents.is_empty() { return delete(file_id).await; }
+    if contents.is_empty() {
+        return delete(file_id).await;
+    }
     let parent = path.parent().expect("slice content path has parent");
     tokio::fs::create_dir_all(parent).await?;
     let bytes = serde_json::to_vec(contents)?;

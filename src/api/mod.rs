@@ -63,6 +63,7 @@ use crate::search::SearchEngine;
         search::search_full,
         search::search_with_graph,
         search::search_image,
+        search::search_image_by_text,
         search::advanced_search_stream,
         search::list_lexicons,
         search::create_lexicon,
@@ -210,6 +211,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/full", get(search::search_full))
         .route("/graph", get(search::search_with_graph))
         .route("/image", post(search::search_image))
+        .route("/image-by-text", get(search::search_image_by_text))
         .route("/lexicons", get(search::list_lexicons).post(search::create_lexicon))
         .route("/lexicons/reload", post(search::reload_lexicon))
         .route("/lexicons/publish", post(search::publish_lexicon))

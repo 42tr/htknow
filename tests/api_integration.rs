@@ -158,17 +158,18 @@ async fn knowledge_base_tree_and_detail_flow() {
     assert!(kb_files_page_json["items"].as_array().expect("items").len() <= 1);
 
     // Tag filter
-    let kb_files_tag_req = authed_empty_request(
-        "GET",
-        format!("/api/v1/knowledge/knowledge_base/{}/files?tag=root", root_kb_id),
-        &user,
-    );
+    let kb_files_tag_req =
+        authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}/files?tag=root", root_kb_id), &user);
     let kb_files_tag_res = app.clone().oneshot(kb_files_tag_req).await.unwrap();
     assert_eq!(kb_files_tag_res.status(), StatusCode::OK);
     let kb_files_tag_json = response_json(kb_files_tag_res).await;
-    assert!(kb_files_tag_json["items"].as_array().expect("tag items").iter().all(|file| {
-        file["id"].as_i64() == Some(root_file_id)
-    }));
+    assert!(
+        kb_files_tag_json["items"]
+            .as_array()
+            .expect("tag items")
+            .iter()
+            .all(|file| { file["id"].as_i64() == Some(root_file_id) })
+    );
 }
 
 #[tokio::test]

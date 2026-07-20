@@ -184,7 +184,8 @@ pub async fn export_knowledge_bases(
         info!("Backfilled image meta for {} files before export", meta_backfilled);
     }
 
-    let file_ids = export_sqlite_data(pool, &export_pool, &target_kb_ids, &all_kb_ids, Some(&slice_contents_dir)).await?;
+    let file_ids =
+        export_sqlite_data(pool, &export_pool, &target_kb_ids, &all_kb_ids, Some(&slice_contents_dir)).await?;
     info!("Exported {} files to SQLite in {}ms", file_ids.len(), step_start.elapsed().as_millis());
 
     // Re-enable foreign keys and close export pool before writing manifest
@@ -449,7 +450,8 @@ async fn init_export_schema(pool: &SqlitePool) -> anyhow::Result<()> {
 /// Export SQLite data. Returns the list of exported file IDs.
 /// `target_kb_ids` are used for data export; `all_kb_ids` includes ancestors for hierarchy preservation.
 async fn export_sqlite_data(
-    src_pool: &SqlitePool, dst_pool: &SqlitePool, target_kb_ids: &[i64], all_kb_ids: &[i64], slice_contents_dir: Option<&Path>,
+    src_pool: &SqlitePool, dst_pool: &SqlitePool, target_kb_ids: &[i64], all_kb_ids: &[i64],
+    slice_contents_dir: Option<&Path>,
 ) -> anyhow::Result<Vec<i64>> {
     let step_start = std::time::Instant::now();
 
@@ -786,24 +788,25 @@ async fn export_slices(
         }
 
         let mut tx = dst_pool.begin().await?;
-        let mut exported_contents: std::collections::HashMap<i64, Vec<(i64, String)>> = std::collections::HashMap::new();
+        let mut exported_contents: std::collections::HashMap<i64, Vec<(i64, String)>> =
+            std::collections::HashMap::new();
         let mut source_contents = std::collections::HashMap::new();
         for row in rows {
             let target_file_id: i64 = row.get("target_file_id");
             let source_slice_id: i64 = row.get("source_slice_id");
             let source_file_id: i64 = row.get("source_file_id");
-            if !source_contents.contains_key(&source_file_id) {
-                source_contents.insert(source_file_id, crate::slice_content::read_all(source_file_id).await?);
+            if let std::collections::hash_map::Entry::Vacant(e) = source_contents.entry(source_file_id) {
+                e.insert(crate::slice_content::read_all(source_file_id).await?);
             }
-            let export_slice_id: i64 = sqlx::query_scalar(
-                "INSERT INTO slices(file_id, created_at, updated_at) VALUES (?, ?, ?) RETURNING id",
-            )
-            .bind(target_file_id)
-            .bind(row.get::<i64, _>("created_at"))
-            .bind(row.get::<i64, _>("updated_at"))
-            .fetch_one(&mut *tx)
-            .await?;
-            let content = source_contents.get(&source_file_id).and_then(|v| v.get(&source_slice_id)).cloned().unwrap_or_default();
+            let export_slice_id: i64 =
+                sqlx::query_scalar("INSERT INTO slices(file_id, created_at, updated_at) VALUES (?, ?, ?) RETURNING id")
+                    .bind(target_file_id)
+                    .bind(row.get::<i64, _>("created_at"))
+                    .bind(row.get::<i64, _>("updated_at"))
+                    .fetch_one(&mut *tx)
+                    .await?;
+            let content =
+                source_contents.get(&source_file_id).and_then(|v| v.get(&source_slice_id)).cloned().unwrap_or_default();
             exported_contents.entry(target_file_id).or_default().push((export_slice_id, content));
             sqlx::query(
                 "INSERT INTO export_slice_id_map(target_file_id, source_slice_id, export_slice_id) VALUES (?, ?, ?)",
@@ -1740,11 +1743,10 @@ mod tests {
         .execute(&src)
         .await
         .context("insert artifact")?;
-        let source_slice: i64 =
-            sqlx::query_scalar("INSERT INTO slices(file_id) VALUES(1) RETURNING id")
-                .fetch_one(&src)
-                .await
-                .context("insert slice")?;
+        let source_slice: i64 = sqlx::query_scalar("INSERT INTO slices(file_id) VALUES(1) RETURNING id")
+            .fetch_one(&src)
+            .await
+            .context("insert slice")?;
         sqlx::query("INSERT INTO slice_positions(slice_id,page_idx,x1,y1,x2,y2) VALUES(?,0,1,2,3,4)")
             .bind(source_slice)
             .execute(&src)

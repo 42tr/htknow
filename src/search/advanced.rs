@@ -347,20 +347,16 @@ fn take_with_limit(items: Vec<SliceRow>, char_limit: usize, reverse_after: bool)
 }
 
 async fn fetch_before_slices(pool: &SqlitePool, file_id: i64, center_id: i64) -> Result<Vec<SliceRow>> {
-    let sql = format!(
-        "SELECT id FROM slices WHERE file_id = ? AND id < ? ORDER BY id DESC LIMIT {}",
-        MAX_NEIGHBOR_SLICES
-    );
+    let sql =
+        format!("SELECT id FROM slices WHERE file_id = ? AND id < ? ORDER BY id DESC LIMIT {}", MAX_NEIGHBOR_SLICES);
     let ids: Vec<i64> = sqlx::query_scalar(&sql).bind(file_id).bind(center_id).fetch_all(pool).await?;
     let contents = crate::slice_content::read_all(file_id).await?;
     Ok(ids.into_iter().map(|id| SliceRow { id, content: contents.get(&id).cloned().unwrap_or_default() }).collect())
 }
 
 async fn fetch_after_slices(pool: &SqlitePool, file_id: i64, center_id: i64) -> Result<Vec<SliceRow>> {
-    let sql = format!(
-        "SELECT id FROM slices WHERE file_id = ? AND id > ? ORDER BY id ASC LIMIT {}",
-        MAX_NEIGHBOR_SLICES
-    );
+    let sql =
+        format!("SELECT id FROM slices WHERE file_id = ? AND id > ? ORDER BY id ASC LIMIT {}", MAX_NEIGHBOR_SLICES);
     let ids: Vec<i64> = sqlx::query_scalar(&sql).bind(file_id).bind(center_id).fetch_all(pool).await?;
     let contents = crate::slice_content::read_all(file_id).await?;
     Ok(ids.into_iter().map(|id| SliceRow { id, content: contents.get(&id).cloned().unwrap_or_default() }).collect())

@@ -1,11 +1,12 @@
 use std::{
-    collections::{HashMap, HashSet}, future::Future, sync::{
+    collections::{HashMap, HashSet}, future::Future, path::Path, sync::{
         Arc, atomic::{AtomicBool, AtomicU64, Ordering}
     }, time::{Duration, Instant, SystemTime, UNIX_EPOCH}
 };
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use base64::{Engine, engine::general_purpose::STANDARD};
+use futures::stream::StreamExt;
 use log::{debug, error, info, warn};
 use lopdf::Document;
 use once_cell::sync::Lazy;
@@ -19,7 +20,7 @@ use tokio::{
 use crate::{
     api::{
         FILE_COLS_NO_CONTENT, File, collect_image_paths_for_files, collect_image_raw_paths_for_files, effective_parse_file_id, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta
-    }, archive, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, search::{self, SearchEngine, tantivy_engine}
+    }, archive, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, image_description, image_parse, search::{self, SearchEngine, content_looks_like_image_reference, tantivy_engine}
 };
 
 /// 将本地文件构造为流式 multipart Part，避免大文件全量读入内存。
@@ -77,6 +78,128 @@ struct Result {
 
 #[allow(clippy::type_complexity)]
 type RawImageJobs = (Vec<(String, String)>, HashMap<String, String>, Vec<String>);
+
+/// 并发调用外部图片文本化接口，保存结果并返回 filename -> description 映射。
+async fn parse_images_to_descriptions(
+    pool: &SqlitePool, file_id: i64, images: &HashMap<String, String>, source: &str,
+) -> anyhow::Result<HashMap<String, String>> {
+    let cfg = config::get();
+    let Some(parse_url) = cfg.services.image_parse_url.as_deref() else {
+        return Ok(HashMap::new());
+    };
+    if images.is_empty() || parse_url.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let concurrency = cfg.services.image_parse_concurrency.max(1);
+
+    let jobs: Vec<(String, String)> = images.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut stream = futures::stream::iter(jobs.into_iter().map(|(filename, base64)| {
+        let source = source.to_string();
+        let pool = pool.clone();
+        async move {
+            match image_parse::parse_image_base64(&filename, &base64, None).await {
+                Ok(resp) => {
+                    if let Err(err) = image_description::save(
+                        &pool,
+                        file_id,
+                        &filename,
+                        &resp.description,
+                        &resp.raw_response,
+                        &source,
+                    )
+                    .await
+                    {
+                        warn!("Failed to save image description for {}: {}", filename, err);
+                    }
+                    Some((filename, resp.description))
+                }
+                Err(err) => {
+                    warn!("Image parse failed for {}: {}", filename, err);
+                    None
+                }
+            }
+        }
+    }))
+    .buffer_unordered(concurrency);
+
+    let mut map = HashMap::new();
+    while let Some(result) = stream.next().await {
+        if let Some((filename, description)) = result {
+            map.insert(filename, description);
+        }
+    }
+    Ok(map)
+}
+
+/// 从数据库加载图片描述；对未命中的图片尝试从已保存的文件补全。
+async fn load_or_parse_image_descriptions(
+    pool: &SqlitePool, file_id: i64, image_names: &[String], source: &str,
+) -> anyhow::Result<HashMap<String, String>> {
+    let mut desc_map = image_description::list_by_file(pool, file_id).await?;
+    if config::get().services.image_parse_url.is_none() {
+        return Ok(desc_map);
+    }
+
+    for name in image_names {
+        if desc_map.contains_key(name) {
+            continue;
+        }
+        let Some(path_str) = resolve_image_storage_path(name) else { continue };
+        let path = Path::new(&path_str);
+        if !path.exists() {
+            continue;
+        }
+        match image_parse::parse_image_file(path, name, None).await {
+            Ok(resp) => {
+                if let Err(err) =
+                    image_description::save(pool, file_id, name, &resp.description, &resp.raw_response, source).await
+                {
+                    warn!("Failed to save image description for {}: {}", name, err);
+                }
+                desc_map.insert(name.clone(), resp.description);
+            }
+            Err(err) => warn!("Failed to parse image {} from disk: {}", name, err),
+        }
+    }
+    Ok(desc_map)
+}
+
+/// 将图片描述追加到图片切片内容中，使文本 embedding / 倒排索引都能检索到描述。
+fn enrich_content_with_image_descriptions(content: &str, desc_map: &HashMap<String, String>) -> String {
+    if desc_map.is_empty() {
+        return content.to_string();
+    }
+    let mut enriched = content.to_string();
+    let mut appended = Vec::new();
+    for (filename, description) in desc_map {
+        if description.trim().is_empty() {
+            continue;
+        }
+        if enriched.contains(filename) || enriched.contains(&format!("/api/v1/knowledge/files/{}", filename)) {
+            appended.push(format!("{}: {}", filename, description));
+        }
+    }
+    if !appended.is_empty() {
+        enriched.push_str("\n\n图片描述：\n");
+        for line in appended {
+            enriched.push_str(&line);
+            enriched.push('\n');
+        }
+    }
+    enriched
+}
+
+/// 将图片描述追加到 ContentItem 中的图片项。
+fn enrich_content_list_with_image_descriptions(content_list: &mut [ContentItem], desc_map: &HashMap<String, String>) {
+    for item in content_list.iter_mut() {
+        if item.typ == "image"
+            && let Some(img_name) = item.img_path.as_deref()
+            && let Some(description) = desc_map.get(img_name).filter(|s| !s.trim().is_empty())
+        {
+            item.image_caption.get_or_insert_with(Vec::new).push(format!("图片描述：{}", description));
+        }
+    }
+}
 
 async fn claim_pending_file_by_id(pool: &SqlitePool, file_id: i64) -> anyhow::Result<Option<File>> {
     let sql = format!(
@@ -249,6 +372,7 @@ where
 struct SliceWithPositions {
     content: String,
     positions: Vec<SlicePosition>,
+    is_image: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -1054,7 +1178,17 @@ impl FileProcessor {
             self.save_custom_images(&normalized.images, timing.as_deref_mut()).await?;
         }
 
-        self.save_custom_slices(file, &normalized.slices, normalized.full_content.as_deref(), timing).await?;
+        let image_descriptions =
+            parse_images_to_descriptions(&self.pool, file.id, &normalized.images, "custom").await?;
+
+        self.save_custom_slices(
+            file,
+            &normalized.slices,
+            normalized.full_content.as_deref(),
+            &image_descriptions,
+            timing,
+        )
+        .await?;
 
         Ok(())
     }
@@ -1118,7 +1252,7 @@ impl FileProcessor {
             return Err(anyhow::anyhow!("Custom parse reuse API returned empty slices"));
         }
 
-        self.save_custom_slices(file, &data.slices, data.full_content.as_deref(), timing).await?;
+        self.save_custom_slices(file, &data.slices, data.full_content.as_deref(), &HashMap::new(), timing).await?;
 
         Ok(true)
     }
@@ -1367,17 +1501,28 @@ impl FileProcessor {
     }
 
     async fn save_custom_slices(
-        &self, file: &File, slices: &[CustomSlice], full_content: Option<&str>, timing: Option<&mut ParseTimingCtx>,
+        &self, file: &File, slices: &[CustomSlice], full_content: Option<&str>,
+        image_descriptions: &HashMap<String, String>, timing: Option<&mut ParseTimingCtx>,
     ) -> anyhow::Result<()> {
         if !self.ensure_file_exists(file.id, "before writing custom slices").await? {
             return Ok(());
         }
 
+        let enriched_slices: Vec<CustomSlice> = slices
+            .iter()
+            .map(|slice| {
+                let content = enrich_content_with_image_descriptions(&slice.content, image_descriptions);
+                CustomSlice { content, positions: slice.positions.clone() }
+            })
+            .collect();
+
         let derived_full_content = match full_content {
-            Some(content) if !content.trim().is_empty() => content.to_string(),
+            Some(content) if !content.trim().is_empty() => {
+                enrich_content_with_image_descriptions(content, image_descriptions)
+            }
             _ => {
                 let mut combined = String::new();
-                for (idx, slice) in slices.iter().enumerate() {
+                for (idx, slice) in enriched_slices.iter().enumerate() {
                     if idx > 0 {
                         combined.push_str("\n\n");
                     }
@@ -1387,9 +1532,16 @@ impl FileProcessor {
             }
         };
 
-        let wrapped: Vec<SliceWithPositions> = slices
+        let wrapped: Vec<SliceWithPositions> = enriched_slices
             .iter()
-            .map(|slice| SliceWithPositions { content: slice.content.clone(), positions: slice.positions.clone() })
+            .map(|slice| {
+                let content = slice.content.clone();
+                SliceWithPositions {
+                    content,
+                    positions: slice.positions.clone(),
+                    is_image: content_looks_like_image_reference(&slice.content),
+                }
+            })
             .collect();
         let embeddings = vec![None; wrapped.len()];
         self.finish_file_processing(
@@ -1665,7 +1817,7 @@ impl FileProcessor {
                         row_num: Some((row_idx + 1) as i32),
                     }];
 
-                    slices.push(SliceWithPositions { content, positions });
+                    slices.push(SliceWithPositions { content, positions, is_image: false });
                 }
             }
 
@@ -1689,7 +1841,8 @@ impl FileProcessor {
         })
         .await?;
 
-        let content_list: Vec<ContentItem>;
+        let mut content_list: Vec<ContentItem>;
+        let mut mineru_images: HashMap<String, String> = HashMap::new();
 
         if !existing_rows.is_empty()
             && existing_rows.iter().any(|row| row.bbox.as_deref().is_some_and(|v| !v.is_empty()))
@@ -1736,6 +1889,7 @@ impl FileProcessor {
         } else {
             // 没有数据，调用 MinerU API
             let mineru_result = self.call_mineru_api(file, is_image, timing.as_deref_mut()).await?;
+            mineru_images = mineru_result.images.clone();
             content_list = timed_step_opt(timing.as_deref_mut(), "parse_mineru_content_list", async {
                 Ok(serde_json::from_str(&mineru_result.content_list)?)
             })
@@ -1800,6 +1954,63 @@ impl FileProcessor {
             .await?;
         }
 
+        // 图片文本化：解析 MinerU/历史图片，持久化描述并 enrich content_list。
+        let image_names: Vec<String> = content_list
+            .iter()
+            .filter_map(|item| if item.typ == "image" { item.img_path.clone() } else { None })
+            .collect();
+        let mut desc_map = if existing_rows.is_empty() {
+            parse_images_to_descriptions(&self.pool, file.id, &mineru_images, "mineru").await?
+        } else {
+            load_or_parse_image_descriptions(&self.pool, file.id, &image_names, "existing").await?
+        };
+
+        // 上传的图片文件本身也需要被文本化，并生成一个图片切片。
+        if is_image && config::get().services.image_parse_url.is_some() && !file.filename.is_empty() {
+            if !desc_map.contains_key(&file.filename) {
+                match image_parse::parse_image_file(Path::new(&file.path), &file.filename, None).await {
+                    Ok(resp) => {
+                        if let Err(err) = image_description::save(
+                            &self.pool,
+                            file.id,
+                            &file.filename,
+                            &resp.description,
+                            &resp.raw_response,
+                            "upload",
+                        )
+                        .await
+                        {
+                            warn!("Failed to save upload image description for {}: {}", file.filename, err);
+                        }
+                        desc_map.insert(file.filename.clone(), resp.description);
+                    }
+                    Err(err) => warn!("Failed to parse upload image {}: {}", file.filename, err),
+                }
+            }
+            if !content_list.iter().any(|item| item.typ == "image" && item.img_path.as_deref() == Some(&file.filename))
+            {
+                let caption = desc_map.get(&file.filename).cloned().unwrap_or_default();
+                content_list.push(ContentItem {
+                    typ: "image".to_string(),
+                    bbox: vec![],
+                    page_idx: 0,
+                    text: None,
+                    text_level: None,
+                    text_format: None,
+                    img_path: Some(file.filename.clone()),
+                    image_caption: if caption.is_empty() {
+                        None
+                    } else {
+                        Some(vec![format!("图片描述：{}", caption)])
+                    },
+                    table_body: None,
+                    table_caption: None,
+                });
+            }
+        }
+
+        enrich_content_list_with_image_descriptions(&mut content_list, &desc_map);
+
         // 构建全文与切片均为 CPU 密集操作，合并放到阻塞线程池执行，避免阻塞异步运行时。
         // content_list 在此之后不再使用，直接移入闭包。
         let slice_type = file.slice_type.clone();
@@ -1814,7 +2025,10 @@ impl FileProcessor {
                 } else {
                     Self::slice_content(&full_content, &slice_type)?
                         .into_iter()
-                        .map(|content| SliceWithPositions { content, positions: vec![] })
+                        .map(|content| {
+                            let is_image = content_looks_like_image_reference(&content);
+                            SliceWithPositions { content, positions: vec![], is_image }
+                        })
                         .collect()
                 };
                 Ok((full_content, slices))
@@ -2309,8 +2523,13 @@ impl FileProcessor {
         &self, file: &File, content: String, slices: Vec<String>, log_message: &str,
         timing: Option<&mut ParseTimingCtx>,
     ) -> anyhow::Result<()> {
-        let wrapped: Vec<SliceWithPositions> =
-            slices.into_iter().map(|content| SliceWithPositions { content, positions: vec![] }).collect();
+        let wrapped: Vec<SliceWithPositions> = slices
+            .into_iter()
+            .map(|content| {
+                let is_image = content_looks_like_image_reference(&content);
+                SliceWithPositions { content, positions: vec![], is_image }
+            })
+            .collect();
         let embeddings = vec![None; wrapped.len()];
         self.finish_file_processing(file, wrapped, embeddings, &content, log_message, None, timing).await
     }
@@ -2357,8 +2576,8 @@ impl FileProcessor {
             let persisted = self.insert_slices_and_positions(file.id, &parse_run_id, slices).await?;
             let mut docs = Vec::with_capacity(persisted.len());
             let mut embs = Vec::with_capacity(persisted.len());
-            for (idx, (id, content)) in persisted.into_iter().enumerate() {
-                docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, content));
+            for (idx, (id, content, is_image)) in persisted.into_iter().enumerate() {
+                docs.push(tantivy_engine::Document::new(id, file.id, file.kb_id, content).with_is_image(is_image));
                 embs.push(embeddings.get(idx).cloned().flatten());
             }
             Ok((docs, embs))
@@ -2424,29 +2643,33 @@ impl FileProcessor {
         Ok(())
     }
 
-    /// 返回每个 slice 的 (id, content) 供后续构建搜索文档使用。
+    /// 返回每个 slice 的 (id, content, is_image) 供后续构建搜索文档使用。
     async fn insert_slices_and_positions(
         &self, file_id: i64, parse_run_id: &str, slices: Vec<SliceWithPositions>,
-    ) -> anyhow::Result<Vec<(i64, String)>> {
+    ) -> anyhow::Result<Vec<(i64, String, bool)>> {
         if slices.is_empty() {
             return Ok(Vec::new());
         }
         // 每批最多 500 条 slice 一个事务，避免长时间持有 SQLite 写锁阻塞其他写操作
         const SLICE_TX_BATCH: usize = 500;
-        let mut persisted: Vec<(i64, String)> = Vec::with_capacity(slices.len());
+        let mut persisted: Vec<(i64, String, bool)> = Vec::with_capacity(slices.len());
         for (chunk_idx, slice_chunk) in slices.chunks(SLICE_TX_BATCH).enumerate() {
             let mut tx = self.pool.begin().await?;
-            let mut chunk_persisted: Vec<(i64, String)> = Vec::with_capacity(slice_chunk.len());
+            let mut chunk_persisted: Vec<(i64, String, bool)> = Vec::with_capacity(slice_chunk.len());
             let mut position_rows: Vec<(i64, SlicePosition)> = Vec::new();
-            let binds_per_row = 3_usize;
+            let binds_per_row = 4_usize;
             let max_vars = 999_usize;
             let batch_size = std::cmp::max(1, max_vars / binds_per_row);
             for (insert_chunk_idx, insert_chunk) in slice_chunk.chunks(batch_size).enumerate() {
                 let insert_offset = insert_chunk_idx * batch_size;
-                let mut slice_sql = QueryBuilder::<Sqlite>::new("INSERT INTO slices (file_id, parse_run_id, ordinal) ");
-                slice_sql.push_values(insert_chunk.iter().enumerate(), |mut b, (idx, _slice)| {
+                let mut slice_sql =
+                    QueryBuilder::<Sqlite>::new("INSERT INTO slices (file_id, parse_run_id, ordinal, is_image) ");
+                slice_sql.push_values(insert_chunk.iter().enumerate(), |mut b, (idx, slice)| {
                     let ordinal = chunk_idx * SLICE_TX_BATCH + insert_offset + idx;
-                    b.push_bind(file_id).push_bind(parse_run_id).push_bind(ordinal as i64);
+                    b.push_bind(file_id)
+                        .push_bind(parse_run_id)
+                        .push_bind(ordinal as i64)
+                        .push_bind(i64::from(slice.is_image));
                 });
                 slice_sql.push(
                     " ON CONFLICT(file_id, parse_run_id, ordinal) WHERE parse_run_id IS NOT NULL AND ordinal IS NOT NULL \
@@ -2465,7 +2688,7 @@ impl FileProcessor {
                     for position in &slice.positions {
                         position_rows.push((id, position.clone()));
                     }
-                    chunk_persisted.push((id, slice.content.clone()));
+                    chunk_persisted.push((id, slice.content.clone(), slice.is_image));
                 }
             }
             if !position_rows.is_empty() {
@@ -2490,7 +2713,11 @@ impl FileProcessor {
                 }
             }
             tx.commit().await?;
-            crate::slice_content::upsert_many(file_id, &chunk_persisted).await?;
+            crate::slice_content::upsert_many(
+                file_id,
+                &chunk_persisted.iter().map(|(id, content, _)| (*id, content.clone())).collect::<Vec<_>>(),
+            )
+            .await?;
             persisted.extend(chunk_persisted);
         }
         Ok(persisted)
@@ -2654,7 +2881,11 @@ impl FileProcessor {
             let end = std::cmp::min(start + chunk_size, chars.len());
             let slice: String = chars[start..end].iter().collect();
             let positions = Self::positions_for_range(segments, start, end);
-            slices.push(SliceWithPositions { content: slice, positions });
+            slices.push(SliceWithPositions {
+                content: slice.clone(),
+                positions,
+                is_image: content_looks_like_image_reference(&slice),
+            });
 
             if end >= chars.len() {
                 break;
@@ -2892,7 +3123,11 @@ impl FileProcessor {
                 }
                 let slice: String = chars[start..end].iter().collect();
                 let positions = Self::positions_for_range(segments, start, end);
-                Some(SliceWithPositions { content: slice, positions })
+                Some(SliceWithPositions {
+                    content: slice.clone(),
+                    positions,
+                    is_image: content_looks_like_image_reference(&slice),
+                })
             })
             .collect()
     }
@@ -3093,7 +3328,9 @@ impl FileProcessor {
 
     async fn fetch_slice_rows(&self, file_id: i64) -> anyhow::Result<Vec<SliceRow>> {
         let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM slices WHERE file_id = ? ORDER BY id")
-            .bind(file_id).fetch_all(&self.pool).await?;
+            .bind(file_id)
+            .fetch_all(&self.pool)
+            .await?;
         let contents = crate::slice_content::read_all(file_id).await?;
         Ok(ids.into_iter().map(|id| SliceRow { id, content: contents.get(&id).cloned().unwrap_or_default() }).collect())
     }
@@ -3212,7 +3449,8 @@ impl FileProcessor {
         crate::slice_content::upsert_many(
             target_file_id,
             &cloned.iter().map(|row| (row.new_id, row.content.clone())).collect::<Vec<_>>(),
-        ).await?;
+        )
+        .await?;
         Ok(cloned)
     }
 
@@ -3291,12 +3529,11 @@ impl FileProcessor {
     ) -> anyhow::Result<String> {
         let mut search_docs = Vec::new();
         for slice in cloned_slices {
-            search_docs.push(tantivy_engine::Document::new(
-                slice.new_id,
-                target.id,
-                target.kb_id,
-                slice.content.clone(),
-            ));
+            let is_image = content_looks_like_image_reference(&slice.content);
+            search_docs.push(
+                tantivy_engine::Document::new(slice.new_id, target.id, target.kb_id, slice.content.clone())
+                    .with_is_image(is_image),
+            );
         }
 
         if !search_docs.is_empty() {
@@ -3379,8 +3616,12 @@ impl FileProcessor {
 
         // 2. 获取文件的所有切片
         let source_file_id = effective_parse_file_id(&self.pool, file.id).await?;
-        let slices = self.fetch_slice_rows(source_file_id).await?
-            .into_iter().map(|row| (row.id, row.content)).collect::<Vec<_>>();
+        let slices = self
+            .fetch_slice_rows(source_file_id)
+            .await?
+            .into_iter()
+            .map(|row| (row.id, row.content))
+            .collect::<Vec<_>>();
 
         if slices.is_empty() {
             debug!("No slices found for file {}, skipping graph building", file.id);

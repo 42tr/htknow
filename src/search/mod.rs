@@ -150,6 +150,11 @@ pub fn is_image_file(filename: &str) -> bool {
         || lower.ends_with(".heif")
 }
 
+/// 根据切片内容判断是否包含图片引用。
+pub fn content_looks_like_image_reference(content: &str) -> bool {
+    content.contains("![") && content.contains("](/api/v1/knowledge/files/")
+}
+
 async fn fetch_rebuild_lancedb_rows(
     pool: &SqlitePool, slice_ids: &[i64],
 ) -> anyhow::Result<Vec<RebuildLanceDbSliceRow>> {
@@ -175,7 +180,9 @@ async fn fetch_rebuild_lancedb_rows(
     for source_file_id in rows.iter().map(|row| row.source_file_id).collect::<HashSet<_>>() {
         contents.insert(source_file_id, crate::slice_content::read_all(source_file_id).await?);
     }
-    for row in &mut rows { row.content = contents.get(&row.source_file_id).and_then(|v| v.get(&row.id)).cloned().unwrap_or_default(); }
+    for row in &mut rows {
+        row.content = contents.get(&row.source_file_id).and_then(|v| v.get(&row.id)).cloned().unwrap_or_default();
+    }
     Ok(rows)
 }
 
@@ -372,6 +379,8 @@ impl SearchEngine {
                 .into_iter()
                 .map(|row| {
                     let mut doc = lancedb::Document::new(row.id, row.file_id, row.kb_id, row.content);
+                    let is_image = content_looks_like_image_reference(&doc.content) || is_image_file(&row.filename);
+                    doc = doc.with_is_image(is_image);
                     if let Some(image_embedding) = image_embeddings.get(&row.file_id) {
                         doc = doc.with_image_embedding(image_embedding.clone());
                     }
@@ -400,6 +409,81 @@ impl SearchEngine {
             removed,
             rebuild_started_at.elapsed().as_secs()
         );
+        Ok(())
+    }
+
+    /// 检查 SQLite 切片数量与 Tantivy 默认索引文档数是否一致，不一致则从 SQLite 重建默认索引。
+    /// 用于 schema 变更（新增 is_image 字段）或索引损坏后的自动恢复。
+    pub async fn maybe_rebuild_tantivy_from_db(&self) -> anyhow::Result<()> {
+        let Some(pool) = &self.pool else {
+            return Err(anyhow!("search engine db pool not set"));
+        };
+
+        let total_slices: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM slices").fetch_one(pool).await?;
+        let index_docs = self.index_reader.searcher().num_docs() as i64;
+        if total_slices == index_docs {
+            info!("Tantivy default index is consistent with SQLite: {} docs", total_slices);
+            return Ok(());
+        }
+
+        info!(
+            "Tantivy default index mismatch: sqlite_slices={} index_docs={}, rebuilding...",
+            total_slices, index_docs
+        );
+
+        #[derive(Debug, sqlx::FromRow)]
+        struct SliceMeta {
+            id: i64,
+            source_file_id: i64,
+            file_id: i64,
+            kb_id: Option<i64>,
+            is_image: i64,
+        }
+
+        let rows: Vec<SliceMeta> = sqlx::query_as(
+            "SELECT s.id, s.file_id AS source_file_id, COALESCE(ref.id, source.id) AS file_id, \
+                    COALESCE(ref.kb_id, source.kb_id) AS kb_id, s.is_image \
+             FROM slices s JOIN files source ON source.id = s.file_id \
+             LEFT JOIN parse_artifacts pa ON pa.source_file_id = source.id \
+             LEFT JOIN files ref ON ref.artifact_id = pa.id \
+             ORDER BY s.id ASC",
+        )
+        .fetch_all(pool)
+        .await?;
+
+        let all_ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
+        if all_ids.is_empty() {
+            return Ok(());
+        }
+
+        let cfg = config::get();
+        let batch_size = cfg.search.tantivy_rebuild_batch_size.max(1);
+
+        let _guard = self.index_write_lock.lock().await;
+        for chunk in all_ids.chunks(batch_size) {
+            self.index_writer.delete_by_field("id", chunk).await?;
+        }
+
+        let mut contents = HashMap::new();
+        for source_file_id in rows.iter().map(|row| row.source_file_id).collect::<HashSet<_>>() {
+            contents.insert(source_file_id, crate::slice_content::read_all(source_file_id).await?);
+        }
+
+        for chunk in rows.chunks(batch_size) {
+            let docs: Vec<tantivy_engine::Document> = chunk
+                .iter()
+                .map(|row| {
+                    let content =
+                        contents.get(&row.source_file_id).and_then(|m| m.get(&row.id)).cloned().unwrap_or_default();
+                    let is_image = row.is_image != 0 || content_looks_like_image_reference(&content);
+                    tantivy_engine::Document::new(row.id, row.file_id, row.kb_id, content).with_is_image(is_image)
+                })
+                .collect();
+            self.index_writer.write_batch(docs).await?;
+        }
+        reload_reader(&self.index_reader, "index")?;
+
+        info!("Tantivy default index rebuilt from SQLite: {} docs", all_ids.len());
         Ok(())
     }
 
@@ -499,10 +583,15 @@ impl SearchEngine {
                 for source_file_id in rows.iter().map(|row| row.source_file_id).collect::<HashSet<_>>() {
                     contents.insert(source_file_id, crate::slice_content::read_all(source_file_id).await?);
                 }
-                let docs: Vec<tantivy_engine::Document> = rows.into_iter().map(|row| tantivy_engine::Document::new(
-                    row.id, row.file_id, row.kb_id,
-                    contents.get(&row.source_file_id).and_then(|v| v.get(&row.id)).cloned().unwrap_or_default(),
-                )).collect();
+                let docs: Vec<tantivy_engine::Document> = rows
+                    .into_iter()
+                    .map(|row| {
+                        let content =
+                            contents.get(&row.source_file_id).and_then(|v| v.get(&row.id)).cloned().unwrap_or_default();
+                        let is_image = content_looks_like_image_reference(&content);
+                        tantivy_engine::Document::new(row.id, row.file_id, row.kb_id, content).with_is_image(is_image)
+                    })
+                    .collect();
                 total_slice_docs += tantivy_engine::add_documents(&mut slice_writer, &slice_schema, docs)?;
                 processed_docs += batch_size;
                 on_progress(RebuildProgress { phase: "build_slice".to_string(), total_docs, processed_docs }).await;
@@ -614,6 +703,7 @@ impl SearchEngine {
         }
 
         let mut lancedb_doc = lancedb::Document::new(doc.id, doc.file_id, doc.kb_id, doc.content);
+        lancedb_doc = lancedb_doc.with_is_image(doc.is_image);
         if let Some(image_embedding) = image_embedding {
             lancedb_doc = lancedb_doc.with_image_embedding(image_embedding);
         }
@@ -642,6 +732,7 @@ impl SearchEngine {
             .zip(image_embeddings.iter())
             .map(|(doc, image_embedding)| {
                 let mut lancedb_doc = lancedb::Document::new(doc.id, doc.file_id, doc.kb_id, doc.content.clone());
+                lancedb_doc = lancedb_doc.with_is_image(doc.is_image);
                 if let Some(embedding) = image_embedding {
                     lancedb_doc = lancedb_doc.with_image_embedding(embedding.clone());
                 }
@@ -676,7 +767,10 @@ impl SearchEngine {
         let slice_ids: Vec<i64> = updates.iter().map(|(id, _)| *id).collect();
         let docs: Vec<tantivy_engine::Document> = updates
             .into_iter()
-            .map(|(id, content)| tantivy_engine::Document::new(id, file_id, kb_id, content))
+            .map(|(id, content)| {
+                let is_image = content_looks_like_image_reference(&content);
+                tantivy_engine::Document::new(id, file_id, kb_id, content).with_is_image(is_image)
+            })
             .collect();
 
         // 1. 默认索引：删除旧 slice 文档并写入新文档，随后 reload reader
@@ -689,8 +783,10 @@ impl SearchEngine {
 
         // 2. LanceDB：软删除旧向量并写入新向量（LanceDB 会自动为 content 生成 embedding）
         lancedb::delete_by_slices(&slice_ids).await?;
-        let lancedb_docs: Vec<lancedb::Document> =
-            docs.into_iter().map(|doc| lancedb::Document::new(doc.id, doc.file_id, doc.kb_id, doc.content)).collect();
+        let lancedb_docs: Vec<lancedb::Document> = docs
+            .into_iter()
+            .map(|doc| lancedb::Document::new(doc.id, doc.file_id, doc.kb_id, doc.content).with_is_image(doc.is_image))
+            .collect();
         lancedb::write_documents_batch(lancedb_docs).await?;
 
         Ok(())
@@ -910,6 +1006,7 @@ impl SearchEngine {
                 &tantivy_query,
                 tantivy_file_ids.as_ref(),
                 tantivy_kb_ids.as_ref(),
+                None,
                 synonym_ref,
             )?;
             debug!("Tantivy branch total {}ms", tantivy_started.elapsed().as_millis());
@@ -1004,10 +1101,115 @@ impl SearchEngine {
             query,
             file_ids,
             kb_ids,
+            None,
             FULL_SNIPPET_MAX_CHARS,
             synonym_ref,
         )
         .await
+    }
+
+    pub async fn search_image_by_text(
+        &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
+    ) -> anyhow::Result<Vec<SearchResultItem>> {
+        let total_start = Instant::now();
+        debug!("Searching images by text for query: {}", query);
+
+        let synonym_start = Instant::now();
+        let synonym_map = match self.load_query_synonyms(query).await {
+            Ok(map) => map,
+            Err(e) => {
+                warn!("Failed to load query synonyms for '{}': {}", query, e);
+                HashMap::new()
+            }
+        };
+        debug!(
+            "Image-by-text synonym lookup {}ms count={}",
+            synonym_start.elapsed().as_millis(),
+            synonym_map.values().map(Vec::len).sum::<usize>()
+        );
+
+        let index_reader = self.index_reader.clone();
+        let schema = self.schema.clone();
+        let tantivy_query = query.to_string();
+        let tantivy_file_ids = file_ids.cloned();
+        let tantivy_kb_ids = kb_ids.cloned();
+        let tantivy_synonym_map = synonym_map.clone();
+        let tantivy_started = Instant::now();
+        let tantivy_task = tokio::task::spawn_blocking(move || {
+            let synonym_ref = if tantivy_synonym_map.is_empty() { None } else { Some(&tantivy_synonym_map) };
+            let results = tantivy_engine::search_sync(
+                &index_reader,
+                &schema,
+                &tantivy_query,
+                tantivy_file_ids.as_ref(),
+                tantivy_kb_ids.as_ref(),
+                Some(true),
+                synonym_ref,
+            )?;
+            debug!("Tantivy image-by-text branch total {}ms", tantivy_started.elapsed().as_millis());
+            anyhow::Ok(results)
+        });
+
+        let lancedb_started = Instant::now();
+        let lancedb_result = lancedb::search_image_by_text(query, file_ids, kb_ids).await;
+        debug!("LanceDB image-by-text branch total {}ms", lancedb_started.elapsed().as_millis());
+        let tantivy_result =
+            tantivy_task.await.map_err(|err| anyhow!("Tantivy image-by-text search task failed: {}", err))?;
+
+        let tantivy_results = tantivy_result?;
+        debug!("Tantivy image-by-text results count: {}", tantivy_results.len());
+
+        let lancedb_results = match lancedb_result {
+            Ok(results) => {
+                debug!("LanceDB image-by-text results count: {}", results.len());
+                results
+            }
+            Err(err) => {
+                warn!(
+                    "Vector image-by-text search failed for query {:?}, falling back to Tantivy-only: {}",
+                    query, err
+                );
+                Vec::new()
+            }
+        };
+
+        let mut merged_map: HashMap<i64, SearchResultItem> = HashMap::new();
+        for result in tantivy_results {
+            if result.content.trim().is_empty() {
+                continue;
+            }
+            merged_map.insert(result.id, result);
+        }
+        for result in lancedb_results {
+            if result.content.trim().is_empty() {
+                continue;
+            }
+            merged_map
+                .entry(result.id)
+                .and_modify(|e| {
+                    if result.score > e.score {
+                        *e = result.clone();
+                    }
+                })
+                .or_insert(result);
+        }
+
+        let mut merged_results: Vec<SearchResultItem> = merged_map.into_values().collect();
+        merged_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        info!("Image-by-text merged results count: {}", merged_results.len());
+
+        if merged_results.is_empty() {
+            return Ok(merged_results);
+        }
+
+        let mut final_results = self.rerank(query, merged_results).await;
+        let limit = config::get().search.limit.max(1);
+        if final_results.len() > limit {
+            final_results.truncate(limit);
+        }
+
+        debug!("Image-by-text search total {}ms", total_start.elapsed().as_millis());
+        Ok(final_results)
     }
 
     pub async fn search_image(

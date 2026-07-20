@@ -66,6 +66,11 @@ impl Document {
         Document { id, file_id, kb_id, content, is_image: false, image_embedding: None }
     }
 
+    pub fn with_is_image(mut self, is_image: bool) -> Self {
+        self.is_image = is_image;
+        self
+    }
+
     pub fn with_image_embedding(mut self, embedding: Arc<Vec<f32>>) -> Self {
         self.is_image = true;
         self.image_embedding = Some(embedding);
@@ -284,6 +289,40 @@ pub async fn search(
         row_count
     );
 
+    Ok(search_results)
+}
+
+pub async fn search_image_by_text(
+    query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
+) -> Result<Vec<SearchResultItem>> {
+    if has_empty_scope(file_ids, kb_ids) {
+        return Ok(Vec::new());
+    }
+
+    let cfg = config::get();
+    let table = get_table()?;
+
+    let query_vector = embedding::get_embedding(query).await?;
+    let fast_search = vector_fast_search_enabled();
+    let mut query_builder =
+        table.query().nearest_to(query_vector)?.column("vector").select(Select::columns(SEARCH_SELECT_COLUMNS));
+    if fast_search {
+        query_builder = query_builder.fast_search();
+    }
+
+    let filter_conditions = build_filter_conditions(true, file_ids, kb_ids);
+    if !filter_conditions.is_empty() {
+        query_builder = query_builder.only_if(filter_conditions.join(" AND "));
+    }
+
+    let mut result_stream = query_builder.limit(cfg.search.limit).execute().await?;
+    let mut search_results = Vec::with_capacity(cfg.search.limit);
+    while let Some(batch_result) = result_stream.next().await {
+        let batch = batch_result?;
+        decode_search_batch(&batch, &mut search_results)?;
+    }
+
+    search_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
     Ok(search_results)
 }
 

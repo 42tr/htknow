@@ -34,6 +34,9 @@ async fn main() -> anyhow::Result<()> {
     if let Err(err) = search_engine.maybe_rebuild_lancedb_from_db().await {
         log::warn!("Failed to reconcile LanceDB from SQLite at startup; continuing with current index: {}", err);
     }
+    if let Err(err) = search_engine.maybe_rebuild_tantivy_from_db().await {
+        log::warn!("Failed to reconcile Tantivy from SQLite at startup; continuing with current index: {}", err);
+    }
     search::schedule_startup_index_maintenance();
     match search_engine.reload_lexicon().await {
         Ok(loaded) => log::info!("Search lexicon loaded: {} words", loaded),

@@ -149,6 +149,7 @@ async fn run_schema_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
     info!("Applied schema migration {}: parse_run_id_and_slice_ordinal", VERSION);
 
     run_parse_artifact_migration(pool).await?;
+    run_image_description_migration(pool).await?;
     Ok(())
 }
 
@@ -188,6 +189,51 @@ async fn run_parse_artifact_migration(pool: &SqlitePool) -> anyhow::Result<()> {
     sqlx::query("CREATE INDEX IF NOT EXISTS idx_files_artifact_id ON files(artifact_id)").execute(&mut *tx).await?;
     tx.commit().await?;
     info!("Applied schema migration {}: shared_parse_artifacts", VERSION);
+    Ok(())
+}
+
+async fn run_image_description_migration(pool: &SqlitePool) -> anyhow::Result<()> {
+    const VERSION: i64 = 3;
+    let mut tx = pool.begin().await?;
+    let claimed = sqlx::query("INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (?, ?)")
+        .bind(VERSION)
+        .bind("image_descriptions_and_slice_is_image")
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if claimed == 0 {
+        tx.rollback().await?;
+        return Ok(());
+    }
+    let slice_columns = sqlx::query("PRAGMA table_info(slices)").fetch_all(&mut *tx).await?;
+    if !slice_columns.iter().any(|row| row.get::<String, _>("name") == "is_image") {
+        sqlx::query("ALTER TABLE slices ADD COLUMN is_image INTEGER NOT NULL DEFAULT 0").execute(&mut *tx).await?;
+    }
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS image_descriptions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            file_id INTEGER NOT NULL,
+            image_filename TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            raw_response TEXT NOT NULL DEFAULT '',
+            source TEXT NOT NULL DEFAULT '',
+            created_at INTEGER DEFAULT (strftime('%s','now')),
+            updated_at INTEGER DEFAULT (strftime('%s','now')),
+            UNIQUE(file_id, image_filename)
+        )",
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_image_descriptions_file_id ON image_descriptions(file_id)")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_image_descriptions_file_filename ON image_descriptions(file_id, image_filename)",
+    )
+    .execute(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    info!("Applied schema migration {}: image_descriptions_and_slice_is_image", VERSION);
     Ok(())
 }
 
@@ -503,18 +549,27 @@ async fn ensure_file_content_externalized(pool: &SqlitePool) -> anyhow::Result<(
 /// 将旧版 `slices.content` 聚合迁移到每个源文件一个 JSON 内容包后删除大文本列。
 async fn ensure_slice_content_externalized(pool: &SqlitePool) -> anyhow::Result<()> {
     let columns = sqlx::query("PRAGMA table_info(slices)").fetch_all(pool).await?;
-    if !columns.iter().any(|row| row.get::<String, _>("name") == "content") { return Ok(()); }
+    if !columns.iter().any(|row| row.get::<String, _>("name") == "content") {
+        return Ok(());
+    }
     info!("Detected legacy `slices.content` column, migrating to slice content files...");
     const BATCH: i64 = 100;
     let mut last_file_id = 0_i64;
     loop {
-        let file_ids: Vec<i64> = sqlx::query_scalar(
-            "SELECT DISTINCT file_id FROM slices WHERE file_id > ? ORDER BY file_id LIMIT ?",
-        ).bind(last_file_id).bind(BATCH).fetch_all(pool).await?;
-        if file_ids.is_empty() { break; }
+        let file_ids: Vec<i64> =
+            sqlx::query_scalar("SELECT DISTINCT file_id FROM slices WHERE file_id > ? ORDER BY file_id LIMIT ?")
+                .bind(last_file_id)
+                .bind(BATCH)
+                .fetch_all(pool)
+                .await?;
+        if file_ids.is_empty() {
+            break;
+        }
         for file_id in &file_ids {
             let rows: Vec<(i64, String)> = sqlx::query_as("SELECT id, content FROM slices WHERE file_id = ?")
-                .bind(file_id).fetch_all(pool).await?;
+                .bind(file_id)
+                .fetch_all(pool)
+                .await?;
             crate::slice_content::write_all(*file_id, &rows.into_iter().collect()).await?;
         }
         last_file_id = *file_ids.last().unwrap();

@@ -1775,6 +1775,48 @@ pub async fn search_image(
     Ok(Json(SearchResult { results }))
 }
 
+/// 基于图片描述的文本检索
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/search/image-by-text",
+    operation_id = "search_image_by_text",
+    tag = "search",
+    params(SearchQuery),
+    responses(
+        (status = 200, description = "图片文本化检索成功", body = SearchResult),
+        (status = 400, description = "请求参数错误"),
+        (status = 500, description = "服务器内部错误")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn search_image_by_text(
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
+    Query(params): Query<SearchQuery>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<SearchResult>> {
+    let query = params.query.trim();
+    if query.is_empty() {
+        return Err(ApiError::BadRequest("query is required".to_string()));
+    }
+
+    let (_is_admin, _user_id, kb_ids_to_search) =
+        resolve_scope_for_user(&pool, &auth_user, params.kb_id.as_ref()).await?;
+    if no_accessible_kb_scope(kb_ids_to_search.as_deref()) {
+        return Ok(Json(SearchResult { results: vec![] }));
+    }
+
+    let raw_results = search_engine
+        .search_image_by_text(query, params.file_id.as_ref(), kb_ids_to_search.as_ref())
+        .await
+        .map_err(|e| ApiError::internal(format!("Image-by-text search failed: {}", e)))?;
+
+    let results = build_slice_results_from_raw(&pool, raw_results, &auth_user, false).await?;
+
+    Ok(Json(SearchResult { results }))
+}
+
 /// 词表列表（管理员）
 #[utoipa::path(
     get,

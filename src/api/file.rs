@@ -2117,8 +2117,12 @@ pub async fn list(
     if let Some(tag) = tag {
         let mut qb = QueryBuilder::<Sqlite>::new(&format!("SELECT {FILE_COLS_NO_CONTENT} FROM files f WHERE 1=1"));
         match kb_filter {
-            Some(None) => { qb.push(" AND f.kb_id IS NULL"); }
-            Some(Some(kb_id)) => { qb.push(" AND f.kb_id = ").push_bind(kb_id); }
+            Some(None) => {
+                qb.push(" AND f.kb_id IS NULL");
+            }
+            Some(Some(kb_id)) => {
+                qb.push(" AND f.kb_id = ").push_bind(kb_id);
+            }
             None => {}
         }
         if !is_admin {
@@ -2128,7 +2132,11 @@ pub async fn list(
         qb.push(" ORDER BY f.created_at DESC");
         let mut files: Vec<File> = qb.build_query_as().fetch_all(&pool).await?;
         files.retain(|file: &File| {
-            if let Ok(tags) = serde_json::from_str::<Vec<String>>(&file.tags) { tags.contains(&tag.to_string()) } else { false }
+            if let Ok(tags) = serde_json::from_str::<Vec<String>>(&file.tags) {
+                tags.contains(&tag.to_string())
+            } else {
+                false
+            }
         });
         let total = files.len() as i64;
         let items = files
@@ -2145,8 +2153,12 @@ pub async fn list(
 
     let mut count_qb = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM files f WHERE 1=1");
     match kb_filter {
-        Some(None) => { count_qb.push(" AND f.kb_id IS NULL"); }
-        Some(Some(kb_id)) => { count_qb.push(" AND f.kb_id = ").push_bind(kb_id); }
+        Some(None) => {
+            count_qb.push(" AND f.kb_id IS NULL");
+        }
+        Some(Some(kb_id)) => {
+            count_qb.push(" AND f.kb_id = ").push_bind(kb_id);
+        }
         None => {}
     }
     if !is_admin {
@@ -2157,8 +2169,12 @@ pub async fn list(
 
     let mut list_qb = QueryBuilder::<Sqlite>::new(&format!("SELECT {FILE_COLS_NO_CONTENT} FROM files f WHERE 1=1"));
     match kb_filter {
-        Some(None) => { list_qb.push(" AND f.kb_id IS NULL"); }
-        Some(Some(kb_id)) => { list_qb.push(" AND f.kb_id = ").push_bind(kb_id); }
+        Some(None) => {
+            list_qb.push(" AND f.kb_id IS NULL");
+        }
+        Some(Some(kb_id)) => {
+            list_qb.push(" AND f.kb_id = ").push_bind(kb_id);
+        }
         None => {}
     }
     if !is_admin {
@@ -2724,7 +2740,10 @@ pub async fn get_highlighted_pdf(
         .await?;
 
         rows.iter()
-            .map(|row| pdf_highlight::HighlightPosition { page_idx: row.page_idx, bbox: [row.x1, row.y1, row.x2, row.y2] })
+            .map(|row| pdf_highlight::HighlightPosition {
+                page_idx: row.page_idx,
+                bbox: [row.x1, row.y1, row.x2, row.y2],
+            })
             .collect()
     } else {
         Vec::new()

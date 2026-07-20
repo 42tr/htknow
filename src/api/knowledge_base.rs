@@ -876,9 +876,7 @@ pub async fn get(
     security(("x-user-id" = []), ("x-role" = []))
 )]
 pub async fn get_files(
-    State(pool): State<SqlitePool>,
-    Path(id): Path<i64>,
-    Query(params): Query<KnowledgeBaseFilesQuery>,
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Query(params): Query<KnowledgeBaseFilesQuery>,
     Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<KnowledgeBaseFilesResponse>> {
     let is_admin = auth_user.is_admin();
@@ -899,9 +897,7 @@ pub async fn get_files(
 
     let push_filters = |qb: &mut QueryBuilder<Sqlite>| {
         if !is_admin {
-            qb.push(" AND (user_id = ")
-                .push_bind(user_id.clone())
-                .push(" OR is_public = 1)");
+            qb.push(" AND (user_id = ").push_bind(user_id.clone()).push(" OR is_public = 1)");
         }
         if let Some(name) = filename {
             qb.push(" AND filename LIKE ").push_bind(format!("%{}%", name));
@@ -910,7 +906,7 @@ pub async fn get_files(
 
     if let Some(tag) = tag {
         let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at FROM files WHERE kb_id = "
+            "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at FROM files WHERE kb_id = ",
         );
         qb.push_bind(id);
         push_filters(&mut qb);
@@ -925,11 +921,7 @@ pub async fn get_files(
             })
             .collect();
         let total = filtered.len() as i64;
-        let items = filtered
-            .into_iter()
-            .skip(offset as usize)
-            .take(limit as usize)
-            .collect();
+        let items = filtered.into_iter().skip(offset as usize).take(limit as usize).collect();
         return Ok(Json(KnowledgeBaseFilesResponse { total, items }));
     }
 
@@ -939,7 +931,7 @@ pub async fn get_files(
     let total: i64 = count_qb.build_query_scalar().fetch_one(&pool).await?;
 
     let mut list_qb = QueryBuilder::<Sqlite>::new(
-        "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at FROM files WHERE kb_id = "
+        "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at FROM files WHERE kb_id = ",
     );
     list_qb.push_bind(id);
     push_filters(&mut list_qb);
