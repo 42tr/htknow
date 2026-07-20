@@ -10,6 +10,8 @@ use axum::{
 };
 use chrono::Utc;
 use log::{error, info, warn};
+use once_cell::sync::Lazy;
+use regex::Regex;
 use serde::{Deserialize, Serialize, de};
 use serde_json::{Value, json};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
@@ -167,6 +169,12 @@ pub struct SearchResultItem {
     pub file: Option<FileInfo>,
     /// 知识库信息
     pub kb: Option<KbInfo>,
+    /// 图片名称（仅图片相关搜索结果）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_filename: Option<String>,
+    /// 图片文本化描述（仅图片相关搜索结果）
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub image_content: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -897,8 +905,54 @@ async fn build_slice_results_from_raw(
         if dedupe_by_content && !seen_contents.insert(r.content.clone()) {
             continue;
         }
-        results.push(SearchResultItem { id: r.id, file_id: r.file_id, content: r.content, score: r.score, file, kb });
+        results.push(SearchResultItem {
+            id: r.id,
+            file_id: r.file_id,
+            content: r.content,
+            score: r.score,
+            file,
+            kb,
+            image_filename: None,
+            image_content: None,
+        });
     }
+    Ok(results)
+}
+
+/// 匹配切片内容中的图片引用，例如 `![img.png](/api/v1/knowledge/files/img.png)`。
+static IMAGE_REF_RE: Lazy<Regex> =
+    Lazy::new(|| Regex::new(r"!\[.*?\]\(/api/v1/knowledge/files/([^)]+)\)").expect("image ref regex is valid"));
+
+fn extract_image_filename_from_content(content: &str) -> Option<String> {
+    IMAGE_REF_RE.captures(content)?.get(1).map(|m| m.as_str().to_string())
+}
+
+/// 为图片相关搜索结果补充图片名称和 split_image 返回的 image_content（描述）。
+async fn enrich_image_search_results(
+    pool: &SqlitePool, mut results: Vec<SearchResultItem>,
+) -> ApiResult<Vec<SearchResultItem>> {
+    let image_file_ids: HashSet<i64> = results
+        .iter()
+        .filter(|r| extract_image_filename_from_content(&r.content).is_some())
+        .map(|r| r.file_id)
+        .collect();
+    if image_file_ids.is_empty() {
+        return Ok(results);
+    }
+
+    let descriptions =
+        crate::image_description::list_by_file_ids(pool, &image_file_ids.into_iter().collect::<Vec<_>>())
+            .await
+            .map_err(|e| ApiError::internal(format!("Failed to load image descriptions: {}", e)))?;
+
+    for result in &mut results {
+        let Some(filename) = extract_image_filename_from_content(&result.content) else { continue };
+        result.image_filename = Some(filename.clone());
+        if let Some(description) = descriptions.get(&(result.file_id, filename)) {
+            result.image_content = Some(description.clone());
+        }
+    }
+
     Ok(results)
 }
 
@@ -1266,6 +1320,8 @@ async fn run_advanced_slice_search_non_stream(
         score: selected.score,
         file: Some(selected.file),
         kb: selected.kb,
+        image_filename: None,
+        image_content: None,
     }])
 }
 
@@ -1817,6 +1873,7 @@ pub async fn search_image_by_text(
         .map_err(|e| ApiError::internal(format!("Image-by-text search failed: {}", e)))?;
 
     let results = build_slice_results_from_raw(&pool, raw_results, &auth_user, false).await?;
+    let results = enrich_image_search_results(&pool, results).await?;
 
     Ok(Json(SearchResult { results }))
 }

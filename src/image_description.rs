@@ -6,7 +6,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result};
-use sqlx::{FromRow, SqlitePool};
+use sqlx::{FromRow, QueryBuilder, Sqlite, SqlitePool};
 
 #[derive(Debug, Clone, FromRow)]
 pub struct ImageDescription {
@@ -69,6 +69,31 @@ pub async fn list_by_file(pool: &SqlitePool, file_id: i64) -> Result<HashMap<Str
     .await
     .with_context(|| format!("failed to list image_descriptions for file_id={}", file_id))?;
     Ok(rows.into_iter().map(|row| (row.image_filename, row.description)).collect())
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct FileImageDescriptionRow {
+    file_id: i64,
+    image_filename: String,
+    description: String,
+}
+
+/// 批量查询多个文件的图片描述，返回 (file_id, image_filename) -> description 映射。
+pub async fn list_by_file_ids(pool: &SqlitePool, file_ids: &[i64]) -> Result<HashMap<(i64, String), String>> {
+    if file_ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+
+    let mut query_builder: QueryBuilder<'_, Sqlite> =
+        QueryBuilder::new("SELECT file_id, image_filename, description FROM image_descriptions WHERE file_id IN (");
+    let mut separated = query_builder.separated(", ");
+    for file_id in file_ids {
+        separated.push_bind(file_id);
+    }
+    separated.push_unseparated(")");
+
+    let rows: Vec<FileImageDescriptionRow> = query_builder.build_query_as().fetch_all(pool).await?;
+    Ok(rows.into_iter().map(|row| ((row.file_id, row.image_filename), row.description)).collect())
 }
 
 /// 复制源文件的所有图片描述记录到目标文件（旧版解析结果复用场景）

@@ -7,11 +7,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::config;
 
-/// 判断图片 embedding 服务是否已配置（非空字符串视为已配置）。
+/// 判断图片 embedding 服务是否已配置。
 pub fn image_embedding_enabled() -> bool {
-    let cfg = config::get();
-    let url = cfg.services.image_embedding_url.trim();
-    !url.is_empty()
+    config::get().services.image_embedding_url.is_some()
 }
 
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(Client::new);
@@ -37,6 +35,11 @@ pub async fn get_image_embedding_from_path(path: &str, text: Option<&str>) -> Re
     let file_name = std::path::Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or("image");
     let mime = mime_guess::from_path(path).first_or_octet_stream();
     let cfg = config::get();
+    let url = cfg
+        .services
+        .image_embedding_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("image embedding URL is not configured"))?;
 
     let part = reqwest::multipart::Part::file(path)
         .await
@@ -46,7 +49,7 @@ pub async fn get_image_embedding_from_path(path: &str, text: Option<&str>) -> Re
     let form = reqwest::multipart::Form::new().part("file", part).text("text", text.unwrap_or(file_name).to_string());
 
     let response = HTTP_CLIENT
-        .post(&cfg.services.image_embedding_url)
+        .post(url)
         .timeout(Duration::from_secs(cfg.search.embedding_timeout_secs))
         .multipart(form)
         .send()
@@ -54,7 +57,7 @@ pub async fn get_image_embedding_from_path(path: &str, text: Option<&str>) -> Re
         .with_context(|| {
             format!(
                 "image embedding request failed: url={}, file={}, timeout={}s",
-                cfg.services.image_embedding_url, file_name, cfg.search.embedding_timeout_secs
+                url, file_name, cfg.search.embedding_timeout_secs
             )
         })?;
 
@@ -66,6 +69,11 @@ pub async fn get_image_embedding_from_bytes(
     file_name: &str, content_type: Option<&str>, bytes: Vec<u8>, text: Option<&str>,
 ) -> Result<Vec<f32>> {
     let cfg = config::get();
+    let url = cfg
+        .services
+        .image_embedding_url
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("image embedding URL is not configured"))?;
     let mut part = reqwest::multipart::Part::bytes(bytes).file_name(file_name.to_string());
     if let Some(content_type) = content_type {
         part = part.mime_str(content_type)?;
@@ -73,7 +81,7 @@ pub async fn get_image_embedding_from_bytes(
     let form = reqwest::multipart::Form::new().part("file", part).text("text", text.unwrap_or(file_name).to_string());
 
     let response = HTTP_CLIENT
-        .post(&cfg.services.image_embedding_url)
+        .post(url)
         .timeout(Duration::from_secs(cfg.search.embedding_timeout_secs))
         .multipart(form)
         .send()
@@ -81,7 +89,7 @@ pub async fn get_image_embedding_from_bytes(
         .with_context(|| {
             format!(
                 "image embedding request failed: url={}, file={}, timeout={}s",
-                cfg.services.image_embedding_url, file_name, cfg.search.embedding_timeout_secs
+                url, file_name, cfg.search.embedding_timeout_secs
             )
         })?;
 
