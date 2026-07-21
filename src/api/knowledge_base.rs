@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use axum::{
-    Extension, extract::{Path, Query, State}, response::Json
+    Extension,
+    extract::{Path, Query, State},
+    response::Json,
 };
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -10,9 +12,12 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::file::{self, FileStatusBreakdown};
 use crate::{
-    AuthUser, api::{
-        common, error::{ApiError, ApiResult}
-    }, search::SearchEngine
+    AuthUser,
+    api::{
+        common,
+        error::{ApiError, ApiResult},
+    },
+    search::SearchEngine,
 };
 
 pub(crate) const KB_TYPE_ANALYSIS: &str = "analysis";
@@ -294,6 +299,7 @@ pub struct FileWithoutContent {
     pub kb_id: Option<i64>,
     pub is_public: bool,
     pub meta: Option<String>,
+    pub summary: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -924,7 +930,7 @@ pub async fn get_files(
 
     if let Some(tag) = tag {
         let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at FROM files WHERE kb_id = ",
+            "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, is_public, meta, summary, created_at, updated_at FROM files WHERE kb_id = ",
         );
         qb.push_bind(id);
         push_filters(&mut qb);
@@ -949,7 +955,7 @@ pub async fn get_files(
     let total: i64 = count_qb.build_query_scalar().fetch_one(&pool).await?;
 
     let mut list_qb = QueryBuilder::<Sqlite>::new(
-        "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at FROM files WHERE kb_id = ",
+        "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, is_public, meta, summary, created_at, updated_at FROM files WHERE kb_id = ",
     );
     list_qb.push_bind(id);
     push_filters(&mut list_qb);
@@ -1223,8 +1229,9 @@ async fn reset_reparse_scope(
         }
 
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
-        let mut update_qb =
-            QueryBuilder::<Sqlite>::new("UPDATE files SET status = 0, parse_run_id = NULL, log = '', updated_at = ");
+        let mut update_qb = QueryBuilder::<Sqlite>::new(
+            "UPDATE files SET status = 0, parse_run_id = NULL, log = '', summary = NULL, updated_at = ",
+        );
         update_qb.push_bind(now);
         update_qb.push(" WHERE id IN (");
         crate::db::push_i64_list(&mut update_qb, file_ids);

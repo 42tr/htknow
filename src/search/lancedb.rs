@@ -1,33 +1,46 @@
 use std::{
-    collections::HashSet, path::Path, sync::{
-        Arc, atomic::{AtomicBool, AtomicU64, Ordering}
-    }, time::{Instant, SystemTime, UNIX_EPOCH}
+    collections::HashSet,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, Result};
 use arrow_array::{
-    Array, ArrayRef, BooleanArray, Float32Array, Int64Array, RecordBatch, StringArray, builder::{FixedSizeListBuilder, Float32Builder}
+    Array, ArrayRef, BooleanArray, Float32Array, Int64Array, RecordBatch, StringArray,
+    builder::{FixedSizeListBuilder, Float32Builder},
 };
 use arrow_schema::{DataType, Field, Schema as ArrowSchema};
 use futures::stream::StreamExt;
 use lancedb::{
-    Connection, Table, connect, index::{
-        Index, scalar::{BTreeIndexBuilder, BitmapIndexBuilder}
-    }, query::{ExecutableQuery, QueryBase, Select}, table::{CompactionOptions, NewColumnTransform, OptimizeAction, OptimizeOptions}
+    Connection, Table, connect,
+    index::{
+        Index,
+        scalar::{BTreeIndexBuilder, BitmapIndexBuilder},
+    },
+    query::{ExecutableQuery, QueryBase, Select},
+    table::{CompactionOptions, NewColumnTransform, OptimizeAction, OptimizeOptions},
 };
 use log::{debug, info, warn};
 use once_cell::sync::OnceCell;
 
-use super::{embedding, tantivy_engine::SearchResultItem};
+use super::{SummarySearchResultItem, embedding, tantivy_engine::SearchResultItem};
 use crate::config;
 
 static LANCEDB: OnceCell<Arc<Connection>> = OnceCell::new();
 static LANCEDB_TABLE: OnceCell<Arc<Table>> = OnceCell::new();
+static SUMMARY_LANCEDB_TABLE: OnceCell<Arc<Table>> = OnceCell::new();
 static TABLE_NAME: &str = "documents";
+static SUMMARY_TABLE_NAME: &str = "file_summaries";
 static IS_DELETED_COLUMN: &str = "is_deleted";
 static SEARCH_SELECT_COLUMNS: &[&str] = &["id", "file_id", "kb_id", "content", "_distance"];
+static SUMMARY_SEARCH_SELECT_COLUMNS: &[&str] = &["file_id", "kb_id", "summary", "_distance"];
 static VECTOR_FAST_SEARCH_ENABLED: AtomicBool = AtomicBool::new(false);
 static IMAGE_FAST_SEARCH_ENABLED: AtomicBool = AtomicBool::new(false);
+static SUMMARY_FAST_SEARCH_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// IVF-PQ uses 256 centroids for its 8-bit product quantizer.  Tiny datasets
 /// are both faster with exact search and cannot provide enough training data.
@@ -39,6 +52,8 @@ static OPTIMIZE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(())
 static OPTIMIZE_VERSION: AtomicU64 = AtomicU64::new(0);
 /// 写操作后触发增量索引优化的防抖间隔。
 const OPTIMIZE_DEBOUNCE_MS: u64 = 5000;
+const SUMMARY_RECALL_MULTIPLIER: usize = 5;
+const SUMMARY_RECALL_MAX: usize = 100;
 
 #[derive(Debug, Clone)]
 pub struct CompactStats {
@@ -78,6 +93,19 @@ impl Document {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SummaryDocument {
+    pub file_id: i64,
+    pub kb_id: Option<i64>,
+    pub summary: String,
+}
+
+impl SummaryDocument {
+    pub fn new(file_id: i64, kb_id: Option<i64>, summary: String) -> Self {
+        Self { file_id, kb_id, summary }
+    }
+}
+
 /// 初始化 LanceDB。返回 `true` 表示表是新建或从损坏中恢复的，调用方应考虑从 SQLite 回填数据。
 pub async fn init() -> Result<bool> {
     let cfg = config::get();
@@ -91,6 +119,7 @@ pub async fn init() -> Result<bool> {
 
     // 创建表的 schema
     let schema = create_schema();
+    let summary_schema = create_summary_schema();
 
     // 检查表是否存在
     let conn = get_connection()?;
@@ -130,6 +159,33 @@ pub async fn init() -> Result<bool> {
 
     LANCEDB_TABLE.set(Arc::new(table)).map_err(|_| anyhow::anyhow!("Failed to cache LanceDB table"))?;
 
+    let t4 = Instant::now();
+    let summary_table_names = conn.table_names().execute().await.unwrap_or_default();
+    let summary_table_exists = summary_table_names.contains(&SUMMARY_TABLE_NAME.to_string());
+    let (summary_table, summary_was_recreated) = if summary_table_exists {
+        match conn.open_table(SUMMARY_TABLE_NAME).execute().await {
+            Ok(table) => (table, false),
+            Err(err) => {
+                warn!(
+                    "LanceDB table '{}' exists but cannot be opened (likely corrupted): {}. Attempting recovery...",
+                    SUMMARY_TABLE_NAME, err
+                );
+                (recover_named_table(storage_path, SUMMARY_TABLE_NAME, &summary_schema).await?, true)
+            }
+        }
+    } else {
+        (create_empty_named_table(SUMMARY_TABLE_NAME, &summary_schema).await?, true)
+    };
+    ensure_is_deleted_column(&summary_table).await?;
+    SUMMARY_LANCEDB_TABLE
+        .set(Arc::new(summary_table))
+        .map_err(|_| anyhow::anyhow!("Failed to cache LanceDB summary table"))?;
+    info!(
+        "LanceDB init substep: open/create/recover summary table took {}ms (recreated={})",
+        t4.elapsed().as_millis(),
+        summary_was_recreated
+    );
+
     Ok(was_recreated)
 }
 
@@ -139,9 +195,16 @@ pub fn schedule_startup_index_maintenance() {
     tokio::spawn(async move {
         let _guard = OPTIMIZE_LOCK.lock().await;
         let started_at = Instant::now();
-        let result = match get_table() {
-            Ok(table) => maintain_search_indices(&table).await,
-            Err(err) => Err(err),
+        let result = match (get_table(), get_summary_table()) {
+            (Ok(table), Ok(summary_table)) => {
+                async {
+                    maintain_search_indices(&table).await?;
+                    maintain_summary_search_indices(&summary_table).await?;
+                    Ok(())
+                }
+                .await
+            }
+            (Err(err), _) | (_, Err(err)) => Err(err),
         };
         if let Err(err) = result {
             warn!("LanceDB background index initialization failed: {}", err);
@@ -157,6 +220,19 @@ async fn create_empty_table(schema: &Arc<ArrowSchema>) -> Result<Table> {
         .execute()
         .await
         .with_context(|| format!("Failed to create LanceDB table '{}'", TABLE_NAME))
+}
+
+async fn create_empty_named_table(table_name: &str, schema: &Arc<ArrowSchema>) -> Result<Table> {
+    let conn = get_connection()?;
+    let empty_batch = if table_name == SUMMARY_TABLE_NAME {
+        create_summary_empty_batch(schema)?
+    } else {
+        create_empty_batch(schema)?
+    };
+    conn.create_table(table_name, empty_batch)
+        .execute()
+        .await
+        .with_context(|| format!("Failed to create LanceDB table '{}'", table_name))
 }
 
 async fn recover_table(storage_path: &str, schema: &Arc<ArrowSchema>) -> Result<Table> {
@@ -183,6 +259,28 @@ async fn recover_table(storage_path: &str, schema: &Arc<ArrowSchema>) -> Result<
     create_empty_table(schema).await
 }
 
+async fn recover_named_table(storage_path: &str, table_name: &str, schema: &Arc<ArrowSchema>) -> Result<Table> {
+    let conn = get_connection()?;
+
+    if let Err(err) = conn.drop_table(table_name, &[]).await {
+        warn!("LanceDB drop_table failed (will remove filesystem directory instead): {}", err);
+    }
+
+    let table_dir = Path::new(storage_path).join(format!("{}.lance", table_name));
+    if table_dir.exists() {
+        let backup_dir = {
+            let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+            table_dir.with_file_name(format!("{}.lance.corrupted.{}", table_name, timestamp))
+        };
+        warn!("Moving corrupted LanceDB table from {} to {}", table_dir.display(), backup_dir.display());
+        tokio::fs::rename(&table_dir, &backup_dir)
+            .await
+            .with_context(|| format!("Failed to move corrupted LanceDB table to {}", backup_dir.display()))?;
+    }
+
+    create_empty_named_table(table_name, schema).await
+}
+
 pub async fn write_documents(doc: Document) -> Result<()> {
     let table = get_table()?;
     let schema = create_schema();
@@ -202,6 +300,43 @@ pub async fn write_documents_batch_for_rebuild(docs: Vec<Document>) -> Result<()
     write_documents_batch_inner(docs, false).await
 }
 
+pub async fn write_summary(doc: SummaryDocument) -> Result<()> {
+    let summary = doc.summary.trim();
+    if summary.is_empty() {
+        delete_summary_by_file(doc.file_id).await?;
+        return Ok(());
+    }
+
+    let file_id = doc.file_id;
+    let table = get_summary_table()?;
+    let schema = create_summary_schema();
+    let batch = create_summary_record_batch(
+        vec![SummaryDocument { file_id, kb_id: doc.kb_id, summary: summary.to_string() }],
+        &schema,
+    )
+    .await?;
+    delete_summary_by_file(file_id).await?;
+    table.add(batch).execute().await?;
+    on_write_may_need_optimize();
+    Ok(())
+}
+
+pub async fn replace_summaries_batch_for_rebuild(docs: Vec<SummaryDocument>) -> Result<()> {
+    let docs: Vec<SummaryDocument> = docs.into_iter().filter(|doc| !doc.summary.trim().is_empty()).collect();
+    if docs.is_empty() {
+        return Ok(());
+    }
+
+    let file_ids: Vec<i64> = docs.iter().map(|doc| doc.file_id).collect();
+    let table = get_summary_table()?;
+    let schema = create_summary_schema();
+    let batch = create_summary_record_batch(docs, &schema).await?;
+    delete_summary_by_predicate(build_in_predicate("file_id", &file_ids), false).await?;
+    table.add(batch).execute().await?;
+    set_fast_search_enabled(false, &SUMMARY_FAST_SEARCH_ENABLED);
+    Ok(())
+}
+
 async fn write_documents_batch_inner(docs: Vec<Document>, schedule_optimize: bool) -> Result<()> {
     if docs.is_empty() {
         return Ok(());
@@ -215,6 +350,7 @@ async fn write_documents_batch_inner(docs: Vec<Document>, schedule_optimize: boo
     } else {
         set_fast_search_enabled(false, &VECTOR_FAST_SEARCH_ENABLED);
         set_fast_search_enabled(false, &IMAGE_FAST_SEARCH_ENABLED);
+        set_fast_search_enabled(false, &SUMMARY_FAST_SEARCH_ENABLED);
     }
     Ok(())
 }
@@ -367,6 +503,46 @@ pub async fn search_image(
     Ok(search_results)
 }
 
+pub async fn search_summary(
+    query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
+) -> Result<Vec<SummarySearchResultItem>> {
+    if has_empty_scope(file_ids, kb_ids) {
+        return Ok(Vec::new());
+    }
+
+    let cfg = config::get();
+    let recall_limit = summary_recall_limit(cfg.search.limit);
+    let table = get_summary_table()?;
+    let query_vector = embedding::get_embedding(query).await?;
+    let fast_search = summary_fast_search_enabled();
+    let mut query_builder =
+        table.query().nearest_to(query_vector)?.column("vector").select(Select::columns(SUMMARY_SEARCH_SELECT_COLUMNS));
+    if fast_search {
+        query_builder = query_builder.fast_search();
+    }
+
+    let filter_conditions = build_summary_filter_conditions(file_ids, kb_ids);
+    if !filter_conditions.is_empty() {
+        query_builder = query_builder.only_if(filter_conditions.join(" AND "));
+    }
+
+    let mut result_stream = query_builder.limit(recall_limit).execute().await?;
+    let mut search_results = Vec::with_capacity(recall_limit);
+    while let Some(batch_result) = result_stream.next().await {
+        let batch = batch_result?;
+        decode_summary_search_batch(&batch, &mut search_results)?;
+    }
+
+    search_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    Ok(search_results)
+}
+
+fn summary_recall_limit(final_limit: usize) -> usize {
+    let final_limit = final_limit.max(1);
+    let max_recall = SUMMARY_RECALL_MAX.max(final_limit);
+    final_limit.saturating_mul(SUMMARY_RECALL_MULTIPLIER).min(max_recall)
+}
+
 fn build_in_predicate(column: &str, ids: &[i64]) -> String {
     if ids.len() == 1 {
         format!("{column} = {}", ids[0])
@@ -403,6 +579,24 @@ pub async fn delete_by_files(file_ids: &[i64]) -> Result<()> {
     delete_by_predicate(build_in_predicate("file_id", file_ids)).await
 }
 
+pub async fn delete_summary_by_file(file_id: i64) -> Result<()> {
+    delete_summaries_by_files(&[file_id]).await
+}
+
+pub async fn delete_summaries_by_files(file_ids: &[i64]) -> Result<()> {
+    if file_ids.is_empty() {
+        return Ok(());
+    }
+    delete_summary_by_predicate(build_in_predicate("file_id", file_ids), true).await
+}
+
+pub async fn delete_summaries_by_files_for_rebuild(file_ids: &[i64]) -> Result<()> {
+    if file_ids.is_empty() {
+        return Ok(());
+    }
+    delete_summary_by_predicate(build_in_predicate("file_id", file_ids), false).await
+}
+
 pub async fn delete_by_slices(slice_ids: &[i64]) -> Result<()> {
     if slice_ids.is_empty() {
         return Ok(());
@@ -429,6 +623,24 @@ pub async fn delete_by_kbs(kb_ids: &[i64]) -> Result<()> {
     delete_by_predicate(build_in_predicate("kb_id", kb_ids)).await
 }
 
+pub async fn delete_summaries_by_kbs(kb_ids: &[i64]) -> Result<()> {
+    if kb_ids.is_empty() {
+        return Ok(());
+    }
+    delete_summary_by_predicate(build_in_predicate("kb_id", kb_ids), true).await
+}
+
+async fn delete_summary_by_predicate(predicate: String, schedule_optimize: bool) -> Result<()> {
+    let table = get_summary_table()?;
+    table.update().only_if(predicate).column(IS_DELETED_COLUMN, "true").execute().await?;
+    if schedule_optimize {
+        on_write_may_need_optimize();
+    } else {
+        set_fast_search_enabled(false, &SUMMARY_FAST_SEARCH_ENABLED);
+    }
+    Ok(())
+}
+
 /// 清理已删除的记录，释放磁盘和内存空间
 pub async fn compact() -> Result<CompactStats> {
     let _guard = OPTIMIZE_LOCK.lock().await;
@@ -436,6 +648,7 @@ pub async fn compact() -> Result<CompactStats> {
     // 先禁用 fast_search，避免在 compact 期间使用未就绪的索引
     VECTOR_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
     IMAGE_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
+    SUMMARY_FAST_SEARCH_ENABLED.store(false, Ordering::Relaxed);
 
     let table = get_table()?;
     let storage_path = config::get().storage.lancedb_path.clone();
@@ -464,6 +677,9 @@ pub async fn compact() -> Result<CompactStats> {
 
     refresh_fast_search_state_for_column(&table, "vector", &VECTOR_FAST_SEARCH_ENABLED).await?;
     refresh_fast_search_state_for_column(&table, "image_vector", &IMAGE_FAST_SEARCH_ENABLED).await?;
+    if let Ok(summary_table) = get_summary_table() {
+        refresh_fast_search_state_for_column(&summary_table, "vector", &SUMMARY_FAST_SEARCH_ENABLED).await?;
+    }
 
     let total_rows_after = table.count_rows(None).await? as u64;
     let deleted_rows_after = table.count_rows(Some(format!("{} = true", IS_DELETED_COLUMN))).await? as u64;
@@ -491,12 +707,54 @@ fn get_table() -> Result<Arc<Table>> {
     LANCEDB_TABLE.get().cloned().ok_or_else(|| anyhow::anyhow!("LanceDB table not initialized"))
 }
 
+fn get_summary_table() -> Result<Arc<Table>> {
+    SUMMARY_LANCEDB_TABLE.get().cloned().ok_or_else(|| anyhow::anyhow!("LanceDB summary table not initialized"))
+}
+
 /// 清空 LanceDB 中所有文档，用于从 SQLite 完全重建。
 pub async fn clear_all_documents() -> Result<()> {
     let table = get_table()?;
     table.delete("true").await?;
     on_write_may_need_optimize();
     Ok(())
+}
+
+pub async fn load_existing_summaries(expected_count: u64) -> Result<Vec<SummaryDocument>> {
+    let table = get_summary_table()?;
+    let predicate = format!("({} = false OR {} IS NULL)", IS_DELETED_COLUMN, IS_DELETED_COLUMN);
+    let started_at = std::time::Instant::now();
+
+    info!("Loading existing LanceDB file summaries: expected={}", expected_count);
+    let capacity = usize::try_from(expected_count).unwrap_or(0);
+    let mut existing = Vec::with_capacity(capacity);
+    let mut stream =
+        table.query().select(Select::columns(&["file_id", "kb_id", "summary"])).only_if(predicate).execute().await?;
+
+    while let Some(batch_result) = stream.next().await {
+        let batch = batch_result?;
+        let file_id_array = batch
+            .column_by_name("file_id")
+            .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+            .ok_or_else(|| anyhow::anyhow!("Missing or invalid file_id column"))?;
+        let kb_id_array = batch.column_by_name("kb_id").and_then(|col| col.as_any().downcast_ref::<Int64Array>());
+        let summary_array = batch
+            .column_by_name("summary")
+            .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+            .ok_or_else(|| anyhow::anyhow!("Missing or invalid summary column"))?;
+
+        for i in 0..batch.num_rows() {
+            let file_id = file_id_array.value(i);
+            let kb_id = kb_id_array.and_then(|arr| if arr.is_null(i) { None } else { Some(arr.value(i)) });
+            existing.push(SummaryDocument::new(file_id, kb_id, summary_array.value(i).to_string()));
+        }
+    }
+
+    info!(
+        "Loaded existing LanceDB file summaries: count={} elapsed={}ms",
+        existing.len(),
+        started_at.elapsed().as_millis()
+    );
+    Ok(existing)
 }
 
 /// 一次性加载 LanceDB 中所有未软删除的文档 id。
@@ -567,6 +825,10 @@ fn image_fast_search_enabled() -> bool {
     IMAGE_FAST_SEARCH_ENABLED.load(Ordering::Relaxed)
 }
 
+fn summary_fast_search_enabled() -> bool {
+    SUMMARY_FAST_SEARCH_ENABLED.load(Ordering::Relaxed)
+}
+
 fn set_fast_search_enabled(enabled: bool, flag: &AtomicBool) {
     flag.store(enabled, Ordering::Relaxed);
 }
@@ -575,6 +837,7 @@ fn set_fast_search_enabled(enabled: bool, flag: &AtomicBool) {
 fn on_write_may_need_optimize() {
     set_fast_search_enabled(false, &VECTOR_FAST_SEARCH_ENABLED);
     set_fast_search_enabled(false, &IMAGE_FAST_SEARCH_ENABLED);
+    set_fast_search_enabled(false, &SUMMARY_FAST_SEARCH_ENABLED);
 
     let version = OPTIMIZE_VERSION.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
     tokio::spawn(async move {
@@ -638,6 +901,11 @@ async fn run_debounced_optimize(version: u64) {
                     {
                         warn!("LanceDB refresh image_vector fast_search after optimize failed: {}", e);
                     }
+                    if let Ok(summary_table) = get_summary_table()
+                        && let Err(e) = maintain_summary_search_indices(&summary_table).await
+                    {
+                        warn!("LanceDB maintain summary vector index after optimize failed: {}", e);
+                    }
                 }
                 Err(e) => warn!("LanceDB list indices after optimize failed: {}", e),
             }
@@ -685,6 +953,12 @@ async fn maintain_search_indices(table: &Table) -> Result<()> {
     Ok(())
 }
 
+async fn maintain_summary_search_indices(table: &Table) -> Result<()> {
+    let indices = ensure_summary_search_indices(table).await?;
+    refresh_fast_search_state_from_indices(table, &indices, "vector", &SUMMARY_FAST_SEARCH_ENABLED).await?;
+    Ok(())
+}
+
 fn has_empty_scope(file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>) -> bool {
     matches!(file_ids, Some(ids) if ids.is_empty()) || matches!(kb_ids, Some(ids) if ids.is_empty())
 }
@@ -694,6 +968,21 @@ fn build_filter_conditions(is_image: bool, file_ids: Option<&Vec<i64>>, kb_ids: 
         format!("({} = false OR {} IS NULL)", IS_DELETED_COLUMN, IS_DELETED_COLUMN),
         format!("is_image = {}", is_image),
     ];
+
+    if let Some(fids) = file_ids {
+        let ids_str = fids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+        filter_conditions.push(format!("file_id IN ({})", ids_str));
+    }
+    if let Some(kids) = kb_ids {
+        let ids_str = kids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
+        filter_conditions.push(format!("kb_id IN ({})", ids_str));
+    }
+
+    filter_conditions
+}
+
+fn build_summary_filter_conditions(file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>) -> Vec<String> {
+    let mut filter_conditions = vec![format!("({} = false OR {} IS NULL)", IS_DELETED_COLUMN, IS_DELETED_COLUMN)];
 
     if let Some(fids) = file_ids {
         let ids_str = fids.iter().map(|id| id.to_string()).collect::<Vec<_>>().join(", ");
@@ -737,6 +1026,35 @@ fn decode_search_batch(batch: &RecordBatch, search_results: &mut Vec<SearchResul
         let score = distance_array.map_or(0.5, |arr| distance_to_score(arr.value(i)));
 
         search_results.push(SearchResultItem { id, file_id, kb_id, content, score });
+    }
+
+    Ok(())
+}
+
+fn decode_summary_search_batch(batch: &RecordBatch, search_results: &mut Vec<SummarySearchResultItem>) -> Result<()> {
+    let num_rows = batch.num_rows();
+
+    let file_id_array = batch
+        .column_by_name("file_id")
+        .and_then(|col| col.as_any().downcast_ref::<Int64Array>())
+        .ok_or_else(|| anyhow::anyhow!("Missing or invalid file_id column"))?;
+
+    let kb_id_array = batch.column_by_name("kb_id").and_then(|col| col.as_any().downcast_ref::<Int64Array>());
+
+    let summary_array = batch
+        .column_by_name("summary")
+        .and_then(|col| col.as_any().downcast_ref::<StringArray>())
+        .ok_or_else(|| anyhow::anyhow!("Missing or invalid summary column"))?;
+
+    let distance_array = batch.column_by_name("_distance").and_then(|col| col.as_any().downcast_ref::<Float32Array>());
+
+    for i in 0..num_rows {
+        let file_id = file_id_array.value(i);
+        let kb_id = kb_id_array.and_then(|arr| if arr.is_null(i) { None } else { Some(arr.value(i)) });
+        let summary = summary_array.value(i).to_string();
+        let score = distance_array.map_or(0.5, |arr| distance_to_score(arr.value(i)));
+
+        search_results.push(SummarySearchResultItem { file_id, kb_id, summary, score });
     }
 
     Ok(())
@@ -787,6 +1105,21 @@ fn create_schema() -> Arc<ArrowSchema> {
     ]))
 }
 
+fn create_summary_schema() -> Arc<ArrowSchema> {
+    let vector_dim = config::get().ai.embedding_dim;
+    Arc::new(ArrowSchema::new(vec![
+        Field::new("file_id", DataType::Int64, false),
+        Field::new("kb_id", DataType::Int64, true),
+        Field::new("summary", DataType::Utf8, false),
+        Field::new(IS_DELETED_COLUMN, DataType::Boolean, true),
+        Field::new(
+            "vector",
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Float32, true)), vector_dim),
+            false,
+        ),
+    ]))
+}
+
 fn create_empty_batch(schema: &Arc<ArrowSchema>) -> Result<RecordBatch> {
     let vector_dim = config::get().ai.embedding_dim;
     let image_vector_dim = config::get().ai.image_embedding_dim;
@@ -806,16 +1139,36 @@ fn create_empty_batch(schema: &Arc<ArrowSchema>) -> Result<RecordBatch> {
     let mut image_list_builder = FixedSizeListBuilder::new(image_value_builder, image_vector_dim);
     let image_vector_array: ArrayRef = Arc::new(image_list_builder.finish());
 
-    Ok(RecordBatch::try_new(schema.clone(), vec![
-        id_array,
-        file_id_array,
-        kb_id_array,
-        content_array,
-        is_image_array,
-        is_deleted_array,
-        vector_array,
-        image_vector_array,
-    ])?)
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            id_array,
+            file_id_array,
+            kb_id_array,
+            content_array,
+            is_image_array,
+            is_deleted_array,
+            vector_array,
+            image_vector_array,
+        ],
+    )?)
+}
+
+fn create_summary_empty_batch(schema: &Arc<ArrowSchema>) -> Result<RecordBatch> {
+    let vector_dim = config::get().ai.embedding_dim;
+    let file_id_array: ArrayRef = Arc::new(Int64Array::from(Vec::<i64>::new()));
+    let kb_id_array: ArrayRef = Arc::new(Int64Array::from(Vec::<Option<i64>>::new()));
+    let summary_array: ArrayRef = Arc::new(StringArray::from(Vec::<String>::new()));
+    let is_deleted_array: ArrayRef = Arc::new(BooleanArray::from(Vec::<bool>::new()));
+
+    let value_builder = Float32Builder::new();
+    let mut list_builder = FixedSizeListBuilder::new(value_builder, vector_dim);
+    let vector_array: ArrayRef = Arc::new(list_builder.finish());
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![file_id_array, kb_id_array, summary_array, is_deleted_array, vector_array],
+    )?)
 }
 
 async fn create_record_batch(docs: Vec<Document>, schema: &Arc<ArrowSchema>) -> Result<RecordBatch> {
@@ -880,16 +1233,55 @@ async fn create_record_batch(docs: Vec<Document>, schema: &Arc<ArrowSchema>) -> 
     }
     let image_vector_array: ArrayRef = Arc::new(image_list_builder.finish());
 
-    Ok(RecordBatch::try_new(schema.clone(), vec![
-        id_array,
-        file_id_array,
-        kb_id_array,
-        content_array,
-        is_image_array,
-        is_deleted_array,
-        vector_array,
-        image_vector_array,
-    ])?)
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            id_array,
+            file_id_array,
+            kb_id_array,
+            content_array,
+            is_image_array,
+            is_deleted_array,
+            vector_array,
+            image_vector_array,
+        ],
+    )?)
+}
+
+async fn create_summary_record_batch(docs: Vec<SummaryDocument>, schema: &Arc<ArrowSchema>) -> Result<RecordBatch> {
+    let vector_dim = config::get().ai.embedding_dim;
+    let file_ids: Vec<i64> = docs.iter().map(|d| d.file_id).collect();
+    let kb_ids: Vec<Option<i64>> = docs.iter().map(|d| d.kb_id).collect();
+    let summaries: Vec<String> = docs.iter().map(|d| d.summary.trim().to_string()).collect();
+    let is_deleted: Vec<bool> = vec![false; docs.len()];
+    let embeddings = embedding::get_embeddings(&summaries).await?;
+
+    let file_id_array: ArrayRef = Arc::new(Int64Array::from(file_ids));
+    let kb_id_array: ArrayRef = Arc::new(Int64Array::from(kb_ids));
+    let summary_array: ArrayRef = Arc::new(StringArray::from(summaries));
+    let is_deleted_array: ArrayRef = Arc::new(BooleanArray::from(is_deleted));
+
+    let value_builder = Float32Builder::new();
+    let mut list_builder = FixedSizeListBuilder::new(value_builder, vector_dim);
+
+    for embedding_vec in embeddings {
+        if embedding_vec.len() != vector_dim as usize {
+            anyhow::bail!("Summary embedding dimension mismatch: expected {}, got {}", vector_dim, embedding_vec.len());
+        }
+
+        let values_builder = list_builder.values();
+        for &value in &embedding_vec {
+            values_builder.append_value(value);
+        }
+        list_builder.append(true);
+    }
+
+    let vector_array: ArrayRef = Arc::new(list_builder.finish());
+
+    Ok(RecordBatch::try_new(
+        schema.clone(),
+        vec![file_id_array, kb_id_array, summary_array, is_deleted_array, vector_array],
+    )?)
 }
 
 async fn ensure_is_deleted_column(table: &lancedb::Table) -> Result<()> {
@@ -960,6 +1352,50 @@ async fn ensure_search_indices(table: &Table) -> Result<Vec<lancedb::index::Inde
     let refreshed_indices = if created_index { table.list_indices().await? } else { existing_indices };
     debug!(
         "LanceDB indices: {}",
+        refreshed_indices
+            .iter()
+            .map(|idx| format!("{}:{:?}:{:?}", idx.name, idx.index_type, idx.columns))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+
+    Ok(refreshed_indices)
+}
+
+async fn ensure_summary_search_indices(table: &Table) -> Result<Vec<lancedb::index::IndexConfig>> {
+    let existing_indices = table.list_indices().await?;
+    let row_count = table.count_rows(None).await?;
+    let mut created_index = false;
+
+    if row_count >= MIN_VECTORS_FOR_INDEX {
+        if !has_index_on_column(&existing_indices, "vector") {
+            info!("Creating LanceDB summary vector index on column=vector (vectors={})", row_count);
+            table.create_index(&["vector"], Index::Auto).replace(false).execute().await?;
+            created_index = true;
+        }
+    } else {
+        info!(
+            "Deferring LanceDB summary vector index: vectors={} minimum={} (exact search remains enabled)",
+            row_count, MIN_VECTORS_FOR_INDEX
+        );
+    }
+
+    let scalar_indices = [
+        ("file_id", Index::BTree(BTreeIndexBuilder::default())),
+        ("kb_id", Index::BTree(BTreeIndexBuilder::default())),
+        ("is_deleted", Index::Bitmap(BitmapIndexBuilder::default())),
+    ];
+    for (column, index) in scalar_indices {
+        if !has_index_on_column(&existing_indices, column) {
+            info!("Creating LanceDB summary scalar index on column={}", column);
+            table.create_index(&[column], index).replace(false).execute().await?;
+            created_index = true;
+        }
+    }
+
+    let refreshed_indices = if created_index { table.list_indices().await? } else { existing_indices };
+    debug!(
+        "LanceDB summary indices: {}",
         refreshed_indices
             .iter()
             .map(|idx| format!("{}:{:?}:{:?}", idx.name, idx.index_type, idx.columns))

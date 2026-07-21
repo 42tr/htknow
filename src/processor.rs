@@ -1,7 +1,12 @@
 use std::{
-    collections::{HashMap, HashSet}, future::Future, path::Path, sync::{
-        Arc, atomic::{AtomicBool, AtomicU64, Ordering}
-    }, time::{Duration, Instant, SystemTime, UNIX_EPOCH}
+    collections::{HashMap, HashSet},
+    future::Future,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use aho_corasick::{AhoCorasick, MatchKind};
@@ -14,13 +19,21 @@ use reqwest::multipart;
 use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tokio::{
-    fs, io::{AsyncBufReadExt, AsyncReadExt}, time
+    fs,
+    io::{AsyncBufReadExt, AsyncReadExt},
+    time,
 };
 
 use crate::{
     api::{
-        FILE_COLS_NO_CONTENT, File, collect_image_paths_for_files, collect_image_raw_paths_for_files, effective_parse_file_id, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta
-    }, archive, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, image_description, image_parse, search::{self, SearchEngine, content_looks_like_image_reference, tantivy_engine}
+        FILE_COLS_NO_CONTENT, File, collect_image_paths_for_files, collect_image_raw_paths_for_files,
+        effective_parse_file_id, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path,
+        update_file_custom_image_meta,
+    },
+    archive, config,
+    graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor},
+    image_description, image_parse,
+    search::{self, SearchEngine, content_looks_like_image_reference, tantivy_engine},
 };
 
 /// 将本地文件构造为流式 multipart Part，避免大文件全量读入内存。
@@ -276,6 +289,8 @@ struct CustomParseData {
     #[serde(default)]
     full_content: Option<String>,
     #[serde(default)]
+    summary: Option<String>,
+    #[serde(default)]
     images: Option<HashMap<String, String>>,
     #[serde(default)]
     content_list: Option<Vec<ContentItem>>,
@@ -285,6 +300,7 @@ struct CustomParseData {
 struct NormalizedCustomParseData {
     slices: Vec<CustomSlice>,
     full_content: Option<String>,
+    summary: Option<String>,
     images: HashMap<String, String>,
     content_list: Option<Vec<ContentItem>>,
     image_paths: Vec<String>,
@@ -348,7 +364,8 @@ struct RawSlicePosition {
 
 fn deserialize_slice_positions<'de, D>(deserializer: D) -> std::result::Result<Vec<SlicePosition>, D::Error>
 where
-    D: Deserializer<'de>, {
+    D: Deserializer<'de>,
+{
     let raw_positions: Option<Vec<RawSlicePosition>> = Option::deserialize(deserializer)?;
     let mut positions = Vec::new();
     if let Some(raw_positions) = raw_positions {
@@ -542,7 +559,8 @@ impl ParseTimingCtx {
 
     async fn step<T, Fut>(&mut self, step: &'static str, fut: Fut) -> anyhow::Result<T>
     where
-        Fut: Future<Output=anyhow::Result<T>>, {
+        Fut: Future<Output = anyhow::Result<T>>,
+    {
         let (seq, started_at) = self.step_start(step);
         match fut.await {
             Ok(value) => {
@@ -557,11 +575,10 @@ impl ParseTimingCtx {
     }
 }
 
-async fn timed_step_opt<T, Fut>(
-    timing: Option<&mut ParseTimingCtx>, step: &'static str, fut: Fut,
-) -> anyhow::Result<T>
+async fn timed_step_opt<T, Fut>(timing: Option<&mut ParseTimingCtx>, step: &'static str, fut: Fut) -> anyhow::Result<T>
 where
-    Fut: Future<Output=anyhow::Result<T>>, {
+    Fut: Future<Output = anyhow::Result<T>>,
+{
     match timing {
         Some(ctx) => ctx.step(step, fut).await,
         None => fut.await,
@@ -609,14 +626,16 @@ impl FileProcessor {
         )
     }
 
-    async fn ensure_parse_artifact(&self, file: &File, full_content: &str) -> anyhow::Result<i64> {
+    async fn ensure_parse_artifact(
+        &self, file: &File, full_content: &str, summary: Option<&str>,
+    ) -> anyhow::Result<i64> {
         let key = Self::artifact_key(file);
         let cfg = config::get();
         let config_hash = format!("{}:{}", cfg.slice.smart_slice_max_chars, cfg.slice.fixed_slice_overlap_chars);
         sqlx::query(
             "INSERT OR IGNORE INTO parse_artifacts
-             (artifact_key, content_hash, slice_type, parser_version, config_hash, source_file_id, full_content)
-             VALUES (?, ?, ?, 'builtin-v1', ?, ?, ?)",
+             (artifact_key, content_hash, slice_type, parser_version, config_hash, source_file_id, full_content, summary)
+             VALUES (?, ?, ?, 'builtin-v1', ?, ?, ?, ?)",
         )
         .bind(&key)
         .bind(&file.hash)
@@ -624,12 +643,35 @@ impl FileProcessor {
         .bind(config_hash)
         .bind(file.id)
         .bind(full_content)
+        .bind(summary)
         .execute(&self.pool)
         .await?;
         let artifact_id: i64 = sqlx::query_scalar("SELECT id FROM parse_artifacts WHERE artifact_key = ?")
             .bind(key)
             .fetch_one(&self.pool)
             .await?;
+        let updated_source_summary = sqlx::query(
+            "UPDATE parse_artifacts
+             SET summary = ?, updated_at = strftime('%s','now')
+             WHERE id = ? AND source_file_id = ?",
+        )
+        .bind(summary)
+        .bind(artifact_id)
+        .bind(file.id)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        if updated_source_summary == 0 && summary.is_some() {
+            sqlx::query(
+                "UPDATE parse_artifacts
+             SET summary = COALESCE(NULLIF(summary, ''), ?), updated_at = strftime('%s','now')
+             WHERE id = ? AND (summary IS NULL OR summary = '')",
+            )
+            .bind(summary)
+            .bind(artifact_id)
+            .execute(&self.pool)
+            .await?;
+        }
         sqlx::query("UPDATE files SET artifact_id = ? WHERE id = ?")
             .bind(artifact_id)
             .bind(file.id)
@@ -639,7 +681,7 @@ impl FileProcessor {
     }
 
     async fn adopt_existing_artifact_if_needed(
-        &self, file: &File, artifact_id: i64, full_content: &str,
+        &self, file: &File, artifact_id: i64, full_content: &str, summary: Option<&str>,
     ) -> anyhow::Result<()> {
         let source_file_id: i64 = sqlx::query_scalar("SELECT source_file_id FROM parse_artifacts WHERE id = ?")
             .bind(artifact_id)
@@ -658,6 +700,7 @@ impl FileProcessor {
         let mut source = file.clone();
         source.id = source_file_id;
         source.content = Some(full_content.to_string());
+        source.summary = summary.map(str::to_string);
         self.reindex_cloned_slices(file, &shared, &source).await?;
         Ok(())
     }
@@ -839,6 +882,22 @@ impl FileProcessor {
         crate::pdf_content::delete(file_id).await?;
         if let Err(e) = crate::file_content::delete(file_id).await {
             warn!("Failed to delete content file for processing cleanup of file {}: {}", file_id, e);
+        }
+        sqlx::query("UPDATE files SET summary = NULL WHERE id = ?").bind(file_id).execute(&mut **tx).await?;
+        Ok(())
+    }
+
+    async fn persist_file_summary(
+        &self, file_id: i64, kb_id: Option<i64>, summary: Option<&str>,
+    ) -> anyhow::Result<()> {
+        let summary = summary.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+        });
+        if let Some(summary) = summary {
+            self.search_engine.write_summary(file_id, kb_id, summary).await?;
+        } else {
+            self.search_engine.delete_summary_by_file(file_id).await?;
         }
         Ok(())
     }
@@ -1192,6 +1251,7 @@ impl FileProcessor {
             file,
             &normalized.slices,
             normalized.full_content.as_deref(),
+            normalized.summary.as_deref(),
             &image_descriptions,
             timing,
         )
@@ -1255,11 +1315,19 @@ impl FileProcessor {
         }
 
         let data = parsed.data.ok_or_else(|| anyhow::anyhow!("Custom parse reuse API returned empty data"))?;
-        if data.slices.is_empty() {
-            return Err(anyhow::anyhow!("Custom parse reuse API returned empty slices"));
+        if data.slices.is_empty() && data.summary.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(anyhow::anyhow!("Custom parse reuse API returned empty slices and summary"));
         }
 
-        self.save_custom_slices(file, &data.slices, data.full_content.as_deref(), &HashMap::new(), timing).await?;
+        self.save_custom_slices(
+            file,
+            &data.slices,
+            data.full_content.as_deref(),
+            data.summary.as_deref(),
+            &HashMap::new(),
+            timing,
+        )
+        .await?;
 
         Ok(true)
     }
@@ -1339,6 +1407,10 @@ impl FileProcessor {
             })
             .collect();
         let full_content = data.full_content.map(|content| Self::rewrite_custom_image_refs(&content, &image_mapping));
+        let summary = data.summary.and_then(|summary| {
+            let trimmed = summary.trim();
+            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+        });
 
         let mut image_paths = Vec::new();
         let mut seen = HashSet::new();
@@ -1355,7 +1427,14 @@ impl FileProcessor {
             }
         }
 
-        Ok(NormalizedCustomParseData { slices, full_content, images: normalized_images, content_list, image_paths })
+        Ok(NormalizedCustomParseData {
+            slices,
+            full_content,
+            summary,
+            images: normalized_images,
+            content_list,
+            image_paths,
+        })
     }
 
     fn ensure_safe_image_name(image_name: &str) -> anyhow::Result<()> {
@@ -1500,15 +1579,15 @@ impl FileProcessor {
         }
 
         let data = parsed.data.ok_or_else(|| anyhow::anyhow!("Custom parse API returned empty data"))?;
-        if data.slices.is_empty() {
-            return Err(anyhow::anyhow!("Custom parse API returned empty slices"));
+        if data.slices.is_empty() && data.summary.as_deref().unwrap_or("").trim().is_empty() {
+            return Err(anyhow::anyhow!("Custom parse API returned empty slices and summary"));
         }
 
         Ok(data)
     }
 
     async fn save_custom_slices(
-        &self, file: &File, slices: &[CustomSlice], full_content: Option<&str>,
+        &self, file: &File, slices: &[CustomSlice], full_content: Option<&str>, summary: Option<&str>,
         image_descriptions: &HashMap<String, String>, timing: Option<&mut ParseTimingCtx>,
     ) -> anyhow::Result<()> {
         if !self.ensure_file_exists(file.id, "before writing custom slices").await? {
@@ -1558,6 +1637,7 @@ impl FileProcessor {
             &derived_full_content,
             "Custom parse processed successfully",
             None,
+            summary,
             timing,
         )
         .await
@@ -1752,6 +1832,7 @@ impl FileProcessor {
             embeddings,
             &full_content,
             "Excel processed successfully",
+            None,
             None,
             timing,
         )
@@ -2058,6 +2139,7 @@ impl FileProcessor {
             &full_content,
             "PDF processed successfully",
             index_filename,
+            None,
             timing,
         )
         .await
@@ -2538,7 +2620,7 @@ impl FileProcessor {
             })
             .collect();
         let embeddings = vec![None; wrapped.len()];
-        self.finish_file_processing(file, wrapped, embeddings, &content, log_message, None, timing).await
+        self.finish_file_processing(file, wrapped, embeddings, &content, log_message, None, None, timing).await
     }
 
     /// 标记文件处理失败
@@ -2558,7 +2640,7 @@ impl FileProcessor {
     #[allow(clippy::too_many_arguments)]
     async fn finish_file_processing(
         &self, file: &File, slices: Vec<SliceWithPositions>, embeddings: Vec<Option<Arc<Vec<f32>>>>,
-        full_content: &str, log_message: &str, index_name_override: Option<&str>,
+        full_content: &str, log_message: &str, index_name_override: Option<&str>, summary: Option<&str>,
         mut timing: Option<&mut ParseTimingCtx>,
     ) -> anyhow::Result<()> {
         if !self.ensure_file_exists(file.id, "before writing slices").await? {
@@ -2616,16 +2698,25 @@ impl FileProcessor {
             return Ok(());
         }
         timed_step_opt(timing.as_deref_mut(), "publish_parse_artifact", async {
-            let artifact_id = self.ensure_parse_artifact(file, full_content).await?;
-            self.adopt_existing_artifact_if_needed(file, artifact_id, full_content).await?;
+            let artifact_id = self.ensure_parse_artifact(file, full_content, summary).await?;
+            self.adopt_existing_artifact_if_needed(file, artifact_id, full_content, summary).await?;
             Ok(())
         })
         .await?;
+        let normalized_summary = summary.and_then(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() { None } else { Some(trimmed.to_string()) }
+        });
+        timed_step_opt(timing.as_deref_mut(), "write_summary_index", async {
+            self.persist_file_summary(file.id, file.kb_id, normalized_summary.as_deref()).await
+        })
+        .await?;
         timed_step_opt(timing.as_deref_mut(), "finalize_file_status", async {
-            let sql = "UPDATE files SET status = 1, parse_run_id = NULL, log = ?, updated_at = strftime('%s','now') \
+            let sql = "UPDATE files SET status = 1, parse_run_id = NULL, log = ?, summary = ?, updated_at = strftime('%s','now') \
                        WHERE id = ? AND status = 2 AND parse_run_id = ?";
             let updated = sqlx::query(sql)
                 .bind(log_message)
+                .bind(normalized_summary.as_deref())
                 .bind(file.id)
                 .bind(&parse_run_id)
                 .execute(&self.pool)
@@ -3222,8 +3313,19 @@ impl FileProcessor {
             } else {
                 crate::file_content::read(source_file_id).await?.unwrap_or_default()
             };
+            let summary = if let Some(artifact_id) = source.artifact_id {
+                sqlx::query_scalar::<_, Option<String>>("SELECT summary FROM parse_artifacts WHERE id = ?")
+                    .bind(artifact_id)
+                    .fetch_optional(&self.pool)
+                    .await?
+                    .flatten()
+            } else {
+                source.summary.clone()
+            };
             source_for_reindex.content = Some(full_content.clone());
-            let artifact_id = self.ensure_parse_artifact(&source_for_reindex, &full_content).await?;
+            source_for_reindex.summary = summary.clone();
+            let artifact_id =
+                self.ensure_parse_artifact(&source_for_reindex, &full_content, summary.as_deref()).await?;
             let rows = self.fetch_slice_rows(source_file_id).await?;
             let shared_slices: Vec<ClonedSlice> = rows
                 .into_iter()
@@ -3240,11 +3342,12 @@ impl FileProcessor {
             .await?;
             let indexed_content = self.reindex_cloned_slices(target, &shared_slices, &source_for_reindex).await?;
             sqlx::query(
-                "UPDATE files SET status = 1, parse_run_id = NULL, artifact_id = ?, log = ?, \
+                "UPDATE files SET status = 1, parse_run_id = NULL, artifact_id = ?, log = ?, summary = ?, \
                  updated_at = strftime('%s','now') WHERE id = ?",
             )
             .bind(artifact_id)
             .bind(format!("Reused shared parse artifact {} from file {}", artifact_id, source_file_id))
+            .bind(summary.as_deref())
             .bind(target.id)
             .execute(&self.pool)
             .await?;
@@ -3252,6 +3355,7 @@ impl FileProcessor {
             let mut updated_file = target.clone();
             updated_file.artifact_id = Some(artifact_id);
             updated_file.content = Some(indexed_content);
+            updated_file.summary = summary.clone();
             self.maybe_build_knowledge_graph(&updated_file).await;
             return Ok(());
         }
@@ -3314,9 +3418,10 @@ impl FileProcessor {
 
         let final_log = format!("Reused parsed data from file {}", source.id);
         sqlx::query(
-            "UPDATE files SET status = 1, parse_run_id = NULL, log = ?, updated_at = strftime('%s','now') WHERE id = ?",
+            "UPDATE files SET status = 1, parse_run_id = NULL, log = ?, summary = ?, updated_at = strftime('%s','now') WHERE id = ?",
         )
         .bind(&final_log)
+        .bind(source.summary.as_deref())
         .bind(target.id)
         .execute(&self.pool)
         .await?;
@@ -3324,6 +3429,7 @@ impl FileProcessor {
 
         let mut updated_file = target.clone();
         updated_file.content = Some(full_content.clone());
+        updated_file.summary = source.summary.clone();
         self.maybe_build_knowledge_graph(&updated_file).await;
 
         Ok(())
@@ -3582,6 +3688,7 @@ impl FileProcessor {
         self.search_engine
             .write_full(tantivy_engine::Document::new(target.id, target.id, target.kb_id, index_full_content))
             .await?;
+        self.persist_file_summary(target.id, target.kb_id, source.summary.as_deref()).await?;
 
         Ok(full_content)
     }
@@ -3784,14 +3891,14 @@ mod tests {
                 filename TEXT NOT NULL, path TEXT NOT NULL, size INTEGER NOT NULL,
                 tags TEXT NOT NULL, status INTEGER NOT NULL, log TEXT NOT NULL,
                 slice_type TEXT NOT NULL, kb_id INTEGER, is_public INTEGER NOT NULL,
-                meta TEXT, parse_priority INTEGER NOT NULL, parse_run_id TEXT, artifact_id INTEGER,
+                meta TEXT, summary TEXT, parse_priority INTEGER NOT NULL, parse_run_id TEXT, artifact_id INTEGER,
                 created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
             )",
         )
         .execute(&pool)
         .await?;
         sqlx::query(
-            "INSERT INTO files VALUES (1, 'u', 'n', 'h', 'f.txt', '/tmp/f', 1, '', 0, '', 'text', NULL, 0, NULL, 50, NULL, NULL, 1, 1)",
+            "INSERT INTO files VALUES (1, 'u', 'n', 'h', 'f.txt', '/tmp/f', 1, '', 0, '', 'text', NULL, 0, NULL, NULL, 50, NULL, NULL, 1, 1)",
         )
         .execute(&pool)
         .await?;
@@ -3832,6 +3939,7 @@ mod tests {
                 positions: Vec::new(),
             }],
             full_content: Some("full /api/v1/knowledge/files/img.png".to_string()),
+            summary: None,
             images: Some(images),
             content_list: Some(vec![image_content_item("images/img.png")]),
         };
@@ -3854,6 +3962,7 @@ mod tests {
                 positions: Vec::new(),
             }],
             full_content: None,
+            summary: None,
             images: None,
             content_list: None,
         };

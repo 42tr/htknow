@@ -16,6 +16,7 @@ CREATE TABLE IF NOT EXISTS files (
     parse_priority INTEGER NOT NULL DEFAULT 50, -- 解析队列优先级快照，避免领取待解析文件时跨表排序
     is_public INTEGER NOT NULL DEFAULT 0, -- 是否公开: 0-私有, 1-公开
     meta TEXT DEFAULT NULL, -- 元数据，存储任意JSON数据
+    summary TEXT DEFAULT NULL, -- 文件摘要
     created_at INTEGER DEFAULT (strftime('%s','now')),
     updated_at INTEGER DEFAULT (strftime('%s','now'))
 );
@@ -75,6 +76,7 @@ CREATE TABLE IF NOT EXISTS parse_artifacts (
     config_hash TEXT NOT NULL,
     source_file_id INTEGER NOT NULL,
     full_content TEXT DEFAULT NULL,
+    summary TEXT DEFAULT NULL,
     created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
 );
