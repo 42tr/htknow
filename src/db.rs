@@ -1,11 +1,15 @@
 use std::{
-    collections::HashSet, fs::OpenOptions, path::{Path, PathBuf}, time::Duration
+    collections::HashSet,
+    fs::OpenOptions,
+    path::{Path, PathBuf},
+    time::Duration,
 };
 
 use anyhow::Context;
 use log::info;
 use sqlx::{
-    QueryBuilder, Row, Sqlite, SqlitePool, sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous}
+    QueryBuilder, Row, Sqlite, SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous},
 };
 
 use crate::config;
@@ -124,7 +128,10 @@ async fn run_schema_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
         .rows_affected();
     if claimed == 0 {
         tx.rollback().await?;
-        return run_parse_artifact_migration(pool).await;
+        run_parse_artifact_migration(pool).await?;
+        run_image_description_migration(pool).await?;
+        run_file_summary_migration(pool).await?;
+        return Ok(());
     }
 
     let file_columns = sqlx::query("PRAGMA table_info(files)").fetch_all(&mut *tx).await?;
@@ -152,6 +159,7 @@ async fn run_schema_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
 
     run_parse_artifact_migration(pool).await?;
     run_image_description_migration(pool).await?;
+    run_file_summary_migration(pool).await?;
     Ok(())
 }
 
@@ -182,6 +190,7 @@ async fn run_parse_artifact_migration(pool: &SqlitePool) -> anyhow::Result<()> {
             config_hash TEXT NOT NULL,
             source_file_id INTEGER NOT NULL,
             full_content TEXT DEFAULT NULL,
+            summary TEXT DEFAULT NULL,
             created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
             updated_at INTEGER NOT NULL DEFAULT (strftime('%s','now'))
         )",
@@ -236,6 +245,35 @@ async fn run_image_description_migration(pool: &SqlitePool) -> anyhow::Result<()
     .await?;
     tx.commit().await?;
     info!("Applied schema migration {}: image_descriptions_and_slice_is_image", VERSION);
+    Ok(())
+}
+
+async fn run_file_summary_migration(pool: &SqlitePool) -> anyhow::Result<()> {
+    const VERSION: i64 = 4;
+    let mut tx = pool.begin().await?;
+    let claimed = sqlx::query("INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (?, ?)")
+        .bind(VERSION)
+        .bind("file_summaries")
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if claimed == 0 {
+        tx.rollback().await?;
+        return Ok(());
+    }
+
+    let file_columns = sqlx::query("PRAGMA table_info(files)").fetch_all(&mut *tx).await?;
+    if !file_columns.iter().any(|row| row.get::<String, _>("name") == "summary") {
+        sqlx::query("ALTER TABLE files ADD COLUMN summary TEXT DEFAULT NULL").execute(&mut *tx).await?;
+    }
+
+    let artifact_columns = sqlx::query("PRAGMA table_info(parse_artifacts)").fetch_all(&mut *tx).await?;
+    if !artifact_columns.iter().any(|row| row.get::<String, _>("name") == "summary") {
+        sqlx::query("ALTER TABLE parse_artifacts ADD COLUMN summary TEXT DEFAULT NULL").execute(&mut *tx).await?;
+    }
+
+    tx.commit().await?;
+    info!("Applied schema migration {}: file_summaries", VERSION);
     Ok(())
 }
 
@@ -862,7 +900,8 @@ pub async fn batch_insert_with_returning<T, BindFn>(
     tx: &mut sqlx::Transaction<'_, Sqlite>, prefix_sql: &str, rows: &[T], binds_per_row: usize, mut bind: BindFn,
 ) -> anyhow::Result<Vec<i64>>
 where
-    BindFn: FnMut(&mut QueryBuilder<'_, Sqlite>, &T), {
+    BindFn: FnMut(&mut QueryBuilder<'_, Sqlite>, &T),
+{
     if rows.is_empty() {
         return Ok(Vec::new());
     }
@@ -917,6 +956,7 @@ mod tests {
                 parse_priority INTEGER NOT NULL DEFAULT 50,
                 is_public INTEGER NOT NULL DEFAULT 0,
                 meta TEXT DEFAULT NULL,
+                summary TEXT DEFAULT NULL,
                 created_at INTEGER,
                 updated_at INTEGER
             )",
@@ -991,6 +1031,7 @@ mod tests {
         assert_eq!(artifact_migration_count, 1);
         let artifact_column = sqlx::query("PRAGMA table_info(files)").fetch_all(&pool).await?;
         assert!(artifact_column.iter().any(|row| row.get::<String, _>("name") == "artifact_id"));
+        assert!(artifact_column.iter().any(|row| row.get::<String, _>("name") == "summary"));
         Ok(())
     }
 }

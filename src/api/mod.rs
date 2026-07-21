@@ -1,5 +1,6 @@
 use axum::{
-    Extension, Router, routing::{delete, get, post, put}
+    Extension, Router,
+    routing::{delete, get, post, put},
 };
 use sqlx::SqlitePool;
 use utoipa::OpenApi;
@@ -14,7 +15,9 @@ mod system;
 // 重新导出 File 类型供其他模块使用
 pub use file::File;
 pub(crate) use file::{
-    FILE_COLS_NO_CONTENT, backfill_missing_image_meta_for_files, collect_image_paths_for_files, collect_image_raw_paths_for_files, effective_parse_file_id, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta
+    FILE_COLS_NO_CONTENT, backfill_missing_image_meta_for_files, collect_image_paths_for_files,
+    collect_image_raw_paths_for_files, effective_parse_file_id, find_reusable_parsed_file, remove_image_files,
+    resolve_image_storage_path, update_file_custom_image_meta,
 };
 
 use crate::search::SearchEngine;
@@ -62,6 +65,7 @@ use crate::search::SearchEngine;
         // Search
         search::search,
         search::search_full,
+        search::search_summary,
         search::search_with_graph,
         search::search_image,
         search::search_image_by_text,
@@ -132,6 +136,8 @@ use crate::search::SearchEngine;
             search::SearchResultItem,
             search::FullSearchResult,
             search::FullSearchResultItem,
+            search::SummarySearchResult,
+            search::SummarySearchResultItem,
             search::FileInfo,
             search::KbInfo,
             search::LexiconItem,
@@ -213,6 +219,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
     let search_router = Router::new()
         .route("/", get(search::search))
         .route("/full", get(search::search_full))
+        .route("/summary", get(search::search_summary))
         .route("/graph", get(search::search_with_graph))
         .route("/image", post(search::search_image))
         .route("/image-by-text", get(search::search_image_by_text))

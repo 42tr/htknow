@@ -1,12 +1,18 @@
 use std::{
-    cmp::Ordering, collections::{HashMap, HashSet}, convert::Infallible, time::Instant
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    convert::Infallible,
+    time::Instant,
 };
 
 use anyhow::anyhow;
 use axum::{
-    Extension, extract::{Multipart, Path, Query, State}, response::{
-        Json, sse::{Event, KeepAlive, KeepAliveStream, Sse}
-    }
+    Extension,
+    extract::{Multipart, Path, Query, State},
+    response::{
+        Json,
+        sse::{Event, KeepAlive, KeepAliveStream, Sse},
+    },
 };
 use chrono::Utc;
 use log::{error, info, warn};
@@ -21,13 +27,19 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::File;
 use crate::{
-    AuthUser, api::{
-        common, error::{ApiError, ApiResult}
-    }, processor, search::{
-        RebuildProgress, SearchEngine, SearchResultItem as EngineSearchResultItem, advanced::{
-            ChunkRefiner, ChunkSegment, LlmClient, PlanAction, PlanStep, QueryPlanner, RefineOutcome, RelevanceJudge, assemble_context_chunk
-        }
-    }
+    AuthUser,
+    api::{
+        common,
+        error::{ApiError, ApiResult},
+    },
+    processor,
+    search::{
+        RebuildProgress, SearchEngine, SearchResultItem as EngineSearchResultItem,
+        advanced::{
+            ChunkRefiner, ChunkSegment, LlmClient, PlanAction, PlanStep, QueryPlanner, RefineOutcome, RelevanceJudge,
+            assemble_context_chunk,
+        },
+    },
 };
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -111,7 +123,8 @@ pub struct AdvancedSearchQuery {
 
 fn deserialize_id_list<'de, D>(deserializer: D) -> Result<Option<Vec<i64>>, D::Error>
 where
-    D: serde::Deserializer<'de>, {
+    D: serde::Deserializer<'de>,
+{
     let raw = Option::<String>::deserialize(deserializer)?;
     let Some(raw) = raw else {
         return Ok(None);
@@ -198,6 +211,23 @@ pub struct FullSearchResultItem {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct FullSearchResult {
     pub results: Vec<FullSearchResultItem>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SummarySearchResultItem {
+    /// 文件摘要
+    pub summary: String,
+    /// 搜索得分
+    pub score: f32,
+    /// 文件信息
+    pub file: Option<File>,
+    /// 知识库信息
+    pub kb: Option<KbInfo>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SummarySearchResult {
+    pub results: Vec<SummarySearchResultItem>,
 }
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -859,6 +889,10 @@ fn has_permission(
 
 fn no_accessible_kb_scope(kb_ids: Option<&[i64]>) -> bool {
     matches!(kb_ids, Some(ids) if ids.is_empty())
+}
+
+fn file_matches_kb_scope(file: &File, kb_ids: Option<&[i64]>) -> bool {
+    kb_ids.is_none_or(|ids| file.kb_id.is_some_and(|kb_id| ids.contains(&kb_id)))
 }
 
 async fn resolve_scope_for_user(
@@ -1712,6 +1746,139 @@ pub async fn search_full(
     };
 
     Ok(Json(FullSearchResult { results }))
+}
+
+/// 文件摘要语义搜索
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/search/summary",
+    operation_id = "search_summary",
+    tag = "search",
+    params(FullSearchQuery),
+    responses(
+        (status = 200, description = "文件摘要搜索成功", body = SummarySearchResult),
+        (status = 400, description = "请求参数错误")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn search_summary(
+    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
+    Query(params): Query<FullSearchQuery>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<SummarySearchResult>> {
+    let (is_admin, user_id, kb_ids_to_search) =
+        resolve_scope_for_user(&pool, &auth_user, params.kb_id.as_ref()).await?;
+    if no_accessible_kb_scope(kb_ids_to_search.as_deref()) {
+        return Ok(Json(SummarySearchResult { results: vec![] }));
+    }
+
+    let allowed_kb_ids: HashSet<i64> = if is_admin {
+        HashSet::new()
+    } else {
+        crate::api::knowledge_base::get_user_viewable_kb_ids(&pool, &user_id, false).await.into_iter().collect()
+    };
+    let allowed_ref = if is_admin { None } else { Some(&allowed_kb_ids) };
+
+    let file_ids = if let Some(filename) = params.filename.as_ref().filter(|f| !f.is_empty()) {
+        let matched_ids =
+            search_file_ids_by_name(&pool, filename, kb_ids_to_search.as_ref(), &user_id, is_admin).await?;
+        if matched_ids.is_empty() {
+            return Ok(Json(SummarySearchResult { results: vec![] }));
+        }
+        match params.file_id {
+            Some(ref explicit_ids) if !explicit_ids.is_empty() => {
+                let explicit_set: HashSet<i64> = explicit_ids.iter().copied().collect();
+                let intersected: Vec<i64> = matched_ids.into_iter().filter(|id| explicit_set.contains(id)).collect();
+                if intersected.is_empty() {
+                    return Ok(Json(SummarySearchResult { results: vec![] }));
+                }
+                Some(intersected)
+            }
+            _ => Some(matched_ids),
+        }
+    } else {
+        params.file_id.clone()
+    };
+
+    let results = if params.query.trim().is_empty() {
+        if file_ids.is_none() {
+            return Ok(Json(SummarySearchResult { results: vec![] }));
+        }
+        let ids = file_ids.unwrap_or_default();
+        if ids.is_empty() {
+            return Ok(Json(SummarySearchResult { results: vec![] }));
+        }
+        let file_map = get_full_files_by_ids(&pool, &ids).await?;
+        let kb_ids_in_files: Vec<i64> = file_map.values().filter_map(|f| f.kb_id).collect();
+        let kb_map =
+            if !kb_ids_in_files.is_empty() { get_kbs_by_ids(&pool, &kb_ids_in_files).await? } else { HashMap::new() };
+        file_map
+            .values()
+            .filter_map(|f| {
+                let summary = f.summary.as_deref().unwrap_or("").trim();
+                if summary.is_empty()
+                    || !file_matches_kb_scope(f, kb_ids_to_search.as_deref())
+                    || !has_visibility_permission(
+                        Some((f.is_public, f.user_id.as_str())),
+                        f.kb_id.and_then(|kid| kb_map.get(&kid)).map(|k| (k.is_public, k.user_id.as_str(), k.id)),
+                        &user_id,
+                        is_admin,
+                        allowed_ref,
+                    )
+                {
+                    return None;
+                }
+                Some(SummarySearchResultItem {
+                    summary: summary.to_string(),
+                    score: 0.0,
+                    file: Some(f.clone()),
+                    kb: f.kb_id.and_then(|kid| kb_map.get(&kid).cloned()),
+                })
+            })
+            .collect::<Vec<_>>()
+    } else {
+        let raw_results = search_engine
+            .search_summary(&params.query, file_ids.as_ref(), kb_ids_to_search.as_ref())
+            .await
+            .map_err(|e| crate::api::error::ApiError::internal(format!("Summary search failed: {}", e)))?;
+
+        if raw_results.is_empty() {
+            return Ok(Json(SummarySearchResult { results: vec![] }));
+        }
+
+        let file_ids: Vec<i64> = raw_results.iter().map(|r| r.file_id).collect();
+        let file_map = get_full_files_by_ids(&pool, &file_ids).await?;
+        let kb_ids: Vec<i64> = file_map.values().filter_map(|f| f.kb_id).collect();
+        let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(&pool, &kb_ids).await? } else { HashMap::new() };
+
+        raw_results
+            .into_iter()
+            .filter_map(|r| {
+                let Some(file) = file_map.get(&r.file_id).cloned() else {
+                    warn!("Summary search skipped orphan vector result for missing file {}", r.file_id);
+                    return None;
+                };
+                let kb = file.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
+                if file_matches_kb_scope(&file, kb_ids_to_search.as_deref())
+                    && has_visibility_permission(
+                        Some((file.is_public, file.user_id.as_str())),
+                        kb.as_ref().map(|k| (k.is_public, k.user_id.as_str(), k.id)),
+                        &user_id,
+                        is_admin,
+                        allowed_ref,
+                    )
+                {
+                    Some(SummarySearchResultItem { summary: r.summary, score: r.score, file: Some(file), kb })
+                } else {
+                    None
+                }
+            })
+            .collect()
+    };
+
+    Ok(Json(SummarySearchResult { results }))
 }
 
 /// 使用知识图谱增强的搜索

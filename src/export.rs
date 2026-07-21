@@ -2,7 +2,8 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::Context;
 use arrow_array::{
-    ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray, builder::{FixedSizeListBuilder, Float32Builder}
+    ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray,
+    builder::{FixedSizeListBuilder, Float32Builder},
 };
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use futures::stream::StreamExt;
@@ -10,12 +11,18 @@ use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use sqlx::{Encode, QueryBuilder, Row, Sqlite, SqlitePool, Type, sqlite::SqlitePoolOptions};
 use tantivy::{
-    TantivyDocument, Term, collector::TopDocs, doc, query::{BooleanQuery, Occur, Query, TermQuery}, schema::{IndexRecordOption, Value as _}
+    TantivyDocument, Term,
+    collector::TopDocs,
+    doc,
+    query::{BooleanQuery, Occur, Query, TermQuery},
+    schema::{IndexRecordOption, Value as _},
 };
 use utoipa::ToSchema;
 
 use crate::{
-    api::{backfill_missing_image_meta_for_files, collect_image_raw_paths_for_files}, config, search::tantivy_engine
+    api::{backfill_missing_image_meta_for_files, collect_image_raw_paths_for_files},
+    config,
+    search::tantivy_engine,
 };
 
 const EXPORT_MANIFEST_FILENAME: &str = "manifest.json";
@@ -40,6 +47,7 @@ type FileRow = (
     Option<i64>,
     i32,
     i32,
+    Option<String>,
     Option<String>,
     i64,
     i64,
@@ -584,7 +592,7 @@ async fn export_files(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i6
 
     for chunk in kb_ids.chunks(SQLITE_BATCH_SIZE) {
         let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, parse_priority, is_public, meta, created_at, updated_at FROM files WHERE kb_id IN (",
+            "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, parse_priority, is_public, meta, summary, created_at, updated_at FROM files WHERE kb_id IN (",
         );
         let mut separated = qb.separated(", ");
         for id in chunk {
@@ -626,6 +634,7 @@ async fn export_files(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i6
                     row.get::<i32, _>("parse_priority"),
                     row.get::<i32, _>("is_public"),
                     row.get::<Option<String>, _>("meta"),
+                    row.get::<Option<String>, _>("summary"),
                     row.get::<i64, _>("created_at"),
                     row.get::<i64, _>("updated_at"),
                 )
@@ -651,6 +660,7 @@ async fn export_files(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i6
                 "parse_priority",
                 "is_public",
                 "meta",
+                "summary",
                 "created_at",
                 "updated_at",
             ],
@@ -672,6 +682,7 @@ async fn export_files(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i6
                 prio,
                 is_pub,
                 meta,
+                summary,
                 cat,
                 uat,
             )| {
@@ -690,6 +701,7 @@ async fn export_files(src_pool: &SqlitePool, dst_pool: &SqlitePool, kb_ids: &[i6
                     .push_bind(prio)
                     .push_bind(is_pub)
                     .push_bind(meta)
+                    .push_bind(summary)
                     .push_bind(cat)
                     .push_bind(uat);
             },
@@ -714,7 +726,8 @@ struct RowBinder<'qb, 'args> {
 impl<'qb, 'args> RowBinder<'qb, 'args> {
     fn push_bind<T>(&mut self, value: T) -> &mut Self
     where
-        T: 'args+Send+Encode<'args, Sqlite>+Type<Sqlite>, {
+        T: 'args + Send + Encode<'args, Sqlite> + Type<Sqlite>,
+    {
         if !self.first {
             self.qb.push(", ");
         }
@@ -729,7 +742,8 @@ async fn batch_insert_rows<Src>(
     insert_or_ignore: bool,
 ) -> Result<(), sqlx::Error>
 where
-    Src: Clone, {
+    Src: Clone,
+{
     if rows.is_empty() {
         return Ok(());
     }

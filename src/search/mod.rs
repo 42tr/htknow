@@ -1,5 +1,9 @@
 use std::{
-    collections::{HashMap, HashSet}, fs, path::Path, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}
+    collections::{HashMap, HashSet},
+    fs,
+    path::Path,
+    sync::Arc,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::{Context, anyhow};
@@ -131,6 +135,14 @@ pub struct RebuildProgress {
     pub phase: String,
     pub total_docs: i64,
     pub processed_docs: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SummarySearchResultItem {
+    pub file_id: i64,
+    pub kb_id: Option<i64>,
+    pub summary: String,
+    pub score: f32,
 }
 
 /// 根据文件名后缀判断是否为图片文件。
@@ -287,6 +299,7 @@ impl SearchEngine {
                 warn!("SQLite has no valid slices but LanceDB has {} documents; clearing LanceDB", lancedb_count);
                 lancedb::clear_all_documents().await?;
             }
+            self.sync_lancedb_summaries_from_db().await?;
             return Ok(());
         }
 
@@ -341,9 +354,7 @@ impl SearchEngine {
         }
 
         if missing_ids.is_empty() && extra_ids.is_empty() && orphan_ids.is_empty() {
-            if !orphan_ids.is_empty() {
-                lancedb::schedule_optimize_after_rebuild();
-            }
+            self.sync_lancedb_summaries_from_db().await?;
             return Ok(());
         }
 
@@ -453,6 +464,106 @@ impl SearchEngine {
             removed,
             rebuild_started_at.elapsed().as_secs()
         );
+        self.sync_lancedb_summaries_from_db().await?;
+        Ok(())
+    }
+
+    async fn sync_lancedb_summaries_from_db(&self) -> anyhow::Result<()> {
+        let Some(pool) = &self.pool else {
+            return Err(anyhow!("search engine db pool not set"));
+        };
+
+        #[derive(Debug, sqlx::FromRow)]
+        struct SummaryRow {
+            id: i64,
+            kb_id: Option<i64>,
+            summary: String,
+        }
+
+        let sqlite_rows: Vec<SummaryRow> = sqlx::query_as(
+            "SELECT id, kb_id, summary FROM files \
+             WHERE status = 1 AND summary IS NOT NULL AND trim(summary) != '' \
+             ORDER BY id ASC",
+        )
+        .fetch_all(pool)
+        .await?;
+        let mut sqlite_by_file_id = HashMap::with_capacity(sqlite_rows.len());
+        for row in sqlite_rows {
+            let summary = row.summary.trim();
+            if !summary.is_empty() {
+                sqlite_by_file_id.insert(row.id, lancedb::SummaryDocument::new(row.id, row.kb_id, summary.to_string()));
+            }
+        }
+
+        let existing_summaries = lancedb::load_existing_summaries(sqlite_by_file_id.len() as u64).await?;
+        let mut existing_counts: HashMap<i64, usize> = HashMap::with_capacity(existing_summaries.len());
+        let mut replace_file_ids: HashSet<i64> = HashSet::new();
+        let mut delete_file_ids: HashSet<i64> = HashSet::new();
+
+        for existing in existing_summaries {
+            *existing_counts.entry(existing.file_id).or_insert(0) += 1;
+            match sqlite_by_file_id.get(&existing.file_id) {
+                Some(expected) if expected.kb_id == existing.kb_id && expected.summary == existing.summary.trim() => {}
+                Some(_) => {
+                    replace_file_ids.insert(existing.file_id);
+                }
+                None => {
+                    delete_file_ids.insert(existing.file_id);
+                }
+            }
+        }
+
+        for (&file_id, &count) in &existing_counts {
+            if count > 1 {
+                if sqlite_by_file_id.contains_key(&file_id) {
+                    replace_file_ids.insert(file_id);
+                } else {
+                    delete_file_ids.insert(file_id);
+                }
+            }
+        }
+
+        for &file_id in sqlite_by_file_id.keys() {
+            if !existing_counts.contains_key(&file_id) {
+                replace_file_ids.insert(file_id);
+            }
+        }
+
+        for file_id in &replace_file_ids {
+            delete_file_ids.remove(file_id);
+        }
+
+        if replace_file_ids.is_empty() && delete_file_ids.is_empty() {
+            info!("LanceDB file summary vectors are consistent with SQLite: {} summaries", sqlite_by_file_id.len());
+            return Ok(());
+        }
+
+        let cfg = config::get();
+        let batch_size = cfg.search.lancedb_rebuild_batch_size.max(1);
+        let started_at = Instant::now();
+        let replace_docs: Vec<lancedb::SummaryDocument> =
+            replace_file_ids.iter().filter_map(|id| sqlite_by_file_id.get(id).cloned()).collect();
+        let mut replaced = 0usize;
+        for docs in replace_docs.chunks(batch_size) {
+            lancedb::replace_summaries_batch_for_rebuild(docs.to_vec()).await?;
+            replaced += docs.len();
+        }
+
+        let delete_ids: Vec<i64> = delete_file_ids.into_iter().collect();
+        let mut deleted = 0usize;
+        for ids in delete_ids.chunks(batch_size) {
+            lancedb::delete_summaries_by_files_for_rebuild(ids).await?;
+            deleted += ids.len();
+        }
+
+        lancedb::schedule_optimize_after_rebuild();
+        info!(
+            "LanceDB file summary vectors synced from SQLite: total={} replaced={} deleted={} elapsed={}s",
+            sqlite_by_file_id.len(),
+            replaced,
+            deleted,
+            started_at.elapsed().as_secs()
+        );
         Ok(())
     }
 
@@ -557,8 +668,9 @@ impl SearchEngine {
 
     pub async fn rebuild_tantivy_indexes<F, Fut>(&self, job_tag: &str, mut on_progress: F) -> anyhow::Result<()>
     where
-        F: FnMut(RebuildProgress) -> Fut+Send,
-        Fut: std::future::Future<Output=()>+Send, {
+        F: FnMut(RebuildProgress) -> Fut + Send,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
         let Some(pool) = &self.pool else {
             return Err(anyhow!("search engine db pool not set"));
         };
@@ -803,6 +915,14 @@ impl SearchEngine {
         Ok(())
     }
 
+    pub async fn write_summary(&self, file_id: i64, kb_id: Option<i64>, summary: String) -> anyhow::Result<()> {
+        lancedb::write_summary(lancedb::SummaryDocument::new(file_id, kb_id, summary)).await
+    }
+
+    pub async fn delete_summary_by_file(&self, file_id: i64) -> anyhow::Result<()> {
+        lancedb::delete_summary_by_file(file_id).await
+    }
+
     /// 更新指定切片在默认索引与 LanceDB 中的内容。
     ///
     /// 内部会先删除旧 slice 文档/向量，再写入新内容，并 reload 默认索引 reader。
@@ -910,6 +1030,7 @@ impl SearchEngine {
                 } else {
                     lancedb::delete_by_files(file_ids).await?;
                 }
+                lancedb::delete_summaries_by_files(file_ids).await?;
                 debug!("search_delete file_count={} lancedb {}ms", file_ids.len(), step_start.elapsed().as_millis());
                 anyhow::Ok(())
             };
@@ -976,6 +1097,7 @@ impl SearchEngine {
                 } else {
                     lancedb::delete_by_kbs(kb_ids).await?;
                 }
+                lancedb::delete_summaries_by_kbs(kb_ids).await?;
                 debug!("search_delete kb_count={} lancedb {}ms", kb_ids.len(), step_start.elapsed().as_millis());
                 anyhow::Ok(())
             };
@@ -1158,6 +1280,26 @@ impl SearchEngine {
         .await
     }
 
+    pub async fn search_summary(
+        &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
+    ) -> anyhow::Result<Vec<SummarySearchResultItem>> {
+        let total_start = Instant::now();
+        let vector_results = lancedb::search_summary(query, file_ids, kb_ids).await?;
+        debug!("Summary vector search returned {} candidates", vector_results.len());
+        if vector_results.is_empty() {
+            return Ok(vector_results);
+        }
+
+        let mut final_results = self.rerank_summaries(query, vector_results).await;
+        let limit = config::get().search.limit.max(1);
+        if final_results.len() > limit {
+            final_results.truncate(limit);
+        }
+
+        debug!("Summary search total {}ms", total_start.elapsed().as_millis());
+        Ok(final_results)
+    }
+
     pub async fn search_image_by_text(
         &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     ) -> anyhow::Result<Vec<SearchResultItem>> {
@@ -1273,21 +1415,30 @@ impl SearchEngine {
     async fn compute_rerank_scores(
         &self, query: &str, results: &[SearchResultItem],
     ) -> anyhow::Result<Vec<Option<f32>>> {
-        let cfg = config::get();
+        let documents: Vec<String> = results.iter().map(|result| result.content.clone()).collect();
+        self.compute_rerank_scores_for_texts(query, &documents).await
+    }
 
+    async fn compute_rerank_scores_for_texts(
+        &self, query: &str, source_documents: &[String],
+    ) -> anyhow::Result<Vec<Option<f32>>> {
+        let cfg = config::get();
         // 提取所有文档内容用于重排序，并做去重（按内容借用，去重映射只需单次 clone 进 documents）
         let mut documents: Vec<String> = Vec::new();
-        let mut document_index_map: Vec<usize> = Vec::with_capacity(results.len());
+        let mut document_index_map: Vec<usize> = Vec::with_capacity(source_documents.len());
         let mut document_index_by_content: HashMap<&str, usize> = HashMap::new();
-        for result in results.iter() {
-            if let Some(&idx) = document_index_by_content.get(result.content.as_str()) {
+        for document in source_documents.iter() {
+            if let Some(&idx) = document_index_by_content.get(document.as_str()) {
                 document_index_map.push(idx);
                 continue;
             }
             let idx = documents.len();
-            documents.push(result.content.clone());
-            document_index_by_content.insert(result.content.as_str(), idx);
+            documents.push(document.clone());
+            document_index_by_content.insert(document.as_str(), idx);
             document_index_map.push(idx);
+        }
+        if documents.is_empty() {
+            return Ok(Vec::new());
         }
 
         // 根据 URL 后缀判断使用哪种 rerank 接口格式
@@ -1402,6 +1553,44 @@ impl SearchEngine {
             reranked_results.into_iter().filter(|f| f.score >= threshold).collect();
         info!("Reranked results count: {}", filter_results.len());
         debug!("Rerank total {}ms", rerank_total_start.elapsed().as_millis());
+        filter_results
+    }
+
+    async fn rerank_summaries(
+        &self, query: &str, results: Vec<SummarySearchResultItem>,
+    ) -> Vec<SummarySearchResultItem> {
+        let rerank_total_start = Instant::now();
+        let cfg = config::get();
+        let summaries: Vec<String> = results.iter().map(|result| result.summary.clone()).collect();
+
+        let scores = match self.compute_rerank_scores_for_texts(query, &summaries).await {
+            Ok(scores) => scores,
+            Err(err) => {
+                warn!(
+                    "Summary rerank failed for query {:?}, returning vector summary results without rerank: {}",
+                    query, err
+                );
+                return results;
+            }
+        };
+
+        let mut reranked_results: Vec<SummarySearchResultItem> = results
+            .into_iter()
+            .enumerate()
+            .map(|(i, mut result)| {
+                if let Some(Some(score)) = scores.get(i) {
+                    result.score = *score;
+                }
+                result
+            })
+            .collect();
+
+        reranked_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        let threshold = cfg.ai.rerank_threshold;
+        let filter_results: Vec<SummarySearchResultItem> =
+            reranked_results.into_iter().filter(|result| result.score >= threshold).collect();
+        info!("Reranked summary results count: {}", filter_results.len());
+        debug!("Summary rerank total {}ms", rerank_total_start.elapsed().as_millis());
         filter_results
     }
 

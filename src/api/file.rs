@@ -1,10 +1,18 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet}, io::{Seek, Write}, path::Component, sync::{Arc, OnceLock}, time::Instant
+    collections::{BTreeMap, HashMap, HashSet},
+    io::{Seek, Write},
+    path::Component,
+    sync::{Arc, OnceLock},
+    time::Instant,
 };
 
 use anyhow::Result as AnyResult;
 use axum::{
-    Extension, body::Body, extract::{Multipart, Path, Query, State}, http::{StatusCode, header}, response::Json
+    Extension,
+    body::Body,
+    extract::{Multipart, Path, Query, State},
+    http::{StatusCode, header},
+    response::Json,
 };
 use bytes::Bytes;
 use log::{debug, error, info, warn};
@@ -13,14 +21,22 @@ use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use tempfile::NamedTempFile;
 use tokio::{
-    fs, io::AsyncWriteExt as _, spawn, sync::{OwnedSemaphorePermit, Semaphore}
+    fs,
+    io::AsyncWriteExt as _,
+    spawn,
+    sync::{OwnedSemaphorePermit, Semaphore},
 };
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    AuthUser, api::{
-        common, error::{ApiError, ApiResult}
-    }, archive::{self, ArchiveEntry, ExtractResult}, config, pdf_highlight, processor, search::SearchEngine
+    AuthUser,
+    api::{
+        common,
+        error::{ApiError, ApiResult},
+    },
+    archive::{self, ArchiveEntry, ExtractResult},
+    config, pdf_highlight, processor,
+    search::SearchEngine,
 };
 
 /// 以流式方式打开文件，返回 (字节数, Body)。
@@ -72,7 +88,7 @@ fn stream_from_std_file(mut file: std::fs::File) -> Result<(u64, Body), ApiError
 ///
 /// 列表类查询不需要全文 content，用此清单避免把可能很大的文本从 SQLite/文件系统读进内存。
 pub(crate) const FILE_COLS_NO_CONTENT: &str = "id, user_id, user_name, hash, filename, path, size, NULL as content, \
-     tags, status, log, slice_type, kb_id, is_public, meta, created_at, updated_at, artifact_id";
+     tags, status, log, slice_type, kb_id, is_public, meta, summary, created_at, updated_at, artifact_id";
 
 /// Excel 单 sheet 数据
 #[derive(Debug, Serialize, ToSchema)]
@@ -132,6 +148,7 @@ pub struct File {
     pub kb_id: Option<i64>,
     pub is_public: bool,
     pub meta: Option<String>,
+    pub summary: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
     /// 共享解析产物内部引用，不作为对外 API 字段返回。
@@ -1249,6 +1266,13 @@ async fn clear_file_parse_rows_for_ids_in_tx(
         slices_qb.build().execute(&mut **tx).await?;
     }
 
+    for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
+        let mut files_qb = QueryBuilder::<Sqlite>::new("UPDATE files SET summary = NULL WHERE id IN (");
+        crate::db::push_i64_list(&mut files_qb, chunk);
+        files_qb.push(")");
+        files_qb.build().execute(&mut **tx).await?;
+    }
+
     Ok(())
 }
 
@@ -1452,7 +1476,7 @@ async fn execute_reparse_failed(
     clear_file_parse_rows_for_ids_in_tx(&mut tx, &file_ids).await?;
 
     let mut qb = QueryBuilder::<Sqlite>::new(
-        "UPDATE files SET status = 0, parse_run_id = NULL, log = '', updated_at = strftime('%s','now') WHERE status = -1 AND id IN (",
+        "UPDATE files SET status = 0, parse_run_id = NULL, log = '', summary = NULL, updated_at = strftime('%s','now') WHERE status = -1 AND id IN (",
     );
     crate::db::push_i64_list(&mut qb, &file_ids);
     qb.push(")");
