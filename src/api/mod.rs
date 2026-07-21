@@ -28,6 +28,7 @@ use crate::search::SearchEngine;
         knowledge_base::create,
         knowledge_base::get,
         knowledge_base::get_files,
+        knowledge_base::get_tags,
         knowledge_base::update,
         knowledge_base::reparse,
         knowledge_base::reparse_by_id,
@@ -94,6 +95,8 @@ use crate::search::SearchEngine;
             knowledge_base::KnowledgeResponse,
             knowledge_base::KnowledgeDetailResponse,
             knowledge_base::KnowledgeBaseFilesResponse,
+            knowledge_base::KnowledgeBaseTagsResponse,
+            knowledge_base::TagFileCount,
             knowledge_base::KnowledgeTreeFile,
             knowledge_base::KnowledgeTreeNode,
             knowledge_base::KnowledgeCreateReq,
@@ -184,6 +187,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/reparse", post(knowledge_base::reparse))
         .route("/{id}/reparse", post(knowledge_base::reparse_by_id))
         .route("/{id}/files", get(knowledge_base::get_files))
+        .route("/{id}/tags", get(knowledge_base::get_tags))
         .route("/export", post(knowledge_base::batch_export_kb))
         .route("/tree", get(knowledge_base::tree))
         .route("/{id}", get(knowledge_base::get).put(knowledge_base::update).delete(knowledge_base::delete))

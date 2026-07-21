@@ -260,6 +260,24 @@ pub struct KnowledgeBaseFilesResponse {
     pub items: Vec<FileWithoutContent>,
 }
 
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct KnowledgeBaseTagsQuery {
+    /// 是否包含当前用户可访问的子知识库，默认 false
+    pub include_descendants: Option<bool>,
+}
+
+#[derive(Debug, Serialize, sqlx::FromRow, ToSchema)]
+pub struct TagFileCount {
+    pub tag: String,
+    pub file_count: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct KnowledgeBaseTagsResponse {
+    pub kb_id: i64,
+    pub tags: Vec<TagFileCount>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, sqlx::FromRow, ToSchema)]
 pub struct FileWithoutContent {
     pub id: i64,
@@ -940,6 +958,81 @@ pub async fn get_files(
     let items: Vec<FileWithoutContent> = list_qb.build_query_as().fetch_all(&pool).await?;
 
     Ok(Json(KnowledgeBaseFilesResponse { total, items }))
+}
+
+/// 获取知识库文件标签及其文件数量
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/knowledge_base/{id}/tags",
+    operation_id = "knowledge_base_tags",
+    tag = "knowledge_base",
+    params(
+        ("id" = i64, Path, description = "知识库 ID"),
+        KnowledgeBaseTagsQuery
+    ),
+    responses(
+        (status = 200, description = "成功返回知识库标签统计", body = KnowledgeBaseTagsResponse),
+        (status = 401, description = "未授权"),
+        (status = 404, description = "知识库不存在或无权限")
+    ),
+    security(("x-user-id" = []), ("x-role" = []))
+)]
+pub async fn get_tags(
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Query(params): Query<KnowledgeBaseTagsQuery>,
+    Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<KnowledgeBaseTagsResponse>> {
+    let is_admin = auth_user.is_admin();
+    let user_id = auth_user.user_id.clone();
+    if is_admin {
+        let exists = sqlx::query_scalar::<_, i64>("SELECT id FROM knowledge_bases WHERE id = ?")
+            .bind(id)
+            .fetch_optional(&pool)
+            .await?;
+        if exists.is_none() {
+            return Err(ApiError::NotFound("Knowledge base not found or permission denied.".to_string()));
+        }
+    }
+    common::ensure_kb_accessible(&pool, id, &user_id, is_admin).await?;
+
+    let include_descendants = params.include_descendants.unwrap_or(false);
+    let mut qb = QueryBuilder::<Sqlite>::new("");
+    if include_descendants {
+        qb.push("WITH RECURSIVE descendants AS (SELECT id FROM knowledge_bases WHERE id = ")
+            .push_bind(id)
+            .push(" UNION ALL SELECT kb.id FROM knowledge_bases kb JOIN descendants d ON kb.parent_id = d.id");
+        if !is_admin {
+            qb.push(" WHERE kb.user_id = ")
+                .push_bind(user_id.clone())
+                .push(" OR kb.is_public = 1 OR kb.id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ")
+                .push_bind(user_id.clone())
+                .push(")");
+        }
+        qb.push(") ");
+    }
+
+    qb.push(
+        "SELECT CAST(tag.value AS TEXT) AS tag, COUNT(DISTINCT f.id) AS file_count \
+         FROM files f \
+         JOIN json_each( \
+             CASE WHEN json_valid(f.tags) \
+                  THEN CASE WHEN json_type(f.tags) = 'array' THEN f.tags ELSE '[]' END \
+                  ELSE '[]' END \
+         ) AS tag \
+         WHERE tag.type = 'text' AND trim(CAST(tag.value AS TEXT)) <> ''",
+    );
+    if include_descendants {
+        qb.push(" AND f.kb_id IN (SELECT id FROM descendants)");
+    } else {
+        qb.push(" AND f.kb_id = ").push_bind(id);
+    }
+    if !is_admin {
+        qb.push(" AND ");
+        common::push_file_access_filter(&mut qb, &user_id, Some("f"));
+    }
+    qb.push(" GROUP BY tag.value ORDER BY file_count DESC, tag COLLATE NOCASE ASC");
+
+    let tags = qb.build_query_as::<TagFileCount>().fetch_all(&pool).await?;
+    Ok(Json(KnowledgeBaseTagsResponse { kb_id: id, tags }))
 }
 
 /// 删除知识库

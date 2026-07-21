@@ -173,6 +173,123 @@ async fn knowledge_base_tree_and_detail_flow() {
 }
 
 #[tokio::test]
+async fn knowledge_base_tag_stats_respect_scope_data_quality_and_permissions() {
+    let app = app().await;
+    let pool = get_pool().await;
+    let env = setup_env();
+    let owner = TestUser::with_role("tag-owner", "user");
+    let viewer = TestUser::with_role("tag-viewer", "user");
+
+    let root_kb_id = insert_kb(&pool, &owner, "Tag Root", "analysis", None, true).await;
+    let child_kb_id = insert_kb(&pool, &owner, "Tag Child", "analysis", Some(root_kb_id), false).await;
+    let file_dir = env.data_dir.join("files");
+    fs::create_dir_all(&file_dir).unwrap();
+
+    let private_path = file_dir.join(format!("tag-private-{}.txt", next_seq()));
+    let public_path = file_dir.join(format!("tag-public-{}.txt", next_seq()));
+    let child_path = file_dir.join(format!("tag-child-{}.txt", next_seq()));
+    let invalid_path = file_dir.join(format!("tag-invalid-{}.txt", next_seq()));
+    fs::write(&private_path, b"private").unwrap();
+    fs::write(&public_path, b"public").unwrap();
+    fs::write(&child_path, b"child").unwrap();
+    fs::write(&invalid_path, b"invalid").unwrap();
+
+    insert_file(
+        &pool,
+        &owner,
+        "tag-private.txt",
+        &private_path,
+        Some(root_kb_id),
+        vec!["alpha".to_string(), "shared".to_string(), "shared".to_string()],
+        false,
+    )
+    .await;
+    insert_file(
+        &pool,
+        &owner,
+        "tag-public.txt",
+        &public_path,
+        Some(root_kb_id),
+        vec!["alpha".to_string(), "".to_string(), "beta".to_string()],
+        true,
+    )
+    .await;
+    insert_file(
+        &pool,
+        &owner,
+        "tag-child.txt",
+        &child_path,
+        Some(child_kb_id),
+        vec!["child".to_string(), "shared".to_string()],
+        true,
+    )
+    .await;
+    let invalid_file_id =
+        insert_file(&pool, &owner, "tag-invalid.txt", &invalid_path, Some(root_kb_id), vec![], false).await;
+    sqlx::query("UPDATE files SET tags = 'not-json' WHERE id = ?").bind(invalid_file_id).execute(&pool).await.unwrap();
+
+    let direct_req =
+        authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}/tags", root_kb_id), &owner);
+    let direct_res = app.clone().oneshot(direct_req).await.unwrap();
+    assert_eq!(direct_res.status(), StatusCode::OK);
+    let direct_json = response_json(direct_res).await;
+    assert_eq!(direct_json["kb_id"].as_i64(), Some(root_kb_id));
+    assert_eq!(
+        direct_json["tags"],
+        serde_json::json!([
+            {"tag": "alpha", "file_count": 2},
+            {"tag": "beta", "file_count": 1},
+            {"tag": "shared", "file_count": 1}
+        ])
+    );
+
+    let descendants_req = authed_empty_request(
+        "GET",
+        format!("/api/v1/knowledge/knowledge_base/{}/tags?include_descendants=true", root_kb_id),
+        &owner,
+    );
+    let descendants_res = app.clone().oneshot(descendants_req).await.unwrap();
+    assert_eq!(descendants_res.status(), StatusCode::OK);
+    let descendants_json = response_json(descendants_res).await;
+    assert_eq!(
+        descendants_json["tags"],
+        serde_json::json!([
+            {"tag": "alpha", "file_count": 2},
+            {"tag": "shared", "file_count": 2},
+            {"tag": "beta", "file_count": 1},
+            {"tag": "child", "file_count": 1}
+        ])
+    );
+
+    let viewer_req = authed_empty_request(
+        "GET",
+        format!("/api/v1/knowledge/knowledge_base/{}/tags?include_descendants=true", root_kb_id),
+        &viewer,
+    );
+    let viewer_res = app.clone().oneshot(viewer_req).await.unwrap();
+    assert_eq!(viewer_res.status(), StatusCode::OK);
+    let viewer_json = response_json(viewer_res).await;
+    assert_eq!(
+        viewer_json["tags"],
+        serde_json::json!([
+            {"tag": "alpha", "file_count": 1},
+            {"tag": "beta", "file_count": 1}
+        ])
+    );
+
+    let inaccessible_kb_id = insert_kb(&pool, &owner, "Tag Private", "analysis", None, false).await;
+    let inaccessible_req =
+        authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}/tags", inaccessible_kb_id), &viewer);
+    let inaccessible_res = app.clone().oneshot(inaccessible_req).await.unwrap();
+    assert_eq!(inaccessible_res.status(), StatusCode::NOT_FOUND);
+
+    let admin = TestUser::new("tag-admin");
+    let missing_req = authed_empty_request("GET", "/api/v1/knowledge/knowledge_base/9223372036854775807/tags", &admin);
+    let missing_res = app.oneshot(missing_req).await.unwrap();
+    assert_eq!(missing_res.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
 async fn file_endpoints_flow() {
     let app = app().await;
     let pool = get_pool().await;
