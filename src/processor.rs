@@ -812,6 +812,7 @@ impl FileProcessor {
 
         tx.commit().await?;
 
+        self.delete_processing_file_content(file_id).await;
         remove_image_files(image_paths).await;
 
         if let Err(e) = self.search_engine.delete(Some(file_id), None).await {
@@ -827,6 +828,7 @@ impl FileProcessor {
         self.delete_processing_file_data(&mut tx, file_id).await?;
         tx.commit().await?;
 
+        self.delete_processing_file_content(file_id).await;
         remove_image_files(image_paths).await;
 
         if let Err(e) = self.search_engine.delete(Some(file_id), None).await {
@@ -878,13 +880,21 @@ impl FileProcessor {
             .execute(&mut **tx)
             .await?;
         sqlx::query("DELETE FROM slices WHERE file_id = ?").bind(file_id).execute(&mut **tx).await?;
-        crate::slice_content::delete(file_id).await?;
-        crate::pdf_content::delete(file_id).await?;
+        sqlx::query("UPDATE files SET summary = NULL WHERE id = ?").bind(file_id).execute(&mut **tx).await?;
+        Ok(())
+    }
+
+    // Keep filesystem cleanup outside the SQLite transaction so disk I/O cannot hold the writer lock.
+    async fn delete_processing_file_content(&self, file_id: i64) {
+        if let Err(e) = crate::slice_content::delete(file_id).await {
+            warn!("Failed to delete slice content file for processing cleanup of file {}: {}", file_id, e);
+        }
+        if let Err(e) = crate::pdf_content::delete(file_id).await {
+            warn!("Failed to delete PDF content file for processing cleanup of file {}: {}", file_id, e);
+        }
         if let Err(e) = crate::file_content::delete(file_id).await {
             warn!("Failed to delete content file for processing cleanup of file {}: {}", file_id, e);
         }
-        sqlx::query("UPDATE files SET summary = NULL WHERE id = ?").bind(file_id).execute(&mut **tx).await?;
-        Ok(())
     }
 
     async fn persist_file_summary(

@@ -801,17 +801,22 @@ async fn export_slices(
             continue;
         }
 
-        let mut tx = dst_pool.begin().await?;
         let mut exported_contents: std::collections::HashMap<i64, Vec<(i64, String)>> =
             std::collections::HashMap::new();
         let mut source_contents = std::collections::HashMap::new();
-        for row in rows {
-            let target_file_id: i64 = row.get("target_file_id");
-            let source_slice_id: i64 = row.get("source_slice_id");
+        // Read external slice content before opening the destination write transaction.
+        for row in &rows {
             let source_file_id: i64 = row.get("source_file_id");
             if let std::collections::hash_map::Entry::Vacant(e) = source_contents.entry(source_file_id) {
                 e.insert(crate::slice_content::read_all(source_file_id).await?);
             }
+        }
+
+        let mut tx = dst_pool.begin().await?;
+        for row in rows {
+            let target_file_id: i64 = row.get("target_file_id");
+            let source_slice_id: i64 = row.get("source_slice_id");
+            let source_file_id: i64 = row.get("source_file_id");
             let export_slice_id: i64 =
                 sqlx::query_scalar("INSERT INTO slices(file_id, created_at, updated_at) VALUES (?, ?, ?) RETURNING id")
                     .bind(target_file_id)

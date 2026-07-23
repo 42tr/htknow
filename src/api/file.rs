@@ -1663,9 +1663,8 @@ async fn execute_batch_delete(
     debug!("file_batch_delete collect_image_paths ids={} {}ms", file_ids.len(), step_start.elapsed().as_millis());
 
     let step_start = Instant::now();
-    let mut tx = pool.begin().await?;
-    delete_file_rows_in_tx(&mut tx, &file_ids).await?;
-    tx.commit().await?;
+    // Delete in bounded transactions so a large request cannot monopolize SQLite's writer lock.
+    delete_file_rows_batched(pool, &file_ids).await?;
     debug!("file_batch_delete delete_rows ids={} {}ms", file_ids.len(), step_start.elapsed().as_millis());
 
     let step_start = Instant::now();

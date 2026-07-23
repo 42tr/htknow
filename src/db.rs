@@ -48,7 +48,6 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     // 增大页缓存与 mmap、临时表落内存，减少磁盘 IO。内存库无需这些设置。
     if is_file_db {
         connect_options = connect_options
-            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
             .synchronous(SqliteSynchronous::Normal)
             .pragma("cache_size", "-65536") // 64MB 页缓存（负值表示 KB）
             .pragma("mmap_size", "268435456") // 256MB 内存映射
