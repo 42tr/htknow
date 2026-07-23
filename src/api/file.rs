@@ -399,6 +399,49 @@ fn map_search_engine_error(err: anyhow::Error) -> ApiError {
     ApiError::Internal(format!("Internal error: {}", msg))
 }
 
+/// 可选的文件切片方式。
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SliceTypeOption {
+    pub value: String,
+    pub label: String,
+    pub description: String,
+}
+
+/// 获取当前支持的文件切片方式。
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/files/slice-types",
+    operation_id = "file_slice_types",
+    tag = "file",
+    responses(
+        (status = 200, description = "切片方式列表", body = Vec<SliceTypeOption>),
+        (status = 401, description = "未授权")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
+    )
+)]
+pub async fn slice_types() -> ApiResult<Json<Vec<SliceTypeOption>>> {
+    Ok(Json(vec![
+        SliceTypeOption {
+            value: "smart".to_string(),
+            label: "智能切片".to_string(),
+            description: "根据文档结构智能切分，PDF 会保留标题和位置上下文。".to_string(),
+        },
+        SliceTypeOption {
+            value: "fixed".to_string(),
+            label: "固定长度".to_string(),
+            description: "按固定字数切分，切片之间保留重叠内容。".to_string(),
+        },
+        SliceTypeOption {
+            value: "paragraph".to_string(),
+            label: "按段落".to_string(),
+            description: "按空行分隔段落，每个段落作为一个切片。".to_string(),
+        },
+    ]))
+}
+
 /// 上传文件（支持单个或多个文件）
 ///
 /// form-data 参数：

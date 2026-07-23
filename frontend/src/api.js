@@ -470,6 +470,14 @@ export const api = {
   },
 
   // 文件
+  async getSliceTypes() {
+    const response = await fetch(`${API_BASE}/files/slice-types`, {
+      headers: getHeaders(),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '获取切片方式失败'))
+    return response.json()
+  },
+
   async uploadFiles(knowledgeBaseId, files, tags = [], isPublic = false, sliceType = 'smart') {
     const formData = new FormData()
     if (knowledgeBaseId) {

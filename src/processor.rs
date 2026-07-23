@@ -2115,19 +2115,17 @@ impl FileProcessor {
         let (full_content, slices) = timed_step_opt(timing.as_deref_mut(), "slice_build", async {
             tokio::task::spawn_blocking(move || -> anyhow::Result<(String, Vec<SliceWithPositions>)> {
                 let (full_content, full_segments) = Self::build_full_content_and_segments(&content_list);
-                let slices = if slice_type == "smart" || slice_type.is_empty() {
-                    // 智能切片：使用 content_list
-                    Self::smart_slice_content_with_positions(&content_list)?
-                } else if slice_type == "fixed" {
-                    Self::fixed_slice_content_with_positions(&full_content, &full_segments)?
-                } else {
-                    Self::slice_content(&full_content, &slice_type)?
+                let slices = match slice_type.as_str() {
+                    "fixed" => Self::fixed_slice_content_with_positions(&full_content, &full_segments)?,
+                    "paragraph" => Self::slice_content(&full_content, "paragraph")?
                         .into_iter()
                         .map(|content| {
                             let is_image = content_looks_like_image_reference(&content);
                             SliceWithPositions { content, positions: vec![], is_image }
                         })
-                        .collect()
+                        .collect(),
+                    // smart、空值和未知类型统一使用结构化智能切片。
+                    _ => Self::smart_slice_content_with_positions(&content_list)?,
                 };
                 Ok((full_content, slices))
             })
@@ -2453,44 +2451,6 @@ impl FileProcessor {
                 }
                 if !current.trim().is_empty() {
                     slices.push(current.trim().to_string());
-                }
-            }
-            "sentence" => {
-                const SENTENCE_END: [char; 6] = ['。', '.', '?', '!', '？', '！'];
-                let mut buf = String::new();
-                loop {
-                    let mut line = String::new();
-                    let n = reader.read_line(&mut line).await?;
-                    if n == 0 {
-                        break;
-                    }
-
-                    let (content, term) = if line.ends_with("\r\n") {
-                        let c = line.drain(..line.len() - 2).collect::<String>();
-                        (c, "\r\n")
-                    } else if line.ends_with('\n') {
-                        let c = line.drain(..line.len() - 1).collect::<String>();
-                        (c, "\n")
-                    } else {
-                        (line, "")
-                    };
-
-                    full_content.push_str(&content);
-                    full_content.push_str(term);
-
-                    for ch in content.chars().chain(term.chars()) {
-                        if SENTENCE_END.contains(&ch) {
-                            if !buf.trim().is_empty() {
-                                slices.push(buf.trim().to_string());
-                            }
-                            buf.clear();
-                        } else {
-                            buf.push(ch);
-                        }
-                    }
-                }
-                if !buf.trim().is_empty() {
-                    slices.push(buf.trim().to_string());
                 }
             }
             _ => {
@@ -2875,17 +2835,8 @@ impl FileProcessor {
                 // 按段落分片（以双换行符分隔）
                 Ok(content.split("\n\n").map(|s| s.trim()).filter(|s| !s.is_empty()).map(|s| s.to_string()).collect())
             }
-            "sentence" => {
-                // 按句子分片（简单实现：以句号、问号、感叹号分隔）
-                Ok(content
-                    .split(['。', '.', '?', '!', '？', '！'])
-                    .map(|s| s.trim())
-                    .filter(|s| !s.is_empty())
-                    .map(|s| s.to_string())
-                    .collect())
-            }
             _ => {
-                // 固定长度分片（每8000字符，重叠100字符）
+                // 智能回退：纯文本没有结构化内容项，因此使用长度窗口保留上下文。
                 let cfg = config::get();
                 let chunk_size = cfg.slice.smart_slice_max_chars;
                 let overlap = cfg.slice.fixed_slice_overlap_chars;

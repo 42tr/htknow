@@ -43,6 +43,7 @@ use crate::search::SearchEngine;
         knowledge_base::remove_permission,
         // File
         file::upload,
+        file::slice_types,
         file::list,
         file::stats,
         file::get,
@@ -112,6 +113,7 @@ use crate::search::SearchEngine;
             knowledge_base::KbPermissionCreateReq,
             crate::export::ExportManifest,
             file::File,
+            file::SliceTypeOption,
             file::FileListResponse,
             file::UpdateFileReq,
             file::MoveFileReq,
@@ -201,6 +203,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/{id}/permissions/{user_id}", delete(knowledge_base::remove_permission));
     let file_router = Router::new()
         .route("/", get(file::list).post(file::upload))
+        .route("/slice-types", get(file::slice_types))
         .route("/batch-delete", post(file::batch_delete))
         .route("/reparse-failed", post(file::reparse_failed))
         .route("/stats", get(file::stats))

@@ -29,17 +29,16 @@ const showGraph = ref(false)
 const showTagsEditor = ref(false)
 const showMoveKbSelector = ref(false)
 const showArchive = ref(false)
-const selectedSliceType = ref(props.file.slice_type || 'paragraph')
+const selectedSliceType = ref(props.file.slice_type || 'smart')
 const updating = ref(false)
 const downloading = ref(false)
 const moving = ref(false)
 const editingTags = ref([])
 const newTag = ref('')
 
-const sliceTypes = [
-  { value: 'smart', label: '智能切片', desc: '根据文档结构智能切分（推荐）' },
-  { value: 'fixed', label: '固定长度', desc: '每 8000 字符一个切片，重叠 100 字' },
-]
+const sliceTypes = ref([])
+const sliceTypesLoading = ref(false)
+const sliceTypesError = ref('')
 
 const isStorageKb = computed(() => props.kbType === 'storage')
 
@@ -81,7 +80,7 @@ const sliceTypeLabel = computed(() => {
   if (isStorageKb.value) {
     return '存储模式'
   }
-  const type = sliceTypes.find(t => t.value === props.file.slice_type)
+  const type = sliceTypes.value.find(t => t.value === props.file.slice_type)
   return type ? type.label : '智能切片'
 })
 
@@ -116,6 +115,22 @@ const handleUpdateSliceType = async () => {
     alert('更新失败：' + e.message)
   } finally {
     updating.value = false
+  }
+}
+
+const openSliceSettings = async () => {
+  selectedSliceType.value = props.file.slice_type || 'smart'
+  showSettings.value = true
+  if (sliceTypes.value.length > 0 || sliceTypesLoading.value) return
+
+  sliceTypesLoading.value = true
+  sliceTypesError.value = ''
+  try {
+    sliceTypes.value = await api.getSliceTypes()
+  } catch (e) {
+    sliceTypesError.value = e.message
+  } finally {
+    sliceTypesLoading.value = false
   }
 }
 
@@ -338,7 +353,7 @@ const handleMoveToKb = async (kb) => {
           </button>
           <button
             v-if="!isStorageKb && !isArchive"
-            @click="showSettings = true; selectedSliceType = file.slice_type || 'smart'"
+            @click="openSliceSettings"
             class="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-all"
             title="修改切片方式"
           >
@@ -474,7 +489,9 @@ const handleMoveToKb = async (kb) => {
             </button>
           </div>
 
-          <div class="space-y-2 mb-6">
+          <div v-if="sliceTypesLoading" class="mb-6 text-sm text-slate-500">加载切片方式...</div>
+          <div v-else-if="sliceTypesError" class="mb-6 text-sm text-red-500">{{ sliceTypesError }}</div>
+          <div v-else class="space-y-2 mb-6">
             <label
               v-for="type in sliceTypes"
               :key="type.value"
@@ -493,7 +510,7 @@ const handleMoveToKb = async (kb) => {
               />
               <div>
                 <p class="font-medium text-slate-800">{{ type.label }}</p>
-                <p class="text-xs text-slate-500">{{ type.desc }}</p>
+                <p class="text-xs text-slate-500">{{ type.description }}</p>
               </div>
             </label>
           </div>
