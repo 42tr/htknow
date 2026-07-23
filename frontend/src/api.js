@@ -29,6 +29,23 @@ const readErrorMessage = async (response, fallback) => {
 }
 
 export const api = {
+  async getSettings(group = null) {
+    const url = group ? `${API_BASE}/system/settings?group=${encodeURIComponent(group)}` : `${API_BASE}/system/settings`
+    const response = await fetch(url, { headers: getHeaders() })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '获取系统配置失败'))
+    return response.json()
+  },
+
+  async updateSettings(settings) {
+    const response = await fetch(`${API_BASE}/system/settings`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify({ settings }),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '保存系统配置失败'))
+    return response.json()
+  },
+
   // 搜索
   async search(query, kbId = null, fileId = null, options = {}) {
     const { advanced = false } = options

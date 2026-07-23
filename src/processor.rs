@@ -34,6 +34,7 @@ use crate::{
     graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor},
     image_description, image_parse,
     search::{self, SearchEngine, content_looks_like_image_reference, tantivy_engine},
+    settings,
 };
 
 /// 将本地文件构造为流式 multipart Part，避免大文件全量读入内存。
@@ -96,14 +97,13 @@ type RawImageJobs = (Vec<(String, String)>, HashMap<String, String>, Vec<String>
 async fn parse_images_to_descriptions(
     pool: &SqlitePool, file_id: i64, images: &HashMap<String, String>, source: &str,
 ) -> anyhow::Result<HashMap<String, String>> {
-    let cfg = config::get();
-    let Some(parse_url) = cfg.services.image_parse_url.as_deref() else {
-        return Ok(HashMap::new());
-    };
-    if images.is_empty() || parse_url.is_empty() {
+    if settings::image_parse_mode() == "none" {
         return Ok(HashMap::new());
     }
-    let concurrency = cfg.services.image_parse_concurrency.max(1);
+    if images.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let concurrency = settings::image_parse_concurrency().max(1);
 
     let jobs: Vec<(String, String)> = images.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let mut stream = futures::stream::iter(jobs.into_iter().map(|(filename, base64)| {
@@ -148,10 +148,10 @@ async fn parse_images_to_descriptions(
 async fn load_or_parse_image_descriptions(
     pool: &SqlitePool, file_id: i64, image_names: &[String], source: &str,
 ) -> anyhow::Result<HashMap<String, String>> {
-    let mut desc_map = image_description::list_by_file(pool, file_id).await?;
-    if config::get().services.image_parse_url.is_none() {
-        return Ok(desc_map);
+    if settings::image_parse_mode() == "none" {
+        return Ok(HashMap::new());
     }
+    let mut desc_map = image_description::list_by_file(pool, file_id).await?;
 
     for name in image_names {
         if desc_map.contains_key(name) {
@@ -2014,7 +2014,7 @@ impl FileProcessor {
         };
 
         // 上传的图片文件本身也需要被文本化，并生成一个图片切片。
-        if is_image && config::get().services.image_parse_url.is_some() && !file.filename.is_empty() {
+        if is_image && settings::image_parse_mode() != "none" && !file.filename.is_empty() {
             if !desc_map.contains_key(&file.filename) {
                 match image_parse::parse_image_file(Path::new(&file.path), &file.filename, None).await {
                     Ok(resp) => {

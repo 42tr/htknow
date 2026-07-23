@@ -1,14 +1,55 @@
-use axum::{Extension, Json, extract::State, response::Response};
+use axum::{Extension, Json, extract::{Query, State}, response::Response};
 use chrono::Utc;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use utoipa::ToSchema;
 
 use crate::{
     AuthUser, api::{
         common, error::{ApiError, ApiResult}
-    }, search::{SearchEngine, tantivy_engine::ForceMergeStats}
+    }, search::{SearchEngine, tantivy_engine::ForceMergeStats}, settings::{self, SettingItem, UpdateSettingsRequest}
 };
+
+#[derive(Debug, Deserialize)]
+pub struct SettingsQuery {
+    pub group: Option<String>,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct SettingsResponse {
+    pub settings: std::collections::BTreeMap<String, SettingItem>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/system/settings",
+    params(("group" = Option<String>, Query, description = "配置分组")),
+    responses((status = 200, description = "系统配置", body = SettingsResponse)),
+    security(("x-user-id" = [], "x-role" = []))
+)]
+pub async fn get_settings(
+    Query(query): Query<SettingsQuery>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<SettingsResponse>> {
+    common::ensure_admin(&auth_user)?;
+    Ok(Json(SettingsResponse { settings: settings::list(query.group.as_deref()) }))
+}
+
+#[utoipa::path(
+    put,
+    path = "/api/v1/knowledge/system/settings",
+    request_body = UpdateSettingsRequest,
+    responses((status = 200, description = "配置已更新", body = SettingsResponse)),
+    security(("x-user-id" = [], "x-role" = []))
+)]
+pub async fn update_settings(
+    State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Json(req): Json<UpdateSettingsRequest>,
+) -> ApiResult<Json<SettingsResponse>> {
+    common::ensure_admin(&auth_user)?;
+    settings::update(&pool, &auth_user.user_id, &req.settings)
+        .await
+        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    Ok(Json(SettingsResponse { settings: settings::list(None) }))
+}
 
 /// 进程内存占用
 #[derive(Debug, Serialize, ToSchema)]

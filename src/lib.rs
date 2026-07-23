@@ -13,11 +13,13 @@ pub mod frontend;
 pub mod graph;
 pub mod image_description;
 pub mod image_parse;
+pub mod image_ocr;
 pub mod log4rs;
 pub mod pdf_content;
 pub mod pdf_highlight;
 pub mod processor;
 pub mod search;
+pub mod settings;
 pub mod slice_content;
 
 /// User authentication info extracted from request headers

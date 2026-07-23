@@ -74,6 +74,18 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 
 ### 外部服务
 默认值为示例地址，请按实际部署环境调整。
+
+运行中的系统配置可以通过管理员前端“配置”页修改，也可以调用通用接口：
+
+```shell
+GET /api/v1/knowledge/system/settings?group=image_parse
+PUT /api/v1/knowledge/system/settings
+```
+
+运行时配置优先级为：数据库配置 > 环境变量 > 默认值。原有 `HTKNOW_IMAGE_PARSE_URL` 仍作为自定义图片接口的默认配置兼容保留。
+
+图片处理模式使用 `image_parse.*` 配置项：`ocr` 调用 `image_parse.ocr_url` 外部 OCR 接口，`custom` 调用自定义 JSON 接口，`none` 不生成图片文本描述。OCR 接口请求为 `{ "figure_base64": "..." }`，响应为 `{ "data": "ocr结果" }`。
+
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `HTKNOW_MINERU_URL` | `http://192.168.0.46:10001/file_parse` | MinerU PDF 解析 |
@@ -87,6 +99,7 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | `HTKNOW_EMBEDDING_URL` | `http://222.190.139.186:59700/v1/embeddings` | 文本向量服务 |
 | `HTKNOW_IMAGE_EMBEDDING_URL` | `http://192.168.0.46:59802/v1/embeddings/file` | 图片向量服务 |
 | `HTKNOW_RERANK_URL` | `http://222.190.139.186:59600/v1/rerank` | Rerank 服务 |
+| `HTKNOW_IMAGE_OCR_URL` | 空 | OCR 图片文本接口（也可通过系统配置页面设置） |
 
 ### AI 模型
 | 环境变量 | 默认值 | 说明 |

@@ -95,6 +95,8 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
         info!("Skipping default knowledge base initialization");
     }
 
+    crate::settings::init(&pool).await?;
+
     info!("Database initialized successfully");
 
     Ok(pool)

@@ -7,6 +7,7 @@ import FileUpload from './components/FileUpload.vue'
 import KnowledgeGraph from './components/KnowledgeGraph.vue'
 import AdvancedSearchPanel from './components/AdvancedSearchPanel.vue'
 import SearchDictionaryManager from './components/SearchDictionaryManager.vue'
+import SettingsPanel from './components/SettingsPanel.vue'
 import { api } from './api'
 
 const activeTab = ref('search')
@@ -46,6 +47,7 @@ const tabs = [
   { id: 'knowledge', name: '知识库', icon: '📚' },
   { id: 'graph', name: '知识图谱', icon: '🕸️' },
   { id: 'upload', name: '上传', icon: '📤' },
+  { id: 'settings', name: '配置', icon: '⚙️' },
 ]
 
 const handleSearchResults = (results) => {
@@ -307,6 +309,10 @@ const clearAdvanced = () => {
         </div>
 
         <FileUpload />
+      </div>
+
+      <div v-if="activeTab === 'settings'" class="space-y-6">
+        <SettingsPanel />
       </div>
     </main>
 

@@ -93,6 +93,8 @@ use crate::search::SearchEngine;
         system::lancedb_compact,
         system::index_force_merge,
         system::index_rebuild_status,
+        system::get_settings,
+        system::update_settings,
     ),
     components(
         schemas(
@@ -167,6 +169,9 @@ use crate::search::SearchEngine;
             system::TantivyForceMergeIndexStats,
             system::TantivyForceMergeResponse,
             system::IndexRebuildStatus,
+            system::SettingsResponse,
+            crate::settings::SettingItem,
+            crate::settings::UpdateSettingsRequest,
         )
     ),
     tags(
@@ -240,6 +245,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/entities/{id}", get(graph::get_entity))
         .route("/stats", get(graph::get_graph_stats));
     let system_router = Router::new()
+        .route("/settings", get(system::get_settings).put(system::update_settings))
         .route("/heap", get(system::heap_profile))
         .route("/heap/pdf", get(system::heap_profile_pdf))
         .route("/lancedb/compact", post(system::lancedb_compact))
