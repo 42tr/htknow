@@ -47,7 +47,7 @@ fn defaults() -> BTreeMap<String, Value> {
     BTreeMap::from([
         (IMAGE_PARSE_MODE.to_string(), json!(if cfg.services.image_parse_url.is_some() { "custom" } else { "none" })),
         (IMAGE_PARSE_URL.to_string(), json!(cfg.services.image_parse_url)),
-        (IMAGE_OCR_URL.to_string(), json!(std::env::var("HTKNOW_IMAGE_OCR_URL").ok().filter(|v| !v.trim().is_empty()))),
+        (IMAGE_OCR_URL.to_string(), json!(cfg.services.image_ocr_url)),
         (IMAGE_PARSE_TIMEOUT.to_string(), json!(cfg.services.image_parse_timeout_secs)),
         (IMAGE_PARSE_CONCURRENCY.to_string(), json!(cfg.services.image_parse_concurrency)),
     ])

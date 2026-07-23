@@ -95,6 +95,8 @@ pub struct ServicesConfig {
     pub rerank_url: String,
     /// 图片文本化服务地址（可选）
     pub image_parse_url: Option<String>,
+    /// OCR 图片文本服务地址（可选）
+    pub image_ocr_url: Option<String>,
     /// 图片文本化服务超时（秒）
     pub image_parse_timeout_secs: u64,
     /// 图片文本化并发数
@@ -255,6 +257,7 @@ impl ServicesConfig {
             image_embedding_url: env_optional("HTKNOW_IMAGE_EMBEDDING_URL"),
             rerank_url: env_or("HTKNOW_RERANK_URL", "http://222.190.139.186:59600/v1/rerank"),
             image_parse_url: env_optional("HTKNOW_IMAGE_PARSE_URL"),
+            image_ocr_url: env_optional("HTKNOW_IMAGE_OCR_URL"),
             image_parse_timeout_secs: env_or_parse("HTKNOW_IMAGE_PARSE_TIMEOUT_SECS", 120),
             image_parse_concurrency: env_or_parse("HTKNOW_IMAGE_PARSE_CONCURRENCY", 5),
         }
