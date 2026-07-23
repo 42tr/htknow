@@ -177,43 +177,6 @@ async fn load_or_parse_image_descriptions(
     Ok(desc_map)
 }
 
-/// 将图片描述追加到图片切片内容中，使文本 embedding / 倒排索引都能检索到描述。
-fn enrich_content_with_image_descriptions(content: &str, desc_map: &HashMap<String, String>) -> String {
-    if desc_map.is_empty() {
-        return content.to_string();
-    }
-    let mut enriched = content.to_string();
-    let mut appended = Vec::new();
-    for (filename, description) in desc_map {
-        if description.trim().is_empty() {
-            continue;
-        }
-        if enriched.contains(filename) || enriched.contains(&format!("/api/v1/knowledge/files/{}", filename)) {
-            appended.push(format!("{}: {}", filename, description));
-        }
-    }
-    if !appended.is_empty() {
-        enriched.push_str("\n\n图片描述：\n");
-        for line in appended {
-            enriched.push_str(&line);
-            enriched.push('\n');
-        }
-    }
-    enriched
-}
-
-/// 将图片描述追加到 ContentItem 中的图片项。
-fn enrich_content_list_with_image_descriptions(content_list: &mut [ContentItem], desc_map: &HashMap<String, String>) {
-    for item in content_list.iter_mut() {
-        if item.typ == "image"
-            && let Some(img_name) = item.img_path.as_deref()
-            && let Some(description) = desc_map.get(img_name).filter(|s| !s.trim().is_empty())
-        {
-            item.image_caption.get_or_insert_with(Vec::new).push(format!("图片描述：{}", description));
-        }
-    }
-}
-
 async fn claim_pending_file_by_id(pool: &SqlitePool, file_id: i64) -> anyhow::Result<Option<File>> {
     let sql = format!(
         "UPDATE files
@@ -1254,15 +1217,13 @@ impl FileProcessor {
             self.save_custom_images(&normalized.images, timing.as_deref_mut()).await?;
         }
 
-        let image_descriptions =
-            parse_images_to_descriptions(&self.pool, file.id, &normalized.images, "custom").await?;
+        parse_images_to_descriptions(&self.pool, file.id, &normalized.images, "custom").await?;
 
         self.save_custom_slices(
             file,
             &normalized.slices,
             normalized.full_content.as_deref(),
             normalized.summary.as_deref(),
-            &image_descriptions,
             timing,
         )
         .await?;
@@ -1334,7 +1295,6 @@ impl FileProcessor {
             &data.slices,
             data.full_content.as_deref(),
             data.summary.as_deref(),
-            &HashMap::new(),
             timing,
         )
         .await?;
@@ -1598,27 +1558,17 @@ impl FileProcessor {
 
     async fn save_custom_slices(
         &self, file: &File, slices: &[CustomSlice], full_content: Option<&str>, summary: Option<&str>,
-        image_descriptions: &HashMap<String, String>, timing: Option<&mut ParseTimingCtx>,
+        timing: Option<&mut ParseTimingCtx>,
     ) -> anyhow::Result<()> {
         if !self.ensure_file_exists(file.id, "before writing custom slices").await? {
             return Ok(());
         }
 
-        let enriched_slices: Vec<CustomSlice> = slices
-            .iter()
-            .map(|slice| {
-                let content = enrich_content_with_image_descriptions(&slice.content, image_descriptions);
-                CustomSlice { content, positions: slice.positions.clone() }
-            })
-            .collect();
-
         let derived_full_content = match full_content {
-            Some(content) if !content.trim().is_empty() => {
-                enrich_content_with_image_descriptions(content, image_descriptions)
-            }
+            Some(content) if !content.trim().is_empty() => content.to_string(),
             _ => {
                 let mut combined = String::new();
-                for (idx, slice) in enriched_slices.iter().enumerate() {
+                for (idx, slice) in slices.iter().enumerate() {
                     if idx > 0 {
                         combined.push_str("\n\n");
                     }
@@ -1628,7 +1578,7 @@ impl FileProcessor {
             }
         };
 
-        let wrapped: Vec<SliceWithPositions> = enriched_slices
+        let wrapped: Vec<SliceWithPositions> = slices
             .iter()
             .map(|slice| {
                 let content = slice.content.clone();
@@ -2085,9 +2035,7 @@ impl FileProcessor {
                     Err(err) => warn!("Failed to parse upload image {}: {}", file.filename, err),
                 }
             }
-            if !content_list.iter().any(|item| item.typ == "image" && item.img_path.as_deref() == Some(&file.filename))
-            {
-                let caption = desc_map.get(&file.filename).cloned().unwrap_or_default();
+            if !content_list.iter().any(|item| item.typ == "image" && item.img_path.as_deref() == Some(&file.filename)) {
                 content_list.push(ContentItem {
                     typ: "image".to_string(),
                     bbox: vec![],
@@ -2096,18 +2044,12 @@ impl FileProcessor {
                     text_level: None,
                     text_format: None,
                     img_path: Some(file.filename.clone()),
-                    image_caption: if caption.is_empty() {
-                        None
-                    } else {
-                        Some(vec![format!("图片描述：{}", caption)])
-                    },
+                    image_caption: None,
                     table_body: None,
                     table_caption: None,
                 });
             }
         }
-
-        enrich_content_list_with_image_descriptions(&mut content_list, &desc_map);
 
         // 构建全文与切片均为 CPU 密集操作，合并放到阻塞线程池执行，避免阻塞异步运行时。
         // content_list 在此之后不再使用，直接移入闭包。
