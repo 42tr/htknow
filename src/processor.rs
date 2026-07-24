@@ -1,12 +1,7 @@
 use std::{
-    collections::{HashMap, HashSet},
-    future::Future,
-    path::Path,
-    sync::{
-        Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
-    },
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    collections::{HashMap, HashSet}, future::Future, path::Path, sync::{
+        Arc, atomic::{AtomicBool, AtomicU64, Ordering}
+    }, time::{Duration, Instant, SystemTime, UNIX_EPOCH}
 };
 
 use aho_corasick::{AhoCorasick, MatchKind};
@@ -19,22 +14,13 @@ use reqwest::multipart;
 use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tokio::{
-    fs,
-    io::{AsyncBufReadExt, AsyncReadExt},
-    time,
+    fs, io::{AsyncBufReadExt, AsyncReadExt}, time
 };
 
 use crate::{
     api::{
-        FILE_COLS_NO_CONTENT, File, collect_image_paths_for_files, collect_image_raw_paths_for_files,
-        effective_parse_file_id, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path,
-        update_file_custom_image_meta,
-    },
-    archive, config,
-    graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor},
-    image_description, image_parse,
-    search::{self, SearchEngine, content_looks_like_image_reference, tantivy_engine},
-    settings,
+        FILE_COLS_NO_CONTENT, File, collect_image_paths_for_files, collect_image_raw_paths_for_files, effective_parse_file_id, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta
+    }, archive, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, image_description, image_parse, search::{self, SearchEngine, content_looks_like_image_reference, tantivy_engine}, settings
 };
 
 /// 将本地文件构造为流式 multipart Part，避免大文件全量读入内存。
@@ -327,8 +313,7 @@ struct RawSlicePosition {
 
 fn deserialize_slice_positions<'de, D>(deserializer: D) -> std::result::Result<Vec<SlicePosition>, D::Error>
 where
-    D: Deserializer<'de>,
-{
+    D: Deserializer<'de>, {
     let raw_positions: Option<Vec<RawSlicePosition>> = Option::deserialize(deserializer)?;
     let mut positions = Vec::new();
     if let Some(raw_positions) = raw_positions {
@@ -522,8 +507,7 @@ impl ParseTimingCtx {
 
     async fn step<T, Fut>(&mut self, step: &'static str, fut: Fut) -> anyhow::Result<T>
     where
-        Fut: Future<Output = anyhow::Result<T>>,
-    {
+        Fut: Future<Output=anyhow::Result<T>>, {
         let (seq, started_at) = self.step_start(step);
         match fut.await {
             Ok(value) => {
@@ -538,10 +522,11 @@ impl ParseTimingCtx {
     }
 }
 
-async fn timed_step_opt<T, Fut>(timing: Option<&mut ParseTimingCtx>, step: &'static str, fut: Fut) -> anyhow::Result<T>
+async fn timed_step_opt<T, Fut>(
+    timing: Option<&mut ParseTimingCtx>, step: &'static str, fut: Fut,
+) -> anyhow::Result<T>
 where
-    Fut: Future<Output = anyhow::Result<T>>,
-{
+    Fut: Future<Output=anyhow::Result<T>>, {
     match timing {
         Some(ctx) => ctx.step(step, fut).await,
         None => fut.await,
@@ -883,7 +868,7 @@ impl FileProcessor {
         }
 
         let cfg = config::get();
-        let configured_concurrency = cfg.server.process_concurrency.max(1);
+        let configured_concurrency = settings::file_parse_concurrency().max(1);
         let db_safe_concurrency = (cfg.database.max_connections as usize).saturating_sub(2).max(1);
         let concurrency = configured_concurrency.min(db_safe_concurrency);
         if concurrency < configured_concurrency {
@@ -1062,13 +1047,20 @@ impl FileProcessor {
             let is_presentation = filename_lower.ends_with(".ppt") || filename_lower.ends_with(".pptx");
             let is_excel = filename_lower.ends_with(".xls") || filename_lower.ends_with(".xlsx");
 
-            let cfg = config::get();
-            let custom_url = cfg.services.custom_parse_url.as_deref();
-            let custom_reuse_url = cfg.services.custom_parse_reuse_url.as_deref();
+            let custom_url = if settings::file_parse_mode() == "custom" {
+                settings::file_parse_custom_url()
+            } else {
+                None
+            };
+            let custom_reuse_url = if settings::file_parse_mode() == "custom" {
+                settings::file_parse_custom_reuse_url()
+            } else {
+                None
+            };
 
             if let Some(reuse_url) = custom_reuse_url {
                 info!("Custom parse reuse enabled");
-                match self.process_file_with_custom_reuse_parser(file, reuse_url, Some(&mut timing)).await {
+                match self.process_file_with_custom_reuse_parser(file, &reuse_url, Some(&mut timing)).await {
                     Ok(true) => {
                         timing.set_pipeline("custom_reuse");
                         info!(
@@ -1110,7 +1102,7 @@ impl FileProcessor {
 
                     timing.set_pipeline("custom_parser");
                     info!("Custom parse enabled, routing converted PDF for file {} to {}", file.id, custom_url);
-                    self.process_file_with_custom_parser(&temp_file, custom_url, Some(&mut timing)).await?;
+                    self.process_file_with_custom_parser(&temp_file, &custom_url, Some(&mut timing)).await?;
                     return Ok(());
                 }
 
@@ -1138,7 +1130,7 @@ impl FileProcessor {
             {
                 timing.set_pipeline("custom_parser");
                 info!("Custom parse enabled, routing file {} to {}", file.id, custom_url);
-                self.process_file_with_custom_parser(file, custom_url, Some(&mut timing)).await?;
+                self.process_file_with_custom_parser(file, &custom_url, Some(&mut timing)).await?;
                 return Ok(());
             }
 
@@ -1167,7 +1159,7 @@ impl FileProcessor {
                     info!("Image embedding URL not configured, skipping image embedding for file {}", file.id);
                     None
                 };
-                self.process_pdf_file(file, image_embedding, true, None, Some(&mut timing)).await?;
+                self.process_image_file(file, image_embedding, Some(&mut timing)).await?;
             } else if is_audio {
                 timing.set_pipeline("audio");
                 if !self.ensure_file_exists(file.id, "before audio processing").await? {
@@ -1290,14 +1282,8 @@ impl FileProcessor {
             return Err(anyhow::anyhow!("Custom parse reuse API returned empty slices and summary"));
         }
 
-        self.save_custom_slices(
-            file,
-            &data.slices,
-            data.full_content.as_deref(),
-            data.summary.as_deref(),
-            timing,
-        )
-        .await?;
+        self.save_custom_slices(file, &data.slices, data.full_content.as_deref(), data.summary.as_deref(), timing)
+            .await?;
 
         Ok(true)
     }
@@ -1676,7 +1662,9 @@ impl FileProcessor {
         let stored_pdf_path = pdf_dir.join(&pdf_filename);
         let temp_pdf_path = pdf_dir.join(format!(".{}.pdf.tmp", file.id));
         let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string();
-        let mut convert_url = reqwest::Url::parse(&cfg.services.office_convert_url)?;
+        let office_convert_url = settings::file_parse_office_convert_url()
+            .ok_or_else(|| anyhow::anyhow!("file_parse.office_convert_url is not configured"))?;
+        let mut convert_url = reqwest::Url::parse(&office_convert_url)?;
         if !convert_url.query_pairs().any(|(key, _)| key == "target_format") {
             convert_url.query_pairs_mut().append_pair("target_format", "pdf");
         }
@@ -1875,6 +1863,60 @@ impl FileProcessor {
     }
 
     /// 处理 PDF 文件，调用 MinerU API
+    async fn process_image_file(
+        &self, file: &File, image_embedding: Option<Arc<Vec<f32>>>, mut timing: Option<&mut ParseTimingCtx>,
+    ) -> anyhow::Result<()> {
+        if !self.ensure_file_exists(file.id, "image processing start").await? {
+            return Ok(());
+        }
+
+        let description = match timed_step_opt(
+            timing.as_deref_mut(),
+            "parse_image",
+            image_parse::parse_image_file(Path::new(&file.path), &file.filename, None),
+        )
+        .await
+        {
+            Ok(response) => {
+                if !response.description.trim().is_empty()
+                    && let Err(err) = image_description::save(
+                        &self.pool,
+                        file.id,
+                        &file.filename,
+                        &response.description,
+                        &response.raw_response,
+                        "upload",
+                    )
+                    .await
+                {
+                    warn!("Failed to save image description for {}: {}", file.filename, err);
+                }
+                response.description
+            }
+            Err(err) => {
+                warn!("Failed to parse image {}: {}", file.filename, err);
+                String::new()
+            }
+        };
+
+        let image_ref = format!("![{}](/api/v1/knowledge/files/{})", file.filename, file.filename);
+        let full_content =
+            if description.trim().is_empty() { image_ref } else { format!("{}\n{}", image_ref, description.trim()) };
+        let slices = vec![SliceWithPositions { content: full_content.clone(), positions: vec![], is_image: true }];
+        self.finish_file_processing(
+            file,
+            slices,
+            vec![image_embedding],
+            &full_content,
+            "Image processed successfully",
+            None,
+            None,
+            timing,
+        )
+        .await
+    }
+
+    /// 处理 PDF 文件，调用 MinerU API
     async fn process_pdf_file(
         &self, file: &File, image_embedding: Option<Arc<Vec<f32>>>, is_image: bool, index_filename: Option<&str>,
         mut timing: Option<&mut ParseTimingCtx>,
@@ -2035,7 +2077,8 @@ impl FileProcessor {
                     Err(err) => warn!("Failed to parse upload image {}: {}", file.filename, err),
                 }
             }
-            if !content_list.iter().any(|item| item.typ == "image" && item.img_path.as_deref() == Some(&file.filename)) {
+            if !content_list.iter().any(|item| item.typ == "image" && item.img_path.as_deref() == Some(&file.filename))
+            {
                 content_list.push(ContentItem {
                     typ: "image".to_string(),
                     bbox: vec![],
@@ -2098,18 +2141,18 @@ impl FileProcessor {
     async fn call_mineru_api(
         &self, file: &File, is_image: bool, mut timing: Option<&mut ParseTimingCtx>,
     ) -> anyhow::Result<Result> {
-        let cfg = config::get();
+        let max_pages = settings::file_parse_mineru_max_pages();
 
-        if !is_image && cfg.services.mineru_max_pages > 0 {
+        if !is_image && max_pages > 0 {
             // lopdf 解析整个 PDF 是同步阻塞操作（仅用于获取页数），放到阻塞线程池
             let path = file.path.clone();
             let page_count =
                 tokio::task::spawn_blocking(move || Document::load(&path).map(|doc| doc.get_pages().len())).await?;
             match page_count {
                 Ok(total_pages) => {
-                    if total_pages > cfg.services.mineru_max_pages {
+                    if total_pages > max_pages {
                         return timed_step_opt(timing.as_deref_mut(), "mineru_api_in_ranges", async {
-                            self.call_mineru_api_in_ranges(file, total_pages, cfg.services.mineru_max_pages).await
+                            self.call_mineru_api_in_ranges(file, total_pages, max_pages).await
                         })
                         .await;
                     }
@@ -2184,8 +2227,9 @@ impl FileProcessor {
     async fn call_mineru_api_with_path(
         &self, file_path: &str, filename: &str, is_image: bool, start_page: Option<usize>, end_page: Option<usize>,
     ) -> anyhow::Result<Result> {
-        let cfg = config::get();
-        let mineru_url = cfg.services.mineru_url.trim_end_matches('/');
+        let mineru_url = settings::file_parse_mineru_url()
+            .ok_or_else(|| anyhow::anyhow!("file_parse.mineru_url is not configured"))?;
+        let mineru_url = mineru_url.trim_end_matches('/');
 
         let client = self.services_http_client()?;
         if mineru_url.ends_with("/file_parse") {

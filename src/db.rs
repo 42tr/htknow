@@ -1,15 +1,11 @@
 use std::{
-    collections::HashSet,
-    fs::OpenOptions,
-    path::{Path, PathBuf},
-    time::Duration,
+    collections::HashSet, fs::OpenOptions, path::{Path, PathBuf}, time::Duration
 };
 
 use anyhow::Context;
 use log::info;
 use sqlx::{
-    QueryBuilder, Row, Sqlite, SqlitePool,
-    sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous},
+    QueryBuilder, Row, Sqlite, SqlitePool, sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous}
 };
 
 use crate::config;
@@ -901,8 +897,7 @@ pub async fn batch_insert_with_returning<T, BindFn>(
     tx: &mut sqlx::Transaction<'_, Sqlite>, prefix_sql: &str, rows: &[T], binds_per_row: usize, mut bind: BindFn,
 ) -> anyhow::Result<Vec<i64>>
 where
-    BindFn: FnMut(&mut QueryBuilder<'_, Sqlite>, &T),
-{
+    BindFn: FnMut(&mut QueryBuilder<'_, Sqlite>, &T), {
     if rows.is_empty() {
         return Ok(Vec::new());
     }

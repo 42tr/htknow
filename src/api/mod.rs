@@ -1,6 +1,5 @@
 use axum::{
-    Extension, Router,
-    routing::{delete, get, post, put},
+    Extension, Router, routing::{delete, get, post, put}
 };
 use sqlx::SqlitePool;
 use utoipa::OpenApi;
@@ -15,9 +14,7 @@ mod system;
 // 重新导出 File 类型供其他模块使用
 pub use file::File;
 pub(crate) use file::{
-    FILE_COLS_NO_CONTENT, backfill_missing_image_meta_for_files, collect_image_paths_for_files,
-    collect_image_raw_paths_for_files, effective_parse_file_id, find_reusable_parsed_file, remove_image_files,
-    resolve_image_storage_path, update_file_custom_image_meta,
+    FILE_COLS_NO_CONTENT, backfill_missing_image_meta_for_files, collect_image_paths_for_files, collect_image_raw_paths_for_files, effective_parse_file_id, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta
 };
 
 use crate::search::SearchEngine;

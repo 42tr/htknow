@@ -1,18 +1,10 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
-    io::{Seek, Write},
-    path::Component,
-    sync::{Arc, OnceLock},
-    time::Instant,
+    collections::{BTreeMap, HashMap, HashSet}, io::{Seek, Write}, path::Component, sync::{Arc, Mutex, OnceLock}, time::Instant
 };
 
 use anyhow::Result as AnyResult;
 use axum::{
-    Extension,
-    body::Body,
-    extract::{Multipart, Path, Query, State},
-    http::{StatusCode, header},
-    response::Json,
+    Extension, body::Body, extract::{Multipart, Path, Query, State}, http::{StatusCode, header}, response::Json
 };
 use bytes::Bytes;
 use log::{debug, error, info, warn};
@@ -21,22 +13,14 @@ use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use tempfile::NamedTempFile;
 use tokio::{
-    fs,
-    io::AsyncWriteExt as _,
-    spawn,
-    sync::{OwnedSemaphorePermit, Semaphore},
+    fs, io::AsyncWriteExt as _, spawn, sync::{OwnedSemaphorePermit, Semaphore}
 };
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    AuthUser,
-    api::{
-        common,
-        error::{ApiError, ApiResult},
-    },
-    archive::{self, ArchiveEntry, ExtractResult},
-    config, pdf_highlight, processor,
-    search::SearchEngine,
+    AuthUser, api::{
+        common, error::{ApiError, ApiResult}
+    }, archive::{self, ArchiveEntry, ExtractResult}, config, pdf_highlight, processor, search::SearchEngine
 };
 
 /// 以流式方式打开文件，返回 (字节数, Body)。
@@ -369,16 +353,17 @@ pub async fn get_file_status_breakdown_for_unassigned(
     query_file_status_breakdown(pool, FileStatsScope::UnassignedOnly, user_id, is_admin).await
 }
 
-static BACKGROUND_REUSE_SEMAPHORE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+static BACKGROUND_REUSE_SEMAPHORE: OnceLock<Mutex<(usize, Arc<Semaphore>)>> = OnceLock::new();
 
 fn background_reuse_semaphore() -> Arc<Semaphore> {
-    BACKGROUND_REUSE_SEMAPHORE
-        .get_or_init(|| {
-            let cfg = config::get();
-            let limit = cfg.server.process_concurrency.max(1).min(cfg.database.max_connections as usize).max(1);
-            Arc::new(Semaphore::new(limit))
-        })
-        .clone()
+    let cfg = config::get();
+    let limit = crate::settings::file_parse_concurrency().max(1).min(cfg.database.max_connections as usize).max(1);
+    let state = BACKGROUND_REUSE_SEMAPHORE.get_or_init(|| Mutex::new((limit, Arc::new(Semaphore::new(limit)))));
+    let mut state = state.lock().expect("background reuse semaphore lock poisoned");
+    if state.0 != limit {
+        *state = (limit, Arc::new(Semaphore::new(limit)));
+    }
+    state.1.clone()
 }
 
 async fn acquire_background_reuse_permit(semaphore: Arc<Semaphore>, file_id: i64) -> Option<OwnedSemaphorePermit> {
@@ -746,7 +731,7 @@ pub async fn upload(
     if immediate_parse || sync {
         if sync {
             let reuse_already_tried = reuse_duplicates;
-            let concurrency = config::get().server.process_concurrency.max(1);
+            let concurrency = crate::settings::file_parse_concurrency().max(1);
             let semaphore = Arc::new(Semaphore::new(concurrency));
             let mut handles = Vec::with_capacity(parse_file_ids.len());
             for file_id in parse_file_ids {

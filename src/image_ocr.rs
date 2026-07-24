@@ -28,9 +28,7 @@ pub async fn parse_base64(image_base64: &str) -> Result<crate::image_parse::Imag
         .filter(|c| !c.is_whitespace())
         .collect::<String>();
     let decoded_data = STANDARD.decode(&payload).context("invalid image base64")?;
-    let request = OcrRequest {
-        figure_base64: STANDARD.encode(decoded_data),
-    };
+    let request = OcrRequest { figure_base64: STANDARD.encode(decoded_data) };
 
     let response = HTTP_CLIENT
         .post(&url)

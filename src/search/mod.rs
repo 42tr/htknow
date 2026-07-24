@@ -1,9 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
-    fs,
-    path::Path,
-    sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    collections::{HashMap, HashSet}, fs, path::Path, sync::Arc, time::{Duration, Instant, SystemTime, UNIX_EPOCH}
 };
 
 use anyhow::{Context, anyhow};
@@ -668,9 +664,8 @@ impl SearchEngine {
 
     pub async fn rebuild_tantivy_indexes<F, Fut>(&self, job_tag: &str, mut on_progress: F) -> anyhow::Result<()>
     where
-        F: FnMut(RebuildProgress) -> Fut + Send,
-        Fut: std::future::Future<Output = ()> + Send,
-    {
+        F: FnMut(RebuildProgress) -> Fut+Send,
+        Fut: std::future::Future<Output=()>+Send, {
         let Some(pool) = &self.pool else {
             return Err(anyhow!("search engine db pool not set"));
         };

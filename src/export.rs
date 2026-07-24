@@ -2,8 +2,7 @@ use std::{collections::HashMap, path::Path, sync::Arc};
 
 use anyhow::Context;
 use arrow_array::{
-    ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray,
-    builder::{FixedSizeListBuilder, Float32Builder},
+    ArrayRef, BooleanArray, Int64Array, RecordBatch, StringArray, builder::{FixedSizeListBuilder, Float32Builder}
 };
 use arrow_schema::{DataType, Schema as ArrowSchema};
 use futures::stream::StreamExt;
@@ -11,18 +10,12 @@ use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use sqlx::{Encode, QueryBuilder, Row, Sqlite, SqlitePool, Type, sqlite::SqlitePoolOptions};
 use tantivy::{
-    TantivyDocument, Term,
-    collector::TopDocs,
-    doc,
-    query::{BooleanQuery, Occur, Query, TermQuery},
-    schema::{IndexRecordOption, Value as _},
+    TantivyDocument, Term, collector::TopDocs, doc, query::{BooleanQuery, Occur, Query, TermQuery}, schema::{IndexRecordOption, Value as _}
 };
 use utoipa::ToSchema;
 
 use crate::{
-    api::{backfill_missing_image_meta_for_files, collect_image_raw_paths_for_files},
-    config,
-    search::tantivy_engine,
+    api::{backfill_missing_image_meta_for_files, collect_image_raw_paths_for_files}, config, search::tantivy_engine
 };
 
 const EXPORT_MANIFEST_FILENAME: &str = "manifest.json";
@@ -726,8 +719,7 @@ struct RowBinder<'qb, 'args> {
 impl<'qb, 'args> RowBinder<'qb, 'args> {
     fn push_bind<T>(&mut self, value: T) -> &mut Self
     where
-        T: 'args + Send + Encode<'args, Sqlite> + Type<Sqlite>,
-    {
+        T: 'args+Send+Encode<'args, Sqlite>+Type<Sqlite>, {
         if !self.first {
             self.qb.push(", ");
         }
@@ -742,8 +734,7 @@ async fn batch_insert_rows<Src>(
     insert_or_ignore: bool,
 ) -> Result<(), sqlx::Error>
 where
-    Src: Clone,
-{
+    Src: Clone, {
     if rows.is_empty() {
         return Ok(());
     }
