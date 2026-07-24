@@ -21,6 +21,7 @@ pub struct SettingItem {
     pub group: &'static str,
     pub editable: bool,
     pub source: &'static str,
+    pub secret: bool,
 }
 
 #[derive(Debug, Deserialize, ToSchema)]
@@ -40,21 +41,31 @@ pub const FILE_PARSE_CONCURRENCY: &str = "file_parse.concurrency";
 pub const FILE_PARSE_MINERU_MAX_PAGES: &str = "file_parse.mineru_max_pages";
 pub const FILE_PARSE_MINERU_URL: &str = "file_parse.mineru_url";
 pub const FILE_PARSE_OFFICE_CONVERT_URL: &str = "file_parse.office_convert_url";
+pub const SERVICE_AUDIO_URL: &str = "services.audio_transcription_url";
+pub const SERVICE_AUDIO_KEY: &str = "services.audio_transcription_key";
+pub const SERVICE_EMBEDDING_URL: &str = "services.embedding_url";
+pub const SERVICE_IMAGE_EMBEDDING_URL: &str = "services.image_embedding_url";
+pub const SERVICE_RERANK_URL: &str = "services.rerank_url";
 
-fn definitions() -> BTreeMap<&'static str, (&'static str, &'static str)> {
+fn definitions() -> BTreeMap<&'static str, (&'static str, &'static str, bool)> {
     BTreeMap::from([
-        (IMAGE_PARSE_MODE, ("image_parse", "enum")),
-        (IMAGE_PARSE_URL, ("image_parse", "url")),
-        (IMAGE_OCR_URL, ("image_parse", "url")),
-        (IMAGE_PARSE_TIMEOUT, ("image_parse", "integer")),
-        (IMAGE_PARSE_CONCURRENCY, ("image_parse", "integer")),
-        (FILE_PARSE_MODE, ("file_parse", "file_mode")),
-        (FILE_PARSE_CUSTOM_URL, ("file_parse", "url")),
-        (FILE_PARSE_CUSTOM_REUSE_URL, ("file_parse", "url")),
-        (FILE_PARSE_CONCURRENCY, ("file_parse", "integer")),
-        (FILE_PARSE_MINERU_MAX_PAGES, ("file_parse", "integer")),
-        (FILE_PARSE_MINERU_URL, ("file_parse", "url")),
-        (FILE_PARSE_OFFICE_CONVERT_URL, ("file_parse", "url")),
+        (IMAGE_PARSE_MODE, ("image_parse", "enum", false)),
+        (IMAGE_PARSE_URL, ("image_parse", "url", false)),
+        (IMAGE_OCR_URL, ("image_parse", "url", false)),
+        (IMAGE_PARSE_TIMEOUT, ("image_parse", "integer", false)),
+        (IMAGE_PARSE_CONCURRENCY, ("image_parse", "integer", false)),
+        (FILE_PARSE_MODE, ("file_parse", "file_mode", false)),
+        (FILE_PARSE_CUSTOM_URL, ("file_parse", "url", false)),
+        (FILE_PARSE_CUSTOM_REUSE_URL, ("file_parse", "url", false)),
+        (FILE_PARSE_CONCURRENCY, ("file_parse", "integer", false)),
+        (FILE_PARSE_MINERU_MAX_PAGES, ("file_parse", "integer", false)),
+        (FILE_PARSE_MINERU_URL, ("file_parse", "url", false)),
+        (FILE_PARSE_OFFICE_CONVERT_URL, ("file_parse", "url", false)),
+        (SERVICE_AUDIO_URL, ("services", "url", false)),
+        (SERVICE_AUDIO_KEY, ("services", "secret", true)),
+        (SERVICE_EMBEDDING_URL, ("services", "url", false)),
+        (SERVICE_IMAGE_EMBEDDING_URL, ("services", "url", false)),
+        (SERVICE_RERANK_URL, ("services", "url", false)),
     ])
 }
 
@@ -73,6 +84,11 @@ fn defaults() -> BTreeMap<String, Value> {
         (FILE_PARSE_MINERU_MAX_PAGES.to_string(), json!(cfg.services.mineru_max_pages)),
         (FILE_PARSE_MINERU_URL.to_string(), json!(cfg.services.mineru_url)),
         (FILE_PARSE_OFFICE_CONVERT_URL.to_string(), json!(cfg.services.office_convert_url)),
+        (SERVICE_AUDIO_URL.to_string(), json!(cfg.services.audio_transcription_url)),
+        (SERVICE_AUDIO_KEY.to_string(), json!(cfg.services.audio_transcription_key)),
+        (SERVICE_EMBEDDING_URL.to_string(), json!(cfg.services.embedding_url)),
+        (SERVICE_IMAGE_EMBEDDING_URL.to_string(), json!(cfg.services.image_embedding_url)),
+        (SERVICE_RERANK_URL.to_string(), json!(cfg.services.rerank_url)),
     ])
 }
 
@@ -160,16 +176,37 @@ pub fn file_parse_office_convert_url() -> Option<String> {
         .filter(|v| !v.trim().is_empty())
 }
 
+pub fn audio_transcription_url() -> Option<String> {
+    get(SERVICE_AUDIO_URL).and_then(|v| v.as_str().map(str::to_owned)).filter(|v| !v.trim().is_empty())
+}
+
+pub fn audio_transcription_key() -> Option<String> {
+    get(SERVICE_AUDIO_KEY).and_then(|v| v.as_str().map(str::to_owned)).filter(|v| !v.is_empty())
+}
+
+pub fn embedding_url() -> Option<String> {
+    get(SERVICE_EMBEDDING_URL).and_then(|v| v.as_str().map(str::to_owned)).filter(|v| !v.trim().is_empty())
+}
+
+pub fn image_embedding_url() -> Option<String> {
+    get(SERVICE_IMAGE_EMBEDDING_URL).and_then(|v| v.as_str().map(str::to_owned)).filter(|v| !v.trim().is_empty())
+}
+
+pub fn rerank_url() -> Option<String> {
+    get(SERVICE_RERANK_URL).and_then(|v| v.as_str().map(str::to_owned)).filter(|v| !v.trim().is_empty())
+}
+
 pub fn validate(updates: &BTreeMap<String, Value>) -> anyhow::Result<()> {
     let defs = definitions();
     for (key, value) in updates {
-        let Some((_, value_type)) = defs.get(key.as_str()) else {
+        let Some((_, value_type, _)) = defs.get(key.as_str()) else {
             anyhow::bail!("unknown setting: {}", key);
         };
         match (*value_type, value) {
             ("enum", Value::String(v)) if ["ocr", "custom", "none"].contains(&v.as_str()) => {}
             ("file_mode", Value::String(v)) if ["mineru", "default", "custom"].contains(&v.as_str()) => {}
             ("url", Value::String(v)) if v.is_empty() || v.starts_with("http://") || v.starts_with("https://") => {}
+            ("secret", Value::String(_)) => {}
             ("integer", Value::Number(v)) if v.as_u64().is_some() => {}
             _ => anyhow::bail!("invalid value for setting: {}", key),
         }
@@ -239,14 +276,15 @@ pub fn list(group: Option<&str>) -> BTreeMap<String, SettingItem> {
     let values = SETTINGS.get().and_then(|s| s.read().ok()).map(|v| v.clone()).unwrap_or_else(defaults);
     definitions()
         .into_iter()
-        .filter(|(_, (g, _))| group.is_none_or(|wanted| wanted == *g))
-        .map(|(key, (group, value_type))| {
+        .filter(|(_, (g, _, _))| group.is_none_or(|wanted| wanted == *g))
+        .map(|(key, (group, value_type, secret))| {
             (key.to_string(), SettingItem {
-                value: values.get(key).cloned().unwrap_or(Value::Null),
+                value: if secret { Value::Null } else { values.get(key).cloned().unwrap_or(Value::Null) },
                 value_type,
                 group,
                 editable: true,
                 source: "runtime",
+                secret,
             })
         })
         .collect()

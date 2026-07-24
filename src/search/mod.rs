@@ -1437,7 +1437,9 @@ impl SearchEngine {
         }
 
         // 根据 URL 后缀判断使用哪种 rerank 接口格式
-        let use_v1_format = cfg.services.rerank_url.ends_with("/v1/rerank");
+        let rerank_url = crate::settings::rerank_url()
+            .ok_or_else(|| anyhow!("services.rerank_url is not configured"))?;
+        let use_v1_format = rerank_url.ends_with("/v1/rerank");
 
         // 调用 BGE-Rerank API
         let rerank_http_start = Instant::now();
@@ -1448,7 +1450,7 @@ impl SearchEngine {
                 documents: documents.clone(),
             };
             RERANK_HTTP_CLIENT
-                .post(&cfg.services.rerank_url)
+                .post(&rerank_url)
                 .timeout(Duration::from_secs(cfg.search.rerank_timeout_secs))
                 .json(&rerank_request)
                 .send()
@@ -1456,7 +1458,7 @@ impl SearchEngine {
         } else {
             let rerank_request = SimpleRerankRequest { query: query.to_string(), texts: documents.clone() };
             RERANK_HTTP_CLIENT
-                .post(&cfg.services.rerank_url)
+                .post(&rerank_url)
                 .timeout(Duration::from_secs(cfg.search.rerank_timeout_secs))
                 .json(&rerank_request)
                 .send()

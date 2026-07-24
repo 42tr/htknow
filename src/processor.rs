@@ -2528,9 +2528,10 @@ impl FileProcessor {
         let form = multipart::Form::new().part("file", file_part);
 
         let client = self.services_http_client()?;
-        let cfg = config::get();
-        let mut req_builder = client.post(&cfg.services.audio_transcription_url).multipart(form);
-        if let Some(key) = &cfg.services.audio_transcription_key
+        let audio_url = settings::audio_transcription_url()
+            .ok_or_else(|| anyhow::anyhow!("services.audio_transcription_url is not configured"))?;
+        let mut req_builder = client.post(&audio_url).multipart(form);
+        if let Some(key) = settings::audio_transcription_key()
             && !key.is_empty()
         {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", key));

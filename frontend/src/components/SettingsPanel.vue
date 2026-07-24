@@ -10,6 +10,7 @@ const activeEditor = ref('')
 const form = reactive({
   mode: 'none', url: '', ocr_url: '', timeout_secs: 120, concurrency: 5,
   file_mode: 'mineru', custom_url: '', custom_reuse_url: '', mineru_url: '', office_convert_url: '', file_concurrency: 1, mineru_max_pages: 50,
+  audio_url: '', audio_key: '', embedding_url: '', image_embedding_url: '', rerank_url: '',
 })
 
 const isCustom = computed(() => form.mode === 'custom')
@@ -20,9 +21,10 @@ const load = async () => {
   loading.value = true
   error.value = ''
   try {
-    const [imageData, fileData] = await Promise.all([api.getSettings('image_parse'), api.getSettings('file_parse')])
+    const [imageData, fileData, serviceData] = await Promise.all([api.getSettings('image_parse'), api.getSettings('file_parse'), api.getSettings('services')])
     const settings = imageData.settings || {}
     const fileSettings = fileData.settings || {}
+    const serviceSettings = serviceData.settings || {}
     form.mode = settings['image_parse.mode']?.value || 'none'
     form.url = settings['image_parse.url']?.value || ''
     form.ocr_url = settings['image_parse.ocr_url']?.value || ''
@@ -35,6 +37,10 @@ const load = async () => {
     form.office_convert_url = fileSettings['file_parse.office_convert_url']?.value || ''
     form.file_concurrency = fileSettings['file_parse.concurrency']?.value || 1
     form.mineru_max_pages = fileSettings['file_parse.mineru_max_pages']?.value ?? 50
+    form.audio_url = serviceSettings['services.audio_transcription_url']?.value || ''
+    form.embedding_url = serviceSettings['services.embedding_url']?.value || ''
+    form.image_embedding_url = serviceSettings['services.image_embedding_url']?.value || ''
+    form.rerank_url = serviceSettings['services.rerank_url']?.value || ''
   } catch (err) {
     error.value = err.message || '读取配置失败'
   } finally {
@@ -69,6 +75,20 @@ const save = async () => {
     error.value = '文件解析复用接口地址必须以 http:// 或 https:// 开头'
     return
   }
+  for (const [label, value] of [
+    ['音频转写', form.audio_url],
+    ['文本 Embedding', form.embedding_url],
+    ['Rerank', form.rerank_url],
+  ]) {
+    if (!/^https?:\/\//i.test(value.trim())) {
+      error.value = `${label}接口地址必须以 http:// 或 https:// 开头`
+      return
+    }
+  }
+  if (form.image_embedding_url.trim() && !/^https?:\/\//i.test(form.image_embedding_url.trim())) {
+    error.value = '图片 Embedding 接口地址必须以 http:// 或 https:// 开头'
+    return
+  }
   saving.value = true
   try {
     const updates = {
@@ -80,6 +100,13 @@ const save = async () => {
       'file_parse.mode': form.file_mode,
       'file_parse.concurrency': Number(form.file_concurrency),
       'file_parse.office_convert_url': form.office_convert_url.trim(),
+      'services.audio_transcription_url': form.audio_url.trim(),
+      'services.embedding_url': form.embedding_url.trim(),
+      'services.image_embedding_url': form.image_embedding_url.trim(),
+      'services.rerank_url': form.rerank_url.trim(),
+    }
+    if (form.audio_key.trim()) {
+      updates['services.audio_transcription_key'] = form.audio_key.trim()
     }
     if (form.file_mode === 'mineru') {
       updates['file_parse.mineru_url'] = form.mineru_url.trim()
@@ -265,6 +292,70 @@ Content-Type: application/json
         <p class="mt-1 text-xs font-normal text-slate-500">Word/PPT 文件在进入 MinerU 或自定义解析接口前，会先转换为 PDF。</p>
       </div>
       <p class="mt-4 text-sm text-slate-500">文件解析配置将在后续文件处理或重新解析时生效。</p>
+    </div>
+
+    <div v-if="!loading" class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+      <h3 class="mb-4 text-lg font-semibold text-slate-800">服务配置</h3>
+      <div class="space-y-4">
+        <label class="block text-sm font-medium text-slate-700">音频转写接口
+          <input v-model="form.audio_url" @focus="setActiveEditor('audio')" @blur="clearActiveEditor" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2" placeholder="https://example.com/audio/transcriptions">
+        </label>
+        <label class="block text-sm font-medium text-slate-700">音频转写 API Key（留空保持不变）
+          <input v-model="form.audio_key" type="password" autocomplete="new-password" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2" placeholder="请输入新的 API Key">
+        </label>
+        <div v-if="activeEditor === 'audio'" class="rounded-lg bg-slate-50 p-4 text-sm text-slate-600">
+          <p class="font-medium text-slate-700">请求格式</p>
+          <pre class="mt-2 overflow-x-auto">POST {{ '{' }}url{{ '}' }}
+Content-Type: multipart/form-data
+Authorization: Bearer &lt;API Key&gt;
+
+file: 音频文件</pre>
+          <p class="mt-4 font-medium text-slate-700">响应格式</p>
+          <pre class="mt-2 overflow-x-auto">{{ '{' }} "text": "转写文本", "language": "zh" {{ '}' }}</pre>
+        </div>
+        <label class="block text-sm font-medium text-slate-700">文本 Embedding 接口
+          <input v-model="form.embedding_url" @focus="setActiveEditor('embedding')" @blur="clearActiveEditor" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2" placeholder="https://example.com/v1/embeddings">
+        </label>
+        <div v-if="activeEditor === 'embedding'" class="rounded-lg bg-slate-50 p-4 text-sm text-slate-600">
+          <p class="font-medium text-slate-700">请求格式</p>
+          <pre class="mt-2 overflow-x-auto">POST {{ '{' }}url{{ '}' }}
+Content-Type: application/json
+
+{{ '{' }} "model": "模型名", "input": ["文本"] {{ '}' }}</pre>
+          <p class="mt-4 font-medium text-slate-700">响应格式</p>
+          <pre class="mt-2 overflow-x-auto">{{ '{' }} "data": [{{ '{' }} "embedding": [0.1, 0.2] {{ '}' }}] {{ '}' }}</pre>
+        </div>
+        <label class="block text-sm font-medium text-slate-700">图片 Embedding 接口（可选）
+          <input v-model="form.image_embedding_url" @focus="setActiveEditor('image_embedding')" @blur="clearActiveEditor" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2" placeholder="未配置时不进行图片向量化">
+        </label>
+        <div v-if="activeEditor === 'image_embedding'" class="rounded-lg bg-slate-50 p-4 text-sm text-slate-600">
+          <p class="font-medium text-slate-700">请求格式</p>
+          <pre class="mt-2 overflow-x-auto">POST {{ '{' }}url{{ '}' }}
+Content-Type: multipart/form-data
+
+file: 图片文件
+text: 图片文件名或关联文本</pre>
+          <p class="mt-4 font-medium text-slate-700">响应格式</p>
+          <pre class="mt-2 overflow-x-auto">{{ '{' }} "data": [{{ '{' }} "embedding": [0.1, 0.2] {{ '}' }}] {{ '}' }}</pre>
+        </div>
+        <label class="block text-sm font-medium text-slate-700">Rerank 接口
+          <input v-model="form.rerank_url" @focus="setActiveEditor('rerank')" @blur="clearActiveEditor" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2" placeholder="https://example.com/v1/rerank">
+        </label>
+        <div v-if="activeEditor === 'rerank'" class="rounded-lg bg-slate-50 p-4 text-sm text-slate-600">
+          <p class="font-medium text-slate-700">请求格式</p>
+          <pre class="mt-2 overflow-x-auto">/v1/rerank:
+{{ '{' }} "model": "模型名", "query": "查询文本", "documents": ["文档1"] {{ '}' }}
+
+/rerank:
+{{ '{' }} "query": "查询文本", "texts": ["文档1"] {{ '}' }}</pre>
+          <p class="mt-4 font-medium text-slate-700">响应格式</p>
+          <pre class="mt-2 overflow-x-auto">/v1/rerank:
+{{ '{' }} "results": [{{ '{' }} "index": 0, "relevance_score": 0.9 {{ '}' }}] {{ '}' }}
+
+/rerank:
+[{{ '{' }} "index": 0, "score": 0.9 {{ '}' }}]</pre>
+        </div>
+      </div>
     </div>
   </section>
 </template>
