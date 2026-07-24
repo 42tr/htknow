@@ -805,7 +805,13 @@ pub async fn get(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<File>> {
     let query = "SELECT * FROM files WHERE id = ?";
-    let mut file: File = sqlx::query_as(query).bind(id).fetch_one(&pool).await?;
+    let mut file: File = match sqlx::query_as(query).bind(id).fetch_one(&pool).await {
+        Ok(file) => file,
+        Err(sqlx::Error::RowNotFound) => {
+            return Err(ApiError::NotFound(format!("File {} not found", id)));
+        }
+        Err(e) => return Err(e.into()),
+    };
 
     ensure_file_readable(&file, &auth_user)?;
 
