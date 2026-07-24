@@ -19,6 +19,13 @@ const password = ref('')
 const error = ref('')
 const downloading = ref(new Set())
 const expandedDirs = ref(new Set())
+const pendingDownloadPath = ref('')
+
+const isPasswordError = (msg) => {
+  if (!msg) return false
+  const lower = msg.toLowerCase()
+  return lower.includes('密码') || lower.includes('password protected') || lower.includes('password required')
+}
 
 const isArchive = computed(() => {
   if (!props.file?.filename) return false
@@ -111,10 +118,22 @@ const extractArchive = async () => {
           expandedDirs.value.add(parts[0])
         }
       }
+      // 解压成功后，如果有等待下载的文件，自动继续下载
+      const pendingPath = pendingDownloadPath.value
+      if (pendingPath) {
+        pendingDownloadPath.value = ''
+        await downloadEntry(pendingPath)
+      }
     }
   } catch (e) {
     console.error('[ArchiveViewer] extractArchive failed:', e)
-    error.value = e.message || '解压失败'
+    if (isPasswordError(e.message)) {
+      needsPassword.value = true
+      entries.value = []
+      error.value = e.message || '请输入解压密码'
+    } else {
+      error.value = e.message || '解压失败'
+    }
   } finally {
     loading.value = false
     console.log('[ArchiveViewer] extractArchive done')
@@ -143,8 +162,16 @@ const downloadEntry = async (path) => {
     link.click()
     link.remove()
     window.URL.revokeObjectURL(url)
+    pendingDownloadPath.value = ''
   } catch (e) {
-    alert('下载失败：' + (e?.message || '未知错误'))
+    if (isPasswordError(e.message)) {
+      pendingDownloadPath.value = path
+      needsPassword.value = true
+      entries.value = []
+      error.value = e.message || '压缩文件已加密，请输入密码后下载'
+    } else {
+      alert('下载失败：' + (e?.message || '未知错误'))
+    }
   } finally {
     downloading.value.delete(path)
   }
@@ -197,6 +224,9 @@ watch(() => props.file, () => {
               <p class="text-sm text-slate-400">请输入解压密码</p>
             </div>
             <div class="max-w-xs mx-auto">
+              <p v-if="pendingDownloadPath" class="mb-2 text-sm text-blue-500 text-center">
+                输入密码后继续下载：{{ pendingDownloadPath.split('/').pop() }}
+              </p>
               <input
                 v-model="password"
                 @keyup.enter="handlePasswordSubmit"
@@ -210,6 +240,7 @@ watch(() => props.file, () => {
               >
                 确认解压
               </button>
+              <p v-if="error" class="mt-2 text-sm text-red-500 text-center">{{ error }}</p>
             </div>
           </div>
 

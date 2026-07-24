@@ -704,7 +704,7 @@ export const api = {
     const response = await fetch(`${API_BASE}/files/${id}/archive-download?path=${encodedPath}`, {
       headers: getHeaders(false),
     })
-    if (!response.ok) throw new Error('下载文件失败')
+    if (!response.ok) throw new Error(await readErrorMessage(response, '下载文件失败'))
     return response.blob()
   },
 
