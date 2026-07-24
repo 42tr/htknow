@@ -949,7 +949,7 @@ impl FileProcessor {
     }
 
     async fn try_reuse_existing_data(&self, file: &File) -> anyhow::Result<bool> {
-        if !config::get().server.reuse_duplicate_files {
+        if !settings::file_parse_reuse_duplicates() {
             return Ok(false);
         }
         let Some(source_file) =
@@ -3248,7 +3248,7 @@ impl FileProcessor {
         }
 
         // 新结构只复制搜索投影，SQLite 中的切片/PDF 解析结果由 artifact 共享。
-        if config::get().server.reuse_duplicate_files {
+        if settings::file_parse_reuse_duplicates() {
             let source_file_id = effective_parse_file_id(&self.pool, source.id).await?;
             let mut source_for_reindex = source.clone();
             let full_content = if let Some(artifact_id) = source.artifact_id {

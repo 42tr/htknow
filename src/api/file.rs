@@ -465,7 +465,7 @@ pub async fn upload(
     let cfg = config::get();
     let dir = &cfg.storage.files_path;
     tokio::fs::create_dir_all(dir).await?;
-    let reuse_duplicates = cfg.server.reuse_duplicate_files;
+    let reuse_duplicates = crate::settings::file_parse_reuse_duplicates();
 
     let mut files_data: Vec<(String, String, String, i64)> = Vec::new();
     let mut slice_type = String::new();

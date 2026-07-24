@@ -9,7 +9,7 @@ const success = ref('')
 const activeEditor = ref('')
 const form = reactive({
   mode: 'none', url: '', ocr_url: '', timeout_secs: 120, concurrency: 5,
-  file_mode: 'mineru', custom_url: '', custom_reuse_url: '', mineru_url: '', office_convert_url: '', file_concurrency: 1, mineru_max_pages: 50,
+  file_mode: 'mineru', custom_url: '', custom_reuse_url: '', mineru_url: '', office_convert_url: '', file_concurrency: 1, reuse_duplicates: true, mineru_max_pages: 50,
   audio_url: '', audio_key: '', embedding_url: '', image_embedding_url: '', rerank_url: '',
 })
 
@@ -36,6 +36,7 @@ const load = async () => {
     form.mineru_url = fileSettings['file_parse.mineru_url']?.value || ''
     form.office_convert_url = fileSettings['file_parse.office_convert_url']?.value || ''
     form.file_concurrency = fileSettings['file_parse.concurrency']?.value || 1
+    form.reuse_duplicates = fileSettings['file_parse.reuse_duplicate_files']?.value ?? true
     form.mineru_max_pages = fileSettings['file_parse.mineru_max_pages']?.value ?? 50
     form.audio_url = serviceSettings['services.audio_transcription_url']?.value || ''
     form.embedding_url = serviceSettings['services.embedding_url']?.value || ''
@@ -99,6 +100,7 @@ const save = async () => {
       'image_parse.concurrency': Number(form.concurrency),
       'file_parse.mode': form.file_mode,
       'file_parse.concurrency': Number(form.file_concurrency),
+      'file_parse.reuse_duplicate_files': form.reuse_duplicates,
       'file_parse.office_convert_url': form.office_convert_url.trim(),
       'services.audio_transcription_url': form.audio_url.trim(),
       'services.embedding_url': form.embedding_url.trim(),
@@ -290,6 +292,10 @@ Content-Type: application/json
           <input v-model="form.office_convert_url" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2" placeholder="http://localhost:8003/convert">
         </label>
         <p class="mt-1 text-xs font-normal text-slate-500">Word/PPT 文件在进入 MinerU 或自定义解析接口前，会先转换为 PDF。</p>
+        <label class="mt-4 flex items-center gap-2 text-sm font-medium text-slate-700">
+          <input v-model="form.reuse_duplicates" type="checkbox" class="h-4 w-4 rounded border-slate-300">
+          复用重复文件的解析结果
+        </label>
       </div>
       <p class="mt-4 text-sm text-slate-500">文件解析配置将在后续文件处理或重新解析时生效。</p>
     </div>

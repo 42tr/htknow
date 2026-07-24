@@ -41,6 +41,7 @@ pub const FILE_PARSE_CONCURRENCY: &str = "file_parse.concurrency";
 pub const FILE_PARSE_MINERU_MAX_PAGES: &str = "file_parse.mineru_max_pages";
 pub const FILE_PARSE_MINERU_URL: &str = "file_parse.mineru_url";
 pub const FILE_PARSE_OFFICE_CONVERT_URL: &str = "file_parse.office_convert_url";
+pub const FILE_PARSE_REUSE_DUPLICATES: &str = "file_parse.reuse_duplicate_files";
 pub const SERVICE_AUDIO_URL: &str = "services.audio_transcription_url";
 pub const SERVICE_AUDIO_KEY: &str = "services.audio_transcription_key";
 pub const SERVICE_EMBEDDING_URL: &str = "services.embedding_url";
@@ -61,6 +62,7 @@ fn definitions() -> BTreeMap<&'static str, (&'static str, &'static str, bool)> {
         (FILE_PARSE_MINERU_MAX_PAGES, ("file_parse", "integer", false)),
         (FILE_PARSE_MINERU_URL, ("file_parse", "url", false)),
         (FILE_PARSE_OFFICE_CONVERT_URL, ("file_parse", "url", false)),
+        (FILE_PARSE_REUSE_DUPLICATES, ("file_parse", "boolean", false)),
         (SERVICE_AUDIO_URL, ("services", "url", false)),
         (SERVICE_AUDIO_KEY, ("services", "secret", true)),
         (SERVICE_EMBEDDING_URL, ("services", "url", false)),
@@ -84,6 +86,7 @@ fn defaults() -> BTreeMap<String, Value> {
         (FILE_PARSE_MINERU_MAX_PAGES.to_string(), json!(cfg.services.mineru_max_pages)),
         (FILE_PARSE_MINERU_URL.to_string(), json!(cfg.services.mineru_url)),
         (FILE_PARSE_OFFICE_CONVERT_URL.to_string(), json!(cfg.services.office_convert_url)),
+        (FILE_PARSE_REUSE_DUPLICATES.to_string(), json!(cfg.server.reuse_duplicate_files)),
         (SERVICE_AUDIO_URL.to_string(), json!(cfg.services.audio_transcription_url)),
         (SERVICE_AUDIO_KEY.to_string(), json!(cfg.services.audio_transcription_key)),
         (SERVICE_EMBEDDING_URL.to_string(), json!(cfg.services.embedding_url)),
@@ -162,6 +165,10 @@ pub fn file_parse_concurrency() -> usize {
     get(FILE_PARSE_CONCURRENCY).and_then(|v| v.as_u64()).unwrap_or(1) as usize
 }
 
+pub fn file_parse_reuse_duplicates() -> bool {
+    get(FILE_PARSE_REUSE_DUPLICATES).and_then(|v| v.as_bool()).unwrap_or(true)
+}
+
 pub fn file_parse_mineru_max_pages() -> usize {
     get(FILE_PARSE_MINERU_MAX_PAGES).and_then(|v| v.as_u64()).unwrap_or(50) as usize
 }
@@ -207,6 +214,7 @@ pub fn validate(updates: &BTreeMap<String, Value>) -> anyhow::Result<()> {
             ("file_mode", Value::String(v)) if ["mineru", "default", "custom"].contains(&v.as_str()) => {}
             ("url", Value::String(v)) if v.is_empty() || v.starts_with("http://") || v.starts_with("https://") => {}
             ("secret", Value::String(_)) => {}
+            ("boolean", Value::Bool(_)) => {}
             ("integer", Value::Number(v)) if v.as_u64().is_some() => {}
             _ => anyhow::bail!("invalid value for setting: {}", key),
         }
