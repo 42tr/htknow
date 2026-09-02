@@ -1,0 +1,46 @@
+# Multi-architecture runtime image for htknow (used by GitHub Actions).
+#
+# The release binaries for each architecture are compiled outside the
+# container (cargo build --release) and placed at:
+#   dist/amd64/htknow   (x86_64-unknown-linux-gnu)
+#   dist/arm64/htknow   (aarch64-unknown-linux-gnu)
+#
+# Build with:
+#   docker buildx build -f Dockerfile.release \
+#     --platform linux/amd64,linux/arm64 -t htknow:<tag> --push .
+
+FROM debian:bookworm-slim
+
+ARG DEBIAN_FRONTEND=noninteractive
+ARG TARGETARCH
+
+# Install runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    # Timezone data
+    tzdata \
+    # sqlite3
+    sqlite3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure timezone
+ENV TZ=Asia/Shanghai
+RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && echo ${TZ} > /etc/timezone
+
+# Create application directory
+WORKDIR /app
+
+# Create data directories
+RUN mkdir -p /app/data/images /app/data/temp /app/data/db
+
+# Copy the pre-compiled binary for the target architecture
+COPY dist/${TARGETARCH}/htknow /app/htknow
+
+# Set permissions
+RUN chmod +x /app/htknow
+
+# Expose the application port
+EXPOSE 8080
+
+ENV RUST_LOG=info
+
+CMD ["/app/htknow"]
