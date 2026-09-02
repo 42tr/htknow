@@ -337,13 +337,19 @@ pub struct ListQuery {
     pub parent_id: Option<i64>,
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct KnowledgeBaseListResponse {
+    pub total: i64,
+    pub items: Vec<KnowledgeResponse>,
+}
+
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct TreeQuery {
     /// 知识库 ID（可选），传入则返回该知识库的子树，不传则返回完整树
     pub kb_id: Option<i64>,
 }
 
-/// 获取知识库列表
+/// 获取知识库列表（传 page/size 时分页返回，不传则返回全部）
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/knowledge_base/",
@@ -351,7 +357,7 @@ pub struct TreeQuery {
     tag = "knowledge_base",
     params(ListQuery),
     responses(
-        (status = 200, description = "成功返回知识库列表", body = Vec<KnowledgeResponse>),
+        (status = 200, description = "成功返回知识库列表", body = KnowledgeBaseListResponse),
         (status = 401, description = "未授权")
     ),
     security(
@@ -361,52 +367,68 @@ pub struct TreeQuery {
 )]
 pub async fn list(
     State(pool): State<SqlitePool>, Query(params): Query<ListQuery>, Extension(auth_user): Extension<AuthUser>,
-) -> ApiResult<Json<Vec<KnowledgeResponse>>> {
+) -> ApiResult<Json<KnowledgeBaseListResponse>> {
     let is_admin = auth_user.is_admin();
-    // Determine pagination: default size 10, default page 1
+    // 仅在显式传入分页参数时分页；否则返回全部
+    let paginate = params.page.is_some() || params.size.is_some();
     let size = params.size.unwrap_or(10).max(1);
     let page = params.page.unwrap_or(1).max(1);
     let limit = size;
     let offset = (page - 1) * size;
 
+    let push_filters = |qb: &mut QueryBuilder<Sqlite>| {
+        if !is_admin {
+            let user_id = auth_user.user_id.clone();
+            qb.push(" AND (user_id = ")
+                .push_bind(user_id.clone())
+                .push(" OR is_public = 1 OR id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ")
+                .push_bind(user_id)
+                .push("))");
+        }
+
+        // Filter by parent_id
+        if let Some(parent_id) = params.parent_id {
+            qb.push(" AND parent_id = ").push_bind(parent_id);
+        } else {
+            qb.push(" AND parent_id IS NULL");
+        }
+
+        // If `id` provided, try to parse as integer id and filter by id
+        if let Some(id_str) = params.id.as_deref() {
+            qb.push(" AND id = ").push_bind(id_str.to_string());
+        }
+
+        // name fuzzy search (only name column)
+        if let Some(name) = &params.name {
+            qb.push("AND name LIKE ").push_bind(format!("%{}%", name));
+        }
+    };
+
     // Start building the query
     let mut qb = QueryBuilder::<Sqlite>::new(
         "SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority FROM knowledge_bases WHERE 1=1 ",
     );
-    if !is_admin {
-        let user_id = auth_user.user_id.clone();
-        qb.push(" AND (user_id = ")
-            .push_bind(user_id.clone())
-            .push(" OR is_public = 1 OR id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ")
-            .push_bind(user_id)
-            .push("))");
-    }
-
-    // Filter by parent_id
-    if let Some(parent_id) = params.parent_id {
-        qb.push(" AND parent_id = ").push_bind(parent_id);
-    } else {
-        qb.push(" AND parent_id IS NULL");
-    }
-
-    // If `id` provided, try to parse as integer id and filter by id
-    if let Some(id_str) = params.id.as_deref() {
-        qb.push(" AND id = ").push_bind(id_str);
-    }
-
-    // name fuzzy search (only name column)
-    if let Some(name) = &params.name {
-        qb.push("AND name LIKE ").push_bind(format!("%{}%", name));
-    }
+    push_filters(&mut qb);
 
     // ordering and pagination
     qb.push(" ORDER BY id");
-    qb.push(" LIMIT ").push_bind(limit);
-    qb.push(" OFFSET ").push_bind(offset);
+    if paginate {
+        qb.push(" LIMIT ").push_bind(limit);
+        qb.push(" OFFSET ").push_bind(offset);
+    }
 
     // Execute
     let query = qb.build_query_as::<Knowledge>();
     let knowledges = query.fetch_all(&pool).await?;
+
+    let total = if paginate {
+        let mut count_qb = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM knowledge_bases WHERE 1=1 ");
+        push_filters(&mut count_qb);
+        count_qb.build_query_scalar::<i64>().fetch_one(&pool).await?
+    } else {
+        knowledges.len() as i64
+    };
+
     let knowledge_ids: Vec<i64> = knowledges.iter().map(|kb| kb.id).collect();
 
     // Get file counts and children counts in parallel
@@ -442,7 +464,7 @@ pub async fn list(
         })
         .collect();
 
-    Ok(Json(knowledge_responses))
+    Ok(Json(KnowledgeBaseListResponse { total, items: knowledge_responses }))
 }
 
 async fn get_children_kb_counts(

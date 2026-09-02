@@ -98,6 +98,7 @@ use crate::search::SearchEngine;
             knowledge_base::Knowledge,
             knowledge_base::KnowledgeResponse,
             knowledge_base::KnowledgeDetailResponse,
+            knowledge_base::KnowledgeBaseListResponse,
             knowledge_base::KnowledgeBaseFilesResponse,
             knowledge_base::KnowledgeBaseTagsResponse,
             knowledge_base::TagFileCount,

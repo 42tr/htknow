@@ -42,7 +42,8 @@ const loadChildren = async (parentId) => {
   }
 
   try {
-    childrenKbs.value = await api.getKnowledgeBases(parentId);
+    const data = await api.getKnowledgeBases(parentId);
+    childrenKbs.value = data.items || [];
   } catch (e) {
     console.error('Failed to load knowledge bases', e);
   } finally {

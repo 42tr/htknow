@@ -56,7 +56,8 @@ const currentFileId = computed(() => scopeType.value === 'file' ? selectedFileId
 // 加载知识库列表
 const loadKnowledgeBases = async () => {
   try {
-    knowledgeBases.value = await api.getKnowledgeBases()
+    const data = await api.getKnowledgeBases()
+    knowledgeBases.value = data.items || []
   } catch (error) {
     console.error('加载知识库列表失败:', error)
   }

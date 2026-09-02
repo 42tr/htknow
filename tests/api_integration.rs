@@ -30,8 +30,51 @@ async fn knowledge_base_flow() {
     let list_res = app.clone().oneshot(list_req).await.unwrap();
     assert_eq!(list_res.status(), StatusCode::OK);
     let list_bytes = list_res.into_body().collect().await.unwrap().to_bytes();
-    let list: Vec<Value> = serde_json::from_slice(&list_bytes).unwrap();
+    let list_json: Value = serde_json::from_slice(&list_bytes).unwrap();
+    let list: Vec<Value> = serde_json::from_value(list_json["items"].clone()).unwrap();
     assert!(list.iter().any(|kb| kb["id"].as_i64() == Some(kb_id) && kb["name"].as_str() == Some("Integration KB")));
+    assert!(list_json["total"].as_i64().unwrap() >= 1);
+
+    // Create more KBs to exercise pagination
+    for i in 0..3 {
+        let body = serde_json::json!({
+            "name": format!("Integration KB Paged {}", i),
+            "description": "kb for pagination tests",
+            "kb_type": "analysis",
+            "parent_id": null,
+            "is_public": false
+        });
+        let req = authed_json_request("POST", "/api/v1/knowledge/knowledge_base/", &user, body);
+        let res = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+    }
+
+    // Without pagination params, all KBs are returned
+    let all_req = authed_empty_request("GET", "/api/v1/knowledge/knowledge_base/", &user);
+    let all_res = app.clone().oneshot(all_req).await.unwrap();
+    assert_eq!(all_res.status(), StatusCode::OK);
+    let all_json = response_json(all_res).await;
+    let total = all_json["total"].as_i64().expect("total");
+    assert_eq!(all_json["items"].as_array().unwrap().len() as i64, total);
+    assert!(total >= 4);
+
+    // With pagination params, only one page is returned and total reflects the full count.
+    // Other tests run concurrently against the shared app, so `total` may grow between requests;
+    // only assert bounds instead of exact equality.
+    let paged_req = authed_empty_request("GET", "/api/v1/knowledge/knowledge_base/?page=2&size=2", &user);
+    let paged_res = app.clone().oneshot(paged_req).await.unwrap();
+    assert_eq!(paged_res.status(), StatusCode::OK);
+    let paged_json = response_json(paged_res).await;
+    assert!(paged_json["total"].as_i64().unwrap() >= total);
+    let paged_items = paged_json["items"].as_array().unwrap();
+    assert!(paged_items.len() <= 2);
+    let first_page_req = authed_empty_request("GET", "/api/v1/knowledge/knowledge_base/?page=1&size=2", &user);
+    let first_page_res = app.clone().oneshot(first_page_req).await.unwrap();
+    let first_page_json = response_json(first_page_res).await;
+    let first_page_items = first_page_json["items"].as_array().unwrap();
+    assert_eq!(first_page_items.len(), 2);
+    let first_ids: Vec<i64> = first_page_items.iter().map(|kb| kb["id"].as_i64().unwrap()).collect();
+    assert!(paged_items.iter().all(|kb| !first_ids.contains(&kb["id"].as_i64().unwrap())));
 
     let update_body = serde_json::json!({
         "parent_id": kb_id
@@ -664,7 +707,8 @@ async fn kb_permission_viewer_can_read_but_not_modify() {
     let list_res = app.clone().oneshot(list_req).await.unwrap();
     assert_eq!(list_res.status(), StatusCode::OK);
     let list_bytes = list_res.into_body().collect().await.unwrap().to_bytes();
-    let list: Vec<Value> = serde_json::from_slice(&list_bytes).unwrap();
+    let list_json: Value = serde_json::from_slice(&list_bytes).unwrap();
+    let list: Vec<Value> = serde_json::from_value(list_json["items"].clone()).unwrap();
     let kb = list.iter().find(|k| k["id"].as_i64() == Some(kb_id)).expect("viewer sees the kb");
     assert_eq!(kb["current_user_permission"].as_str(), Some("viewer"));
 

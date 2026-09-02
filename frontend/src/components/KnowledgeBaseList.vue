@@ -31,6 +31,11 @@ const totalFiles = ref(0)
 const fileFilterName = ref('')
 const fileFilterTag = ref('')
 
+// Pagination state for the KB grid
+const kbCurrentPage = ref(1)
+const kbPageSize = ref(12)
+const totalKbs = ref(0)
+
 // Permission modal state
 const showPermissionModal = ref(false)
 const permissionModalKb = ref(null)
@@ -196,19 +201,21 @@ const loadKbContent = async (kbId) => {
     let newCurrentKb;
     if (targetId === null) {
       // Root view: fetch top-level KBs and unassigned files
-      const [topLevelKbs, unassignedFiles] = await Promise.all([
-        api.getKnowledgeBases(null),
+      const [kbData, unassignedFiles] = await Promise.all([
+        api.getKnowledgeBases(null, { page: kbCurrentPage.value, size: kbPageSize.value }),
         api.getFiles(null, null, { page: currentPage.value, size: pageSize.value })
       ]);
-      childrenKbs.value = topLevelKbs
+      childrenKbs.value = kbData.items || []
+      totalKbs.value = kbData.total || 0
       files.value = unassignedFiles.items || []
       totalFiles.value = unassignedFiles.total || 0
       newCurrentKb = { id: null, name: '所有知识库', kb_type: null }
       breadcrumbs.value = []
     } else {
       // Inside a specific KB
-      const [data, filesData] = await Promise.all([
+      const [data, kbData, filesData] = await Promise.all([
         api.getKnowledgeBase(targetId),
+        api.getKnowledgeBases(targetId, { page: kbCurrentPage.value, size: kbPageSize.value }),
         api.getKnowledgeBaseFiles(targetId, {
           page: currentPage.value,
           size: pageSize.value,
@@ -216,11 +223,18 @@ const loadKbContent = async (kbId) => {
           tag: fileFilterTag.value || undefined,
         })
       ])
-      childrenKbs.value = data.children_kbs || []
+      childrenKbs.value = kbData.items || []
+      totalKbs.value = kbData.total || 0
       files.value = filesData.items || []
       totalFiles.value = filesData.total || 0
       newCurrentKb = { id: data.id, name: data.name, description: data.description, kb_type: data.kb_type }
       breadcrumbs.value = data.path || []
+    }
+    // 若当前页已没有知识库（如删除后），回退一页重新加载
+    if (childrenKbs.value.length === 0 && totalKbs.value > 0 && kbCurrentPage.value > 1) {
+      kbCurrentPage.value -= 1
+      await loadKbContent(targetId)
+      return
     }
     const nextPriorityDrafts = {}
     for (const kb of childrenKbs.value) {
@@ -240,6 +254,7 @@ const loadKbContent = async (kbId) => {
 // --- Navigation ---
 const navigateToKb = (kbId) => {
   currentPage.value = 1
+  kbCurrentPage.value = 1
   fileFilterName.value = ''
   fileFilterTag.value = ''
   loadKbContent(kbId)
@@ -726,6 +741,15 @@ onMounted(() => {
            </div>
         </div>
       </div>
+
+      <Pagination
+        v-if="totalKbs > 0"
+        v-model:page="kbCurrentPage"
+        v-model:size="kbPageSize"
+        :total="totalKbs"
+        :sizes="[12, 24, 48]"
+        @change="loadKbContent(getCurrentKbId())"
+      />
 
       <!-- Files -->
       <div class="mt-6 space-y-3" v-if="files.length > 0 || currentKb?.id !== null">

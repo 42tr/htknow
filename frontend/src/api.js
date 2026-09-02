@@ -360,14 +360,17 @@ export const api = {
   },
 
   // 知识库
-  async getKnowledgeBases(parentId = null) {
+  async getKnowledgeBases(parentId = null, params = {}) {
     let url = `${API_BASE}/knowledge_base/`;
-    const params = new URLSearchParams();
+    const searchParams = new URLSearchParams();
     // A null parentId fetches top-level KBs by default on the backend.
     if (parentId) {
-      params.append('parent_id', parentId);
+      searchParams.append('parent_id', parentId);
     }
-    const queryString = params.toString();
+    // 不传分页参数时后端返回全部
+    if (params.page) searchParams.set('page', String(params.page));
+    if (params.size) searchParams.set('size', String(params.size));
+    const queryString = searchParams.toString();
     if (queryString) {
       url += `?${queryString}`;
     }
