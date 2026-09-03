@@ -78,12 +78,12 @@ jobs:
 
       - name: Build release binary
         run: |
+          set +e
           set -uo pipefail
-          cargo build --release --locked --target ${{ matrix.target }} 2>&1 | tee build.log
-          code=${PIPESTATUS[0]}
+          code=0
+          cargo build --release --locked --target ${{ matrix.target }} 2>&1 | tee build.log || code=${PIPESTATUS[0]}
           if [ "${code}" -ne 0 ]; then
             echo "=========== BUILD FAILED (exit ${code}) ==========="
-            awk '/^error/{found=1} found' build.log | head -80 | sed 's/^/BUILDERR: /'
             msg="$(grep -v -E '^(Compiling|Downloaded|Downloading)' build.log | tail -60 | head -c 4000)"
             msg="${msg//'%'/'%25'}"
             msg="${msg//$'\n'/'%0A'}"
