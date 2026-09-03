@@ -17,8 +17,6 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -46,7 +44,8 @@ jobs:
         run: |
           set -euo pipefail
           sudo apt-get update
-          packages="protobuf-compiler"
+          # protobuf-compiler: protoc 可执行文件；libprotobuf-dev: google/protobuf/*.proto 头文件
+          packages="protobuf-compiler libprotobuf-dev"
           if [ "${{ matrix.cross }}" = "true" ]; then
             packages="${packages} gcc-aarch64-linux-gnu g++-aarch64-linux-gnu"
           fi
@@ -71,47 +70,8 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
-      - name: Enable error annotations
-        run: |
-          echo "::add-matcher::.github/rust-errors.json"
-          echo "::add-matcher::.github/build-error-matcher.json"
-
       - name: Build release binary
-        run: |
-          set +e
-          set -uo pipefail
-          code=0
-          cargo build --release --locked --target ${{ matrix.target }} 2>&1 | tee build.log || code=${PIPESTATUS[0]}
-          if [ "${code}" -ne 0 ]; then
-            echo "=========== BUILD FAILED (exit ${code}) ==========="
-            msg="$(grep -v -E '^(Compiling|Downloaded|Downloading)' build.log | tail -60 | head -c 4000)"
-            msg="${msg//'%'/'%25'}"
-            msg="${msg//$'\n'/'%0A'}"
-            msg="${msg//$'\r'/'%0D'}"
-            echo "::error::BUILD FAILED (exit ${code})%0A${msg}"
-            exit "${code}"
-          fi
-
-      - name: Upload build log (on failure)
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: build-log-${{ matrix.target }}
-          path: build.log
-          if-no-files-found: ignore
-
-      - name: Publish build error log (on failure, temporary debug)
-        if: failure()
-        run: |
-          set -euo pipefail
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          tail -n 300 build.log > "build-error-${{ matrix.target }}.log"
-          git fetch origin build-debug --depth 1 || true
-          git checkout -B build-debug "origin/build-debug" 2>/dev/null || git checkout --orphan build-debug
-          git add "build-error-${{ matrix.target }}.log"
-          git commit -m "debug: build error log for ${{ matrix.target }} (run ${{ github.run_id }})"
-          git push -f origin build-debug
+        run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package binary
         run: |
@@ -158,8 +118,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist/amd64 dist/arm64
-          find artifacts/htknow-amd64 -type f -name htknow -exec cp {} dist/amd64/htknow \\;
-          find artifacts/htknow-arm64 -type f -name htknow -exec cp {} dist/arm64/htknow \\;
+          find artifacts/htknow-amd64 -type f -name htknow -exec cp {} dist/amd64/htknow \;
+          find artifacts/htknow-arm64 -type f -name htknow -exec cp {} dist/arm64/htknow \;
           chmod +x dist/amd64/htknow dist/arm64/htknow
           ls -lh dist/amd64/htknow dist/arm64/htknow
 
