@@ -18,6 +18,8 @@ jobs:
   build:
     name: Build ${{ matrix.target }}
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -82,6 +84,19 @@ jobs:
           name: build-log-${{ matrix.target }}
           path: build.log
           if-no-files-found: ignore
+
+      - name: Publish build error log (on failure, temporary debug)
+        if: failure()
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          tail -n 300 build.log > "build-error-${{ matrix.target }}.log"
+          git fetch origin build-debug --depth 1 || true
+          git checkout -B build-debug "origin/build-debug" 2>/dev/null || git checkout --orphan build-debug
+          git add "build-error-${{ matrix.target }}.log"
+          git commit -m "debug: build error log for ${{ matrix.target }} (run ${{ github.run_id }})"
+          git push -f origin build-debug
 
       - name: Package binary
         run: |
