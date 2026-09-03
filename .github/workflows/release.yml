@@ -84,6 +84,11 @@ jobs:
           if [ "${code}" -ne 0 ]; then
             echo "=========== BUILD FAILED (exit ${code}) ==========="
             awk '/^error/{found=1} found' build.log | head -80 | sed 's/^/BUILDERR: /'
+            msg="$(grep -v -E '^(Compiling|Downloaded|Downloading)' build.log | tail -60 | head -c 4000)"
+            msg="${msg//'%'/'%25'}"
+            msg="${msg//$'\n'/'%0A'}"
+            msg="${msg//$'\r'/'%0D'}"
+            echo "::error::BUILD FAILED (exit ${code})%0A${msg}"
             exit "${code}"
           fi
 
