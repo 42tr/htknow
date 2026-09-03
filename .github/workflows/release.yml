@@ -72,6 +72,9 @@ jobs:
         with:
           key: release-${{ matrix.target }}
 
+      - name: Enable error annotations
+        run: echo "::add-matcher::.github/rust-errors.json"
+
       - name: Build release binary
         run: |
           set -euo pipefail
