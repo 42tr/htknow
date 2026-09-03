@@ -72,12 +72,20 @@ jobs:
           key: release-${{ matrix.target }}
 
       - name: Enable error annotations
-        run: echo "::add-matcher::.github/rust-errors.json"
+        run: |
+          echo "::add-matcher::.github/rust-errors.json"
+          echo "::add-matcher::.github/build-error-matcher.json"
 
       - name: Build release binary
         run: |
-          set -euo pipefail
+          set -uo pipefail
           cargo build --release --locked --target ${{ matrix.target }} 2>&1 | tee build.log
+          code=${PIPESTATUS[0]}
+          if [ "${code}" -ne 0 ]; then
+            echo "=========== BUILD FAILED (exit ${code}) ==========="
+            awk '/^error/{found=1} found' build.log | head -80 | sed 's/^/BUILDERR: /'
+            exit "${code}"
+          fi
 
       - name: Upload build log (on failure)
         if: failure()
