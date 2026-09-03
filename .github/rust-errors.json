@@ -1,18 +1,7 @@
 {
   "problemMatcher": [
     {
-      "owner": "cargo-error",
-      "severity": "error",
-      "pattern": [
-        {
-          "regexp": "^error(?:\\[([^\\]]+)\\])?:\\s+(.*)$",
-          "code": 1,
-          "message": 2
-        }
-      ]
-    },
-    {
-      "owner": "rustc-error",
+      "owner": "rust-error-located",
       "severity": "error",
       "pattern": [
         {
@@ -21,20 +10,30 @@
           "message": 2
         },
         {
-          "regexp": "^\\s+-->\\s+([^:\\s]+):(\\d+):(\\d+)$",
+          "regexp": "^\\s+-->\\s+(\\S+):(\\d+):(\\d+)",
           "file": 1,
           "line": 2,
-          "column": 3,
-          "loop": true
+          "column": 3
         }
       ]
     },
     {
-      "owner": "cargo-warning",
+      "owner": "rust-error-plain",
+      "severity": "error",
+      "pattern": [
+        {
+          "regexp": "^error(?:\\[([^\\]]+)\\])?:\\s+(.*)$",
+          "code": 1,
+          "message": 2
+        }
+      ]
+    },
+    {
+      "owner": "rust-note",
       "severity": "warning",
       "pattern": [
         {
-          "regexp": "^(?:error|fatal):\\s+(.*)$",
+          "regexp": "^\\s+=\\s+note:\\s+(.*)$",
           "message": 1
         }
       ]
