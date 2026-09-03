@@ -71,7 +71,17 @@ jobs:
           key: release-${{ matrix.target }}
 
       - name: Build release binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          cargo build --release --locked --target ${{ matrix.target }} 2>&1 | tee build.log
+
+      - name: Upload build log (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log-${{ matrix.target }}
+          path: build.log
+          if-no-files-found: ignore
 
       - name: Package binary
         run: |
