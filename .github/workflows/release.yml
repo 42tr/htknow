@@ -161,6 +161,8 @@ jobs:
           file: Dockerfile.release
           platforms: linux/amd64,linux/arm64
           push: true
+          # 阿里云 ACR 个人版不支持 OCI provenance 工件,必须关闭
+          provenance: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
 
