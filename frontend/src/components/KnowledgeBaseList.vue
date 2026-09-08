@@ -509,27 +509,14 @@ onMounted(() => {
           v-for="kb in childrenKbs"
           :key="`kb-${kb.id}`"
           @click="navigateToKb(kb.id)"
-          class="kb-row group grid cursor-pointer gap-4 px-4 py-4 transition-colors hover:bg-slate-50 lg:grid-cols-[minmax(0,1fr)_auto_auto] lg:items-center lg:px-5"
+          class="kb-row group grid cursor-pointer gap-4 px-4 py-4 transition-colors hover:bg-slate-50 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center lg:px-5"
         >
           <div class="min-w-0">
-            <div class="flex items-start gap-3">
-              <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-100">
-                <span class="text-[10px] font-semibold tracking-wide">KB</span>
-              </div>
-              <div class="min-w-0 flex-1">
+            <div class="min-w-0">
                 <div class="flex flex-wrap items-center gap-1.5">
                   <h3 class="max-w-full truncate text-sm font-semibold text-slate-800">{{ kb.name }}</h3>
-                  <span :class="[
-                    'px-2 py-0.5 text-xs rounded-full border',
-                    kb.is_public ? 'bg-green-50 text-green-600 border-green-200' : 'bg-slate-50 text-slate-600 border-slate-200'
-                  ]">
-                    {{ kb.is_public ? '公开' : '私有' }}
-                  </span>
-                  <span :class="[
-                    'px-2 py-0.5 text-xs rounded-full border',
-                    kb.kb_type === 'storage' ? 'bg-amber-50 text-amber-600 border-amber-200' : 'bg-indigo-50 text-indigo-600 border-indigo-200'
-                  ]">
-                    {{ kb.kb_type === 'storage' ? '存储型' : '分析型' }}
+                  <span v-if="kb.kb_type === 'storage'" class="px-2 py-0.5 text-xs rounded-full border border-amber-200 bg-amber-50 text-amber-600">
+                    存储型
                   </span>
                 </div>
                 <p class="mt-1 line-clamp-1 text-sm text-slate-500">{{ kb.description || '暂无描述' }}</p>
@@ -537,38 +524,39 @@ onMounted(() => {
                   <span>{{ kb.children_kb_count || 0 }} 个子知识库</span>
                   <span>{{ kb.file_count || 0 }} 个文件</span>
                 </div>
-              </div>
             </div>
           </div>
 
-          <div class="priority-control rounded-lg border border-slate-200 bg-slate-50 p-2.5" @click.stop>
-            <div class="flex items-center justify-between gap-3 lg:block">
-              <label class="text-xs text-slate-600">解析优先级</label>
-              <span class="text-xs text-slate-400" v-if="kb.kb_type === 'storage'">不参与解析</span>
-            </div>
-            <div class="mt-2 flex items-center gap-2">
-              <input
-                v-model.number="priorityDrafts[kb.id]"
-                type="number"
-                min="0"
-                max="100"
-                step="1"
-                :disabled="kb.kb_type === 'storage' || prioritySaving[kb.id] || (kb.current_user_permission !== 'editor' && kb.current_user_permission !== 'admin')"
-                class="w-20 px-2 py-1 text-sm border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-slate-100 disabled:text-slate-400"
-              />
-              <button
-                type="button"
-                :disabled="kb.kb_type === 'storage' || prioritySaving[kb.id] || (kb.current_user_permission !== 'editor' && kb.current_user_permission !== 'admin')"
-                @click="(e) => handleSaveParsePriority(e, kb)"
-                class="px-2.5 py-1 text-xs font-medium rounded-md border border-slate-200 bg-white text-slate-700 hover:border-blue-300 hover:text-blue-600 disabled:bg-slate-100 disabled:text-slate-400 disabled:border-slate-200"
-              >
-                {{ prioritySaving[kb.id] ? '保存中...' : '保存' }}
-              </button>
-            </div>
-          </div>
-
-          <div class="flex items-center justify-between gap-2 lg:justify-end">
+          <div class="flex flex-wrap items-center justify-between gap-2 lg:flex-nowrap lg:justify-end">
              <div class="flex items-center gap-0.5">
+                <button
+                  v-if="kb.current_user_permission === 'admin'"
+                  type="button"
+                  @click="(e) => handleTogglePublic(e, kb.id, kb.is_public)"
+                  class="p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-700"
+                  :title="kb.is_public ? '当前公开，点击设为私有' : '当前私有，点击设为公开'"
+                >
+                  <svg v-if="kb.is_public" class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M7 11V7a5 5 0 0 1 9.9-1M5 11h14v9H5z" /></svg>
+                  <svg v-else class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect width="14" height="10" x="5" y="11" rx="1" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M8 11V7a4 4 0 0 1 8 0v4" /></svg>
+                </button>
+                <span v-else class="p-1.5 text-slate-400" :title="kb.is_public ? '公开' : '私有'">
+                  <svg v-if="kb.is_public" class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M7 11V7a5 5 0 0 1 9.9-1M5 11h14v9H5z" /></svg>
+                  <svg v-else class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><rect width="14" height="10" x="5" y="11" rx="1" /><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M8 11V7a4 4 0 0 1 8 0v4" /></svg>
+                </span>
+                <label class="flex items-center gap-1 px-1.5 text-slate-500" title="解析优先级">
+                  <svg class="h-4 w-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M4 7h16M7 12h10M10 17h4" /></svg>
+                  <input
+                    v-model.number="priorityDrafts[kb.id]"
+                    type="number"
+                    min="0"
+                    max="100"
+                    step="1"
+                    :disabled="kb.kb_type === 'storage' || prioritySaving[kb.id] || (kb.current_user_permission !== 'editor' && kb.current_user_permission !== 'admin')"
+                    class="w-9 bg-transparent text-center text-xs font-medium text-slate-600 outline-none disabled:text-slate-300"
+                    @click.stop
+                    @change="(e) => handleSaveParsePriority(e, kb)"
+                  />
+                </label>
                 <span
                   v-if="kb.current_user_permission"
                   class="px-2 py-0.5 text-xs rounded-full border"
@@ -590,22 +578,6 @@ onMounted(() => {
                     <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 4.354a4 4 0 110 5.292M15 21H3v-1a6 6 0 0112 0v1zm0 0h6v-1a6 6 0 00-9-5.197M13 7a4 4 0 11-8 0 4 4 0 018 0z" />
                   </svg>
                 </button>
-                <button
-                  v-if="kb.current_user_permission === 'admin'"
-                  @click="(e) => handleTogglePublic(e, kb.id, kb.is_public)"
-                  :class="[
-                    'opacity-100 sm:opacity-0 sm:group-hover:opacity-100 p-1.5 rounded-md transition-all',
-                    kb.is_public ? 'text-green-500 hover:bg-green-50' : 'text-slate-500 hover:bg-slate-100'
-                  ]"
-                  :title="kb.is_public ? '设置为私有' : '设置为公开'"
-                >
-                  <svg v-if="kb.is_public" class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 00-8 0v4h8z" />
-                 </svg>
-                 <svg v-else class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M3.055 11H5a2 2 0 012 2v1a2 2 0 012 2 2 2 0 012 2v2.945M8 3.935V5.5A2.5 2.5 0 0010.5 8h.5a2 2 0 012 2 2 2 0 104 0 2 2 0 012-2h1.064M15 20.488V18a2 2 0 012-2h3.064M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
-                 </svg>
-               </button>
                <button
                  v-if="kb.current_user_permission === 'editor' || kb.current_user_permission === 'admin'"
                  @click="(e) => handleReparseChildKb(e, kb)"
