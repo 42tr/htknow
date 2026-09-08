@@ -33,7 +33,7 @@ const copyContent = async (text) => {
 </script>
 
 <template>
-  <div class="bg-white border border-slate-200 rounded-2xl p-6 shadow-sm mb-6">
+  <div class="advanced-search-panel max-w-4xl mx-auto bg-white border border-slate-200 rounded-2xl p-5 shadow-sm mb-6">
     <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
       <div>
         <div class="flex items-center gap-2">
@@ -108,7 +108,7 @@ const copyContent = async (text) => {
       </div>
     </div>
 
-    <div class="grid gap-6 md:grid-cols-2 mt-6">
+    <div class="grid gap-5 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)] mt-5">
       <section class="space-y-3">
         <h4 class="text-sm font-semibold text-slate-700 flex items-center gap-2">
           <span class="w-2 h-2 rounded-full bg-amber-400"></span> 过程记录

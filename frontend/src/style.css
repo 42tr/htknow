@@ -92,6 +92,14 @@ main h2 {
   letter-spacing: -0.025em;
 }
 
+.page-heading {
+  text-align: left;
+}
+
+.page-heading p {
+  max-width: 720px;
+}
+
 main .text-slate-500 {
   color: #737373 !important;
 }
@@ -110,6 +118,28 @@ main .rounded-2xl {
 
 main .rounded-xl {
   border-radius: 10px !important;
+}
+
+.search-layout .search-section {
+  padding-top: 2px;
+  padding-bottom: 2px;
+}
+
+.search-results .search-snippet,
+.search-results .line-clamp-2 {
+  line-height: 1.65;
+}
+
+.advanced-search-panel pre {
+  max-width: 100%;
+}
+
+.settings-toolbar {
+  border-bottom: 1px solid #eeeeee;
+}
+
+.settings-toolbar ~ .rounded-xl {
+  padding: 20px !important;
 }
 
 main input,
@@ -154,21 +184,28 @@ footer {
 
   header nav {
     max-width: calc(100vw - 150px);
-    overflow-x: auto;
-    scrollbar-width: none;
-  }
-
-  header nav::-webkit-scrollbar {
-    display: none;
+    flex-wrap: wrap;
+    justify-content: flex-end;
   }
 
   header nav button {
-    flex: 0 0 auto;
     padding-left: 10px !important;
     padding-right: 10px !important;
   }
 
   main.max-w-6xl {
     padding: 28px 16px 48px;
+  }
+
+  .page-heading {
+    margin-bottom: 20px;
+  }
+
+  .advanced-search-panel {
+    padding: 16px !important;
+  }
+
+  .settings-toolbar {
+    top: 0.5rem;
   }
 }

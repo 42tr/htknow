@@ -234,7 +234,7 @@ const clearAdvanced = () => {
                   : 'text-slate-600 hover:text-slate-900'
               ]"
             >
-              <span class="mr-1.5">{{ tab.icon }}</span>
+              <span v-if="tab.icon" class="mr-1.5">{{ tab.icon }}</span>
               {{ tab.name }}
             </button>
           </nav>
@@ -246,8 +246,8 @@ const clearAdvanced = () => {
     <main class="flex-1 max-w-6xl mx-auto px-6 py-8 w-full">
       <!-- Search Tab -->
       <div v-if="activeTab === 'search'" class="space-y-6">
-        <div class="text-center mb-8">
-          <h2 class="text-3xl font-bold text-slate-800 mb-2">搜索知识库</h2>
+        <div class="page-heading mb-6">
+          <h2 class="text-2xl font-semibold text-slate-800 mb-1">搜索知识库</h2>
           <p class="text-slate-500">在所有文档中快速查找您需要的信息</p>
         </div>
 
@@ -272,8 +272,8 @@ const clearAdvanced = () => {
       </div>
 
       <div v-if="activeTab === 'dictionary'" class="space-y-6">
-        <div class="text-center mb-8">
-          <h2 class="text-3xl font-bold text-slate-800 mb-2">词表与同义词</h2>
+        <div class="page-heading mb-6">
+          <h2 class="text-2xl font-semibold text-slate-800 mb-1">词表与同义词</h2>
           <p class="text-slate-500">管理搜索词表并发布重建索引，查看重建进度与 ETA</p>
         </div>
         <SearchDictionaryManager />
@@ -281,9 +281,9 @@ const clearAdvanced = () => {
 
       <!-- Knowledge Base Tab -->
       <div v-if="activeTab === 'knowledge'" class="space-y-6">
-        <div class="flex items-center justify-between mb-6">
+        <div class="page-heading mb-6">
           <div>
-            <h2 class="text-2xl font-bold text-slate-800">知识库管理</h2>
+            <h2 class="text-2xl font-semibold text-slate-800">知识库管理</h2>
             <p class="text-slate-500 mt-1">管理您的知识库和文档</p>
           </div>
         </div>
@@ -293,8 +293,8 @@ const clearAdvanced = () => {
 
       <!-- Knowledge Graph Tab -->
       <div v-if="activeTab === 'graph'" class="space-y-6">
-        <div class="text-center mb-8">
-          <h2 class="text-3xl font-bold text-slate-800 mb-2">知识图谱</h2>
+        <div class="page-heading mb-6">
+          <h2 class="text-2xl font-semibold text-slate-800 mb-1">知识图谱</h2>
           <p class="text-slate-500">探索文档中的实体和关系</p>
         </div>
 
@@ -303,8 +303,8 @@ const clearAdvanced = () => {
 
       <!-- Upload Tab -->
       <div v-if="activeTab === 'upload'" class="space-y-6">
-        <div class="text-center mb-8">
-          <h2 class="text-2xl font-bold text-slate-800 mb-2">上传文档</h2>
+        <div class="page-heading mb-6">
+          <h2 class="text-2xl font-semibold text-slate-800 mb-1">上传文档</h2>
           <p class="text-slate-500">将文档添加到知识库中</p>
         </div>
 
@@ -316,13 +316,5 @@ const clearAdvanced = () => {
       </div>
     </main>
 
-    <!-- Footer -->
-    <footer class="border-t border-slate-200 bg-white mt-auto">
-      <div class="max-w-6xl mx-auto px-6 py-4">
-        <p class="text-center text-sm text-slate-500">
-          知识库管理系统 · Powered by Rust + Vue
-        </p>
-      </div>
-    </footer>
   </div>
 </template>

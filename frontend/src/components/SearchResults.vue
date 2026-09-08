@@ -67,7 +67,7 @@ defineProps({
 </script>
 
 <template>
-  <div class="max-w-3xl mx-auto">
+  <div class="search-results max-w-4xl mx-auto">
     <!-- Loading State -->
     <div v-if="loading" class="flex justify-center py-12">
       <div class="flex items-center gap-3 text-slate-500">
@@ -90,7 +90,7 @@ defineProps({
     </div>
 
     <!-- Results -->
-    <div v-else class="space-y-4">
+    <div v-else class="space-y-3">
       <p class="text-sm text-slate-500 mb-4">找到 {{ results.length }} 个结果</p>
 
       <div
@@ -116,7 +116,7 @@ defineProps({
             <p v-else class="text-slate-600 text-sm line-clamp-2 mb-2">
               {{ result.content || (isImageFile(result.file?.filename) ? '图片匹配结果' : '无内容预览') }}
             </p>
-            <div class="flex items-center gap-4 text-xs text-slate-400">
+            <div class="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-400">
               <span class="flex items-center gap-1">
                 <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z" />

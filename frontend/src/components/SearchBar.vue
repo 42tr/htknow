@@ -113,9 +113,11 @@ const handleKeydown = (e) => {
 </script>
 
 <template>
-  <div class="max-w-4xl mx-auto space-y-4">
+  <div class="search-layout max-w-4xl mx-auto space-y-3">
+    <div class="search-panel rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+      <div class="grid gap-4 md:grid-cols-[minmax(0,0.9fr)_minmax(0,1.4fr)] md:gap-0">
     <!-- Search Scope Selection -->
-    <div class="rounded-2xl border border-slate-200/80 bg-white/90 p-4 shadow-sm">
+    <div class="search-section min-w-0 md:pr-4">
       <label class="block text-xs font-semibold tracking-wide text-slate-600">搜索范围</label>
       <button
         @click="showKbSelector = true"
@@ -126,13 +128,13 @@ const handleKeydown = (e) => {
           <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l4-4 4 4m0 6l-4 4-4-4" />
         </svg>
       </button>
-      <p class="mt-3 text-xs text-slate-500">
+      <p class="mt-2 text-xs text-slate-500">
         当前搜索将在 <span class="font-medium text-blue-600">{{ localSelectedKb.name }}</span> 及其子知识库中进行。
       </p>
     </div>
 
     <!-- Search Mode Selection -->
-    <div class="rounded-2xl border border-slate-200/80 bg-white/90 p-4 shadow-sm">
+    <div class="search-section min-w-0 md:border-l md:border-slate-200 md:pl-4">
       <label class="block text-xs font-semibold tracking-wide text-slate-600 mb-2">搜索模式</label>
       <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-1.5">
         <button
@@ -168,10 +170,11 @@ const handleKeydown = (e) => {
           高级搜索
         </button>
       </div>
-      <p class="mt-3 text-xs text-slate-500 leading-5">
+      <p class="mt-2 text-xs text-slate-500 leading-5">
         文件搜索返回高亮片段；切片搜索返回命中的切片内容；图片搜索支持以图搜图；高级搜索以 SSE 流返回更长上下文。
       </p>
     </div>
+      </div>
 
     <!-- Knowledge Base Selector Modal -->
     <KnowledgeBaseSelector
@@ -181,7 +184,7 @@ const handleKeydown = (e) => {
     />
 
     <!-- 图片搜索上传 -->
-    <div v-if="searchMode === 'image'" class="space-y-4 rounded-2xl border border-slate-200/80 bg-white/90 p-4 shadow-sm">
+    <div v-if="searchMode === 'image'" class="mt-4 space-y-4 border-t border-slate-200 pt-4">
       <div class="flex flex-wrap items-center gap-3">
         <input
           ref="fileInput"
@@ -221,7 +224,7 @@ const handleKeydown = (e) => {
           @keydown="handleKeydown"
           type="text"
           placeholder="图片描述（可选）..."
-          class="w-full h-16 pl-12 pr-28 sm:pr-36 bg-white border border-slate-200 rounded-2xl text-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
+          class="w-full h-14 pl-12 pr-28 sm:pr-36 bg-white border border-slate-200 rounded-2xl text-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
         />
         <button
           @click="handleSearch"
@@ -313,7 +316,7 @@ const handleKeydown = (e) => {
           @keydown="handleKeydown"
           type="text"
           placeholder="输入关键词搜索..."
-          class="w-full h-16 pl-12 pr-28 sm:pr-36 bg-white border border-slate-200 rounded-2xl text-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
+          class="w-full h-14 pl-12 pr-28 sm:pr-36 bg-white border border-slate-200 rounded-2xl text-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
         />
         <button
           @click="handleSearch"
@@ -323,6 +326,7 @@ const handleKeydown = (e) => {
           搜索
         </button>
       </div>
+    </div>
     </div>
 
     <p v-if="error" class="rounded-xl border border-red-200 bg-red-50 px-4 py-2 text-center text-sm text-red-600">{{ error }}</p>

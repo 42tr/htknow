@@ -131,7 +131,7 @@ onMounted(load)
 
 <template>
   <section class="space-y-6">
-    <div class="flex items-center justify-between">
+    <div class="settings-toolbar sticky top-16 z-20 -mx-1 px-1 py-2 bg-white/90 backdrop-blur-sm flex items-center justify-between">
       <div>
         <h2 class="text-2xl font-bold text-slate-800">系统配置</h2>
         <p class="mt-1 text-slate-500">配置图片处理和文件解析相关参数</p>
