@@ -252,7 +252,7 @@ const availableEntityTypes = computed(() => {
   const types = new Set(allNodes.value.map(n => n.type))
   return Array.from(types).map(type => ({
     type,
-    ...entityTypeMap[type] || { label: type, icon: '📌' },
+    ...entityTypeMap[type] || { label: type, icon: '·' },
     count: allNodes.value.filter(n => n.type === type).length
   }))
 })
@@ -801,18 +801,18 @@ watch(() => props.entityType, () => {
 })
 
 const entityTypeMap = {
-  'person': { label: '人物', icon: '👤' },
-  'organization': { label: '组织', icon: '🏢' },
-  'location': { label: '地点', icon: '📍' },
-  'date': { label: '日期', icon: '📅' },
-  'product': { label: '产品', icon: '📦' },
-  'technology': { label: '技术', icon: '⚡' },
-  'concept': { label: '概念', icon: '💡' },
-  'api': { label: 'API', icon: '🔌' },
+  'person': { label: '人物', icon: '人' },
+  'organization': { label: '组织', icon: '组织' },
+  'location': { label: '地点', icon: '地' },
+  'date': { label: '日期', icon: '日' },
+  'product': { label: '产品', icon: '品' },
+  'technology': { label: '技术', icon: '技' },
+  'concept': { label: '概念', icon: '概' },
+  'api': { label: 'API', icon: 'API' },
 }
 
 const getEntityTypeInfo = (type) => {
-  return entityTypeMap[type] || { label: type, icon: '📌' }
+  return entityTypeMap[type] || { label: type, icon: '·' }
 }
 </script>
 
@@ -839,7 +839,7 @@ const getEntityTypeInfo = (type) => {
             @click="resetView"
             class="px-3 py-1.5 text-sm bg-white border border-slate-300 rounded-lg hover:bg-slate-50 transition-colors"
           >
-            🔄 重置
+            重置
           </button>
         </div>
       </div>
@@ -1066,17 +1066,17 @@ const getEntityTypeInfo = (type) => {
       
       <!-- 操作提示 -->
       <div class="absolute top-4 left-4 bg-white/90 rounded-lg shadow border border-slate-200 px-3 py-2 text-xs text-slate-600">
-        <div>💡 <strong>点击节点</strong>: 展开关联实体</div>
-        <div>💡 <strong>点击关系文字</strong>: 查看原文证据</div>
-        <div>💡 <strong>拖拽节点</strong>: 点击并拖动</div>
-        <div>💡 <strong>平移视图</strong>: Shift + 拖动 或 中键拖动</div>
-        <div>💡 <strong>缩放</strong>: 滚轮滚动</div>
+        <div><strong>点击节点</strong>: 展开关联实体</div>
+        <div><strong>点击关系文字</strong>: 查看原文证据</div>
+        <div><strong>拖拽节点</strong>: 点击并拖动</div>
+        <div><strong>平移视图</strong>: Shift + 拖动 或 中键拖动</div>
+        <div><strong>缩放</strong>: 滚轮滚动</div>
       </div>
       
       <!-- 提示 -->
       <div v-if="!loading && nodes.length === 0" class="absolute inset-0 flex items-center justify-center">
         <div class="text-center text-slate-400">
-          <span class="text-4xl block mb-2">🕸️</span>
+          <span class="text-xl block mb-2 font-semibold">GRAPH</span>
           <p>暂无图谱数据</p>
           <p class="text-sm mt-1">启用图谱构建并成功处理文档后，可在此查看</p>
         </div>

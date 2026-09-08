@@ -135,7 +135,7 @@ const closeModal = () => {
                    <input type="radio" v-model="isPublic" :value="false" class="w-4 h-4 text-blue-500" />
                    <div>
                      <div class="flex items-center gap-2 mb-1">
-                       <span class="text-lg">🔒</span>
+                       <span class="text-xs font-semibold">PRIVATE</span>
                        <span class="font-medium text-slate-800">私有</span>
                      </div>
                      <p class="text-xs text-slate-500">仅自己可见</p>
@@ -150,7 +150,7 @@ const closeModal = () => {
                    <input type="radio" v-model="isPublic" :value="true" class="w-4 h-4 text-green-500" />
                    <div>
                      <div class="flex items-center gap-2 mb-1">
-                       <span class="text-lg">🌐</span>
+                       <span class="text-xs font-semibold">PUBLIC</span>
                        <span class="font-medium text-slate-800">公开</span>
                      </div>
                      <p class="text-xs text-slate-500">所有人可见</p>
@@ -173,7 +173,7 @@ const closeModal = () => {
                    <input type="radio" v-model="kbType" value="analysis" class="w-4 h-4 text-indigo-500" />
                    <div>
                      <div class="flex items-center gap-2 mb-1">
-                       <span class="text-lg">🧠</span>
+                       <span class="text-xs font-semibold">ANALYSIS</span>
                        <span class="font-medium text-slate-800">分析型</span>
                      </div>
                      <p class="text-xs text-slate-500">解析并切片，支持搜索与知识图谱</p>
@@ -188,7 +188,7 @@ const closeModal = () => {
                    <input type="radio" v-model="kbType" value="storage" class="w-4 h-4 text-amber-500" />
                    <div>
                      <div class="flex items-center gap-2 mb-1">
-                       <span class="text-lg">🗄️</span>
+                       <span class="text-xs font-semibold">STORAGE</span>
                        <span class="font-medium text-slate-800">存储型</span>
                      </div>
                      <p class="text-xs text-slate-500">仅存储文件，不进行解析</p>

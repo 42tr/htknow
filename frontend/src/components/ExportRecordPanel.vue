@@ -106,9 +106,9 @@ const copyPath = async (path) => {
                 {{ formatKbNames(record.kbNames) }}
               </div>
               <div class="flex items-center gap-3 mt-1.5 text-xs text-slate-400">
-                <span v-if="record.fileCount">📄 {{ formatSize(record.fileCount) }} 文件</span>
-                <span v-if="record.sliceCount">📑 {{ formatSize(record.sliceCount) }} 切片</span>
-                <span v-if="record.tantivyDocCount">🔍 {{ formatSize(record.tantivyDocCount) }} 索引</span>
+                <span v-if="record.fileCount">{{ formatSize(record.fileCount) }} 文件</span>
+                <span v-if="record.sliceCount">{{ formatSize(record.sliceCount) }} 切片</span>
+                <span v-if="record.tantivyDocCount">{{ formatSize(record.tantivyDocCount) }} 索引</span>
               </div>
             </div>
             <button

@@ -69,7 +69,7 @@ watch(() => props.kb.id, () => {
       </button>
       <div class="flex items-center gap-3">
         <div class="w-12 h-12 bg-linear-to-br from-blue-100 to-indigo-100 rounded-xl flex items-center justify-center">
-          <span class="text-2xl">📚</span>
+          <span class="text-xs font-semibold tracking-wide">KB</span>
         </div>
          <div>
            <h2 class="text-xl font-bold text-slate-800 flex items-center gap-2">
@@ -78,13 +78,13 @@ watch(() => props.kb.id, () => {
                 'px-2 py-0.5 text-xs rounded-full border',
                 kb.is_public ? 'bg-green-50 text-green-600 border-green-200' : 'bg-slate-50 text-slate-600 border-slate-200'
               ]">
-                {{ kb.is_public ? '🌐 公开' : '🔒 私有' }}
+                {{ kb.is_public ? '公开' : '私有' }}
               </span>
              <span :class="[
                'px-2 py-0.5 text-xs rounded-full border',
                kb.kb_type === 'storage' ? 'bg-amber-50 text-amber-600 border-amber-200' : 'bg-indigo-50 text-indigo-600 border-indigo-200'
              ]">
-               {{ kb.kb_type === 'storage' ? '🗄️ 存储型' : '🧠 分析型' }}
+               {{ kb.kb_type === 'storage' ? '存储型' : '分析型' }}
              </span>
              <span
                v-if="kb.current_user_permission"
@@ -95,7 +95,7 @@ watch(() => props.kb.id, () => {
                  'bg-slate-50 text-slate-500 border-slate-200': kb.current_user_permission === 'viewer'
                }"
              >
-               {{ kb.current_user_permission === 'admin' ? '⚙️ 管理员' : kb.current_user_permission === 'editor' ? '✏️ 可写' : '👁️ 只读' }}
+               {{ kb.current_user_permission === 'admin' ? '管理员' : kb.current_user_permission === 'editor' ? '可写' : '只读' }}
              </span>
            </h2>
            <p class="text-sm text-slate-500">{{ kb.description || '暂无描述' }}</p>
@@ -125,7 +125,7 @@ watch(() => props.kb.id, () => {
     <!-- Empty -->
     <div v-else-if="files.length === 0" class="text-center py-12">
       <div class="w-16 h-16 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-4">
-        <span class="text-3xl">📄</span>
+        <span class="text-xs font-semibold tracking-wide">FILE</span>
       </div>
       <p class="text-slate-500 mb-2">暂无文件</p>
       <p class="text-sm text-slate-400">请在「上传」页面添加文件到此知识库</p>

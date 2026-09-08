@@ -56,7 +56,7 @@ onMounted(() => {
         <div class="px-6 py-4 border-b border-slate-200 flex items-center justify-between flex-shrink-0">
           <div class="flex items-center gap-3">
             <div class="w-10 h-10 bg-gradient-to-br from-purple-100 to-indigo-100 rounded-lg flex items-center justify-center">
-              <span class="text-xl">🕸️</span>
+              <span class="text-xs font-semibold">GRAPH</span>
             </div>
             <div>
               <h2 class="text-lg font-semibold text-slate-800">文件知识图谱</h2>
@@ -77,22 +77,22 @@ onMounted(() => {
         <div v-if="stats" class="px-6 py-3 border-b border-slate-100 bg-slate-50 flex-shrink-0">
           <div class="flex items-center gap-6 text-sm">
             <div class="flex items-center gap-2">
-              <span class="text-blue-500">🔵</span>
+              <span class="text-blue-500">●</span>
               <span class="text-slate-600">实体节点:</span>
               <span class="font-semibold text-slate-800">{{ stats.node_count }}</span>
             </div>
             <div class="flex items-center gap-2">
-              <span class="text-purple-500">↔️</span>
+              <span class="text-purple-500">↔</span>
               <span class="text-slate-600">关系边:</span>
               <span class="font-semibold text-slate-800">{{ stats.edge_count }}</span>
             </div>
             <div class="flex items-center gap-2">
-              <span class="text-green-500">📊</span>
+              <span class="text-green-500">▦</span>
               <span class="text-slate-600">实体类型:</span>
               <span class="font-semibold text-slate-800">{{ Object.keys(stats.entity_types || {}).length }}</span>
             </div>
             <div class="flex items-center gap-2">
-              <span class="text-orange-500">🔗</span>
+              <span class="text-orange-500">⌁</span>
               <span class="text-slate-600">关系类型:</span>
               <span class="font-semibold text-slate-800">{{ Object.keys(stats.relation_types || {}).length }}</span>
             </div>
@@ -106,7 +106,7 @@ onMounted(() => {
         <div class="flex-1 overflow-auto p-4">
           <div v-if="stats && stats.node_count === 0" class="flex items-center justify-center h-96">
             <div class="text-center text-slate-400">
-              <span class="text-4xl block mb-2">🕸️</span>
+              <span class="text-xl block mb-2 font-semibold">GRAPH</span>
               <p>此文件暂无知识图谱数据</p>
               <p class="text-sm mt-1">启用图谱构建并成功处理文档后，可在此查看</p>
             </div>

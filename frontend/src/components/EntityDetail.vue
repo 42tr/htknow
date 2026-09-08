@@ -15,33 +15,33 @@ const entityDetail = ref(null)
 const loading = ref(false)
 
 const entityTypeMap = {
-  'person': { label: '人物', icon: '👤', color: 'blue' },
-  'organization': { label: '组织', icon: '🏢', color: 'purple' },
-  'location': { label: '地点', icon: '📍', color: 'green' },
-  'date': { label: '日期', icon: '📅', color: 'orange' },
-  'product': { label: '产品', icon: '📦', color: 'pink' },
-  'technology': { label: '技术', icon: '⚡', color: 'cyan' },
-  'concept': { label: '概念', icon: '💡', color: 'yellow' },
-  'api': { label: 'API', icon: '🔌', color: 'indigo' },
+  'person': { label: '人物', icon: '人', color: 'blue' },
+  'organization': { label: '组织', icon: '组织', color: 'purple' },
+  'location': { label: '地点', icon: '地', color: 'green' },
+  'date': { label: '日期', icon: '日', color: 'orange' },
+  'product': { label: '产品', icon: '品', color: 'pink' },
+  'technology': { label: '技术', icon: '技', color: 'cyan' },
+  'concept': { label: '概念', icon: '概', color: 'yellow' },
+  'api': { label: 'API', icon: 'API', color: 'indigo' },
 }
 
 const relationTypeMap = {
-  'cooccurs': { label: '共现', icon: '🔗', color: 'blue' },
-  'isa': { label: '是一种', icon: '📌', color: 'purple' },
-  'partof': { label: '部分', icon: '🧩', color: 'green' },
-  'hasproperty': { label: '具有属性', icon: '⚙️', color: 'orange' },
-  'dependson': { label: '依赖于', icon: '🔄', color: 'pink' },
-  'relatedto': { label: '相关', icon: '↔️', color: 'cyan' },
-  'contains': { label: '包含', icon: '📦', color: 'indigo' },
-  'mentionedin': { label: '提及于', icon: '📝', color: 'yellow' },
+  'cooccurs': { label: '共现', icon: '共', color: 'blue' },
+  'isa': { label: '是一种', icon: '类', color: 'purple' },
+  'partof': { label: '部分', icon: '部', color: 'green' },
+  'hasproperty': { label: '具有属性', icon: '属', color: 'orange' },
+  'dependson': { label: '依赖于', icon: '依', color: 'pink' },
+  'relatedto': { label: '相关', icon: '关', color: 'cyan' },
+  'contains': { label: '包含', icon: '含', color: 'indigo' },
+  'mentionedin': { label: '提及于', icon: '提', color: 'yellow' },
 }
 
 const getEntityTypeInfo = (type) => {
-  return entityTypeMap[type] || { label: type, icon: '📌', color: 'gray' }
+  return entityTypeMap[type] || { label: type, icon: '·', color: 'gray' }
 }
 
 const getRelationTypeInfo = (type) => {
-  return relationTypeMap[type] || { label: type, icon: '🔗', color: 'gray' }
+  return relationTypeMap[type] || { label: type, icon: '·', color: 'gray' }
 }
 
 const loadEntityDetail = async () => {
@@ -124,7 +124,7 @@ onMounted(() => {
           <!-- 关联实体 -->
           <div v-if="entityDetail.neighbors && entityDetail.neighbors.length > 0">
             <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2">
-              <span>🔗</span>
+              <span>关系</span>
               <span>关联实体 ({{ entityDetail.neighbors.length }})</span>
             </h3>
             <div class="space-y-2">
@@ -162,7 +162,7 @@ onMounted(() => {
           <!-- 文档提及 -->
           <div v-if="entityDetail.mentions && entityDetail.mentions.length > 0">
             <h3 class="text-sm font-semibold text-slate-700 mb-3 flex items-center gap-2">
-              <span>📝</span>
+              <span>提及</span>
               <span>文档提及 ({{ entityDetail.mentions.length }})</span>
             </h3>
             <div class="space-y-2">
@@ -172,7 +172,7 @@ onMounted(() => {
                 class="bg-slate-50 rounded-lg p-4 border border-slate-200"
               >
                 <div class="flex items-start gap-2 mb-2">
-                  <span class="text-xs font-medium text-blue-600">📄 {{ mention.filename }}</span>
+                  <span class="text-xs font-medium text-blue-600">{{ mention.filename }}</span>
                   <span class="text-xs text-slate-400">切片ID: {{ mention.slice_id }}</span>
                 </div>
                 <p class="text-sm text-slate-700 leading-relaxed">
@@ -184,7 +184,7 @@ onMounted(() => {
 
           <!-- 空状态 -->
           <div v-if="(!entityDetail.neighbors || entityDetail.neighbors.length === 0) && (!entityDetail.mentions || entityDetail.mentions.length === 0)" class="text-center py-8 text-slate-400">
-            <span class="text-4xl block mb-2">📭</span>
+            <span class="text-xl block mb-2 font-semibold">EMPTY</span>
             暂无关联信息
           </div>
         </div>

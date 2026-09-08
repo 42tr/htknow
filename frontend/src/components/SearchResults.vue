@@ -25,7 +25,7 @@ const isExcelFile = (filename) => {
   return /\.(xlsx|xls)$/i.test(filename)
 }
 
-const getFileEmoji = (filename) => (isImageFile(filename) ? '🖼️' : '📄')
+const getFileEmoji = (filename) => (isImageFile(filename) ? 'IMG' : 'DOC')
 
 const canHighlight = (result) => isOfficeFile(result.file?.filename)
 
@@ -102,7 +102,7 @@ defineProps({
       >
         <div class="flex items-start gap-4">
           <div class="w-10 h-10 bg-linear-to-br from-amber-100 to-orange-100 rounded-lg flex items-center justify-center shrink-0">
-            <span class="text-lg">{{ getFileEmoji(result.file?.filename) }}</span>
+            <span class="text-[10px] font-semibold tracking-wide text-amber-700">{{ getFileEmoji(result.file?.filename) }}</span>
           </div>
           <div class="flex-1 min-w-0">
             <h3 class="font-semibold text-slate-800 mb-1 truncate">

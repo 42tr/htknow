@@ -40,7 +40,7 @@ const formatSize = (bytes) => {
         :style="{ paddingLeft: (level * 16 + 8) + 'px' }"
         @click="$emit('toggle', child.path)"
       >
-        <span class="text-amber-500 text-sm">{{ isExpanded(child.path) ? '📂' : '📁' }}</span>
+        <span class="text-amber-500 text-sm">{{ isExpanded(child.path) ? '▾' : '▸' }}</span>
         <span class="text-sm text-slate-700">{{ child.name }}</span>
       </div>
 
@@ -50,7 +50,7 @@ const formatSize = (bytes) => {
         class="flex items-center gap-2 py-1.5 px-2 hover:bg-slate-50 rounded cursor-pointer group"
         :style="{ paddingLeft: (level * 16 + 8) + 'px' }"
       >
-        <span class="text-slate-400 text-sm">📄</span>
+        <span class="text-slate-400 text-sm">FILE</span>
         <span class="text-sm text-slate-700 flex-1 truncate">{{ child.name }}</span>
         <span class="text-xs text-slate-400 mr-2">{{ formatSize(child.size) }}</span>
         <button
@@ -59,7 +59,7 @@ const formatSize = (bytes) => {
           class="opacity-0 group-hover:opacity-100 p-1 text-slate-400 hover:text-emerald-500 hover:bg-emerald-50 rounded transition-all text-xs"
           title="下载"
         >
-          {{ downloading.has(child.path) ? '⏳' : '⬇️' }}
+          {{ downloading.has(child.path) ? '…' : '↓' }}
         </button>
       </div>
 

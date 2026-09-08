@@ -51,15 +51,15 @@ const isArchive = computed(() => {
 const statusInfo = computed(() => {
   switch (props.file.status) {
     case 0:
-      return { text: '待处理', color: 'bg-amber-100 text-amber-700', icon: '⏳' }
+      return { text: '待处理', color: 'bg-amber-100 text-amber-700', icon: '·' }
     case 2:
-      return { text: '处理中', color: 'bg-blue-100 text-blue-700', icon: '⚙️' }
+      return { text: '处理中', color: 'bg-blue-100 text-blue-700', icon: '·' }
     case 1:
       return { text: '已完成', color: 'bg-green-100 text-green-700', icon: '✓' }
     case 3:
       return isArchive.value
-        ? { text: '压缩文件', color: 'bg-purple-100 text-purple-700', icon: '📦' }
-        : { text: '不解析', color: 'bg-amber-100 text-amber-700', icon: '🗄️' }
+        ? { text: '压缩文件', color: 'bg-purple-100 text-purple-700', icon: 'ZIP' }
+        : { text: '不解析', color: 'bg-amber-100 text-amber-700', icon: '—' }
     case -1:
       return { text: '处理失败', color: 'bg-red-100 text-red-700', icon: '✗' }
     default:
@@ -72,7 +72,7 @@ const publicInfo = computed(() => {
     isPublic: props.file.is_public,
     text: props.file.is_public ? '公开' : '私有',
     color: props.file.is_public ? 'bg-green-50 text-green-600 border-green-200' : 'bg-slate-50 text-slate-600 border-slate-200',
-    icon: props.file.is_public ? '🌐' : '🔒'
+    icon: ''
   }
 })
 
@@ -253,7 +253,7 @@ const handleMoveToKb = async (kb) => {
       <div class="flex items-start gap-4">
         <!-- File Icon -->
         <div class="w-10 h-10 bg-linear-to-br from-amber-100 to-orange-100 rounded-lg flex items-center justify-center shrink-0">
-          <span class="text-lg">{{ isArchive ? '📦' : '📄' }}</span>
+          <span class="text-[10px] font-semibold tracking-wide">{{ isArchive ? 'ZIP' : 'FILE' }}</span>
         </div>
 
         <!-- File Details -->
@@ -280,7 +280,7 @@ const handleMoveToKb = async (kb) => {
               :key="tag"
               class="px-2 py-0.5 text-xs bg-blue-50 text-blue-600 rounded-full border border-blue-100"
             >
-              🏷️ {{ tag }}
+              {{ tag }}
             </span>
           </div>
 

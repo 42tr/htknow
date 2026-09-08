@@ -42,12 +42,12 @@ const sliceKey = (item) => {
 }
 
 const tabs = [
-  { id: 'search', name: '搜索', icon: '🔍' },
-  { id: 'dictionary', name: '词典', icon: '🧩' },
-  { id: 'knowledge', name: '知识库', icon: '📚' },
-  { id: 'graph', name: '知识图谱', icon: '🕸️' },
-  { id: 'upload', name: '上传', icon: '📤' },
-  { id: 'settings', name: '配置', icon: '⚙️' },
+  { id: 'search', name: '搜索', icon: '' },
+  { id: 'dictionary', name: '词典', icon: '' },
+  { id: 'knowledge', name: '知识库', icon: '' },
+  { id: 'graph', name: '知识图谱', icon: '' },
+  { id: 'upload', name: '上传', icon: '' },
+  { id: 'settings', name: '配置', icon: '' },
 ]
 
 const handleSearchResults = (results) => {
@@ -216,7 +216,7 @@ const clearAdvanced = () => {
         <div class="flex items-center justify-between">
           <div class="flex items-center gap-3">
             <div class="w-10 h-10 bg-linear-to-br from-blue-500 to-indigo-600 rounded-xl flex items-center justify-center">
-              <span class="text-white text-xl">📖</span>
+              <span class="text-white text-xs font-semibold tracking-wide">KB</span>
             </div>
             <h1 class="text-xl font-semibold text-slate-800">知识库</h1>
           </div>

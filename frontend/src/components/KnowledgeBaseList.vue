@@ -605,7 +605,7 @@ onMounted(() => {
     <!-- Empty State -->
     <div v-else-if="childrenKbs.length === 0 && files.length === 0" class="text-center py-12">
         <div class="w-16 h-16 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-4">
-          <span class="text-3xl">🗂️</span>
+          <span class="text-xs font-semibold tracking-wide">EMPTY</span>
         </div>
         <p class="text-slate-500">这个知识库是空的</p>
     </div>
@@ -631,7 +631,7 @@ onMounted(() => {
           </div>
           <div class="flex items-start justify-between mb-3 pl-8">
             <div class="w-12 h-12 bg-linear-to-br from-blue-100 to-indigo-100 rounded-xl flex items-center justify-center">
-              <span class="text-2xl">📚</span>
+              <span class="text-xs font-semibold tracking-wide">KB</span>
             </div>
              <div class="flex items-center gap-1">
                 <span
@@ -643,7 +643,7 @@ onMounted(() => {
                     'bg-slate-50 text-slate-500 border-slate-200': kb.current_user_permission === 'viewer'
                   }"
                 >
-                  {{ kb.current_user_permission === 'admin' ? '⚙️ 管理员' : kb.current_user_permission === 'editor' ? '✏️ 可写' : '👁️ 只读' }}
+                  {{ kb.current_user_permission === 'admin' ? '管理员' : kb.current_user_permission === 'editor' ? '可写' : '只读' }}
                 </span>
                 <button
                   v-if="kb.current_user_permission === 'admin'"
@@ -700,13 +700,13 @@ onMounted(() => {
                 'px-2 py-0.5 text-xs rounded-full border',
                 kb.is_public ? 'bg-green-50 text-green-600 border-green-200' : 'bg-slate-50 text-slate-600 border-slate-200'
               ]">
-                {{ kb.is_public ? '🌐 公开' : '🔒 私有' }}
+                {{ kb.is_public ? '公开' : '私有' }}
               </span>
              <span :class="[
                'px-2 py-0.5 text-xs rounded-full border',
                kb.kb_type === 'storage' ? 'bg-amber-50 text-amber-600 border-amber-200' : 'bg-indigo-50 text-indigo-600 border-indigo-200'
              ]">
-               {{ kb.kb_type === 'storage' ? '🗄️ 存储型' : '🧠 分析型' }}
+               {{ kb.kb_type === 'storage' ? '存储型' : '分析型' }}
              </span>
            </h3>
            <p class="text-sm text-slate-500 line-clamp-2 mb-3">{{ kb.description || '暂无描述' }}</p>

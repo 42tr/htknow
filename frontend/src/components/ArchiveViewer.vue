@@ -192,7 +192,7 @@ watch(() => props.file, () => {
         <!-- Header -->
         <div class="flex items-center justify-between p-5 border-b border-slate-100">
           <div class="flex items-center gap-3">
-            <span class="text-2xl">📦</span>
+            <span class="text-xs font-semibold">ZIP</span>
             <div>
               <h3 class="text-lg font-semibold text-slate-800">压缩文件内容</h3>
               <p class="text-xs text-slate-400">{{ file.filename }}</p>
@@ -219,7 +219,7 @@ watch(() => props.file, () => {
           <!-- Password Input -->
           <div v-else-if="needsPassword" class="py-8 px-4">
             <div class="text-center mb-6">
-              <span class="text-4xl mb-3 block">🔐</span>
+              <span class="text-2xl mb-3 block font-semibold">LOCKED</span>
               <h4 class="text-lg font-medium text-slate-700 mb-1">压缩文件已加密</h4>
               <p class="text-sm text-slate-400">请输入解压密码</p>
             </div>
@@ -246,7 +246,7 @@ watch(() => props.file, () => {
 
           <!-- Error -->
           <div v-else-if="error" class="py-8 text-center">
-            <span class="text-3xl mb-2 block">⚠️</span>
+            <span class="text-2xl mb-2 block font-semibold">!</span>
             <p class="text-red-500 text-sm">{{ error }}</p>
             <button
               @click="extractArchive"
@@ -264,7 +264,7 @@ watch(() => props.file, () => {
                 @click="extractArchive"
                 class="text-blue-500 hover:text-blue-600 transition-all"
               >
-                🔄 重新解压
+                重新解压
               </button>
             </div>
             <div class="border border-slate-100 rounded-xl overflow-hidden">
@@ -281,7 +281,7 @@ watch(() => props.file, () => {
 
           <!-- Empty -->
           <div v-else class="py-12 text-center">
-            <span class="text-3xl mb-2 block">📂</span>
+            <span class="text-2xl mb-2 block font-semibold">EMPTY</span>
             <p class="text-slate-400 text-sm">压缩包为空</p>
           </div>
         </div>

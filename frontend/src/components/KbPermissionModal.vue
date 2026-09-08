@@ -24,9 +24,9 @@ const newUserId = ref('')
 const newPermission = ref('viewer')
 
 const permissionOptions = [
-  { value: 'viewer', label: '👁️ 只读', desc: '可查看、搜索、下载' },
-  { value: 'editor', label: '✏️ 可写', desc: '可上传文件、重新解析' },
-  { value: 'admin', label: '⚙️ 管理员', desc: '可修改属性、删除、管理权限' },
+  { value: 'viewer', label: '只读', desc: '可查看、搜索、下载' },
+  { value: 'editor', label: '可写', desc: '可上传文件、重新解析' },
+  { value: 'admin', label: '管理员', desc: '可修改属性、删除、管理权限' },
 ]
 
 const permissionLabel = (perm) => {
@@ -92,7 +92,7 @@ watch(() => props.show, (val) => {
       <div class="relative bg-white rounded-2xl shadow-xl w-full max-w-lg p-6">
         <div class="flex items-center justify-between mb-5">
           <h3 class="text-lg font-semibold text-slate-800">
-            📋 「{{ kb.name }}」权限管理
+            「{{ kb.name }}」权限管理
           </h3>
           <button @click="emit('close')" class="p-2 text-slate-400 hover:text-slate-600 hover:bg-slate-100 rounded-lg transition-all">
             <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -104,7 +104,7 @@ watch(() => props.show, (val) => {
         <div class="mb-4">
           <p class="text-sm text-slate-500">
             创建者：<span class="font-medium text-slate-700">{{ kb.user_id }}</span>
-            <span class="ml-2 px-2 py-0.5 text-xs rounded-full bg-purple-50 text-purple-600 border border-purple-200">⚙️ 管理员</span>
+            <span class="ml-2 px-2 py-0.5 text-xs rounded-full bg-purple-50 text-purple-600 border border-purple-200">管理员</span>
           </p>
         </div>
 

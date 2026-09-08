@@ -170,7 +170,7 @@ const handleUpload = async () => {
           <input type="radio" v-model="isPublic" :value="false" class="w-4 h-4 text-blue-500" />
           <div>
             <div class="flex items-center gap-2 mb-1">
-              <span class="text-lg">🔒</span>
+              <span class="text-xs font-semibold">PRIVATE</span>
               <span class="font-medium text-slate-800">私有</span>
             </div>
             <p class="text-xs text-slate-500">仅自己可见</p>
@@ -185,7 +185,7 @@ const handleUpload = async () => {
           <input type="radio" v-model="isPublic" :value="true" class="w-4 h-4 text-green-500" />
           <div>
             <div class="flex items-center gap-2 mb-1">
-              <span class="text-lg">🌐</span>
+              <span class="text-xs font-semibold">PUBLIC</span>
               <span class="font-medium text-slate-800">公开</span>
             </div>
             <p class="text-xs text-slate-500">所有人可见</p>
@@ -198,7 +198,7 @@ const handleUpload = async () => {
     <div v-if="isStorageKb" class="bg-white rounded-xl p-5 border border-slate-200 mb-4">
       <label class="block text-sm font-medium text-slate-700 mb-3">切片方式</label>
       <div class="flex items-center gap-3 p-4 rounded-xl border border-amber-200 bg-amber-50 text-amber-700 text-sm">
-        <span class="text-lg">🗄️</span>
+        <span class="text-xs font-semibold">STORAGE</span>
         <div>
           <p class="font-medium">存储型知识库不进行解析</p>
           <p class="text-xs text-amber-600">文件将直接保存，不会生成切片或知识图谱</p>
@@ -268,7 +268,7 @@ const handleUpload = async () => {
         >
           <div class="flex items-center gap-3 min-w-0">
             <div class="w-8 h-8 bg-slate-100 rounded-lg flex items-center justify-center shrink-0">
-              <span class="text-sm">📄</span>
+              <span class="text-xs font-semibold">FILE</span>
             </div>
             <div class="min-w-0">
               <p class="text-sm text-slate-700 truncate">{{ file.name }}</p>

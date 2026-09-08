@@ -22,18 +22,18 @@ const selectedFileId = ref(null)
 
 // 实体类型映射
 const entityTypeMap = {
-  'person': { label: '人物', icon: '👤', color: 'blue' },
-  'organization': { label: '组织', icon: '🏢', color: 'purple' },
-  'location': { label: '地点', icon: '📍', color: 'green' },
-  'date': { label: '日期', icon: '📅', color: 'orange' },
-  'product': { label: '产品', icon: '📦', color: 'pink' },
-  'technology': { label: '技术', icon: '⚡', color: 'cyan' },
-  'concept': { label: '概念', icon: '💡', color: 'yellow' },
-  'api': { label: 'API', icon: '🔌', color: 'indigo' },
-  'document': { label: '文档', icon: '📄', color: 'gray' },
-  'chapter': { label: '章节', icon: '📑', color: 'slate' },
-  'table': { label: '表格', icon: '📊', color: 'teal' },
-  'image': { label: '图片', icon: '🖼️', color: 'rose' },
+  'person': { label: '人物', icon: '人', color: 'blue' },
+  'organization': { label: '组织', icon: '组织', color: 'purple' },
+  'location': { label: '地点', icon: '地', color: 'green' },
+  'date': { label: '日期', icon: '日', color: 'orange' },
+  'product': { label: '产品', icon: '品', color: 'pink' },
+  'technology': { label: '技术', icon: '技', color: 'cyan' },
+  'concept': { label: '概念', icon: '概', color: 'yellow' },
+  'api': { label: 'API', icon: 'API', color: 'indigo' },
+  'document': { label: '文档', icon: '文', color: 'gray' },
+  'chapter': { label: '章节', icon: '章', color: 'slate' },
+  'table': { label: '表格', icon: '表', color: 'teal' },
+  'image': { label: '图片', icon: '图', color: 'rose' },
 }
 
 const entityTypes = computed(() => {
@@ -41,7 +41,7 @@ const entityTypes = computed(() => {
   return Object.entries(stats.value.entity_types || {}).map(([type, count]) => ({
     type,
     count,
-    ...entityTypeMap[type] || { label: type, icon: '📌', color: 'gray' }
+    ...entityTypeMap[type] || { label: type, icon: '·', color: 'gray' }
   }))
 })
 
@@ -139,7 +139,7 @@ const closeEntityDetail = () => {
 }
 
 const getEntityTypeInfo = (type) => {
-  return entityTypeMap[type] || { label: type, icon: '📌', color: 'gray' }
+  return entityTypeMap[type] || { label: type, icon: '·', color: 'gray' }
 }
 
 const formatDate = (timestamp) => {
@@ -184,7 +184,7 @@ onMounted(() => {
               scopeType === 'all' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
             ]"
           >
-            🌐 全部
+            全部
           </button>
           <button
             @click="scopeType = 'kb'; handleScopeChange()"
@@ -193,7 +193,7 @@ onMounted(() => {
               scopeType === 'kb' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
             ]"
           >
-            📚 知识库
+            知识库
           </button>
           <button
             @click="scopeType = 'file'; handleScopeChange()"
@@ -202,7 +202,7 @@ onMounted(() => {
               scopeType === 'file' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
             ]"
           >
-            📄 文件
+            文件
           </button>
         </div>
 
@@ -248,7 +248,7 @@ onMounted(() => {
       <div class="bg-white rounded-xl p-6 border border-slate-200 shadow-sm">
         <div class="flex items-center gap-3">
           <div class="w-12 h-12 bg-blue-100 rounded-lg flex items-center justify-center">
-            <span class="text-2xl">🔵</span>
+            <span class="text-2xl">●</span>
           </div>
           <div>
             <p class="text-sm text-slate-500">实体节点</p>
@@ -260,7 +260,7 @@ onMounted(() => {
       <div class="bg-white rounded-xl p-6 border border-slate-200 shadow-sm">
         <div class="flex items-center gap-3">
           <div class="w-12 h-12 bg-purple-100 rounded-lg flex items-center justify-center">
-            <span class="text-2xl">↔️</span>
+            <span class="text-2xl">↔</span>
           </div>
           <div>
             <p class="text-sm text-slate-500">关系边</p>
@@ -272,7 +272,7 @@ onMounted(() => {
       <div class="bg-white rounded-xl p-6 border border-slate-200 shadow-sm">
         <div class="flex items-center gap-3">
           <div class="w-12 h-12 bg-green-100 rounded-lg flex items-center justify-center">
-            <span class="text-2xl">📊</span>
+            <span class="text-2xl">▦</span>
           </div>
           <div>
             <p class="text-sm text-slate-500">实体类型</p>
@@ -284,7 +284,7 @@ onMounted(() => {
       <div class="bg-white rounded-xl p-6 border border-slate-200 shadow-sm">
         <div class="flex items-center gap-3">
           <div class="w-12 h-12 bg-orange-100 rounded-lg flex items-center justify-center">
-            <span class="text-2xl">🔗</span>
+            <span class="text-2xl">⌁</span>
           </div>
           <div>
             <p class="text-sm text-slate-500">关系类型</p>
@@ -330,7 +330,7 @@ onMounted(() => {
           @click="handleSearch"
           class="px-6 py-3 bg-blue-500 text-white rounded-lg font-medium hover:bg-blue-600 transition-colors"
         >
-          🔍 搜索
+          搜索
         </button>
         <div class="flex gap-1 bg-slate-100 p-1 rounded-lg">
           <button
@@ -340,7 +340,7 @@ onMounted(() => {
               viewMode === 'list' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
             ]"
           >
-            📋 列表
+            列表
           </button>
           <button
             @click="viewMode = 'graph'"
@@ -349,7 +349,7 @@ onMounted(() => {
               viewMode === 'graph' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
             ]"
           >
-            🕸️ 图形
+            图形
           </button>
         </div>
       </div>
@@ -379,7 +379,7 @@ onMounted(() => {
       </div>
 
       <div v-else-if="filteredEntities.length === 0" class="p-8 text-center text-slate-500">
-        <span class="text-4xl mb-2 block">🔍</span>
+        <span class="text-xl mb-2 block font-semibold">SEARCH</span>
         暂无实体数据
       </div>
 
