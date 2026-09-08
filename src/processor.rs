@@ -819,6 +819,7 @@ impl FileProcessor {
     async fn delete_processing_file_data(
         &self, tx: &mut sqlx::Transaction<'_, Sqlite>, file_id: i64,
     ) -> anyhow::Result<()> {
+        crate::graph::graph_manager::clear_file(&mut **tx, file_id).await?;
         sqlx::query("DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id = ?)")
             .bind(file_id)
             .execute(&mut **tx)
@@ -3688,60 +3689,56 @@ impl FileProcessor {
             .map(|row| (row.id, row.content))
             .collect::<Vec<_>>();
 
-        if slices.is_empty() {
-            debug!("No slices found for file {}, skipping graph building", file.id);
+        // Fingerprint includes source IDs, content, and extraction configuration. Changed slices
+        // must be relinked even when their text is identical.
+        use sha2::{Digest, Sha256};
+        let mut digest = Sha256::new();
+        digest.update(b"htknow-graph-v1-chars2000-overlap100");
+        digest.update(config::get().llm.model.as_bytes());
+        digest.update(config::get().llm.api_url.as_deref().unwrap_or_default().as_bytes());
+        for (id, text) in &slices {
+            digest.update(id.to_le_bytes());
+            digest.update((text.len() as u64).to_le_bytes());
+            digest.update(text.as_bytes());
+        }
+        let fingerprint = hex::encode(digest.finalize());
+        let unchanged: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM graph_builds WHERE file_id=? AND status='completed' AND fingerprint=?)",
+        )
+        .bind(file.id)
+        .bind(&fingerprint)
+        .fetch_one(&self.pool)
+        .await?;
+        if unchanged {
             return Ok(());
         }
-
-        // 3. 合并所有切片内容（限制长度避免超出LLM上下文）
-        let mut combined_content = String::new();
-        let max_content_length = 8000; // 限制总长度
-
-        for (_, content) in &slices {
-            if combined_content.len() + content.len() > max_content_length {
-                break;
-            }
-            combined_content.push_str(content);
-            combined_content.push_str("\n\n");
-        }
-
-        if combined_content.trim().is_empty() {
-            debug!("No content to process for file {}", file.id);
-            return Ok(());
-        }
-
-        // 4. 调用LLM提取知识图谱
-        let context = format!("文件名: {}", file.filename);
-
-        let (mut entities, mut relations) =
-            match llm_extractor.extract_knowledge_graph(&combined_content, &context).await {
-                Ok(result) => result,
-                Err(e) => {
-                    error!("LLM knowledge graph extraction failed for file {}: {}", file.id, e);
-                    return Err(e);
+        let run_id: String = sqlx::query_scalar(
+            "INSERT INTO graph_builds(file_id,status,run_id,fingerprint,model) VALUES(?,'running',lower(hex(randomblob(16))),?,?) \
+             ON CONFLICT(file_id) DO UPDATE SET status='running',run_id=excluded.run_id,fingerprint=excluded.fingerprint,model=excluded.model,error=NULL,updated_at=strftime('%s','now') RETURNING run_id"
+        ).bind(file.id).bind(&fingerprint).bind(&config::get().llm.model).fetch_one(&self.pool).await?;
+        let result: anyhow::Result<()> = async {
+            let mut extracted = Vec::new();
+            for (slice_id, content) in slices {
+                for (offset, text) in crate::graph::graph_manager::extraction_chunks(&content) {
+                    let context = format!("文件名: {}; 切片: {}", file.filename, slice_id);
+                    let (entities, relations) = llm_extractor.extract_knowledge_graph(&text, &context).await?;
+                    extracted.push(crate::graph::graph_manager::ExtractedChunk {
+                        slice_id,
+                        offset,
+                        text,
+                        entities,
+                        relations,
+                    });
                 }
-            };
-
-        info!("LLM extracted {} entities and {} relations from file {}", entities.len(), relations.len(), file.id);
-
-        // 5. 为实体和关系添加文件信息
-        for entity in &mut entities {
-            entity.file_id = Some(file.id);
-            entity.kb_id = file.kb_id;
+            }
+            KnowledgeGraph::replace_file(&self.pool, file.id, file.kb_id, &run_id, extracted).await
         }
-
-        for relation in &mut relations {
-            relation.file_id = Some(file.id);
+        .await;
+        if let Err(error) = &result {
+            sqlx::query("UPDATE graph_builds SET status='failed',error=?,updated_at=strftime('%s','now') WHERE file_id=? AND run_id=?")
+                .bind(error.to_string()).bind(file.id).bind(&run_id).execute(&self.pool).await?;
         }
-
-        // 6. 增量直写知识图谱（避免把整个 KB 的图加载到内存）
-        KnowledgeGraph::incremental_update_direct(self.pool.clone(), file.kb_id, entities, relations).await?;
-
-        // 7. 保存图快照
-        KnowledgeGraph::save_snapshot_direct(&self.pool, file.kb_id).await?;
-
-        info!("Knowledge graph updated successfully for file {} (LLM-generated)", file.id);
-
+        result?;
         Ok(())
     }
 }

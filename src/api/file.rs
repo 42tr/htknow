@@ -1275,6 +1275,8 @@ async fn clear_file_parse_rows_for_ids_in_tx(
         return Ok(());
     }
 
+    crate::graph::graph_manager::clear_files(&mut **tx, file_ids).await?;
+
     for chunk in file_ids.chunks(SQLITE_DELETE_CHUNK_SIZE) {
         let mut mentions_qb = QueryBuilder::<Sqlite>::new(
             "DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id IN (",

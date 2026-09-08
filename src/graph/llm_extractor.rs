@@ -25,6 +25,8 @@ struct LLMApiResponse {
 
 #[derive(Debug, Deserialize)]
 struct Choice {
+    #[serde(default)]
+    finish_reason: Option<String>,
     message: ResponseMessage,
 }
 
@@ -36,9 +38,7 @@ struct ResponseMessage {
 /// 知识图谱提取结果（完全由LLM定义）
 #[derive(Debug, Deserialize)]
 struct KnowledgeGraphResponse {
-    #[serde(default)]
     entities: Vec<LLMEntity>,
-    #[serde(default)]
     relations: Vec<LLMRelation>,
 }
 
@@ -53,6 +53,9 @@ struct LLMEntity {
 
 #[derive(Debug, Deserialize)]
 struct LLMRelation {
+    source_type: String,
+    target_type: String,
+    evidence: String,
     source: String,
     target: String,
     #[serde(rename = "type")]
@@ -145,6 +148,9 @@ impl LLMGraphExtractor {
                 // 关系类型完全由LLM定义，直接使用Custom类型
                 let relation_type = RelationType::Custom(r.relation_type);
                 let mut relation = Relation::new(r.source, r.target, relation_type);
+                relation.source_type = Some(r.source_type);
+                relation.target_type = Some(r.target_type);
+                relation.evidence = Some(r.evidence);
                 if let Some(desc) = r.description {
                     relation = relation.with_property("description".to_string(), desc);
                 }
@@ -205,6 +211,9 @@ impl LLMGraphExtractor {
   "relations": [
     {{
       "source": "源实体名称",
+      "source_type": "源实体类型，与entities一致",
+      "target_type": "目标实体类型，与entities一致",
+      "evidence": "支持该关系的连续原文引用，必须逐字来自文本",
       "target": "目标实体名称",
       "type": "关系类型（自定义中文类型）",
       "description": "关系描述（可选）"
@@ -256,11 +265,14 @@ impl LLMGraphExtractor {
             serde_json::from_str(&body).map_err(|e| anyhow!("解析LLM API响应失败: {}. 响应内容: {}", e, body))?;
 
         // 从第一个 choice 的 message 中提取内容
-        let content =
-            api_response.choices.first().ok_or_else(|| anyhow!("LLM响应中没有choices"))?.message.content.clone();
+        let choice = api_response.choices.first().ok_or_else(|| anyhow!("LLM响应中没有choices"))?;
+        if choice.finish_reason.as_deref().is_some_and(|reason| reason != "stop") {
+            return Err(anyhow!("LLM extraction did not finish normally: {:?}", choice.finish_reason));
+        }
+        let content = &choice.message.content;
 
         // 尝试清理可能的markdown代码块标记
-        let clean_content = self.clean_json_response(&content);
+        let clean_content = self.clean_json_response(content);
 
         // 解析 JSON 内容
         serde_json::from_str::<KnowledgeGraphResponse>(&clean_content)
@@ -296,6 +308,12 @@ mod tests {
         // 如果没有设置环境变量，应该是禁用状态
         // assert!(!extractor.is_enabled());
         println!("LLM enabled: {}", extractor.is_enabled());
+    }
+
+    #[test]
+    fn missing_graph_fields_are_not_a_successful_empty_extraction() {
+        assert!(serde_json::from_str::<KnowledgeGraphResponse>("{}").is_err());
+        assert!(serde_json::from_str::<KnowledgeGraphResponse>(r#"{"entities":[],"relations":[]}"#).is_ok());
     }
 
     #[test]

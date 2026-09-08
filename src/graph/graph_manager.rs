@@ -1,299 +1,212 @@
 use std::collections::HashMap;
 
-use anyhow::Result;
-use petgraph::graph::{DiGraph, NodeIndex};
-use sqlx::SqlitePool;
+use anyhow::{Result, ensure};
+use sqlx::{SqliteConnection, SqlitePool};
 
-use super::{Edge, Entity, EntityType, Node, Relation, RelationType};
+use super::{Entity, Relation};
 
-/// 知识图谱管理器
-pub struct KnowledgeGraph {
-    graph: DiGraph<Node, Edge>,
-    node_index: HashMap<String, NodeIndex>,
-    node_id_to_index: HashMap<i64, NodeIndex>,
-    pool: SqlitePool,
-    kb_id: Option<i64>,
+pub async fn migrate(pool: &SqlitePool) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    let claimed = sqlx::query("INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (5, 'graph_provenance')")
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if claimed != 0 {
+        sqlx::raw_sql(include_str!("migration.sql")).execute(&mut *tx).await?;
+    }
+    tx.commit().await?;
+    Ok(())
 }
 
+/// Offsets are UTF-8 byte offsets in the original slice, never in concatenated documents.
+pub struct ExtractedChunk {
+    pub slice_id: i64,
+    pub offset: usize,
+    pub text: String,
+    pub entities: Vec<Entity>,
+    pub relations: Vec<Relation>,
+}
+
+/// Split even a single oversized slice. Overlap helps preserve relationships across boundaries.
+pub fn extraction_chunks(text: &str) -> Vec<(usize, String)> {
+    let boundaries: Vec<usize> = text.char_indices().map(|(i, _)| i).chain(std::iter::once(text.len())).collect();
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start + 1 < boundaries.len() {
+        let end = (start + 2000).min(boundaries.len() - 1);
+        let content = &text[boundaries[start]..boundaries[end]];
+        if !content.trim().is_empty() {
+            chunks.push((boundaries[start], content.to_owned()));
+        }
+        if end == boundaries.len() - 1 {
+            break;
+        }
+        start = end - 100;
+    }
+    chunks
+}
+
+/// Revoke one document's contributions; shared entities are retained.
+pub async fn clear_file(conn: &mut SqliteConnection, file_id: i64) -> Result<(), sqlx::Error> {
+    clear_files(conn, &[file_id]).await
+}
+
+pub async fn clear_files(conn: &mut SqliteConnection, file_ids: &[i64]) -> Result<(), sqlx::Error> {
+    for chunk in file_ids.chunks(500) {
+        // IDs are typed integers, never user-supplied SQL text.
+        let ids = chunk.iter().map(ToString::to_string).collect::<Vec<_>>().join(",");
+        sqlx::query(&format!(
+            "DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id IN ({ids}))"
+        ))
+        .execute(&mut *conn)
+        .await?;
+        for table in ["graph_edges", "graph_node_sources", "graph_builds"] {
+            sqlx::query(&format!("DELETE FROM {table} WHERE file_id IN ({ids})")).execute(&mut *conn).await?;
+        }
+        prune(conn, &ids).await?;
+    }
+    Ok(())
+}
+
+async fn prune(conn: &mut SqliteConnection, file_ids_sql: &str) -> Result<(), sqlx::Error> {
+    sqlx::query(&format!(
+        "DELETE FROM graph_nodes WHERE file_id IN ({file_ids_sql}) AND NOT EXISTS \
+        (SELECT 1 FROM graph_node_sources s WHERE s.node_id=graph_nodes.id) AND NOT EXISTS \
+        (SELECT 1 FROM graph_edges e WHERE e.source_node_id=graph_nodes.id OR e.target_node_id=graph_nodes.id)"
+    ))
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query(&format!("UPDATE graph_nodes SET file_id=(SELECT MIN(s.file_id) FROM graph_node_sources s WHERE s.node_id=graph_nodes.id), \
+        properties=COALESCE((SELECT s.properties FROM graph_node_sources s WHERE s.node_id=graph_nodes.id ORDER BY s.file_id,s.id LIMIT 1), '{{}}') \
+        WHERE file_id IN ({file_ids_sql})"))
+        .execute(&mut *conn).await?;
+    Ok(())
+}
+
+pub struct KnowledgeGraph;
 impl KnowledgeGraph {
-    /// 从数据库加载图
-    pub async fn load_from_db(pool: SqlitePool, kb_id: Option<i64>) -> Result<Self> {
-        let mut graph = DiGraph::new();
-        let mut node_index = HashMap::new();
-        let mut node_id_to_index = HashMap::new();
-
-        // 加载节点
-        let nodes: Vec<(i64, String, String, Option<String>)> = if let Some(kb_id) = kb_id {
-            sqlx::query_as("SELECT id, name, entity_type, properties FROM graph_nodes WHERE kb_id = ?")
-                .bind(kb_id)
-                .fetch_all(&pool)
-                .await?
-        } else {
-            sqlx::query_as("SELECT id, name, entity_type, properties FROM graph_nodes").fetch_all(&pool).await?
-        };
-
-        for (id, name, entity_type_str, properties_json) in nodes {
-            let entity_type = EntityType::Custom(entity_type_str);
-            let properties: HashMap<String, String> = if let Some(json) = properties_json {
-                serde_json::from_str(&json).unwrap_or_default()
-            } else {
-                HashMap::new()
-            };
-
-            let node = Node { id, name: name.clone(), entity_type, properties };
-
-            let idx = graph.add_node(node);
-            node_index.insert(name, idx);
-            node_id_to_index.insert(id, idx);
-        }
-
-        // 加载边（使用 n1.kb_id 避免歧义）
-        let edges: Vec<(i64, i64, i64, String, Option<String>, f32)> = if let Some(kb_id) = kb_id {
-            sqlx::query_as(
-                "SELECT e.id, e.source_node_id, e.target_node_id, e.relation_type, e.properties, e.weight \
-                 FROM graph_edges e \
-                 INNER JOIN graph_nodes n1 ON e.source_node_id = n1.id \
-                 INNER JOIN graph_nodes n2 ON e.target_node_id = n2.id \
-                 WHERE n1.kb_id = ?",
-            )
-            .bind(kb_id)
-            .fetch_all(&pool)
-            .await?
-        } else {
-            sqlx::query_as(
-                "SELECT e.id, e.source_node_id, e.target_node_id, e.relation_type, e.properties, e.weight \
-                 FROM graph_edges e \
-                 INNER JOIN graph_nodes n1 ON e.source_node_id = n1.id \
-                 INNER JOIN graph_nodes n2 ON e.target_node_id = n2.id",
-            )
-            .fetch_all(&pool)
-            .await?
-        };
-
-        for (id, source_id, target_id, relation_type_str, properties_json, weight) in edges {
-            if let (Some(&source_idx), Some(&target_idx)) =
-                (node_id_to_index.get(&source_id), node_id_to_index.get(&target_id))
-            {
-                let relation_type = RelationType::Custom(relation_type_str);
-                let properties: HashMap<String, String> = if let Some(json) = properties_json {
-                    serde_json::from_str(&json).unwrap_or_default()
-                } else {
-                    HashMap::new()
-                };
-
-                let edge = Edge { id, relation_type, weight, properties };
-                graph.add_edge(source_idx, target_idx, edge);
-            }
-        }
-
-        Ok(Self { graph, node_index, node_id_to_index, pool, kb_id })
-    }
-
-    /// 添加节点（在给定事务连接上执行，调用方负责提交）
-    async fn add_node(&mut self, entity: &Entity, conn: &mut sqlx::SqliteConnection) -> Result<NodeIndex> {
-        if let Some(&idx) = self.node_index.get(&entity.name) {
-            return Ok(idx);
-        }
-
-        let entity_type_str = entity.entity_type.as_str();
-        let properties_json = serde_json::to_string(&entity.properties)?;
-
-        let sql = "INSERT INTO graph_nodes (name, entity_type, properties, file_id, kb_id) \
-                   VALUES (?, ?, ?, ?, ?) \
-                   ON CONFLICT(name, entity_type, kb_id) DO UPDATE SET \
-                   properties = excluded.properties, \
-                   updated_at = strftime('%s','now') \
-                   RETURNING id";
-
-        let id: (i64,) = sqlx::query_as(sql)
-            .bind(&entity.name)
-            .bind(entity_type_str)
-            .bind(&properties_json)
-            .bind(entity.file_id)
-            .bind(entity.kb_id.or(self.kb_id))
-            .fetch_one(&mut *conn)
-            .await?;
-
-        let node = Node::from_entity(entity, id.0);
-        let idx = self.graph.add_node(node);
-        self.node_index.insert(entity.name.clone(), idx);
-        self.node_id_to_index.insert(id.0, idx);
-
-        Ok(idx)
-    }
-
-    /// 添加边（在给定事务连接上执行，调用方负责提交）
-    async fn add_edge(
-        &mut self, source_name: &str, target_name: &str, relation: &Relation, conn: &mut sqlx::SqliteConnection,
-    ) -> Result<Option<petgraph::graph::EdgeIndex>> {
-        let source_idx = match self.node_index.get(source_name) {
-            Some(&idx) => idx,
-            None => return Ok(None),
-        };
-
-        let target_idx = match self.node_index.get(target_name) {
-            Some(&idx) => idx,
-            None => return Ok(None),
-        };
-
-        let source_id = self.graph[source_idx].id;
-        let target_id = self.graph[target_idx].id;
-
-        let relation_type_str = relation.relation_type.as_str();
-        let properties_json = serde_json::to_string(&relation.properties)?;
-
-        let sql = "INSERT INTO graph_edges (source_node_id, target_node_id, relation_type, properties, weight, file_id) \
-                   VALUES (?, ?, ?, ?, ?, ?) \
-                   RETURNING id";
-
-        let id: (i64,) = sqlx::query_as(sql)
-            .bind(source_id)
-            .bind(target_id)
-            .bind(relation_type_str)
-            .bind(&properties_json)
-            .bind(relation.weight)
-            .bind(relation.file_id)
-            .fetch_one(&mut *conn)
-            .await?;
-
-        let edge = Edge::from_relation(relation, id.0);
-        let edge_idx = self.graph.add_edge(source_idx, target_idx, edge);
-
-        Ok(Some(edge_idx))
-    }
-
-    /// 增量更新：所有实体/关系的写入在单个事务内完成，避免逐条提交的往返开销
-    pub async fn incremental_update(&mut self, entities: Vec<Entity>, relations: Vec<Relation>) -> Result<()> {
-        let mut tx = self.pool.begin().await?;
-
-        for entity in &entities {
-            self.add_node(entity, &mut tx).await?;
-        }
-
-        for relation in &relations {
-            self.add_edge(&relation.source_name, &relation.target_name, relation, &mut tx).await?;
-        }
-
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// 不加载整个内存图，直接在数据库中做增量 upsert（用于后台文件处理）。
-    pub async fn incremental_update_direct(
-        pool: SqlitePool, kb_id: Option<i64>, entities: Vec<Entity>, relations: Vec<Relation>,
+    /// All LLM work finishes before acquiring the writer lock. A failed/stale build preserves the old graph.
+    pub async fn replace_file(
+        pool: &SqlitePool, file_id: i64, kb_id: Option<i64>, run_id: &str, chunks: Vec<ExtractedChunk>,
     ) -> Result<()> {
         let mut tx = pool.begin().await?;
-        let mut name_to_id: HashMap<String, i64> = HashMap::with_capacity(entities.len());
-
-        for entity in entities {
-            let entity_type_str = entity.entity_type.as_str();
-            let properties_json = serde_json::to_string(&entity.properties)?;
-            let id: (i64,) = sqlx::query_as(
-                "INSERT INTO graph_nodes (name, entity_type, properties, file_id, kb_id) \
-                 VALUES (?, ?, ?, ?, ?) \
-                 ON CONFLICT(name, entity_type, kb_id) DO UPDATE SET \
-                 properties = excluded.properties, \
-                 updated_at = strftime('%s','now') \
-                 RETURNING id",
-            )
-            .bind(&entity.name)
-            .bind(entity_type_str)
-            .bind(&properties_json)
-            .bind(entity.file_id)
-            .bind(entity.kb_id.or(kb_id))
-            .fetch_one(&mut *tx)
-            .await?;
-            name_to_id.insert(entity.name, id.0);
-        }
-
-        for relation in relations {
-            let Some(&source_id) = name_to_id.get(&relation.source_name) else {
-                continue;
-            };
-            let Some(&target_id) = name_to_id.get(&relation.target_name) else {
-                continue;
-            };
-            let relation_type_str = relation.relation_type.as_str();
-            let properties_json = serde_json::to_string(&relation.properties)?;
-            sqlx::query(
-                "INSERT INTO graph_edges (source_node_id, target_node_id, relation_type, properties, weight, file_id) \
-                 VALUES (?, ?, ?, ?, ?, ?)",
-            )
-            .bind(source_id)
-            .bind(target_id)
-            .bind(relation_type_str)
-            .bind(&properties_json)
-            .bind(relation.weight)
-            .bind(relation.file_id)
+        let claimed = sqlx::query(
+            "UPDATE graph_builds SET status='completed', error=NULL, updated_at=strftime('%s','now') \
+            WHERE file_id=? AND run_id=? AND status='running' AND EXISTS \
+            (SELECT 1 FROM files f WHERE f.id=? AND f.kb_id IS ? AND f.status=1)",
+        )
+        .bind(file_id)
+        .bind(run_id)
+        .bind(file_id)
+        .bind(kb_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        ensure!(claimed == 1, "graph build superseded or file changed");
+        sqlx::query("DELETE FROM entity_mentions WHERE slice_id IN (SELECT id FROM slices WHERE file_id=?)")
+            .bind(file_id)
             .execute(&mut *tx)
             .await?;
+        sqlx::query("DELETE FROM graph_edges WHERE file_id=?").bind(file_id).execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM graph_node_sources WHERE file_id=?").bind(file_id).execute(&mut *tx).await?;
+        for chunk in chunks {
+            // A reparse or artifact replacement must not publish references to obsolete slices.
+            let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slices s JOIN files f ON f.id=? \
+                LEFT JOIN parse_artifacts a ON a.id=f.artifact_id WHERE s.id=? AND s.file_id=COALESCE(a.source_file_id,f.id))")
+                .bind(file_id).bind(chunk.slice_id).fetch_one(&mut *tx).await?;
+            ensure!(valid, "source slice changed during graph extraction");
+            let mut names: HashMap<String, Vec<(String, i64)>> = HashMap::new();
+            for entity in chunk.entities {
+                let name = entity.name.trim();
+                let kind = entity.entity_type.as_str();
+                if name.is_empty() || kind.trim().is_empty() {
+                    continue;
+                }
+                // Ground entities in actual source text, not an unsupported LLM description.
+                let Some(position) = chunk.text.find(name) else {
+                    continue;
+                };
+                let properties = serde_json::to_string(&entity.properties)?;
+                // IS handles nullable KBs; the transaction serializes this check and insert.
+                let existing: Option<i64> = sqlx::query_scalar("SELECT id FROM graph_nodes WHERE name=? AND entity_type=? AND kb_id IS ? AND (? IS NOT NULL OR file_id=?) ORDER BY id LIMIT 1")
+                    .bind(name).bind(kind.trim()).bind(kb_id).bind(kb_id).bind(file_id).fetch_optional(&mut *tx).await?;
+                let id = if let Some(id) = existing {
+                    id
+                } else {
+                    sqlx::query_scalar("INSERT INTO graph_nodes(name,entity_type,properties,file_id,kb_id) VALUES(?,?,?,?,?) RETURNING id")
+                        .bind(name).bind(kind.trim()).bind(&properties).bind(file_id).bind(kb_id).fetch_one(&mut *tx).await?
+                };
+                names.entry(name.to_owned()).or_default().push((kind.trim().to_owned(), id));
+                let context_start = chunk.text[..position].char_indices().rev().nth(100).map(|(i, _)| i).unwrap_or(0);
+                let context_end = chunk.text[position + name.len()..]
+                    .char_indices()
+                    .nth(100)
+                    .map(|(i, _)| position + name.len() + i)
+                    .unwrap_or(chunk.text.len());
+                let context = &chunk.text[context_start..context_end];
+                sqlx::query("INSERT OR IGNORE INTO graph_node_sources(node_id,file_id,slice_id,start_offset,end_offset,context,properties) VALUES(?,?,?,?,?,?,?)")
+                    .bind(id).bind(file_id).bind(chunk.slice_id).bind((chunk.offset+position) as i64)
+                    .bind((chunk.offset+position+name.len()) as i64).bind(context).bind(&properties).execute(&mut *tx).await?;
+            }
+            for relation in chunk.relations {
+                let resolve = |name: &str, kind: &Option<String>| -> Option<i64> {
+                    let mut ids: Vec<i64> = names
+                        .get(name.trim())?
+                        .iter()
+                        .filter(|(t, _)| kind.as_ref().is_none_or(|k| k.trim() == t))
+                        .map(|(_, id)| *id)
+                        .collect();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    if ids.len() == 1 { Some(ids[0]) } else { None }
+                };
+                let (Some(source), Some(target)) = (
+                    resolve(&relation.source_name, &relation.source_type),
+                    resolve(&relation.target_name, &relation.target_type),
+                ) else {
+                    log::warn!("Skipping unresolved/ambiguous graph relation in file {}", file_id);
+                    continue;
+                };
+                let kind = relation.relation_type.as_str();
+                if kind.trim().is_empty() {
+                    continue;
+                }
+                // Only quotations validated against source text can serve as relation evidence.
+                let Some(evidence) =
+                    relation.evidence.as_deref().filter(|s| !s.trim().is_empty() && chunk.text.contains(*s))
+                else {
+                    continue;
+                };
+                let id: i64 = sqlx::query_scalar("INSERT INTO graph_edges(source_node_id,target_node_id,relation_type,properties,weight,file_id) VALUES(?,?,?,?,?,?) \
+                    ON CONFLICT DO UPDATE SET weight=excluded.weight RETURNING id")
+                    .bind(source).bind(target).bind(kind.trim()).bind(serde_json::to_string(&relation.properties)?)
+                    .bind(relation.weight).bind(file_id).fetch_one(&mut *tx).await?;
+                sqlx::query("INSERT OR IGNORE INTO graph_edge_sources(edge_id,slice_id,context) VALUES(?,?,?)")
+                    .bind(id)
+                    .bind(chunk.slice_id)
+                    .bind(evidence)
+                    .execute(&mut *tx)
+                    .await?;
+            }
         }
-
+        prune(&mut tx, &file_id.to_string()).await?;
         tx.commit().await?;
         Ok(())
     }
+}
 
-    /// 保存图快照
-    pub async fn save_snapshot(&self) -> Result<()> {
-        let node_count = self.graph.node_count() as i64;
-        let edge_count = self.graph.edge_count() as i64;
-
-        let delete_sql = "DELETE FROM graph_snapshots WHERE kb_id IS ?";
-        sqlx::query(delete_sql).bind(self.kb_id).execute(&self.pool).await?;
-
-        let insert_sql = "INSERT INTO graph_snapshots (kb_id, graph_data, node_count, edge_count) \
-                          VALUES (?, ?, ?, ?)";
-        sqlx::query(insert_sql)
-            .bind(self.kb_id)
-            .bind(Vec::<u8>::new())
-            .bind(node_count)
-            .bind(edge_count)
-            .execute(&self.pool)
-            .await?;
-
-        Ok(())
-    }
-
-    /// 不加载内存图，直接统计数据库中当前 KB 的节点/边数量并保存快照。
-    pub async fn save_snapshot_direct(pool: &SqlitePool, kb_id: Option<i64>) -> Result<()> {
-        let (node_count,): (i64,) = if let Some(kb_id) = kb_id {
-            sqlx::query_as("SELECT COUNT(*) FROM graph_nodes WHERE kb_id = ?").bind(kb_id).fetch_one(pool).await?
-        } else {
-            sqlx::query_as("SELECT COUNT(*) FROM graph_nodes").fetch_one(pool).await?
-        };
-
-        let (edge_count,): (i64,) = if let Some(kb_id) = kb_id {
-            sqlx::query_as(
-                "SELECT COUNT(*) FROM graph_edges e \
-                 INNER JOIN graph_nodes n1 ON e.source_node_id = n1.id \
-                 WHERE n1.kb_id = ?",
-            )
-            .bind(kb_id)
-            .fetch_one(pool)
-            .await?
-        } else {
-            sqlx::query_as(
-                "SELECT COUNT(*) FROM graph_edges e \
-                 INNER JOIN graph_nodes n1 ON e.source_node_id = n1.id",
-            )
-            .fetch_one(pool)
-            .await?
-        };
-
-        let mut tx = pool.begin().await?;
-        sqlx::query("DELETE FROM graph_snapshots WHERE kb_id IS ?").bind(kb_id).execute(&mut *tx).await?;
-        sqlx::query(
-            "INSERT INTO graph_snapshots (kb_id, graph_data, node_count, edge_count) \
-             VALUES (?, ?, ?, ?)",
-        )
-        .bind(kb_id)
-        .bind(Vec::<u8>::new())
-        .bind(node_count)
-        .bind(edge_count)
-        .execute(&mut *tx)
-        .await?;
-        tx.commit().await?;
-
-        Ok(())
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn long_unicode_slice_keeps_tail_and_offsets() {
+        let text = format!("{}末尾实体", "中文".repeat(6000));
+        let chunks = extraction_chunks(&text);
+        assert!(chunks.len() > 1);
+        assert!(chunks.last().unwrap().1.ends_with("末尾实体"));
+        for (offset, chunk) in chunks {
+            assert_eq!(&text[offset..offset + chunk.len()], chunk);
+        }
+        assert!(extraction_chunks("").is_empty());
     }
 }

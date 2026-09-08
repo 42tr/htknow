@@ -130,7 +130,7 @@ onMounted(() => {
             <div class="space-y-2">
               <div
                 v-for="neighbor in entityDetail.neighbors"
-                :key="neighbor.entity.id"
+                :key="neighbor.edge_id"
                 class="bg-white border border-slate-200 rounded-lg p-4 hover:border-blue-300 transition-colors"
               >
                 <div class="flex items-center gap-3">
@@ -167,8 +167,8 @@ onMounted(() => {
             </h3>
             <div class="space-y-2">
               <div
-                v-for="mention in entityDetail.mentions"
-                :key="mention.slice_id"
+                v-for="(mention, index) in entityDetail.mentions"
+                :key="`${mention.file_id}:${mention.slice_id}:${index}`"
                 class="bg-slate-50 rounded-lg p-4 border border-slate-200"
               >
                 <div class="flex items-start gap-2 mb-2">

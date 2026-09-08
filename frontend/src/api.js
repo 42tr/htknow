@@ -733,6 +733,22 @@ export const api = {
     return response.json()
   },
 
+  async getSubgraph(params = {}, signal) {
+    const query = new URLSearchParams()
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== null && value !== undefined && value !== '') query.set(key, value)
+    }
+    const response = await fetch(`${API_BASE}/graph/subgraph?${query}`, { headers: getHeaders(), signal })
+    if (!response.ok) throw new Error('加载图谱失败')
+    return response.json()
+  },
+
+  async getEdgeEvidence(id, signal) {
+    const response = await fetch(`${API_BASE}/graph/edges/${id}/evidence`, { headers: getHeaders(), signal })
+    if (!response.ok) throw new Error('加载关系来源失败')
+    return response.json()
+  },
+
   async getEntity(id) {
     const response = await fetch(`${API_BASE}/graph/entities/${id}`, {
       headers: getHeaders(),

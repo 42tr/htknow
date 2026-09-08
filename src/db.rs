@@ -73,6 +73,7 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     // 自动创建表
     create_tables(&pool).await?;
     run_schema_migrations(&pool).await?;
+    crate::graph::graph_manager::migrate(&pool).await?;
     ensure_file_content_externalized(&pool).await?;
     ensure_slice_content_externalized(&pool).await?;
     ensure_kb_type_column(&pool).await?;

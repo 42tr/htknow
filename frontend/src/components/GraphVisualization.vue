@@ -34,6 +34,9 @@ const nodes = ref([])
 const edges = ref([])
 const loading = ref(false)
 const selectedNode = ref(null)
+const selectedEdge = ref(null)
+const edgeEvidence = ref([])
+const evidenceLoading = ref(false)
 const hoveredNode = ref(null)
 const draggedNode = ref(null)
 const isDragging = ref(false)
@@ -117,185 +120,97 @@ const initCanvas = () => {
 }
 
 // 加载图谱数据
-const loadGraphData = async () => {
-  loading.value = true
-  try {
-    // 获取实体（支持搜索、实体类型、文件ID、知识库ID筛选）
-    const entities = await api.searchEntities(
-      props.query || null,
-      props.entityType || null,
-      props.kbId,
-      props.maxNodes,
-      props.fileId
-    )
+let graphRequest = 0
+let graphAbort = null
+let physicsSteps = 0
+const loadError = ref('')
+const truncated = ref(false)
+const expanding = new Set()
+const NODE_LIMIT = 200
+const EDGE_LIMIT = 400
 
-    // 将实体转换为节点
-    const width = canvas.value.width
-    const height = canvas.value.height
-
-    // 记录搜索匹配的节点ID
-    const matchedIds = new Set(entities.map(e => e.id))
-    matchedNodeIds.value = matchedIds
-
-    // 创建节点映射
-    const nodeMap = new Map()
-
-    // 添加搜索匹配的节点
-    entities.forEach((entity) => {
-      nodeMap.set(entity.id, {
-        id: entity.id,
-        name: entity.name,
-        type: entity.entity_type,
-        x: Math.random() * width,
-        y: Math.random() * height,
-        vx: 0,
-        vy: 0,
-        radius: 8,
-        entity: entity,
-        isMatched: true  // 标记为匹配的节点
-      })
+const mergeSubgraph = (data, replace = false) => {
+  const nodeMap = new Map((replace ? [] : allNodes.value).map(n => [n.id, n]))
+  const matched = new Set(replace ? data.matched_ids : [...matchedNodeIds.value, ...data.matched_ids])
+  for (const entity of data.nodes) {
+    if (nodeMap.has(entity.id)) continue
+    if (nodeMap.size >= NODE_LIMIT) { truncated.value = true; break }
+    nodeMap.set(entity.id, {
+      id: entity.id, name: entity.name, type: entity.entity_type, entity,
+      x: Math.random() * canvas.value.width, y: Math.random() * canvas.value.height,
+      vx: 0, vy: 0, radius: matched.has(entity.id) ? 8 : 6, isMatched: matched.has(entity.id)
     })
+  }
+  const edgeMap = new Map((replace ? [] : allEdges.value).map(e => [e.id, e]))
+  for (const edge of data.edges) {
+    if (!nodeMap.has(edge.source_id) || !nodeMap.has(edge.target_id)) continue
+    if (edgeMap.size >= EDGE_LIMIT && !edgeMap.has(edge.id)) { truncated.value = true; break }
+    edgeMap.set(edge.id, { id: edge.id, source: nodeMap.get(edge.source_id), target: nodeMap.get(edge.target_id), type: edge.relation_type })
+  }
+  matchedNodeIds.value = matched
+  allNodes.value = [...nodeMap.values()]
+  allEdges.value = [...edgeMap.values()]
+  // Give parallel and reverse relations separate curves and labels.
+  const groups = new Map()
+  for (const edge of allEdges.value) {
+    const key = [edge.source.id, edge.target.id].sort((a, b) => a - b).join(':')
+    if (!groups.has(key)) groups.set(key, [])
+    groups.get(key).push(edge)
+  }
+  for (const group of groups.values()) {
+    group.sort((a, b) => a.id - b.id)
+    group.forEach((edge, i) => { edge.curve = (i - (group.length - 1) / 2) * 40 * (edge.source.id <= edge.target.id ? 1 : -1) })
+  }
+  truncated.value ||= data.truncated
+  applyFilters()
+}
 
-    // 获取每个实体的邻居来构建边，同时添加关联的节点
-    const edgeList = []
-    const addedEdges = new Set()
-
-    // 加载所有匹配节点的关系
-    for (const entity of entities) {
-      try {
-        const detail = await api.getEntity(entity.id)
-
-        for (const neighbor of detail.neighbors) {
-          // 如果邻居节点不存在，添加它（作为关联节点）
-          if (!nodeMap.has(neighbor.entity.id)) {
-            nodeMap.set(neighbor.entity.id, {
-              id: neighbor.entity.id,
-              name: neighbor.entity.name,
-              type: neighbor.entity.entity_type,
-              x: Math.random() * width,
-              y: Math.random() * height,
-              vx: 0,
-              vy: 0,
-              radius: 6,  // 关联节点稍小
-              entity: neighbor.entity,
-              isMatched: false  // 标记为关联节点
-            })
-          }
-
-          // 添加边
-          const sourceId = entity.id
-          const targetId = neighbor.entity.id
-          const edgeKey = `${Math.min(sourceId, targetId)}-${Math.max(sourceId, targetId)}`
-          if (!addedEdges.has(edgeKey)) {
-            edgeList.push({
-              sourceId,
-              targetId,
-              type: neighbor.relation_type
-            })
-            addedEdges.add(edgeKey)
-          }
-        }
-      } catch (e) {
-        console.warn('Failed to load neighbor for entity', entity.id)
-      }
-    }
-
-    // 转换为数组
-    allNodes.value = Array.from(nodeMap.values())
-
-    // 构建边（引用节点对象）
-    allEdges.value = edgeList.map(e => ({
-      source: nodeMap.get(e.sourceId),
-      target: nodeMap.get(e.targetId),
-      type: e.type
-    })).filter(e => e.source && e.target)
-
-    // 应用筛选
-    applyFilters()
-
+const loadGraphData = async () => {
+  const request = ++graphRequest
+  graphAbort?.abort()
+  graphAbort = new AbortController()
+  expanding.clear()
+  loading.value = true
+  loadError.value = ''
+  truncated.value = false
+  selectedNode.value = null
+  selectedEdge.value = null
+  allNodes.value = []
+  allEdges.value = []
+  applyFilters()
+  try {
+    const data = await api.getSubgraph({
+      q: props.query, entity_type: props.entityType, kb_id: props.kbId,
+      file_id: props.fileId, limit: Math.max(1, Math.min(200, props.maxNodes))
+    }, graphAbort.signal)
+    if (request !== graphRequest) return
+    mergeSubgraph(data, true)
   } catch (error) {
-    console.error('加载图谱数据失败:', error)
+    if (request === graphRequest && error.name !== 'AbortError') loadError.value = error.message
   } finally {
-    loading.value = false
+    if (request === graphRequest) loading.value = false
   }
 }
 
-// 点击节点后加载更多关联实体
 const expandNode = async (node) => {
-  if (!node) return
-
+  if (!node || expanding.has(node.id)) return
+  if (allNodes.value.length >= NODE_LIMIT || allEdges.value.length >= EDGE_LIMIT) { truncated.value = true; return }
+  const request = graphRequest
+  expanding.add(node.id)
   try {
-    const detail = await api.getEntity(node.id)
-    const width = canvas.value.width
-    const height = canvas.value.height
-
-    // 获取当前所有节点ID
-    const existingIds = new Set(allNodes.value.map(n => n.id))
-    const newNodes = []
-    const newEdges = []
-    const addedEdges = new Set(allEdges.value.map(e =>
-      `${Math.min(e.source.id, e.target.id)}-${Math.max(e.source.id, e.target.id)}`
-    ))
-
-    for (const neighbor of detail.neighbors) {
-      // 如果邻居节点不存在，添加它
-      if (!existingIds.has(neighbor.entity.id)) {
-        const newNode = {
-          id: neighbor.entity.id,
-          name: neighbor.entity.name,
-          type: neighbor.entity.entity_type,
-          // 新节点放在被点击节点附近
-          x: node.x + (Math.random() - 0.5) * 150,
-          y: node.y + (Math.random() - 0.5) * 150,
-          vx: 0,
-          vy: 0,
-          radius: 6,
-          entity: neighbor.entity,
-          isMatched: false
-        }
-        newNodes.push(newNode)
-        existingIds.add(neighbor.entity.id)
-      }
-
-      // 添加边
-      const edgeKey = `${Math.min(node.id, neighbor.entity.id)}-${Math.max(node.id, neighbor.entity.id)}`
-      if (!addedEdges.has(edgeKey)) {
-        newEdges.push({
-          sourceId: node.id,
-          targetId: neighbor.entity.id,
-          type: neighbor.relation_type
-        })
-        addedEdges.add(edgeKey)
-      }
-    }
-
-    // 添加新节点
-    if (newNodes.length > 0) {
-      allNodes.value = [...allNodes.value, ...newNodes]
-    }
-
-    // 构建新边的引用
-    const nodeMap = new Map(allNodes.value.map(n => [n.id, n]))
-    const newEdgeObjects = newEdges.map(e => ({
-      source: nodeMap.get(e.sourceId),
-      target: nodeMap.get(e.targetId),
-      type: e.type
-    })).filter(e => e.source && e.target)
-
-    if (newEdgeObjects.length > 0) {
-      allEdges.value = [...allEdges.value, ...newEdgeObjects]
-    }
-
-    // 重新应用筛选
-    applyFilters()
-
-  } catch (e) {
-    console.warn('Failed to expand node', node.id, e)
+    const data = await api.getSubgraph({ node_id: node.id, kb_id: props.kbId, file_id: props.fileId, limit: 1 }, graphAbort?.signal)
+    if (request !== graphRequest) return
+    mergeSubgraph(data)
+  } catch (error) {
+    if (request === graphRequest && error.name !== 'AbortError') loadError.value = error.message
+  } finally {
+    if (request === graphRequest) expanding.delete(node.id)
   }
 }
 
 // 应用筛选
 const applyFilters = () => {
+  physicsSteps = 240
   // 筛选节点
   let filteredNodes = allNodes.value
   
@@ -389,6 +304,7 @@ watch(searchQuery, () => {
 
 // 物理模拟更新
 const updatePhysics = () => {
+  if (physicsSteps-- <= 0 && !isDragging.value) return
   const width = canvas.value.width
   const height = canvas.value.height
   const centerX = width / 2
@@ -494,14 +410,31 @@ const render = () => {
   for (const edge of edges.value) {
     ctx.beginPath()
     ctx.moveTo(edge.source.x, edge.source.y)
-    ctx.lineTo(edge.target.x, edge.target.y)
+    const dx = edge.target.x - edge.source.x
+    const dy = edge.target.y - edge.source.y
+    const length = Math.hypot(dx, dy) || 1
+    const controlX = (edge.source.x + edge.target.x) / 2 - dy / length * (edge.curve || 0)
+    const controlY = (edge.source.y + edge.target.y) / 2 + dx / length * (edge.curve || 0)
+    ctx.quadraticCurveTo(controlX, controlY, edge.target.x, edge.target.y)
     ctx.strokeStyle = relationColors[edge.type] || relationColors.default
     ctx.stroke()
+    const angle = Math.atan2(edge.target.y - controlY, edge.target.x - controlX)
+    const tipX = edge.target.x - Math.cos(angle) * (edge.target.radius + 3)
+    const tipY = edge.target.y - Math.sin(angle) * (edge.target.radius + 3)
+    ctx.beginPath()
+    ctx.moveTo(tipX, tipY)
+    ctx.lineTo(tipX - 9 * Math.cos(angle - 0.4), tipY - 9 * Math.sin(angle - 0.4))
+    ctx.lineTo(tipX - 9 * Math.cos(angle + 0.4), tipY - 9 * Math.sin(angle + 0.4))
+    ctx.closePath()
+    ctx.fillStyle = ctx.strokeStyle
+    ctx.fill()
     
     // 绘制关系类型标签（如果缩放比例足够大）
     if (scale.value > 0.5) {
-      const midX = (edge.source.x + edge.target.x) / 2
-      const midY = (edge.source.y + edge.target.y) / 2
+      const midX = (edge.source.x + 2 * controlX + edge.target.x) / 4
+      const midY = (edge.source.y + 2 * controlY + edge.target.y) / 4
+      edge.labelX = midX
+      edge.labelY = midY
       
       // 关系类型映射
       const relationLabels = {
@@ -665,6 +598,7 @@ const handleMouseMove = (e) => {
 }
 
 const handleMouseDown = (e) => {
+  physicsSteps = 240
   const rect = canvas.value.getBoundingClientRect()
   const screenX = e.clientX - rect.left
   const screenY = e.clientY - rect.top
@@ -739,12 +673,28 @@ const handleClick = (e) => {
     const dy = node.y - y
     if (dx * dx + dy * dy < node.radius * node.radius * 4) {
       selectedNode.value = node
+      selectedEdge.value = null
       // 点击节点时展开其关联节点
       expandNode(node)
       return
     }
   }
   selectedNode.value = null
+  selectedEdge.value = null
+  if (scale.value <= 0.5) return
+  const edge = edges.value.find(e => Math.abs(e.labelX - x) < 35 && Math.abs(e.labelY - y) < 12)
+  if (!edge) return
+  selectedEdge.value = edge
+  edgeEvidence.value = []
+  evidenceLoading.value = true
+  const request = graphRequest
+  api.getEdgeEvidence(edge.id, graphAbort?.signal).then(evidence => {
+    if (request === graphRequest && selectedEdge.value?.id === edge.id) edgeEvidence.value = evidence
+  }).catch(error => {
+    if (request === graphRequest && error.name !== 'AbortError') loadError.value = error.message
+  }).finally(() => {
+    if (request === graphRequest && selectedEdge.value?.id === edge.id) evidenceLoading.value = false
+  })
 }
 
 const handleResize = () => {
@@ -826,6 +776,8 @@ onMounted(() => {
 })
 
 onBeforeUnmount(() => {
+  ++graphRequest
+  graphAbort?.abort()
   if (animationFrame) {
     cancelAnimationFrame(animationFrame)
   }
@@ -943,6 +895,8 @@ const getEntityTypeInfo = (type) => {
       </div>
     </div>
     
+    <p v-if="loadError" class="px-4 py-2 text-sm text-red-600">{{ loadError }}</p>
+    <p v-if="truncated" class="px-4 py-2 text-sm text-slate-500">当前展示部分图谱，最多 200 个节点、400 条关系。可缩小搜索范围后继续浏览。</p>
     <!-- 画布容器 -->
     <div ref="container" class="relative" style="height: 600px;">
       <canvas
@@ -963,6 +917,16 @@ const getEntityTypeInfo = (type) => {
         </div>
       </div>
       
+      <div v-if="selectedEdge" class="absolute top-4 right-4 bg-white rounded-lg shadow-lg border border-slate-200 p-4 max-w-sm max-h-80 overflow-auto">
+        <button class="float-right text-slate-400" @click="selectedEdge = null">✕</button>
+        <p class="text-sm font-semibold pr-5">{{ selectedEdge.source.name }} → {{ selectedEdge.type }} → {{ selectedEdge.target.name }}</p>
+        <p v-if="evidenceLoading" class="text-xs text-slate-500 mt-2">加载来源…</p>
+        <p v-else-if="!edgeEvidence.length" class="text-xs text-slate-500 mt-2">此关系尚无原文证据；旧图谱需重新构建。</p>
+        <div v-for="(item, i) in edgeEvidence" :key="i" class="mt-3 text-xs">
+          <p class="font-medium">{{ item.filename }}</p>
+          <blockquote class="mt-1 border-l-2 pl-2 whitespace-pre-wrap">{{ item.context }}</blockquote>
+        </div>
+      </div>
       <!-- 选中节点信息 -->
       <div
         v-if="selectedNode"
@@ -1103,6 +1067,7 @@ const getEntityTypeInfo = (type) => {
       <!-- 操作提示 -->
       <div class="absolute top-4 left-4 bg-white/90 rounded-lg shadow border border-slate-200 px-3 py-2 text-xs text-slate-600">
         <div>💡 <strong>点击节点</strong>: 展开关联实体</div>
+        <div>💡 <strong>点击关系文字</strong>: 查看原文证据</div>
         <div>💡 <strong>拖拽节点</strong>: 点击并拖动</div>
         <div>💡 <strong>平移视图</strong>: Shift + 拖动 或 中键拖动</div>
         <div>💡 <strong>缩放</strong>: 滚轮滚动</div>
@@ -1113,7 +1078,7 @@ const getEntityTypeInfo = (type) => {
         <div class="text-center text-slate-400">
           <span class="text-4xl block mb-2">🕸️</span>
           <p>暂无图谱数据</p>
-          <p class="text-sm mt-1">上传文档后将自动生成知识图谱</p>
+          <p class="text-sm mt-1">启用图谱构建并成功处理文档后，可在此查看</p>
         </div>
       </div>
     </div>

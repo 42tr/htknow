@@ -3,6 +3,7 @@ use std::{
 };
 
 use anyhow::{Context, anyhow};
+use futures::StreamExt;
 use log::{debug, info, warn};
 use once_cell::sync::Lazy;
 use reqwest::Client;
@@ -1141,6 +1142,18 @@ impl SearchEngine {
     pub async fn search(
         &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     ) -> anyhow::Result<Vec<SearchResultItem>> {
+        let candidates = self.search_candidates(query, file_ids, kb_ids).await?;
+        if candidates.is_empty() {
+            return Ok(candidates);
+        }
+        let mut results = self.rerank(query, candidates).await;
+        results.truncate(config::get().search.limit.max(1));
+        Ok(results)
+    }
+
+    async fn search_candidates(
+        &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
+    ) -> anyhow::Result<Vec<SearchResultItem>> {
         let total_start = Instant::now();
         debug!("Searching for query: {}", query);
 
@@ -1240,15 +1253,8 @@ impl SearchEngine {
             return Ok(merged_results);
         }
 
-        // 使用 BGE-Rerank 重排序（失败时内部回退为原结果，无需预先 clone 整个结果集）
-        let mut final_results = self.rerank(query, merged_results).await;
-        let limit = config::get().search.limit.max(1);
-        if final_results.len() > limit {
-            final_results.truncate(limit);
-        }
-
-        debug!("Search total {}ms", total_start.elapsed().as_millis());
-        Ok(final_results)
+        debug!("Search candidates total {}ms", total_start.elapsed().as_millis());
+        Ok(merged_results)
     }
 
     pub async fn search_full(
@@ -1437,8 +1443,8 @@ impl SearchEngine {
         }
 
         // 根据 URL 后缀判断使用哪种 rerank 接口格式
-        let rerank_url = crate::settings::rerank_url()
-            .ok_or_else(|| anyhow!("services.rerank_url is not configured"))?;
+        let rerank_url =
+            crate::settings::rerank_url().ok_or_else(|| anyhow!("services.rerank_url is not configured"))?;
         let use_v1_format = rerank_url.ends_with("/v1/rerank");
 
         // 调用 BGE-Rerank API
@@ -1594,57 +1600,16 @@ impl SearchEngine {
     /// 使用知识图谱扩展查询
     /// 从查询中识别实体，并查找相关实体来扩展查询
     pub async fn expand_query_with_graph(&self, query: &str, kb_ids: Option<&Vec<i64>>) -> anyhow::Result<Vec<String>> {
-        let pool = match &self.pool {
-            Some(p) => p,
-            None => return Ok(vec![query.to_string()]), // 如果没有数据库连接，直接返回原查询
+        self.expand_query_with_graph_scope(query, kb_ids, None).await
+    }
+
+    async fn expand_query_with_graph_scope(
+        &self, query: &str, kb_ids: Option<&Vec<i64>>, file_ids: Option<&Vec<i64>>,
+    ) -> anyhow::Result<Vec<String>> {
+        let Some(pool) = &self.pool else {
+            return Ok(vec![query.to_owned()]);
         };
-
-        let mut expanded_queries = vec![query.to_string()];
-
-        // 1. 在知识图谱中搜索匹配的实体
-        let mut qb = QueryBuilder::new("SELECT DISTINCT name, entity_type FROM graph_nodes WHERE name LIKE ");
-        qb.push_bind(format!("%{}%", query));
-
-        if let Some(ids) = kb_ids
-            && !ids.is_empty()
-        {
-            qb.push(" AND kb_id IN (");
-            let mut separated = qb.separated(", ");
-            for id in ids {
-                separated.push_bind(id);
-            }
-            qb.push(")");
-        }
-        qb.push(" LIMIT 10");
-        let entities: Vec<(String, String)> = qb.build_query_as().fetch_all(pool).await?;
-
-        // 2. 对于每个匹配的实体，查找相关实体
-        for (entity_name, _) in entities.iter().take(3) {
-            // 限制为前3个实体
-            // 查找与该实体相关的其他实体（通过边连接）
-            let related_sql = r#"
-                SELECT DISTINCT n.name
-                FROM graph_nodes n
-                JOIN graph_edges e ON (n.id = e.target_node_id OR n.id = e.source_node_id)
-                JOIN graph_nodes source ON (source.id = e.source_node_id OR source.id = e.target_node_id)
-                WHERE source.name = ?
-                AND n.name != ?
-                LIMIT 5
-            "#;
-
-            let related_entities: Vec<(String,)> =
-                sqlx::query_as(related_sql).bind(entity_name).bind(entity_name).fetch_all(pool).await?;
-
-            // 添加相关实体到扩展查询
-            for (related_name,) in related_entities {
-                if !expanded_queries.contains(&related_name) {
-                    expanded_queries.push(related_name);
-                }
-            }
-        }
-
-        info!("Query expansion: '{}' -> {:?}", query, expanded_queries);
-        Ok(expanded_queries)
+        crate::graph::query::expand(pool, query, kb_ids.map(Vec::as_slice), file_ids.map(Vec::as_slice)).await
     }
 
     /// 清理 LanceDB 已删除的记录，释放空间
@@ -1780,49 +1745,65 @@ impl SearchEngine {
     pub async fn search_with_graph_expansion(
         &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     ) -> anyhow::Result<Vec<SearchResultItem>> {
+        if kb_ids.is_some_and(|ids| ids.is_empty()) || file_ids.is_some_and(|ids| ids.is_empty()) {
+            return Ok(vec![]);
+        }
         // 1. 扩展查询
-        let expanded_queries = self.expand_query_with_graph(query, kb_ids).await?;
+        let expanded_queries = self.expand_query_with_graph_scope(query, kb_ids, file_ids).await?;
 
-        if expanded_queries.len() == 1 {
-            // 没有扩展，直接使用原查询
-            return self.search(query, file_ids, kb_ids).await;
-        }
-
-        // 2. 对每个扩展查询并发搜索（彼此独立，无需串行）
+        // Bound external embedding concurrency and rerank only once against the original question.
+        let searches = futures::stream::iter(expanded_queries.clone().into_iter().enumerate())
+            .map(|(index, term)| async move { (index, self.search_candidates(&term, file_ids, kb_ids).await) })
+            .buffered(4);
+        let per_query: Vec<_> = searches.collect().await;
         let mut all_results: HashMap<i64, SearchResultItem> = HashMap::new();
-
-        let search_futures = expanded_queries.iter().enumerate().map(|(idx, expanded_query)| {
-            // 原始查询的结果权重更高
-            let weight = if idx == 0 { 1.0 } else { 0.7 };
-            async move {
-                let results = self.search(expanded_query, file_ids, kb_ids).await;
-                (weight, results)
-            }
-        });
-        let per_query = futures::future::join_all(search_futures).await;
-
-        for (weight, results) in per_query {
-            for mut result in results? {
-                result.score *= weight;
-
-                all_results
-                    .entry(result.id)
-                    .and_modify(|e| {
-                        // 如果已存在，取两者中分数较高的
-                        if result.score > e.score {
-                            *e = result.clone();
-                        }
-                    })
-                    .or_insert(result);
+        for (index, results) in per_query {
+            let results = match results {
+                Ok(results) => results,
+                Err(error) if index != 0 => {
+                    warn!("Graph expansion search failed: {}", error);
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
+            for (rank, mut result) in results.into_iter().enumerate() {
+                // Reciprocal-rank fusion avoids comparing scores from different questions.
+                result.score = (if index == 0 { 1.0 } else { 0.7 }) / (61.0 + rank as f32);
+                all_results.entry(result.id).and_modify(|old| old.score += result.score).or_insert(result);
             }
         }
-
-        // 3. 转换为Vec并按分数排序
-        let mut merged_results: Vec<SearchResultItem> = all_results.into_values().collect();
-        merged_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-
-        info!("Graph-expanded search returned {} results", merged_results.len());
-        Ok(merged_results)
+        if let Some(pool) = &self.pool {
+            match crate::graph::query::evidence(
+                pool,
+                &expanded_queries,
+                kb_ids.map(Vec::as_slice),
+                file_ids.map(Vec::as_slice),
+            )
+            .await
+            {
+                Ok(evidence) => {
+                    for item in evidence {
+                        all_results.entry(item.slice_id).or_insert(SearchResultItem {
+                            id: item.slice_id,
+                            file_id: item.file_id,
+                            kb_id: item.kb_id,
+                            content: item.context,
+                            score: 1.0 / 61.0,
+                        });
+                    }
+                }
+                Err(error) => warn!("Graph evidence retrieval failed: {}", error),
+            }
+        }
+        let mut candidates: Vec<_> = all_results.into_values().collect();
+        candidates.sort_by(|a, b| b.score.total_cmp(&a.score).then(a.id.cmp(&b.id)));
+        candidates.truncate(200);
+        if candidates.is_empty() {
+            return Ok(candidates);
+        }
+        let mut results = self.rerank(query, candidates).await;
+        results.truncate(config::get().search.limit.max(1));
+        Ok(results)
     }
 }
 

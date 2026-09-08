@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 
 pub mod graph_manager;
 pub mod llm_extractor;
+pub mod query;
 
 /// 实体类型枚举
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -63,6 +64,12 @@ impl Entity {
 pub struct Relation {
     pub source_name: String,
     pub target_name: String,
+    #[serde(default)]
+    pub source_type: Option<String>,
+    #[serde(default)]
+    pub target_type: Option<String>,
+    #[serde(default)]
+    pub evidence: Option<String>,
     pub relation_type: RelationType,
     pub properties: HashMap<String, String>,
     pub weight: f32,
@@ -71,7 +78,17 @@ pub struct Relation {
 
 impl Relation {
     pub fn new(source_name: String, target_name: String, relation_type: RelationType) -> Self {
-        Self { source_name, target_name, relation_type, properties: HashMap::new(), weight: 1.0, file_id: None }
+        Self {
+            source_name,
+            target_name,
+            source_type: None,
+            target_type: None,
+            evidence: None,
+            relation_type,
+            properties: HashMap::new(),
+            weight: 1.0,
+            file_id: None,
+        }
     }
 
     pub fn with_property(mut self, key: String, value: String) -> Self {
@@ -119,3 +136,6 @@ impl Edge {
         }
     }
 }
+
+#[cfg(test)]
+pub(crate) mod tests;

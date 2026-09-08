@@ -84,6 +84,8 @@ use crate::search::SearchEngine;
         graph::search_entities,
         graph::get_entity,
         graph::get_graph_stats,
+        graph::get_subgraph,
+        graph::get_edge_evidence,
         // System
         system::heap_profile,
         system::heap_profile_pdf,
@@ -161,6 +163,9 @@ use crate::search::SearchEngine;
             graph::NeighborInfo,
             graph::MentionInfo,
             graph::GraphStats,
+            graph::GraphBuildInfo,
+            graph::Subgraph,
+            graph::GraphEdge,
             system::MemoryUsage,
             system::HeapProfileStatus,
             system::LanceDbCompactStats,
@@ -240,6 +245,8 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/advanced/stream", get(search::advanced_search_stream));
     let graph_router = Router::new()
         .route("/entities", get(graph::search_entities))
+        .route("/subgraph", get(graph::get_subgraph))
+        .route("/edges/{id}/evidence", get(graph::get_edge_evidence))
         .route("/entities/{id}", get(graph::get_entity))
         .route("/stats", get(graph::get_graph_stats));
     let system_router = Router::new()
