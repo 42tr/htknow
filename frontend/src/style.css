@@ -159,6 +159,14 @@ main .rounded-xl {
   justify-content: space-between;
 }
 
+.knowledge-workspace .kb-row + .kb-row {
+  border-top: 1px solid #eeeeee;
+}
+
+.knowledge-workspace .priority-control {
+  min-width: 170px;
+}
+
 .knowledge-workspace .file-section > .overflow-hidden > * + * {
   border-top: 1px solid #f1f1f1;
 }
@@ -242,5 +250,9 @@ footer {
 
   .knowledge-workspace .workspace-toolbar > div {
     width: 100%;
+  }
+
+  .knowledge-workspace .priority-control {
+    min-width: 0;
   }
 }

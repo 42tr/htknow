@@ -504,17 +504,70 @@ onMounted(() => {
             <p class="mt-1 text-xs text-slate-500">共 {{ totalKbs }} 个，点击进入下一级</p>
           </div>
         </div>
-        <div class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
+        <div class="kb-list overflow-hidden border-y border-slate-200 bg-white">
         <div
           v-for="kb in childrenKbs"
           :key="`kb-${kb.id}`"
           @click="navigateToKb(kb.id)"
-          class="kb-card group relative flex min-h-[248px] flex-col rounded-xl border border-slate-200 bg-white p-4 transition-all duration-200 hover:border-slate-400 hover:shadow-sm cursor-pointer"
+          class="kb-row group grid cursor-pointer gap-4 px-4 py-4 transition-colors hover:bg-slate-50 lg:grid-cols-[minmax(0,1fr)_auto_auto] lg:items-center lg:px-5"
         >
-          <div class="mb-4 flex items-start justify-between gap-3">
-            <div class="flex h-10 w-10 items-center justify-center rounded-lg bg-slate-100">
-              <span class="text-xs font-semibold tracking-wide">KB</span>
+          <div class="min-w-0">
+            <div class="flex items-start gap-3">
+              <div class="flex h-9 w-9 shrink-0 items-center justify-center rounded-lg bg-slate-100">
+                <span class="text-[10px] font-semibold tracking-wide">KB</span>
+              </div>
+              <div class="min-w-0 flex-1">
+                <div class="flex flex-wrap items-center gap-1.5">
+                  <h3 class="max-w-full truncate text-sm font-semibold text-slate-800">{{ kb.name }}</h3>
+                  <span :class="[
+                    'px-2 py-0.5 text-xs rounded-full border',
+                    kb.is_public ? 'bg-green-50 text-green-600 border-green-200' : 'bg-slate-50 text-slate-600 border-slate-200'
+                  ]">
+                    {{ kb.is_public ? '公开' : '私有' }}
+                  </span>
+                  <span :class="[
+                    'px-2 py-0.5 text-xs rounded-full border',
+                    kb.kb_type === 'storage' ? 'bg-amber-50 text-amber-600 border-amber-200' : 'bg-indigo-50 text-indigo-600 border-indigo-200'
+                  ]">
+                    {{ kb.kb_type === 'storage' ? '存储型' : '分析型' }}
+                  </span>
+                </div>
+                <p class="mt-1 line-clamp-1 text-sm text-slate-500">{{ kb.description || '暂无描述' }}</p>
+                <div class="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-slate-400">
+                  <span>{{ kb.children_kb_count || 0 }} 个子知识库</span>
+                  <span>{{ kb.file_count || 0 }} 个文件</span>
+                </div>
+              </div>
             </div>
+          </div>
+
+          <div class="priority-control rounded-lg border border-slate-200 bg-slate-50 p-2.5" @click.stop>
+            <div class="flex items-center justify-between gap-3 lg:block">
+              <label class="text-xs text-slate-600">解析优先级</label>
+              <span class="text-xs text-slate-400" v-if="kb.kb_type === 'storage'">不参与解析</span>
+            </div>
+            <div class="mt-2 flex items-center gap-2">
+              <input
+                v-model.number="priorityDrafts[kb.id]"
+                type="number"
+                min="0"
+                max="100"
+                step="1"
+                :disabled="kb.kb_type === 'storage' || prioritySaving[kb.id] || (kb.current_user_permission !== 'editor' && kb.current_user_permission !== 'admin')"
+                class="w-20 px-2 py-1 text-sm border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-slate-100 disabled:text-slate-400"
+              />
+              <button
+                type="button"
+                :disabled="kb.kb_type === 'storage' || prioritySaving[kb.id] || (kb.current_user_permission !== 'editor' && kb.current_user_permission !== 'admin')"
+                @click="(e) => handleSaveParsePriority(e, kb)"
+                class="px-2.5 py-1 text-xs font-medium rounded-md border border-slate-200 bg-white text-slate-700 hover:border-blue-300 hover:text-blue-600 disabled:bg-slate-100 disabled:text-slate-400 disabled:border-slate-200"
+              >
+                {{ prioritySaving[kb.id] ? '保存中...' : '保存' }}
+              </button>
+            </div>
+          </div>
+
+          <div class="flex items-center justify-between gap-2 lg:justify-end">
              <div class="flex items-center gap-0.5">
                 <span
                   v-if="kb.current_user_permission"
@@ -575,53 +628,8 @@ onMounted(() => {
                  </svg>
                </button>
              </div>
-           </div>
-           <h3 class="mb-1 flex flex-wrap items-center gap-1.5 text-sm font-semibold text-slate-800">
-             <span class="max-w-full truncate">{{ kb.name }}</span>
-              <span :class="[
-                'px-2 py-0.5 text-xs rounded-full border',
-                kb.is_public ? 'bg-green-50 text-green-600 border-green-200' : 'bg-slate-50 text-slate-600 border-slate-200'
-              ]">
-                {{ kb.is_public ? '公开' : '私有' }}
-              </span>
-             <span :class="[
-               'px-2 py-0.5 text-xs rounded-full border',
-               kb.kb_type === 'storage' ? 'bg-amber-50 text-amber-600 border-amber-200' : 'bg-indigo-50 text-indigo-600 border-indigo-200'
-             ]">
-               {{ kb.kb_type === 'storage' ? '存储型' : '分析型' }}
-             </span>
-           </h3>
-           <p class="mb-3 line-clamp-2 text-sm leading-5 text-slate-500">{{ kb.description || '暂无描述' }}</p>
-           <div class="mb-3 rounded-lg border border-slate-200 bg-slate-50 p-2.5" @click.stop>
-             <div class="flex items-center justify-between gap-2">
-               <label class="text-xs text-slate-600">解析优先级 (0-100)</label>
-               <span class="text-xs text-slate-400" v-if="kb.kb_type === 'storage'">存储型不参与解析</span>
              </div>
-             <div class="mt-2 flex items-center gap-2">
-               <input
-                 v-model.number="priorityDrafts[kb.id]"
-                 type="number"
-                 min="0"
-                 max="100"
-                 step="1"
-                 :disabled="kb.kb_type === 'storage' || prioritySaving[kb.id] || (kb.current_user_permission !== 'editor' && kb.current_user_permission !== 'admin')"
-                 class="w-24 px-2 py-1 text-sm border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 disabled:bg-slate-100 disabled:text-slate-400"
-               />
-               <button
-                 type="button"
-                 :disabled="kb.kb_type === 'storage' || prioritySaving[kb.id] || (kb.current_user_permission !== 'editor' && kb.current_user_permission !== 'admin')"
-                 @click="(e) => handleSaveParsePriority(e, kb)"
-                 class="px-2.5 py-1 text-xs font-medium rounded-md border border-slate-200 bg-white text-slate-700 hover:border-blue-300 hover:text-blue-600 disabled:bg-slate-100 disabled:text-slate-400 disabled:border-slate-200"
-               >
-                 {{ prioritySaving[kb.id] ? '保存中...' : '保存' }}
-               </button>
-             </div>
-           </div>
-           <div class="mt-auto flex items-center justify-between border-t border-slate-100 pt-3 text-xs text-slate-400">
-              <span>{{ kb.children_kb_count || 0 }} 个子知识库</span>
-              <span>{{ kb.file_count || 0 }} 个文件</span>
-           </div>
-        </div>
+          </div>
         </div>
 
         <Pagination
