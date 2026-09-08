@@ -142,6 +142,32 @@ main .rounded-xl {
   padding: 20px !important;
 }
 
+.knowledge-workspace .workspace-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.knowledge-workspace .workspace-status > div {
+  box-shadow: none !important;
+}
+
+.knowledge-workspace .section-heading {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+}
+
+.knowledge-workspace .file-section > .overflow-hidden > * + * {
+  border-top: 1px solid #f1f1f1;
+}
+
+.knowledge-workspace .file-section > .overflow-hidden > .rounded-xl {
+  border: 0 !important;
+  border-radius: 0 !important;
+}
+
 main input,
 main textarea,
 main select {
@@ -207,5 +233,14 @@ footer {
 
   .settings-toolbar {
     top: 0.5rem;
+  }
+
+  .knowledge-workspace .workspace-toolbar {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+
+  .knowledge-workspace .workspace-toolbar > div {
+    width: 100%;
   }
 }

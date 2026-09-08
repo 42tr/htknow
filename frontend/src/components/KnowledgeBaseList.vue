@@ -397,10 +397,10 @@ onMounted(() => {
 </script>
 
 <template>
-  <div>
-    <!-- Header with Breadcrumbs and Create Button -->
-    <div class="flex items-center justify-between gap-4 mb-6">
-       <nav class="flex items-center text-sm text-slate-500">
+  <div class="knowledge-workspace space-y-6">
+    <!-- Context and actions -->
+    <div class="workspace-toolbar rounded-xl border border-slate-200 bg-white px-4 py-3 sm:px-5">
+      <nav class="flex min-w-0 items-center overflow-x-auto whitespace-nowrap text-sm text-slate-500">
         <span @click="navigateToKb(null)" class="hover:text-blue-500 cursor-pointer">主目录</span>
         <template v-for="crumb in breadcrumbs" :key="crumb.id">
           <span class="mx-2">/</span>
@@ -411,14 +411,14 @@ onMounted(() => {
             <span class="font-semibold text-slate-700">{{ currentKb.name }}</span>
         </template>
       </nav>
-      <div class="flex items-center gap-3">
+      <div class="flex flex-wrap items-center gap-2">
         <button
           v-if="currentKb && currentKb.id === null"
           @click="handleReparse"
           :disabled="reparseLoading"
           title="重新解析所有知识库及未分配文件"
           :class="[
-            'px-4 py-2.5 rounded-xl font-medium transition-all duration-200 border flex items-center gap-2',
+            'px-3 py-2 rounded-lg text-sm font-medium transition-all duration-200 border flex items-center gap-2',
             reparseLoading
               ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
               : 'bg-white text-slate-700 border-slate-200 hover:border-blue-300 hover:text-blue-600'
@@ -435,7 +435,7 @@ onMounted(() => {
           :disabled="currentKbReparseLoading"
           title="重新解析当前知识库及子知识库"
           :class="[
-            'px-4 py-2.5 rounded-xl font-medium transition-all duration-200 border flex items-center gap-2',
+            'px-3 py-2 rounded-lg text-sm font-medium transition-all duration-200 border flex items-center gap-2',
             currentKbReparseLoading
               ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
               : 'bg-white text-slate-700 border-slate-200 hover:border-blue-300 hover:text-blue-600'
@@ -449,7 +449,7 @@ onMounted(() => {
 
         <button
           type="button"
-          class="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:border-slate-400 hover:bg-slate-50"
+          class="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-400 hover:bg-slate-50"
           @click="showExportModal = true"
         >
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -463,7 +463,7 @@ onMounted(() => {
     </div>
 
     <FileStatusSummary
-      class="mb-4"
+      class="workspace-status"
       :stats="stats"
       :loading="statsLoading"
       :retry-failed-loading="reparseFailedLoading"
@@ -476,39 +476,46 @@ onMounted(() => {
     />
 
     <!-- Loading -->
-    <div v-if="loading" class="text-center py-12">
+    <div v-if="loading" class="rounded-xl border border-slate-200 bg-white py-16 text-center text-sm text-slate-500">
         <p>加载中...</p>
     </div>
 
     <!-- Error -->
-    <div v-else-if="error" class="text-center py-12 text-red-500">
+    <div v-else-if="error" class="rounded-xl border border-red-200 bg-red-50 py-16 text-center text-red-600">
         <p>错误: {{ error }}</p>
         <button @click="loadKbContent(getCurrentKbId())">重试</button>
     </div>
 
     <!-- Empty State -->
-    <div v-else-if="childrenKbs.length === 0 && files.length === 0" class="text-center py-12">
-        <div class="w-16 h-16 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-4">
+    <div v-else-if="childrenKbs.length === 0 && files.length === 0" class="rounded-xl border border-dashed border-slate-300 py-16 text-center">
+        <div class="w-12 h-12 bg-slate-100 rounded-xl flex items-center justify-center mx-auto mb-4">
           <span class="text-xs font-semibold tracking-wide">EMPTY</span>
         </div>
         <p class="text-slate-500">这个知识库是空的</p>
     </div>
 
     <!-- Grid for KBs and Files -->
-    <div v-else>
+    <div v-else class="space-y-8">
       <!-- Child KBs -->
-      <div v-if="childrenKbs.length > 0" class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+      <section v-if="childrenKbs.length > 0" class="space-y-4">
+        <div class="section-heading">
+          <div>
+            <h3 class="text-base font-semibold text-slate-800">知识库</h3>
+            <p class="mt-1 text-xs text-slate-500">共 {{ totalKbs }} 个，点击进入下一级</p>
+          </div>
+        </div>
+        <div class="grid grid-cols-1 gap-3 md:grid-cols-2 xl:grid-cols-3">
         <div
           v-for="kb in childrenKbs"
           :key="`kb-${kb.id}`"
           @click="navigateToKb(kb.id)"
-          class="bg-white rounded-xl p-5 border border-slate-200 hover:border-blue-300 hover:shadow-md transition-all duration-200 group cursor-pointer relative"
+          class="kb-card group relative flex min-h-[248px] flex-col rounded-xl border border-slate-200 bg-white p-4 transition-all duration-200 hover:border-slate-400 hover:shadow-sm cursor-pointer"
         >
-          <div class="flex items-start justify-between mb-3">
-            <div class="w-12 h-12 bg-linear-to-br from-blue-100 to-indigo-100 rounded-xl flex items-center justify-center">
+          <div class="mb-4 flex items-start justify-between gap-3">
+            <div class="flex h-10 w-10 items-center justify-center rounded-lg bg-slate-100">
               <span class="text-xs font-semibold tracking-wide">KB</span>
             </div>
-             <div class="flex items-center gap-1">
+             <div class="flex items-center gap-0.5">
                 <span
                   v-if="kb.current_user_permission"
                   class="px-2 py-0.5 text-xs rounded-full border"
@@ -523,7 +530,7 @@ onMounted(() => {
                 <button
                   v-if="kb.current_user_permission === 'admin'"
                   @click="(e) => { e.stopPropagation(); openPermissionModal(kb) }"
-                  class="opacity-0 group-hover:opacity-100 p-2 text-slate-400 hover:text-purple-500 hover:bg-purple-50 rounded-lg transition-all"
+                  class="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 p-1.5 text-slate-400 hover:text-purple-500 hover:bg-purple-50 rounded-md transition-all"
                   title="权限管理"
                 >
                   <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -534,7 +541,7 @@ onMounted(() => {
                   v-if="kb.current_user_permission === 'admin'"
                   @click="(e) => handleTogglePublic(e, kb.id, kb.is_public)"
                   :class="[
-                    'opacity-0 group-hover:opacity-100 p-2 rounded-lg transition-all',
+                    'opacity-100 sm:opacity-0 sm:group-hover:opacity-100 p-1.5 rounded-md transition-all',
                     kb.is_public ? 'text-green-500 hover:bg-green-50' : 'text-slate-500 hover:bg-slate-100'
                   ]"
                   :title="kb.is_public ? '设置为私有' : '设置为公开'"
@@ -550,7 +557,7 @@ onMounted(() => {
                  v-if="kb.current_user_permission === 'editor' || kb.current_user_permission === 'admin'"
                  @click="(e) => handleReparseChildKb(e, kb)"
                  :disabled="kb.kb_type === 'storage' || childKbReparseLoading[kb.id]"
-                 class="opacity-0 group-hover:opacity-100 p-2 text-slate-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                 class="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 p-1.5 text-slate-400 hover:text-blue-500 hover:bg-blue-50 rounded-md transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                  :title="kb.kb_type === 'storage' ? '存储型知识库不参与解析' : (childKbReparseLoading[kb.id] ? '解析中...' : '重新解析该知识库')"
                >
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -560,7 +567,7 @@ onMounted(() => {
                <button
                  v-if="kb.current_user_permission === 'admin'"
                  @click="(e) => handleDeleteKb(e, kb.id)"
-                 class="opacity-0 group-hover:opacity-100 p-2 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-all"
+                 class="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-md transition-all"
                  title="删除"
                >
                 <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -569,8 +576,8 @@ onMounted(() => {
                </button>
              </div>
            </div>
-           <h3 class="font-semibold text-slate-800 mb-1 flex items-center gap-2">
-             {{ kb.name }}
+           <h3 class="mb-1 flex flex-wrap items-center gap-1.5 text-sm font-semibold text-slate-800">
+             <span class="max-w-full truncate">{{ kb.name }}</span>
               <span :class="[
                 'px-2 py-0.5 text-xs rounded-full border',
                 kb.is_public ? 'bg-green-50 text-green-600 border-green-200' : 'bg-slate-50 text-slate-600 border-slate-200'
@@ -584,8 +591,8 @@ onMounted(() => {
                {{ kb.kb_type === 'storage' ? '存储型' : '分析型' }}
              </span>
            </h3>
-           <p class="text-sm text-slate-500 line-clamp-2 mb-3">{{ kb.description || '暂无描述' }}</p>
-           <div class="mb-3 p-2 rounded-lg border border-slate-200 bg-slate-50" @click.stop>
+           <p class="mb-3 line-clamp-2 text-sm leading-5 text-slate-500">{{ kb.description || '暂无描述' }}</p>
+           <div class="mb-3 rounded-lg border border-slate-200 bg-slate-50 p-2.5" @click.stop>
              <div class="flex items-center justify-between gap-2">
                <label class="text-xs text-slate-600">解析优先级 (0-100)</label>
                <span class="text-xs text-slate-400" v-if="kb.kb_type === 'storage'">存储型不参与解析</span>
@@ -610,51 +617,56 @@ onMounted(() => {
                </button>
              </div>
            </div>
-           <div class="flex items-center justify-between text-xs text-slate-400">
+           <div class="mt-auto flex items-center justify-between border-t border-slate-100 pt-3 text-xs text-slate-400">
               <span>{{ kb.children_kb_count || 0 }} 个子知识库</span>
               <span>{{ kb.file_count || 0 }} 个文件</span>
            </div>
         </div>
-      </div>
+        </div>
 
-      <Pagination
-        v-if="totalKbs > 0"
-        v-model:page="kbCurrentPage"
-        v-model:size="kbPageSize"
-        :total="totalKbs"
-        :sizes="[12, 24, 48]"
-        @change="loadKbContent(getCurrentKbId())"
-      />
+        <Pagination
+          v-if="totalKbs > 0"
+          v-model:page="kbCurrentPage"
+          v-model:size="kbPageSize"
+          :total="totalKbs"
+          :sizes="[12, 24, 48]"
+          @change="loadKbContent(getCurrentKbId())"
+        />
+      </section>
 
       <!-- Files -->
-      <div class="mt-6 space-y-3" v-if="files.length > 0 || currentKb?.id !== null">
-        <div class="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 mb-4">
-          <h3 class="text-lg font-semibold text-slate-700">文件 <span class="text-sm font-normal text-slate-500">（共 {{ totalFiles }} 个）</span></h3>
-          <div v-if="currentKb?.id !== null" class="flex items-center gap-2">
+      <section class="file-section space-y-3" v-if="files.length > 0 || currentKb?.id !== null">
+        <div class="section-heading flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div>
+            <h3 class="text-base font-semibold text-slate-800">文件</h3>
+            <p class="mt-1 text-xs text-slate-500">共 {{ totalFiles }} 个文件</p>
+          </div>
+          <div v-if="currentKb?.id !== null" class="flex w-full flex-wrap items-center gap-2 sm:w-auto">
             <input
               v-model="fileFilterName"
               type="text"
               placeholder="文件名搜索"
               @keyup.enter="applyFileFilters"
-              class="px-2.5 py-1.5 text-sm border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 w-40"
+              class="min-w-0 flex-1 px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 sm:w-40 sm:flex-none"
             />
             <input
               v-model="fileFilterTag"
               type="text"
               placeholder="标签筛选"
               @keyup.enter="applyFileFilters"
-              class="px-2.5 py-1.5 text-sm border border-slate-200 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 w-32"
+              class="min-w-0 flex-1 px-3 py-2 text-sm border border-slate-200 rounded-lg focus:outline-none focus:ring-2 focus:ring-blue-500 sm:w-32 sm:flex-none"
             />
             <button
               type="button"
               @click="applyFileFilters"
-              class="px-3 py-1.5 text-sm font-medium rounded-md bg-blue-600 text-white hover:bg-blue-700"
+              class="rounded-lg bg-slate-900 px-3 py-2 text-sm font-medium text-white hover:bg-slate-700"
             >
               搜索
             </button>
           </div>
         </div>
 
+        <div class="overflow-hidden rounded-xl border border-slate-200 bg-white">
         <FileCard
             v-for="file in files"
             :key="`file-${file.id}`"
@@ -665,6 +677,7 @@ onMounted(() => {
             @updated="handleFileAction"
             @deleted="handleFileAction"
         />
+        </div>
 
         <Pagination
           v-if="totalFiles > 0"
@@ -673,7 +686,7 @@ onMounted(() => {
           :total="totalFiles"
           @change="loadKbContent(currentKb?.id ?? null)"
         />
-      </div>
+      </section>
     </div>
 
     <!-- Permission Modal -->
