@@ -4,7 +4,7 @@ import { api } from '../api'
 import FileCard from './FileCard.vue'
 import CreateKnowledgeBase from './CreateKnowledgeBase.vue'
 import FileStatusSummary from './FileStatusSummary.vue'
-import ExportRecordPanel from './ExportRecordPanel.vue'
+import KnowledgeBaseExportModal from './KnowledgeBaseExportModal.vue'
 import KbPermissionModal from './KbPermissionModal.vue'
 import Pagination from './Pagination.vue'
 import { setCurrentKb } from '../store'
@@ -46,10 +46,8 @@ const openPermissionModal = (kb) => {
 }
 
 // Export state
-const selectedKbs = ref(new Map())
-const exportLoading = ref(false)
-const exportIncludeChildren = ref(false)
 const exportRecords = ref([])
+const showExportModal = ref(false)
 const EXPORT_RECORDS_KEY = 'htknow_export_records'
 
 const loadExportRecords = () => {
@@ -89,63 +87,6 @@ const addExportRecord = (result) => {
 const clearExportRecords = () => {
   exportRecords.value = []
   localStorage.removeItem(EXPORT_RECORDS_KEY)
-}
-
-const selectedKbIds = computed(() => Array.from(selectedKbs.value.keys()))
-const selectedKbCount = computed(() => selectedKbs.value.size)
-const hasSelectedKbs = computed(() => selectedKbCount.value > 0)
-const selectedKbNames = computed(() => Array.from(selectedKbs.value.values()).map(kb => kb.name))
-const selectedKbPreview = computed(() => {
-  if (selectedKbNames.value.length === 0) return ''
-  if (selectedKbNames.value.length <= 3) return selectedKbNames.value.join('、')
-  return `${selectedKbNames.value.slice(0, 3).join('、')} 等 ${selectedKbNames.value.length} 个`
-})
-
-const toggleKbSelection = (kb) => {
-  const next = new Map(selectedKbs.value)
-  if (next.has(kb.id)) {
-    next.delete(kb.id)
-  } else {
-    next.set(kb.id, { id: kb.id, name: kb.name })
-  }
-  selectedKbs.value = next
-}
-
-const selectAllKbs = () => {
-  const currentPageIds = childrenKbs.value.map(kb => kb.id)
-  const allSelected = currentPageIds.length > 0 && currentPageIds.every(id => selectedKbs.value.has(id))
-  const next = new Map(selectedKbs.value)
-
-  if (allSelected) {
-    currentPageIds.forEach(id => next.delete(id))
-  } else {
-    childrenKbs.value.forEach(kb => next.set(kb.id, { id: kb.id, name: kb.name }))
-  }
-  selectedKbs.value = next
-}
-
-const clearSelectedKbs = () => {
-  selectedKbs.value = new Map()
-}
-
-const handleExport = async () => {
-  if (selectedKbCount.value === 0) return
-  const ids = selectedKbIds.value
-  const names = selectedKbNames.value
-  const label = names.length <= 2 ? names.join('、') : `${names[0]} 等 ${names.length} 个`
-  if (!confirm(`确定要导出「${label}」${exportIncludeChildren.value ? '（含子知识库）' : ''}吗？`)) return
-
-  exportLoading.value = true
-  try {
-    const result = await api.exportKnowledgeBases(ids, exportIncludeChildren.value)
-    addExportRecord(result)
-    alert(`导出成功！\n路径：${result.export_path}`)
-    clearSelectedKbs()
-  } catch (e) {
-    alert('导出失败：' + e.message)
-  } finally {
-    exportLoading.value = false
-  }
 }
 
 const createEmptyStats = () => ({
@@ -506,76 +447,19 @@ onMounted(() => {
           {{ currentKbReparseLoading ? '解析中...' : '重新解析当前知识库' }}
         </button>
 
-        <!-- Export Controls -->
-        <div v-if="childrenKbs.length > 0 || hasSelectedKbs" class="flex items-center gap-2"
-          :class="hasSelectedKbs ? 'opacity-100' : 'opacity-60'"
+        <button
+          type="button"
+          class="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-4 py-2.5 text-sm font-medium text-slate-700 transition hover:border-slate-400 hover:bg-slate-50"
+          @click="showExportModal = true"
         >
-          <button
-            v-if="childrenKbs.length > 0"
-            @click="selectAllKbs"
-            type="button"
-            class="px-3 py-2 text-sm rounded-xl border border-slate-200 bg-white text-slate-600 hover:border-blue-300 hover:text-blue-600 transition-all duration-200"
-          >
-            {{
-              childrenKbs.length > 0 && childrenKbs.every(kb => selectedKbs.has(kb.id))
-                ? '取消本层全选'
-                : '全选本层'
-            }}
-          </button>
-          <label class="flex items-center gap-1.5 text-sm text-slate-600 cursor-pointer select-none"
-            @click.stop
-          >
-            <input
-              v-model="exportIncludeChildren"
-              type="checkbox"
-              class="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
-            />
-            含子知识库
-          </label>
-          <button
-            @click="handleExport"
-            :disabled="!hasSelectedKbs || exportLoading"
-            :class="[
-              'px-4 py-2.5 rounded-xl font-medium transition-all duration-200 border flex items-center gap-2',
-              !hasSelectedKbs || exportLoading
-                ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
-                : 'bg-blue-50 text-blue-700 border-blue-200 hover:bg-blue-100 hover:border-blue-300'
-            ]"
-          >
             <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
               <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10" />
             </svg>
-            {{ exportLoading ? '导出中...' : `导出选中 (${selectedKbCount})` }}
-          </button>
-          <button
-            v-if="hasSelectedKbs"
-            @click="clearSelectedKbs"
-            type="button"
-            class="px-3 py-2 text-sm rounded-xl border border-slate-200 bg-white text-slate-500 hover:border-red-300 hover:text-red-600 transition-all duration-200"
-          >
-            清空已选
-          </button>
-        </div>
+          导出知识库
+        </button>
 
         <CreateKnowledgeBase :parent-id="currentKb?.id" @created="handleKbCreated" />
       </div>
-    </div>
-
-    <div
-      v-if="hasSelectedKbs"
-      class="mb-4 flex items-center justify-between gap-3 rounded-xl border border-blue-200 bg-blue-50 px-4 py-3 text-sm text-blue-800"
-    >
-      <div class="min-w-0">
-        <span class="font-medium">已选 {{ selectedKbCount }} 个知识库：</span>
-        <span class="truncate">{{ selectedKbPreview }}</span>
-      </div>
-      <button
-        type="button"
-        @click="clearSelectedKbs"
-        class="shrink-0 rounded-lg border border-blue-200 bg-white px-3 py-1.5 text-blue-700 hover:border-blue-300"
-      >
-        清空
-      </button>
     </div>
 
     <FileStatusSummary
@@ -620,16 +504,7 @@ onMounted(() => {
           @click="navigateToKb(kb.id)"
           class="bg-white rounded-xl p-5 border border-slate-200 hover:border-blue-300 hover:shadow-md transition-all duration-200 group cursor-pointer relative"
         >
-          <!-- Selection checkbox -->
-          <div class="absolute top-3 left-3 z-10" @click.stop>
-            <input
-              type="checkbox"
-              :checked="selectedKbs.has(kb.id)"
-              @change="toggleKbSelection(kb)"
-              class="w-5 h-5 rounded border-slate-300 text-blue-600 focus:ring-blue-500 cursor-pointer"
-            />
-          </div>
-          <div class="flex items-start justify-between mb-3 pl-8">
+          <div class="flex items-start justify-between mb-3">
             <div class="w-12 h-12 bg-linear-to-br from-blue-100 to-indigo-100 rounded-xl flex items-center justify-center">
               <span class="text-xs font-semibold tracking-wide">KB</span>
             </div>
@@ -801,17 +676,19 @@ onMounted(() => {
       </div>
     </div>
 
-    <!-- Export Records -->
-    <ExportRecordPanel
-      :records="exportRecords"
-      @clear="clearExportRecords"
-    />
-
     <!-- Permission Modal -->
     <KbPermissionModal
       :kb="permissionModalKb || {}"
       :show="showPermissionModal"
       @close="showPermissionModal = false"
+    />
+
+    <KnowledgeBaseExportModal
+      :show="showExportModal"
+      :records="exportRecords"
+      @close="showExportModal = false"
+      @clear-records="clearExportRecords"
+      @exported="addExportRecord"
     />
   </div>
 </template>
