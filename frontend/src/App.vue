@@ -245,10 +245,11 @@ const clearAdvanced = () => {
     <!-- Main Content -->
     <main class="flex-1 max-w-6xl mx-auto px-6 py-8 w-full">
       <!-- Search Tab -->
-      <div v-if="activeTab === 'search'" class="space-y-6">
-        <div class="page-heading mb-6">
-          <h2 class="text-2xl font-semibold text-slate-800 mb-1">搜索知识库</h2>
-          <p class="text-slate-500">在所有文档中快速查找您需要的信息</p>
+      <div v-if="activeTab === 'search'" class="search-page space-y-6">
+        <div class="search-hero text-center">
+          <div class="mx-auto mb-4 flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-slate-50 text-xs font-semibold tracking-wide text-slate-600">KB</div>
+          <h2 class="text-3xl font-semibold text-slate-800 mb-2">查找知识，从这里开始</h2>
+          <p class="mx-auto max-w-xl text-sm text-slate-500">选择搜索范围和检索方式，在文档中快速定位所需内容</p>
         </div>
 
         <SearchBar

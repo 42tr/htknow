@@ -113,79 +113,80 @@ const handleKeydown = (e) => {
 </script>
 
 <template>
-  <div class="search-layout max-w-4xl mx-auto space-y-3">
-    <div class="search-panel rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
-      <div class="grid gap-4 md:grid-cols-[minmax(0,0.9fr)_minmax(0,1.4fr)] md:gap-0">
-    <!-- Search Scope Selection -->
-    <div class="search-section min-w-0 md:pr-4">
-      <label class="block text-xs font-semibold tracking-wide text-slate-600">搜索范围</label>
-      <button
-        @click="showKbSelector = true"
-        class="mt-2 w-full px-4 py-3 bg-white border border-slate-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent text-left flex justify-between items-center hover:border-blue-300 transition-colors"
-      >
-        <span class="font-medium text-slate-700">{{ localSelectedKb.name }}</span>
-        <svg class="w-5 h-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 9l4-4 4 4m0 6l-4 4-4-4" />
-        </svg>
-      </button>
-      <p class="mt-2 text-xs text-slate-500">
-        当前搜索将在 <span class="font-medium text-blue-600">{{ localSelectedKb.name }}</span> 及其子知识库中进行。
-      </p>
-    </div>
-
-    <!-- Search Mode Selection -->
-    <div class="search-section min-w-0 md:border-l md:border-slate-200 md:pl-4">
-      <label class="block text-xs font-semibold tracking-wide text-slate-600 mb-2">搜索模式</label>
-      <div class="grid grid-cols-2 sm:grid-cols-4 gap-2 rounded-xl border border-slate-200 bg-slate-50 p-1.5">
-        <button
-          type="button"
-          class="px-4 py-2.5 text-sm rounded-lg transition-all duration-200"
-          :class="searchMode === 'full' ? 'bg-slate-900 text-white shadow-sm' : 'text-slate-600 hover:bg-white hover:text-slate-900'"
-          @click="searchMode = 'full'"
-        >
-          文件搜索
-        </button>
-        <button
-          type="button"
-          class="px-4 py-2.5 text-sm rounded-lg transition-all duration-200"
-          :class="searchMode === 'slice' ? 'bg-slate-900 text-white shadow-sm' : 'text-slate-600 hover:bg-white hover:text-slate-900'"
-          @click="searchMode = 'slice'"
-        >
-          切片搜索
-        </button>
-        <button
-          type="button"
-          class="px-4 py-2.5 text-sm rounded-lg transition-all duration-200"
-          :class="searchMode === 'image' ? 'bg-slate-900 text-white shadow-sm' : 'text-slate-600 hover:bg-white hover:text-slate-900'"
-          @click="searchMode = 'image'"
-        >
-          图片搜索
-        </button>
-        <button
-          type="button"
-          class="px-4 py-2.5 text-sm rounded-lg transition-all duration-200"
-          :class="searchMode === 'advanced' ? 'bg-slate-900 text-white shadow-sm' : 'text-slate-600 hover:bg-white hover:text-slate-900'"
-          @click="searchMode = 'advanced'"
-        >
-          高级搜索
-        </button>
-      </div>
-      <p class="mt-2 text-xs text-slate-500 leading-5">
-        文件搜索返回高亮片段；切片搜索返回命中的切片内容；图片搜索支持以图搜图；高级搜索以 SSE 流返回更长上下文。
-      </p>
-    </div>
-      </div>
-
-    <!-- Knowledge Base Selector Modal -->
+  <div class="search-layout mx-auto max-w-4xl">
     <KnowledgeBaseSelector
       :show="showKbSelector"
       @close="showKbSelector = false"
       @select="handleKbSelect"
     />
 
-    <!-- 图片搜索上传 -->
-    <div v-if="searchMode === 'image'" class="mt-4 space-y-4 border-t border-slate-200 pt-4">
-      <div class="flex flex-wrap items-center gap-3">
+    <div class="search-composer overflow-hidden rounded-[22px] border border-slate-200 bg-white shadow-[0_12px_40px_rgba(0,0,0,0.07)]">
+      <div class="flex flex-col gap-3 border-b border-slate-100 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
+        <button
+          type="button"
+          class="inline-flex min-w-0 items-center gap-2 self-start rounded-lg px-2.5 py-2 text-sm text-slate-600 transition hover:bg-slate-100 hover:text-slate-900"
+          @click="showKbSelector = true"
+        >
+          <svg class="h-4 w-4 shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="M3 7.5h6l2 2h10v9a2 2 0 01-2 2H5a2 2 0 01-2-2v-11z" />
+          </svg>
+          <span class="truncate font-medium">{{ localSelectedKb.name }}</span>
+          <svg class="h-3.5 w-3.5 shrink-0 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="m9 7 5 5-5 5" />
+          </svg>
+        </button>
+
+        <div class="flex overflow-x-auto rounded-lg bg-slate-100 p-1">
+          <button
+            v-for="mode in [
+              { id: 'full', label: '文件' },
+              { id: 'slice', label: '切片' },
+              { id: 'image', label: '图片' },
+              { id: 'advanced', label: '高级' },
+            ]"
+            :key="mode.id"
+            type="button"
+            class="shrink-0 rounded-md px-3 py-1.5 text-xs font-medium transition"
+            :class="searchMode === mode.id ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-500 hover:text-slate-800'"
+            @click="searchMode = mode.id"
+          >
+            {{ mode.label }}
+          </button>
+        </div>
+      </div>
+
+      <div v-if="searchMode === 'advanced'" class="grid grid-cols-2 gap-3 border-b border-slate-100 bg-slate-50/60 px-5 py-4 sm:grid-cols-4">
+        <label class="text-xs text-slate-500">
+          <span class="mb-1.5 block">计划步骤</span>
+          <input v-model.number="advancedOptions.maxSteps" type="number" min="1" max="8" class="w-full rounded-lg border bg-white px-3 py-2 text-sm" />
+        </label>
+        <label class="text-xs text-slate-500">
+          <span class="mb-1.5 block">每步文档</span>
+          <input v-model.number="advancedOptions.docLimit" type="number" min="1" max="20" class="w-full rounded-lg border bg-white px-3 py-2 text-sm" />
+        </label>
+        <label class="text-xs text-slate-500">
+          <span class="mb-1.5 block">上下文字数</span>
+          <input v-model.number="advancedOptions.contextChars" type="number" min="200" max="6000" step="100" class="w-full rounded-lg border bg-white px-3 py-2 text-sm" />
+        </label>
+        <div class="flex items-end">
+          <button type="button" class="flex h-[38px] w-full items-center justify-between rounded-lg border border-slate-200 bg-white px-3 text-xs text-slate-600" @click="advancedOptions.debug = !advancedOptions.debug">
+            <span>调试信息</span>
+            <span class="h-2 w-2 rounded-full" :class="advancedOptions.debug ? 'bg-emerald-500' : 'bg-slate-300'"></span>
+          </button>
+        </div>
+      </div>
+
+      <div v-else-if="searchMode === 'slice'" class="flex items-center justify-between gap-4 border-b border-slate-100 bg-slate-50/60 px-5 py-3">
+        <div>
+          <p class="text-xs font-medium text-slate-700">切片高级流程</p>
+          <p class="mt-0.5 text-xs text-slate-400">使用高级判定流程返回切片结果</p>
+        </div>
+        <button type="button" class="relative inline-flex h-6 w-11 shrink-0 items-center rounded-full transition-colors" :class="sliceOptions.useAdvancedFlow ? 'bg-slate-800' : 'bg-slate-300'" @click="sliceOptions.useAdvancedFlow = !sliceOptions.useAdvancedFlow">
+          <span class="inline-block h-5 w-5 rounded-full bg-white shadow transition-transform" :class="sliceOptions.useAdvancedFlow ? 'translate-x-5' : 'translate-x-1'" />
+        </button>
+      </div>
+
+      <div v-if="searchMode === 'image'" class="flex flex-wrap items-center gap-3 border-b border-slate-100 bg-slate-50/60 px-5 py-3">
         <input
           ref="fileInput"
           type="file"
@@ -195,140 +196,52 @@ const handleKeydown = (e) => {
         />
         <button
           type="button"
-          class="px-4 py-2.5 bg-white border border-slate-200 rounded-xl text-sm font-medium text-slate-700 hover:border-blue-300 transition-colors"
+          class="rounded-lg border border-slate-200 bg-white px-3 py-2 text-xs font-medium text-slate-700 transition hover:bg-slate-50"
           @click="fileInput && fileInput.click()"
         >
           选择图片
         </button>
-        <span class="text-sm text-slate-600 truncate max-w-xs sm:max-w-sm">
+        <span class="max-w-xs truncate text-xs text-slate-500 sm:max-w-sm">
           {{ imageFile ? imageFile.name : '未选择图片' }}
         </span>
         <button
           v-if="imageFile"
           type="button"
-          class="text-xs text-slate-500 hover:text-slate-700"
+          class="text-xs text-slate-400 hover:text-slate-700"
           @click="clearImage"
         >
           清除
         </button>
       </div>
 
-      <div class="relative">
-        <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
-          <svg class="h-5 w-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+      <div class="flex items-center gap-3 px-4 py-4 sm:px-5">
+        <div class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-slate-100 text-slate-500">
+          <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.8" d="m21 21-4.35-4.35m1.35-5.15a6.5 6.5 0 1 1-13 0 6.5 6.5 0 0 1 13 0Z" />
           </svg>
         </div>
         <input
           v-model="query"
-          @keydown="handleKeydown"
           type="text"
-          placeholder="图片描述（可选）..."
-          class="w-full h-14 pl-12 pr-28 sm:pr-36 bg-white border border-slate-200 rounded-2xl text-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
+          :placeholder="searchMode === 'image' ? '补充图片描述（可选）' : '输入关键词搜索知识库'"
+          class="h-12 min-w-0 flex-1 border-0 bg-transparent px-0 text-base text-slate-800 shadow-none outline-none placeholder:text-slate-400 focus:ring-0"
+          @keydown="handleKeydown"
         />
         <button
-          @click="handleSearch"
+          type="button"
           :disabled="!canSubmit"
-          class="absolute right-2 top-1/2 -translate-y-1/2 min-w-[88px] sm:min-w-[108px] px-5 py-2.5 bg-linear-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-medium hover:from-blue-600 hover:to-indigo-700 transition-all duration-200 shadow-sm disabled:opacity-60 disabled:cursor-not-allowed"
+          class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-slate-900 text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
+          aria-label="搜索"
+          @click="handleSearch"
         >
-          搜索
-        </button>
-      </div>
-    </div>
-
-    <!-- 文本搜索输入框 -->
-    <div v-else class="space-y-4">
-      <div v-if="searchMode === 'advanced'" class="grid grid-cols-1 md:grid-cols-2 gap-4 bg-white border border-slate-200 rounded-2xl p-4">
-        <div>
-          <label class="block text-xs font-medium text-slate-600 mb-2">计划步骤数</label>
-          <input
-            type="number"
-            min="1"
-            max="8"
-            v-model.number="advancedOptions.maxSteps"
-            class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
-        </div>
-        <div>
-          <label class="block text-xs font-medium text-slate-600 mb-2">每步处理文档</label>
-          <input
-            type="number"
-            min="1"
-            max="20"
-            v-model.number="advancedOptions.docLimit"
-            class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
-        </div>
-        <div>
-          <label class="block text-xs font-medium text-slate-600 mb-2">上下文单侧字数</label>
-          <input
-            type="number"
-            min="200"
-            max="6000"
-            step="100"
-            v-model.number="advancedOptions.contextChars"
-            class="w-full px-3 py-2 border border-slate-200 rounded-lg text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"
-          />
-        </div>
-        <div class="flex items-center gap-3 mt-6">
-          <label class="text-xs font-medium text-slate-600">输出调试信息</label>
-          <button
-            type="button"
-            class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors"
-            :class="advancedOptions.debug ? 'bg-blue-600' : 'bg-slate-300'"
-            @click="advancedOptions.debug = !advancedOptions.debug"
-          >
-            <span
-              class="inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform"
-              :class="advancedOptions.debug ? 'translate-x-5' : 'translate-x-1'"
-            />
-          </button>
-        </div>
-      </div>
-      <div v-else-if="searchMode === 'slice'" class="bg-white border border-slate-200 rounded-2xl p-4">
-        <div class="flex items-center justify-between gap-4">
-          <div>
-            <p class="text-sm font-semibold text-slate-700">切片高级流程</p>
-            <p class="text-xs text-slate-500 mt-1 leading-5">开启后会走高级搜索判定流程，但返回仍是普通切片搜索结果格式。</p>
-          </div>
-          <button
-            type="button"
-            class="relative inline-flex h-6 w-11 items-center rounded-full transition-colors"
-            :class="sliceOptions.useAdvancedFlow ? 'bg-blue-600' : 'bg-slate-300'"
-            @click="sliceOptions.useAdvancedFlow = !sliceOptions.useAdvancedFlow"
-          >
-            <span
-              class="inline-block h-5 w-5 transform rounded-full bg-white shadow transition-transform"
-              :class="sliceOptions.useAdvancedFlow ? 'translate-x-5' : 'translate-x-1'"
-            />
-          </button>
-        </div>
-      </div>
-
-      <div class="relative">
-        <div class="absolute inset-y-0 left-0 pl-4 flex items-center pointer-events-none">
-          <svg class="h-5 w-5 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+          <svg class="h-5 w-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 19V5m-6 6 6-6 6 6" />
           </svg>
-        </div>
-        <input
-          v-model="query"
-          @keydown="handleKeydown"
-          type="text"
-          placeholder="输入关键词搜索..."
-          class="w-full h-14 pl-12 pr-28 sm:pr-36 bg-white border border-slate-200 rounded-2xl text-lg shadow-sm focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
-        />
-        <button
-          @click="handleSearch"
-          :disabled="!canSubmit"
-          class="absolute right-2 top-1/2 -translate-y-1/2 min-w-[88px] sm:min-w-[108px] px-5 py-2.5 bg-linear-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-medium hover:from-blue-600 hover:to-indigo-700 transition-all duration-200 shadow-sm disabled:opacity-60 disabled:cursor-not-allowed"
-        >
-          搜索
         </button>
       </div>
     </div>
-    </div>
 
-    <p v-if="error" class="rounded-xl border border-red-200 bg-red-50 px-4 py-2 text-center text-sm text-red-600">{{ error }}</p>
+    <p class="mt-3 text-center text-xs text-slate-400">在 {{ localSelectedKb.name }} 及其子知识库中搜索</p>
+    <p v-if="error" class="mt-3 rounded-xl border border-red-200 bg-red-50 px-4 py-2 text-center text-sm text-red-600">{{ error }}</p>
   </div>
 </template>
