@@ -331,13 +331,6 @@ const clearAdvanced = () => {
       </div>
     </aside>
     <div class="app-body">
-      <header class="app-topbar">
-        <span>{{ pageTitle }}</span
-        ><span class="scope-caption"
-          >{{ currentKb.name
-          }}<span class="status-dot"></span>知识工作空间</span
-        >
-      </header>
       <main class="app-main">
         <section
           v-if="visited.search"
@@ -372,16 +365,6 @@ const clearAdvanced = () => {
           />
         </section>
         <section v-if="visited.knowledge" v-show="activeTab === 'knowledge'">
-          <div class="page-title">
-            <div>
-              <span class="eyebrow">KNOWLEDGE LIBRARY</span>
-              <h1>知识库</h1>
-              <p>整理资料，连接知识，随时找到所需内容。</p>
-            </div>
-            <button class="primary-button" @click="openUpload">
-              ＋ 上传文件
-            </button>
-          </div>
           <div class="view-tabs">
             <button
               :class="{ active: knowledgeView === 'bases' }"

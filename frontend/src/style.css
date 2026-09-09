@@ -631,8 +631,15 @@ p {
 .directory-row {
   display: flex;
   align-items: center;
+  position: relative;
   border-radius: 5px;
   color: #758399;
+}
+.directory-row:hover .directory-actions,
+.directory-actions[open],
+.directory-actions:focus-within {
+  opacity: 1;
+  pointer-events: auto;
 }
 .directory-row.active,
 .directory-root.active {
@@ -645,9 +652,23 @@ p {
 }
 .directory-expand {
   width: 20px;
+  height: 32px;
   flex-shrink: 0;
-  font-size: 16px;
-  padding: 6px 0;
+  display: grid;
+  place-items: center;
+  padding: 0;
+}
+.directory-expand-placeholder {
+  width: 20px;
+  flex: none;
+}
+.directory-expand svg {
+  width: 13px;
+  height: 13px;
+  transition: transform 160ms ease;
+}
+.directory-expand svg.expanded {
+  transform: rotate(90deg);
 }
 .directory-name {
   overflow: hidden;
@@ -655,17 +676,121 @@ p {
   white-space: nowrap;
   text-align: left;
   flex: 1;
+  display: flex;
+  align-items: center;
+  gap: 7px;
   font-size: 12px;
   padding: 9px 0;
 }
+.directory-resource-icon,
+.directory-root-icon {
+  width: 16px;
+  height: 16px;
+  flex: none;
+}
+.directory-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.directory-actions {
+  position: relative;
+  flex: none;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 120ms ease;
+}
+.directory-actions summary {
+  width: 26px;
+  height: 28px;
+  display: grid;
+  place-items: center;
+  list-style: none;
+  border-radius: 4px;
+  color: #73839a;
+  font-weight: 600;
+  line-height: 1;
+  cursor: pointer;
+}
+.directory-actions summary::-webkit-details-marker {
+  display: none;
+}
+.directory-actions summary:hover {
+  background: #d8e2f1;
+  color: #315fae;
+}
+.directory-action-menu {
+  position: absolute;
+  top: calc(100% + 2px);
+  right: 0;
+  width: 132px;
+  padding: 5px;
+  border: 1px solid #dfe5ef;
+  border-radius: 6px;
+  background: #fff;
+  box-shadow: 0 8px 24px #172b4620;
+  z-index: 40;
+}
+.directory-action-menu button {
+  width: 100%;
+  padding: 7px 9px;
+  border-radius: 4px;
+  text-align: left;
+  font-size: 12px;
+  color: #52647c;
+}
+.directory-action-menu button:hover:not(:disabled) {
+  background: #edf2fa;
+  color: #315fae;
+}
+.directory-action-menu button:disabled {
+  color: #b2bac6;
+  cursor: not-allowed;
+}
 .directory-root {
-  display: block;
+  display: flex;
+  align-items: center;
+  gap: 7px;
   text-align: left;
   width: 100%;
   padding: 10px;
   font-size: 12px;
   color: #647893;
   border-radius: 5px;
+}
+.directory-root-row {
+  display: flex;
+  align-items: center;
+  border-radius: 5px;
+}
+.directory-root-row.active {
+  background: #e2eafa;
+  color: #3568d9;
+}
+.directory-root-row:hover {
+  background: #e7edf7;
+}
+.directory-root-row .directory-root {
+  min-width: 0;
+  flex: 1;
+  background: transparent;
+}
+.directory-export {
+  width: 30px;
+  height: 30px;
+  flex: none;
+  display: grid;
+  place-items: center;
+  margin-right: 3px;
+  border-radius: 5px;
+  color: #71839c;
+}
+.directory-export:hover {
+  background: #d8e2f1;
+  color: #315fae;
+}
+.directory-export svg {
+  width: 16px;
+  height: 16px;
 }
 .directory-empty {
   font-size: 11px;
@@ -732,11 +857,19 @@ p {
   grid-template-columns: 1fr !important;
   gap: 9px !important;
 }
-.kb-row h3:before {
-  content: '▱';
+.kb-resource-icon {
+  width: 19px;
+  height: 19px;
+  flex: none;
   color: #6d94d9;
-  margin-right: 8px;
-  font-size: 18px;
+}
+.file-resource-icon {
+  color: #647b9d;
+  background: #eef3fa;
+}
+.file-resource-icon svg {
+  width: 21px;
+  height: 21px;
 }
 .kb-row .text-xs {
   font-size: 10px;

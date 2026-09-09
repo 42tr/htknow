@@ -6,6 +6,10 @@ const props = defineProps({
   parentId: {
     type: Number,
     default: null
+  },
+  hideTrigger: {
+    type: Boolean,
+    default: false
   }
 })
 
@@ -56,11 +60,18 @@ const closeModal = () => {
   kbType.value = 'analysis'
   error.value = ''
 }
+
+defineExpose({
+  open: () => {
+    showModal.value = true
+  },
+})
 </script>
 
 <template>
   <div>
     <button
+      v-if="!hideTrigger"
       @click="showModal = true"
       class="px-4 py-2.5 bg-gradient-to-r from-blue-500 to-indigo-600 text-white rounded-xl font-medium hover:from-blue-600 hover:to-indigo-700 transition-all duration-200 shadow-sm flex items-center gap-2"
     >

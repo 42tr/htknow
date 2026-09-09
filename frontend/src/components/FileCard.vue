@@ -7,6 +7,7 @@ import FileSlices from './FileSlices.vue'
 import FileGraph from './FileGraph.vue'
 import KnowledgeBaseSelector from './KnowledgeBaseSelector.vue'
 import ArchiveViewer from './ArchiveViewer.vue'
+import ResourceIcon from './ResourceIcon.vue'
 
 const props = defineProps({
   file: {
@@ -288,11 +289,9 @@ const handleMoveToKb = async (kb) => {
       <div class="flex items-start gap-4">
         <!-- File Icon -->
         <div
-          class="w-10 h-10 bg-linear-to-br from-amber-100 to-orange-100 rounded-lg flex items-center justify-center shrink-0"
+          class="file-resource-icon flex h-10 w-10 shrink-0 items-center justify-center rounded-lg"
         >
-          <span class="text-[10px] font-semibold tracking-wide">{{
-            isArchive ? 'ZIP' : 'FILE'
-          }}</span>
+          <ResourceIcon :type="isArchive ? 'archive' : 'file'" />
         </div>
 
         <!-- File Details -->

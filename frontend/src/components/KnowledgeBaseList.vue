@@ -7,6 +7,7 @@ import CreateKnowledgeBase from './CreateKnowledgeBase.vue'
 import FileStatusSummary from './FileStatusSummary.vue'
 import KnowledgeBaseExportModal from './KnowledgeBaseExportModal.vue'
 import KbPermissionModal from './KbPermissionModal.vue'
+import ResourceIcon from './ResourceIcon.vue'
 import { setCurrentKb } from '../store'
 
 const emit = defineEmits(['upload'])
@@ -23,6 +24,8 @@ const reparseLoading = ref(false)
 const reparseFailedLoading = ref(false)
 const currentKbReparseLoading = ref(false)
 const childKbReparseLoading = ref({})
+const createKnowledgeBase = ref(null)
+const createParentId = ref(null)
 const priorityDrafts = ref({})
 const prioritySaving = ref({})
 const locatedFileId = ref(null)
@@ -328,6 +331,12 @@ const handleKbCreated = () => {
   loadKbContent(getCurrentKbId())
 }
 
+const openCreateKnowledgeBase = async (kb) => {
+  createParentId.value = kb?.id ?? null
+  await nextTick()
+  createKnowledgeBase.value?.open()
+}
+
 const handleDeleteKb = async (e, kbId) => {
   e.stopPropagation()
   if (!confirm('确定要删除这个知识库及其所有内容吗？此操作不可逆！')) return
@@ -440,7 +449,7 @@ const handleReparseCurrentKb = async () => {
 }
 
 const handleReparseChildKb = async (e, kb) => {
-  e.stopPropagation()
+  e?.stopPropagation?.()
   if (!kb || kb.kb_type === 'storage') {
     alert('存储型知识库不参与解析')
     return
@@ -517,142 +526,52 @@ onBeforeUnmount(() => listObserver?.disconnect())
   <div class="library-layout">
     <aside class="directory-panel">
       <div class="directory-heading">资料目录</div>
-      <button
-        class="directory-root"
+      <div
+        class="directory-root-row"
         :class="{ active: currentKb?.id == null }"
-        @click="navigateToKb(null)"
       >
-        ▤ 全部知识库</button
-      ><KnowledgeDirectory
+        <button class="directory-root" @click="navigateToKb(null)">
+          <ResourceIcon type="library" class="directory-root-icon" />
+          <span>全部知识库</span>
+        </button>
+        <button
+          type="button"
+          class="directory-export"
+          aria-label="导出知识库"
+          title="导出知识库"
+          @click="showExportModal = true"
+        >
+          <svg
+            aria-hidden="true"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.8"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+          >
+            <path d="M12 3v12m0 0 4-4m-4 4-4-4" />
+            <path d="M5 17v3h14v-3" />
+          </svg>
+        </button>
+      </div>
+      <KnowledgeDirectory
         :key="directoryVersion"
         :selected-id="currentKb?.id"
         @select="navigateToKb"
+        @create="openCreateKnowledgeBase"
+        @reparse="(kb) => handleReparseChildKb(null, kb)"
       /><button class="directory-root" @click="openUnassigned">
         未分配文件
       </button>
+      <CreateKnowledgeBase
+        ref="createKnowledgeBase"
+        :parent-id="createParentId"
+        hide-trigger
+        @created="handleKbCreated"
+      />
     </aside>
     <div class="knowledge-workspace space-y-6">
-      <!-- Context and actions -->
-      <div
-        class="workspace-toolbar rounded-xl border border-slate-200 bg-white px-4 py-3 sm:px-5"
-      >
-        <nav
-          class="flex min-w-0 items-center overflow-x-auto whitespace-nowrap text-sm text-slate-500"
-        >
-          <span
-            @click="navigateToKb(null)"
-            class="hover:text-blue-500 cursor-pointer"
-            >主目录</span
-          >
-          <template v-for="crumb in breadcrumbs" :key="crumb.id">
-            <span class="mx-2">/</span>
-            <span
-              @click="navigateToKb(crumb.id)"
-              class="hover:text-blue-500 cursor-pointer"
-              >{{ crumb.name }}</span
-            >
-          </template>
-          <template v-if="currentKb && currentKb.id !== null">
-            <span class="mx-2">/</span>
-            <span class="font-semibold text-slate-700">{{
-              currentKb.name
-            }}</span>
-          </template>
-        </nav>
-        <div class="flex flex-wrap items-center gap-2">
-          <details class="workspace-more">
-            <summary class="secondary-button">管理知识库</summary>
-            <div class="workspace-more-items">
-              <button
-                v-if="currentKb && currentKb.id === null"
-                @click="handleReparse"
-                :disabled="reparseLoading"
-                title="重新解析所有知识库及未分配文件"
-                :class="[
-                  'px-3 py-2 rounded-lg text-sm font-medium transition-all duration-200 border flex items-center gap-2',
-                  reparseLoading
-                    ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
-                    : 'bg-white text-slate-700 border-slate-200 hover:border-blue-300 hover:text-blue-600',
-                ]"
-              >
-                <svg
-                  class="w-4 h-4"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    stroke-width="2"
-                    d="M4 4v6h6M20 20v-6h-6M5 19a9 9 0 0014-7M19 5a9 9 0 00-14 7"
-                  />
-                </svg>
-                {{ reparseLoading ? '解析中...' : '全部重新解析' }}
-              </button>
-              <button
-                v-if="
-                  currentKb &&
-                  currentKb.id !== null &&
-                  currentKb.kb_type !== 'storage'
-                "
-                @click="handleReparseCurrentKb"
-                :disabled="currentKbReparseLoading"
-                title="重新解析当前知识库及子知识库"
-                :class="[
-                  'px-3 py-2 rounded-lg text-sm font-medium transition-all duration-200 border flex items-center gap-2',
-                  currentKbReparseLoading
-                    ? 'bg-slate-100 text-slate-400 border-slate-200 cursor-not-allowed'
-                    : 'bg-white text-slate-700 border-slate-200 hover:border-blue-300 hover:text-blue-600',
-                ]"
-              >
-                <svg
-                  class="w-4 h-4"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    stroke-width="2"
-                    d="M4 4v6h6M20 20v-6h-6M5 19a9 9 0 0014-7M19 5a9 9 0 00-14 7"
-                  />
-                </svg>
-                {{
-                  currentKbReparseLoading ? '解析中...' : '重新解析当前知识库'
-                }}
-              </button>
-
-              <button
-                type="button"
-                class="flex items-center gap-2 rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm font-medium text-slate-700 transition hover:border-slate-400 hover:bg-slate-50"
-                @click="showExportModal = true"
-              >
-                <svg
-                  class="w-4 h-4"
-                  fill="none"
-                  stroke="currentColor"
-                  viewBox="0 0 24 24"
-                >
-                  <path
-                    stroke-linecap="round"
-                    stroke-linejoin="round"
-                    stroke-width="2"
-                    d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M9 19l3 3m0 0l3-3m-3 3V10"
-                  />
-                </svg>
-                导出知识库
-              </button>
-            </div>
-          </details>
-          <CreateKnowledgeBase
-            :parent-id="currentKb?.id"
-            @created="handleKbCreated"
-          />
-        </div>
-      </div>
-
       <button
         class="status-strip"
         :aria-expanded="showStats"
@@ -741,6 +660,10 @@ onBeforeUnmount(() => listObserver?.disconnect())
               <div class="min-w-0">
                 <div class="min-w-0">
                   <div class="flex flex-wrap items-center gap-1.5">
+                    <ResourceIcon
+                      type="folder"
+                      class="kb-resource-icon"
+                    />
                     <h3
                       class="max-w-full truncate text-sm font-semibold text-slate-800"
                     >
