@@ -1,5 +1,6 @@
 <script setup>
-import { reactive, ref } from 'vue'
+import { vDialog } from './dialog'
+import { computed, nextTick, reactive, ref, watch } from 'vue'
 import SearchBar from './components/SearchBar.vue'
 import SearchResults from './components/SearchResults.vue'
 import KnowledgeBaseList from './components/KnowledgeBaseList.vue'
@@ -9,8 +10,53 @@ import AdvancedSearchPanel from './components/AdvancedSearchPanel.vue'
 import SearchDictionaryManager from './components/SearchDictionaryManager.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import { api } from './api'
+import TaskCenter from './components/TaskCenter.vue'
+import { currentKb } from './store'
 
-const activeTab = ref('search')
+const activeTab = ref(
+  ['search', 'knowledge', 'tasks', 'settings'].includes(location.hash.slice(1))
+    ? location.hash.slice(1)
+    : 'search',
+)
+const scrollPositions = {}
+watch(activeTab, async (value, previous) => {
+  scrollPositions[previous] = window.scrollY
+  await nextTick()
+  window.scrollTo(0, scrollPositions[value] || 0)
+})
+watch(activeTab, (value) => {
+  history.replaceState(null, '', '#' + value)
+})
+const visited = reactive({ [activeTab.value]: true })
+watch(activeTab, (value) => {
+  visited[value] = true
+})
+const settingsView = ref('services')
+const uploadOpen = ref(false)
+const uploadBusy = ref(false)
+const closeUpload = () => {
+  if (!uploadBusy.value) uploadOpen.value = false
+}
+const kbList = ref(null)
+const uploadVersion = ref(0)
+const hasSearched = ref(false)
+const searchFailed = ref(false)
+const pageTitle = computed(
+  () =>
+    ({
+      search: '搜索',
+      knowledge: '知识库',
+      tasks: '任务中心',
+      settings: '管理设置',
+    })[activeTab.value],
+)
+const openUpload = () => {
+  uploadVersion.value++
+  uploadOpen.value = true
+}
+const uploaded = () => {
+  kbList.value?.refresh()
+}
 const knowledgeView = ref('bases')
 const searchResults = ref([])
 const isSearching = ref(false)
@@ -26,7 +72,9 @@ const advancedState = reactive({
   lastQuery: '',
 })
 let advancedController = null
-const newId = () => `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+let advancedRequest = 0
+const newId = () =>
+  `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 const sliceKey = (item) => {
   const ids = item.slice_ids || item.sliceIds
   if (Array.isArray(ids) && ids.length > 0) {
@@ -42,19 +90,15 @@ const sliceKey = (item) => {
   return item.id || ''
 }
 
-const tabs = [
-  { id: 'search', name: '搜索', icon: '' },
-  { id: 'dictionary', name: '词典', icon: '' },
-  { id: 'knowledge', name: '知识库', icon: '' },
-  { id: 'upload', name: '上传', icon: '' },
-  { id: 'settings', name: '配置', icon: '' },
-]
-
 const handleSearchResults = (results) => {
   searchResults.value = results
 }
 
 const handleSearchStart = () => {
+  stopAdvancedSearch()
+  clearAdvanced()
+  hasSearched.value = true
+  searchFailed.value = false
   isSearching.value = true
 }
 
@@ -81,7 +125,11 @@ const pushTimeline = (entry) => {
 }
 
 const pushDebug = (entry) => {
-  advancedState.debugEvents.unshift({ id: newId(), time: Date.now(), ...entry })
+  advancedState.debugEvents.unshift({
+    id: newId(),
+    time: Date.now(),
+    ...entry,
+  })
   if (advancedState.debugEvents.length > 50) {
     advancedState.debugEvents.pop()
   }
@@ -89,9 +137,12 @@ const pushDebug = (entry) => {
 
 const handleAdvancedSearch = ({ query, kbId, options }) => {
   if (!query) return
+  const request = ++advancedRequest
   if (advancedController) {
     advancedController.cancel()
   }
+  hasSearched.value = true
+  searchResults.value = []
   resetAdvancedState()
   advancedState.lastQuery = query
   pushTimeline({ type: 'start', title: '开始搜索', message: query })
@@ -99,7 +150,11 @@ const handleAdvancedSearch = ({ query, kbId, options }) => {
   const handlers = {
     onStatus: (payload) => {
       advancedState.status = payload?.message || payload?.phase || '处理中'
-      pushTimeline({ type: 'status', title: payload?.phase || '状态', message: payload?.message || '' })
+      pushTimeline({
+        type: 'status',
+        title: payload?.phase || '状态',
+        message: payload?.message || '',
+      })
     },
     onPlan: (payload) => {
       const steps = (payload?.steps || []).map((step, index) => ({
@@ -109,12 +164,21 @@ const handleAdvancedSearch = ({ query, kbId, options }) => {
         index: index + 1,
       }))
       advancedState.planSteps = steps
-      const message = steps.map((step) => step.comment || step.action || '').filter(Boolean).join(' → ')
-      pushTimeline({ type: 'plan', title: '执行计划', message: message || '已生成计划' })
+      const message = steps
+        .map((step) => step.comment || step.action || '')
+        .filter(Boolean)
+        .join(' → ')
+      pushTimeline({
+        type: 'plan',
+        title: '执行计划',
+        message: message || '已生成计划',
+      })
     },
     onStep: (payload) => {
       if (payload?.action) {
-        const target = advancedState.planSteps.find((step) => step.action === payload.action)
+        const target = advancedState.planSteps.find(
+          (step) => step.action === payload.action,
+        )
         if (target) {
           target.status = payload.status || 'updated'
           target.details = payload.details || null
@@ -142,7 +206,9 @@ const handleAdvancedSearch = ({ query, kbId, options }) => {
         ...payload,
       }
       const key = sliceKey(entry)
-      const existingIdx = advancedState.results.findIndex((item) => sliceKey(item) === key)
+      const existingIdx = advancedState.results.findIndex(
+        (item) => sliceKey(item) === key,
+      )
       if (existingIdx !== -1) {
         advancedState.results.splice(existingIdx, 1)
       }
@@ -153,7 +219,11 @@ const handleAdvancedSearch = ({ query, kbId, options }) => {
     },
     onErrorEvent: (payload) => {
       advancedState.error = payload?.message || '服务返回错误'
-      pushTimeline({ type: 'error', title: '错误', message: advancedState.error })
+      pushTimeline({
+        type: 'error',
+        title: '错误',
+        message: advancedState.error,
+      })
     },
     onDone: () => {
       advancedState.running = false
@@ -163,7 +233,11 @@ const handleAdvancedSearch = ({ query, kbId, options }) => {
     onError: (err) => {
       advancedState.error = err?.message || '高级搜索失败'
       advancedState.running = false
-      pushTimeline({ type: 'error', title: '连接失败', message: advancedState.error })
+      pushTimeline({
+        type: 'error',
+        title: '连接失败',
+        message: advancedState.error,
+      })
     },
     onFinally: () => {
       advancedController = null
@@ -179,11 +253,19 @@ const handleAdvancedSearch = ({ query, kbId, options }) => {
       contextChars: options?.contextChars,
       debug: options?.debug,
     },
-    handlers,
+    Object.fromEntries(
+      Object.entries(handlers).map(([name, callback]) => [
+        name,
+        (...args) => {
+          if (request === advancedRequest) callback(...args)
+        },
+      ]),
+    ),
   )
 }
 
 const stopAdvancedSearch = () => {
+  advancedRequest++
   if (advancedController) {
     advancedController.cancel()
     advancedController = null
@@ -196,6 +278,7 @@ const stopAdvancedSearch = () => {
 }
 
 const clearAdvanced = () => {
+  stopAdvancedSearch()
   advancedState.active = false
   advancedState.running = false
   advancedState.status = '待开始'
@@ -209,125 +292,186 @@ const clearAdvanced = () => {
 </script>
 
 <template>
-  <div class="min-h-screen flex flex-col bg-linear-to-br from-slate-50 to-slate-100">
-    <!-- Header -->
-    <header class="bg-white border-b border-slate-200 sticky top-0 z-50">
-      <div class="max-w-6xl mx-auto px-6 py-4">
-        <div class="flex items-center justify-between">
-          <div class="flex items-center gap-3">
-            <div class="w-10 h-10 bg-linear-to-br from-blue-500 to-indigo-600 rounded-xl flex items-center justify-center">
-              <span class="text-white text-xs font-semibold tracking-wide">KB</span>
+  <div class="app-shell">
+    <aside class="app-sidebar">
+      <a href="#search" class="brand" @click.prevent="activeTab = 'search'"
+        ><span class="brand-mark">H</span
+        ><span>HTKnow<small>知识工作台</small></span></a
+      >
+      <button class="primary-button sidebar-upload" @click="openUpload">
+        ＋ 上传文件
+      </button>
+      <p class="nav-caption">工作空间</p>
+      <nav aria-label="主导航" class="side-nav">
+        <button
+          v-for="item in [
+            { id: 'search', name: '搜索', icon: '⌕' },
+            { id: 'knowledge', name: '知识库', icon: '▤' },
+            { id: 'tasks', name: '任务中心', icon: '☷' },
+          ]"
+          :key="item.id"
+          :class="{ active: activeTab === item.id }"
+          :aria-current="activeTab === item.id ? 'page' : undefined"
+          @click="activeTab = item.id"
+        >
+          <span aria-hidden="true">{{ item.icon }}</span
+          >{{ item.name }}
+        </button>
+      </nav>
+      <div class="sidebar-bottom">
+        <nav class="side-nav">
+          <button
+            :class="{ active: activeTab === 'settings' }"
+            @click="activeTab = 'settings'"
+          >
+            <span aria-hidden="true">⚙</span>管理设置
+          </button>
+        </nav>
+        <p>让资料成为可用的知识</p>
+      </div>
+    </aside>
+    <div class="app-body">
+      <header class="app-topbar">
+        <span>{{ pageTitle }}</span
+        ><span class="scope-caption"
+          >{{ currentKb.name
+          }}<span class="status-dot"></span>知识工作空间</span
+        >
+      </header>
+      <main class="app-main">
+        <section
+          v-if="visited.search"
+          v-show="activeTab === 'search'"
+          class="search-page"
+          :class="{ 'has-searched': hasSearched }"
+        >
+          <div class="search-intro">
+            <span class="eyebrow">YOUR KNOWLEDGE, CONNECTED</span>
+            <h1>从资料中，找到答案的线索</h1>
+            <p>搜索文档、发现关联，让每一条信息都有出处。</p>
+          </div>
+          <SearchBar
+            @search="handleSearchResults"
+            @search-start="handleSearchStart"
+            @search-end="handleSearchEnd"
+            @search-error="searchFailed = true"
+            @advanced-search="handleAdvancedSearch"
+          />
+          <AdvancedSearchPanel
+            v-if="advancedState.active"
+            :state="advancedState"
+            @cancel="stopAdvancedSearch"
+            @clear="clearAdvanced"
+          />
+          <SearchResults
+            v-else
+            :results="searchResults"
+            :loading="isSearching"
+            :searched="hasSearched"
+            :failed="searchFailed"
+          />
+        </section>
+        <section v-if="visited.knowledge" v-show="activeTab === 'knowledge'">
+          <div class="page-title">
+            <div>
+              <span class="eyebrow">KNOWLEDGE LIBRARY</span>
+              <h1>知识库</h1>
+              <p>整理资料，连接知识，随时找到所需内容。</p>
             </div>
-            <h1 class="text-xl font-semibold text-slate-800">知识库</h1>
-          </div>
-
-          <!-- Navigation -->
-          <nav class="flex gap-1 bg-slate-100 p-1 rounded-xl">
-            <button
-              v-for="tab in tabs"
-              :key="tab.id"
-              @click="activeTab = tab.id"
-              :class="[
-                'px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200',
-                activeTab === tab.id
-                  ? 'bg-white text-slate-900 shadow-sm'
-                  : 'text-slate-600 hover:text-slate-900'
-              ]"
-            >
-              <span v-if="tab.icon" class="mr-1.5">{{ tab.icon }}</span>
-              {{ tab.name }}
+            <button class="primary-button" @click="openUpload">
+              ＋ 上传文件
             </button>
-          </nav>
-        </div>
-      </div>
-    </header>
-
-    <!-- Main Content -->
-    <main class="flex-1 max-w-6xl mx-auto px-6 py-8 w-full">
-      <!-- Search Tab -->
-      <div v-if="activeTab === 'search'" class="search-page space-y-6">
-        <div class="search-hero text-center">
-          <div class="mx-auto mb-4 flex h-10 w-10 items-center justify-center rounded-xl border border-slate-200 bg-slate-50 text-xs font-semibold tracking-wide text-slate-600">KB</div>
-          <h2 class="text-3xl font-semibold text-slate-800 mb-2">查找知识，从这里开始</h2>
-          <p class="mx-auto max-w-xl text-sm text-slate-500">选择搜索范围和检索方式，在文档中快速定位所需内容</p>
-        </div>
-
-        <SearchBar
-          @search="handleSearchResults"
-          @search-start="handleSearchStart"
-          @search-end="handleSearchEnd"
-          @advanced-search="handleAdvancedSearch"
-        />
-
-        <AdvancedSearchPanel
-          v-if="advancedState.active"
-          :state="advancedState"
-          @cancel="stopAdvancedSearch"
-          @clear="clearAdvanced"
-        />
-
-        <SearchResults
-          :results="searchResults"
-          :loading="isSearching"
-        />
-      </div>
-
-      <div v-if="activeTab === 'dictionary'" class="space-y-6">
-        <div class="page-heading mb-6">
-          <h2 class="text-2xl font-semibold text-slate-800 mb-1">词表与同义词</h2>
-          <p class="text-slate-500">管理搜索词表并发布重建索引，查看重建进度与 ETA</p>
-        </div>
-        <SearchDictionaryManager />
-      </div>
-
-      <!-- Knowledge Workspace Tab -->
-      <div v-if="activeTab === 'knowledge'" class="knowledge-page space-y-6">
-        <div class="page-heading knowledge-heading">
-          <div>
-            <h2 class="text-2xl font-semibold text-slate-800">知识库</h2>
-            <p class="text-slate-500 mt-1">管理知识库、文档与知识图谱</p>
           </div>
-        </div>
-
-        <div class="knowledge-view-tabs" role="tablist" aria-label="知识库视图">
-          <button
-            type="button"
-            role="tab"
-            :aria-selected="knowledgeView === 'bases'"
-            :class="{ active: knowledgeView === 'bases' }"
-            @click="knowledgeView = 'bases'"
-          >
-            知识库
-          </button>
-          <button
-            type="button"
-            role="tab"
-            :aria-selected="knowledgeView === 'graph'"
-            :class="{ active: knowledgeView === 'graph' }"
-            @click="knowledgeView = 'graph'"
-          >
-            知识图谱
-          </button>
-        </div>
-
-        <KnowledgeBaseList v-if="knowledgeView === 'bases'" />
-        <KnowledgeGraph v-else />
-      </div>
-
-      <!-- Upload Tab -->
-      <div v-if="activeTab === 'upload'" class="space-y-6">
-        <div class="page-heading mb-6">
-          <h2 class="text-2xl font-semibold text-slate-800 mb-1">上传文档</h2>
-          <p class="text-slate-500">将文档添加到知识库中</p>
-        </div>
-
-        <FileUpload />
-      </div>
-
-      <div v-if="activeTab === 'settings'" class="space-y-6">
-        <SettingsPanel />
-      </div>
-    </main>
-
+          <div class="view-tabs">
+            <button
+              :class="{ active: knowledgeView === 'bases' }"
+              @click="knowledgeView = 'bases'"
+            >
+              文件与目录</button
+            ><button
+              :class="{ active: knowledgeView === 'graph' }"
+              @click="knowledgeView = 'graph'"
+            >
+              知识图谱</button
+            ><span class="scope-caption">{{ currentKb.name }}</span>
+          </div>
+          <KnowledgeBaseList
+            ref="kbList"
+            v-show="knowledgeView === 'bases'"
+            @upload="openUpload"
+          />
+          <KnowledgeGraph
+            v-if="knowledgeView === 'graph' && activeTab === 'knowledge'"
+          />
+        </section>
+        <TaskCenter v-if="activeTab === 'tasks'" />
+        <section v-if="visited.settings" v-show="activeTab === 'settings'">
+          <div class="page-title">
+            <div>
+              <span class="eyebrow">ADMINISTRATION</span>
+              <h1>管理设置</h1>
+              <p>维护检索词表，配置文档解析与服务连接。</p>
+            </div>
+          </div>
+          <div class="view-tabs">
+            <button
+              :class="{ active: settingsView === 'services' }"
+              @click="settingsView = 'services'"
+            >
+              解析与服务</button
+            ><button
+              :class="{ active: settingsView === 'dictionary' }"
+              @click="settingsView = 'dictionary'"
+            >
+              词表与同义词
+            </button>
+          </div>
+          <SettingsPanel
+            v-if="settingsView === 'services'"
+          /><SearchDictionaryManager v-else />
+        </section>
+      </main>
+    </div>
+    <Teleport to="body"
+      ><div
+        v-if="uploadOpen"
+        class="upload-overlay"
+        @click.self="closeUpload"
+        @keydown.esc="closeUpload"
+      >
+        <section
+          v-dialog
+          class="upload-dialog"
+          role="dialog"
+          aria-modal="true"
+          aria-label="上传文件"
+        >
+          <div class="panel-heading">
+            <div>
+              <h2>上传文件</h2>
+              <p>添加到知识库，开始整理和检索。</p>
+            </div>
+            <button
+              class="plain-button"
+              @click="closeUpload"
+              :disabled="uploadBusy"
+              aria-label="关闭上传"
+            >
+              ✕
+            </button>
+          </div>
+          <FileUpload
+            :key="uploadVersion"
+            @busy="uploadBusy = $event"
+            @uploaded="uploaded"
+            @tasks="
+              () => {
+                uploadOpen = false
+                activeTab = 'tasks'
+              }
+            "
+          />
+        </section></div
+    ></Teleport>
   </div>
 </template>

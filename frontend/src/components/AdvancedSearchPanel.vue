@@ -1,4 +1,7 @@
 <script setup>
+import FileDetail from './FileDetail.vue'
+import { vDialog } from '../dialog'
+const selected = ref(null)
 import { computed, ref } from 'vue'
 
 const props = defineProps({
@@ -33,22 +36,33 @@ const copyContent = async (text) => {
 </script>
 
 <template>
-  <div class="advanced-search-panel max-w-4xl mx-auto bg-white border border-slate-200 rounded-2xl p-5 shadow-sm mb-6">
-    <div class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+  <div
+    class="advanced-search-panel max-w-4xl mx-auto bg-white border border-slate-200 rounded-2xl p-5 shadow-sm mb-6"
+  >
+    <div
+      class="flex flex-col gap-3 md:flex-row md:items-center md:justify-between"
+    >
       <div>
         <div class="flex items-center gap-2">
-          <h3 class="text-lg font-semibold text-slate-800">高级搜索流</h3>
+          <h3 class="text-lg font-semibold text-slate-800">深入检索</h3>
           <span
             class="inline-flex items-center gap-1 text-xs font-medium px-2 py-0.5 rounded-full"
-            :class="state.running ? 'bg-green-50 text-green-700' : 'bg-slate-100 text-slate-600'"
+            :class="
+              state.running
+                ? 'bg-green-50 text-green-700'
+                : 'bg-slate-100 text-slate-600'
+            "
           >
-            <span class="h-2 w-2 rounded-full" :class="state.running ? 'bg-green-500 animate-pulse' : 'bg-slate-400'"></span>
+            <span
+              class="h-2 w-2 rounded-full"
+              :class="
+                state.running ? 'bg-green-500 animate-pulse' : 'bg-slate-400'
+              "
+            ></span>
             {{ state.running ? '进行中' : '已结束' }}
           </span>
         </div>
-        <p class="text-sm text-slate-500 mt-1">
-          状态：{{ state.status }}
-        </p>
+        <p class="text-sm text-slate-500 mt-1">状态：{{ state.status }}</p>
       </div>
       <div class="flex gap-3">
         <button
@@ -69,11 +83,15 @@ const copyContent = async (text) => {
       </div>
     </div>
 
-    <div v-if="state.error" class="mt-4 p-3 rounded-xl bg-rose-50 border border-rose-100 text-rose-700 text-sm">
+    <div
+      v-if="state.error"
+      class="mt-4 p-3 rounded-xl bg-rose-50 border border-rose-100 text-rose-700 text-sm"
+    >
       {{ state.error }}
     </div>
 
-    <div v-if="state.planSteps?.length" class="mt-4 space-y-2">
+    <details v-if="state.planSteps?.length" class="mt-4 space-y-2">
+      <summary class="plain-button">查看执行步骤</summary>
       <div
         v-for="step in state.planSteps"
         :key="step.index || step.action"
@@ -90,13 +108,15 @@ const copyContent = async (text) => {
           </div>
           <span
             class="text-xs font-semibold px-2 py-0.5 rounded-full"
-            :class="step.status === 'completed'
-              ? 'bg-emerald-50 text-emerald-700'
-              : step.status === 'skipped'
-                ? 'bg-amber-50 text-amber-700'
-                : step.status === 'started'
-                  ? 'bg-blue-50 text-blue-700'
-                  : 'bg-slate-100 text-slate-600'"
+            :class="
+              step.status === 'completed'
+                ? 'bg-emerald-50 text-emerald-700'
+                : step.status === 'skipped'
+                  ? 'bg-amber-50 text-amber-700'
+                  : step.status === 'started'
+                    ? 'bg-blue-50 text-blue-700'
+                    : 'bg-slate-100 text-slate-600'
+            "
           >
             {{ step.status || 'pending' }}
           </span>
@@ -104,13 +124,16 @@ const copyContent = async (text) => {
         <pre
           v-if="step.details"
           class="mt-2 text-xs text-slate-600 bg-white border border-slate-200 rounded-lg p-2 overflow-auto"
-        >{{ JSON.stringify(step.details, null, 2) }}</pre>
+          >{{ JSON.stringify(step.details, null, 2) }}</pre>
       </div>
-    </div>
+    </details>
 
-    <div class="grid gap-5 lg:grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)] mt-5">
-      <section class="space-y-3">
-        <h4 class="text-sm font-semibold text-slate-700 flex items-center gap-2">
+    <div class="grid gap-5 mt-5">
+      <details class="space-y-3">
+        <summary class="plain-button">查看过程记录</summary>
+        <h4
+          class="text-sm font-semibold text-slate-700 flex items-center gap-2"
+        >
           <span class="w-2 h-2 rounded-full bg-amber-400"></span> 过程记录
         </h4>
         <div
@@ -125,7 +148,9 @@ const copyContent = async (text) => {
             :key="item.id"
             class="rounded-xl border border-slate-100 p-3 bg-slate-50"
           >
-            <div class="flex items-center justify-between text-xs text-slate-500 mb-1">
+            <div
+              class="flex items-center justify-between text-xs text-slate-500 mb-1"
+            >
               <span>{{ item.title }}</span>
               <span>{{ formatTime(item.time) }}</span>
             </div>
@@ -134,11 +159,13 @@ const copyContent = async (text) => {
             </p>
           </li>
         </ul>
-      </section>
+      </details>
 
       <section class="space-y-3">
-        <h4 class="text-sm font-semibold text-slate-700 flex items-center gap-2">
-          <span class="w-2 h-2 rounded-full bg-emerald-400"></span> 相关切片
+        <h4
+          class="text-sm font-semibold text-slate-700 flex items-center gap-2"
+        >
+          <span class="w-2 h-2 rounded-full bg-emerald-400"></span> 相关段落
         </h4>
         <div
           v-if="!hasResults"
@@ -154,7 +181,9 @@ const copyContent = async (text) => {
           >
             <div class="flex items-start justify-between gap-3">
               <div>
-                <p class="text-sm font-semibold text-slate-800">{{ item.file?.filename || '未知文件' }}</p>
+                <p class="text-sm font-semibold text-slate-800">
+                  {{ item.file?.filename || '未知文件' }}
+                </p>
                 <p class="text-xs text-slate-500 mt-1">
                   步骤：{{ item.step_action || '—' }}
                 </p>
@@ -168,38 +197,85 @@ const copyContent = async (text) => {
               </button>
             </div>
             <p class="text-xs text-slate-500 mt-2">
-              相关度：{{ item.judge_score?.toFixed(2) ?? '-' }} · {{ item.judge_reason }}
+              相关度：{{ item.judge_score?.toFixed(2) ?? '-' }} ·
+              {{ item.judge_reason }}
             </p>
             <p v-if="item.refine_reason" class="text-xs text-slate-500 mt-1">
               筛选说明：{{ item.refine_reason }}
             </p>
-            <pre class="mt-3 text-sm text-slate-700 bg-slate-50 rounded-lg p-3 max-h-40 overflow-auto whitespace-pre-wrap">{{ item.content }}</pre>
+            <button
+              v-if="item.file"
+              class="plain-button"
+              @click="selected = item"
+            >
+              查看内容与出处 →
+            </button>
+            <pre
+              class="mt-3 text-sm text-slate-700 bg-slate-50 rounded-lg p-3 max-h-40 overflow-auto whitespace-pre-wrap"
+              >{{ item.content }}</pre>
           </article>
         </div>
       </section>
     </div>
 
-    <div v-if="state.debugEvents.length" class="mt-6 border-t border-dashed border-slate-200 pt-4">
+    <div
+      v-if="state.debugEvents.length"
+      class="mt-6 border-t border-dashed border-slate-200 pt-4"
+    >
       <button
         type="button"
         class="text-xs text-slate-500 hover:text-slate-700 flex items-center gap-1"
         @click="showDebug = !showDebug"
       >
-        <svg class="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+        <svg
+          class="w-3.5 h-3.5"
+          fill="none"
+          stroke="currentColor"
+          viewBox="0 0 24 24"
+        >
+          <path
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            stroke-width="2"
+            d="M19 9l-7 7-7-7"
+          />
         </svg>
         {{ showDebug ? '隐藏调试事件' : '显示调试事件' }}
       </button>
-      <div v-if="showDebug" class="mt-3 max-h-48 overflow-auto bg-slate-50 rounded-xl p-3 text-xs text-slate-600">
+      <div
+        v-if="showDebug"
+        class="mt-3 max-h-48 overflow-auto bg-slate-50 rounded-xl p-3 text-xs text-slate-600"
+      >
         <div
           v-for="event in state.debugEvents"
           :key="event.id"
           class="mb-2 border-b border-slate-200 pb-2 last:border-none last:pb-0"
         >
-          <p class="font-semibold">[{{ event.type }}] {{ formatTime(event.time) }}</p>
-          <pre class="whitespace-pre-wrap">{{ JSON.stringify(event.payload, null, 2) }}</pre>
+          <p class="font-semibold">
+            [{{ event.type }}] {{ formatTime(event.time) }}
+          </p>
+          <pre class="whitespace-pre-wrap">{{
+            JSON.stringify(event.payload, null, 2)
+          }}</pre>
         </div>
       </div>
     </div>
   </div>
+  <Teleport to="body"
+    ><div
+      v-if="selected"
+      v-dialog
+      role="dialog"
+      aria-modal="true"
+      aria-label="文件详情"
+      class="detail-overlay"
+      @click.self="selected = null"
+      @keydown.esc="selected = null"
+    >
+      <FileDetail
+        :file="selected.file"
+        :slice-id="selected.slice_ids?.[0] ?? selected.sliceIds?.[0] ?? null"
+        @close="selected = null"
+      /></div
+  ></Teleport>
 </template>

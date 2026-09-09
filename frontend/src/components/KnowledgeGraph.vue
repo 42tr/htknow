@@ -1,5 +1,6 @@
 <script setup>
 import { ref, onMounted, computed, watch } from 'vue'
+import { currentKb as workspaceKb } from '../store'
 import { api } from '../api.js'
 import EntityDetail from './EntityDetail.vue'
 import GraphVisualization from './GraphVisualization.vue'
@@ -14,35 +15,37 @@ const showEntityDetail = ref(false)
 const viewMode = ref('list') // 'list' or 'graph'
 
 // 范围过滤
-const scopeType = ref('all') // 'all', 'kb', 'file'
+const scopeType = ref(workspaceKb.value.id ? 'kb' : 'all') // 'all', 'kb', 'file'
 const knowledgeBases = ref([])
 const files = ref([])
-const selectedKbId = ref(null)
+const selectedKbId = ref(workspaceKb.value.id)
 const selectedFileId = ref(null)
 
 // 实体类型映射
 const entityTypeMap = {
-  'person': { label: '人物', icon: '人', color: 'blue' },
-  'organization': { label: '组织', icon: '组织', color: 'purple' },
-  'location': { label: '地点', icon: '地', color: 'green' },
-  'date': { label: '日期', icon: '日', color: 'orange' },
-  'product': { label: '产品', icon: '品', color: 'pink' },
-  'technology': { label: '技术', icon: '技', color: 'cyan' },
-  'concept': { label: '概念', icon: '概', color: 'yellow' },
-  'api': { label: 'API', icon: 'API', color: 'indigo' },
-  'document': { label: '文档', icon: '文', color: 'gray' },
-  'chapter': { label: '章节', icon: '章', color: 'slate' },
-  'table': { label: '表格', icon: '表', color: 'teal' },
-  'image': { label: '图片', icon: '图', color: 'rose' },
+  person: { label: '人物', icon: '人', color: 'blue' },
+  organization: { label: '组织', icon: '组织', color: 'purple' },
+  location: { label: '地点', icon: '地', color: 'green' },
+  date: { label: '日期', icon: '日', color: 'orange' },
+  product: { label: '产品', icon: '品', color: 'pink' },
+  technology: { label: '技术', icon: '技', color: 'cyan' },
+  concept: { label: '概念', icon: '概', color: 'yellow' },
+  api: { label: 'API', icon: 'API', color: 'indigo' },
+  document: { label: '文档', icon: '文', color: 'gray' },
+  chapter: { label: '章节', icon: '章', color: 'slate' },
+  table: { label: '表格', icon: '表', color: 'teal' },
+  image: { label: '图片', icon: '图', color: 'rose' },
 }
 
 const entityTypes = computed(() => {
   if (!stats.value) return []
-  return Object.entries(stats.value.entity_types || {}).map(([type, count]) => ({
-    type,
-    count,
-    ...entityTypeMap[type] || { label: type, icon: '·', color: 'gray' }
-  }))
+  return Object.entries(stats.value.entity_types || {}).map(
+    ([type, count]) => ({
+      type,
+      count,
+      ...(entityTypeMap[type] || { label: type, icon: '·', color: 'gray' }),
+    }),
+  )
 })
 
 const filteredEntities = computed(() => {
@@ -50,14 +53,24 @@ const filteredEntities = computed(() => {
 })
 
 // 当前有效的过滤参数
-const currentKbId = computed(() => scopeType.value === 'kb' ? selectedKbId.value : null)
-const currentFileId = computed(() => scopeType.value === 'file' ? selectedFileId.value : null)
+const currentKbId = computed(() =>
+  scopeType.value === 'kb' ? selectedKbId.value : null,
+)
+const currentFileId = computed(() =>
+  scopeType.value === 'file' ? selectedFileId.value : null,
+)
 
 // 加载知识库列表
 const loadKnowledgeBases = async () => {
   try {
     const data = await api.getKnowledgeBases()
     knowledgeBases.value = data.items || []
+    if (
+      workspaceKb.value.id &&
+      !knowledgeBases.value.some((kb) => kb.id === workspaceKb.value.id)
+    ) {
+      knowledgeBases.value.push({ ...workspaceKb.value })
+    }
   } catch (error) {
     console.error('加载知识库列表失败:', error)
   }
@@ -75,7 +88,10 @@ const loadFiles = async () => {
 
 const loadStats = async () => {
   try {
-    stats.value = await api.getGraphStats(currentKbId.value, currentFileId.value)
+    stats.value = await api.getGraphStats(
+      currentKbId.value,
+      currentFileId.value,
+    )
   } catch (error) {
     console.error('加载统计失败:', error)
   }
@@ -89,7 +105,7 @@ const loadEntities = async () => {
       selectedEntityType.value || null,
       currentKbId.value,
       100,
-      currentFileId.value
+      currentFileId.value,
     )
   } catch (error) {
     console.error('加载实体失败:', error)
@@ -178,28 +194,49 @@ onMounted(() => {
         <!-- 范围类型选择 -->
         <div class="flex gap-1 bg-slate-100 p-1 rounded-lg">
           <button
-            @click="scopeType = 'all'; handleScopeChange()"
+            @click="
+              () => {
+                scopeType = 'all'
+                handleScopeChange()
+              }
+            "
             :class="[
               'px-4 py-2 rounded-lg text-sm font-medium transition-all',
-              scopeType === 'all' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+              scopeType === 'all'
+                ? 'bg-white text-slate-900 shadow-sm'
+                : 'text-slate-600 hover:text-slate-900',
             ]"
           >
             全部
           </button>
           <button
-            @click="scopeType = 'kb'; handleScopeChange()"
+            @click="
+              () => {
+                scopeType = 'kb'
+                handleScopeChange()
+              }
+            "
             :class="[
               'px-4 py-2 rounded-lg text-sm font-medium transition-all',
-              scopeType === 'kb' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+              scopeType === 'kb'
+                ? 'bg-white text-slate-900 shadow-sm'
+                : 'text-slate-600 hover:text-slate-900',
             ]"
           >
             知识库
           </button>
           <button
-            @click="scopeType = 'file'; handleScopeChange()"
+            @click="
+              () => {
+                scopeType = 'file'
+                handleScopeChange()
+              }
+            "
             :class="[
               'px-4 py-2 rounded-lg text-sm font-medium transition-all',
-              scopeType === 'file' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+              scopeType === 'file'
+                ? 'bg-white text-slate-900 shadow-sm'
+                : 'text-slate-600 hover:text-slate-900',
             ]"
           >
             文件
@@ -234,10 +271,16 @@ onMounted(() => {
         <div class="text-sm text-slate-500">
           <span v-if="scopeType === 'all'">显示所有知识图谱数据</span>
           <span v-else-if="scopeType === 'kb' && selectedKbId">
-            已选择知识库: <strong class="text-slate-700">{{ knowledgeBases.find(kb => kb.id === selectedKbId)?.name }}</strong>
+            已选择知识库:
+            <strong class="text-slate-700">{{
+              knowledgeBases.find((kb) => kb.id === selectedKbId)?.name
+            }}</strong>
           </span>
           <span v-else-if="scopeType === 'file' && selectedFileId">
-            已选择文件: <strong class="text-slate-700">{{ files.find(f => f.id === selectedFileId)?.filename }}</strong>
+            已选择文件:
+            <strong class="text-slate-700">{{
+              files.find((f) => f.id === selectedFileId)?.filename
+            }}</strong>
           </span>
         </div>
       </div>
@@ -247,48 +290,64 @@ onMounted(() => {
     <div v-if="stats" class="grid grid-cols-1 md:grid-cols-4 gap-4">
       <div class="bg-white rounded-xl p-6 border border-slate-200 shadow-sm">
         <div class="flex items-center gap-3">
-          <div class="w-12 h-12 bg-blue-100 rounded-lg flex items-center justify-center">
+          <div
+            class="w-12 h-12 bg-blue-100 rounded-lg flex items-center justify-center"
+          >
             <span class="text-2xl">●</span>
           </div>
           <div>
             <p class="text-sm text-slate-500">实体节点</p>
-            <p class="text-2xl font-bold text-slate-800">{{ stats.node_count }}</p>
+            <p class="text-2xl font-bold text-slate-800">
+              {{ stats.node_count }}
+            </p>
           </div>
         </div>
       </div>
 
       <div class="bg-white rounded-xl p-6 border border-slate-200 shadow-sm">
         <div class="flex items-center gap-3">
-          <div class="w-12 h-12 bg-purple-100 rounded-lg flex items-center justify-center">
+          <div
+            class="w-12 h-12 bg-purple-100 rounded-lg flex items-center justify-center"
+          >
             <span class="text-2xl">↔</span>
           </div>
           <div>
             <p class="text-sm text-slate-500">关系边</p>
-            <p class="text-2xl font-bold text-slate-800">{{ stats.edge_count }}</p>
+            <p class="text-2xl font-bold text-slate-800">
+              {{ stats.edge_count }}
+            </p>
           </div>
         </div>
       </div>
 
       <div class="bg-white rounded-xl p-6 border border-slate-200 shadow-sm">
         <div class="flex items-center gap-3">
-          <div class="w-12 h-12 bg-green-100 rounded-lg flex items-center justify-center">
+          <div
+            class="w-12 h-12 bg-green-100 rounded-lg flex items-center justify-center"
+          >
             <span class="text-2xl">▦</span>
           </div>
           <div>
             <p class="text-sm text-slate-500">实体类型</p>
-            <p class="text-2xl font-bold text-slate-800">{{ Object.keys(stats.entity_types || {}).length }}</p>
+            <p class="text-2xl font-bold text-slate-800">
+              {{ Object.keys(stats.entity_types || {}).length }}
+            </p>
           </div>
         </div>
       </div>
 
       <div class="bg-white rounded-xl p-6 border border-slate-200 shadow-sm">
         <div class="flex items-center gap-3">
-          <div class="w-12 h-12 bg-orange-100 rounded-lg flex items-center justify-center">
+          <div
+            class="w-12 h-12 bg-orange-100 rounded-lg flex items-center justify-center"
+          >
             <span class="text-2xl">⌁</span>
           </div>
           <div>
             <p class="text-sm text-slate-500">关系类型</p>
-            <p class="text-2xl font-bold text-slate-800">{{ Object.keys(stats.relation_types || {}).length }}</p>
+            <p class="text-2xl font-bold text-slate-800">
+              {{ Object.keys(stats.relation_types || {}).length }}
+            </p>
           </div>
         </div>
       </div>
@@ -306,12 +365,14 @@ onMounted(() => {
             'px-4 py-2 rounded-lg text-sm font-medium transition-all duration-200 flex items-center gap-2',
             selectedEntityType === entityType.type
               ? `bg-${entityType.color}-100 text-${entityType.color}-700 border-2 border-${entityType.color}-300`
-              : 'bg-slate-50 text-slate-600 border-2 border-transparent hover:bg-slate-100'
+              : 'bg-slate-50 text-slate-600 border-2 border-transparent hover:bg-slate-100',
           ]"
         >
           <span>{{ entityType.icon }}</span>
           <span>{{ entityType.label }}</span>
-          <span class="ml-1 px-2 py-0.5 bg-white rounded-full text-xs">{{ entityType.count }}</span>
+          <span class="ml-1 px-2 py-0.5 bg-white rounded-full text-xs">{{
+            entityType.count
+          }}</span>
         </button>
       </div>
     </div>
@@ -337,7 +398,9 @@ onMounted(() => {
             @click="viewMode = 'list'"
             :class="[
               'px-4 py-2 rounded-lg text-sm font-medium transition-all',
-              viewMode === 'list' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+              viewMode === 'list'
+                ? 'bg-white text-slate-900 shadow-sm'
+                : 'text-slate-600 hover:text-slate-900',
             ]"
           >
             列表
@@ -346,7 +409,9 @@ onMounted(() => {
             @click="viewMode = 'graph'"
             :class="[
               'px-4 py-2 rounded-lg text-sm font-medium transition-all',
-              viewMode === 'graph' ? 'bg-white text-slate-900 shadow-sm' : 'text-slate-600 hover:text-slate-900'
+              viewMode === 'graph'
+                ? 'bg-white text-slate-900 shadow-sm'
+                : 'text-slate-600 hover:text-slate-900',
             ]"
           >
             图形
@@ -365,20 +430,30 @@ onMounted(() => {
     />
 
     <!-- 实体列表 -->
-    <div v-if="viewMode === 'list'" class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden">
+    <div
+      v-if="viewMode === 'list'"
+      class="bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden"
+    >
       <div class="px-6 py-4 border-b border-slate-200 bg-slate-50">
         <h3 class="font-semibold text-slate-800">
           实体列表
-          <span class="text-sm text-slate-500 ml-2">({{ filteredEntities.length }} 个实体)</span>
+          <span class="text-sm text-slate-500 ml-2"
+            >({{ filteredEntities.length }} 个实体)</span
+          >
         </h3>
       </div>
 
       <div v-if="loading" class="p-8 text-center">
-        <div class="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"></div>
+        <div
+          class="inline-block animate-spin rounded-full h-8 w-8 border-b-2 border-blue-500"
+        ></div>
         <p class="mt-2 text-slate-500">加载中...</p>
       </div>
 
-      <div v-else-if="filteredEntities.length === 0" class="p-8 text-center text-slate-500">
+      <div
+        v-else-if="filteredEntities.length === 0"
+        class="p-8 text-center text-slate-500"
+      >
         <span class="text-xl mb-2 block font-semibold">SEARCH</span>
         暂无实体数据
       </div>
@@ -392,13 +467,19 @@ onMounted(() => {
         >
           <div class="flex items-center justify-between">
             <div class="flex items-center gap-3 flex-1">
-              <div :class="`w-10 h-10 bg-${getEntityTypeInfo(entity.entity_type).color}-100 rounded-lg flex items-center justify-center`">
-                <span class="text-xl">{{ getEntityTypeInfo(entity.entity_type).icon }}</span>
+              <div
+                :class="`w-10 h-10 bg-${getEntityTypeInfo(entity.entity_type).color}-100 rounded-lg flex items-center justify-center`"
+              >
+                <span class="text-xl">{{
+                  getEntityTypeInfo(entity.entity_type).icon
+                }}</span>
               </div>
               <div class="flex-1">
                 <h4 class="font-medium text-slate-800">{{ entity.name }}</h4>
                 <div class="flex items-center gap-2 mt-1">
-                  <span :class="`px-2 py-0.5 text-xs rounded-full bg-${getEntityTypeInfo(entity.entity_type).color}-100 text-${getEntityTypeInfo(entity.entity_type).color}-700`">
+                  <span
+                    :class="`px-2 py-0.5 text-xs rounded-full bg-${getEntityTypeInfo(entity.entity_type).color}-100 text-${getEntityTypeInfo(entity.entity_type).color}-700`"
+                  >
                     {{ getEntityTypeInfo(entity.entity_type).label }}
                   </span>
                   <span class="text-xs text-slate-400">
@@ -407,9 +488,7 @@ onMounted(() => {
                 </div>
               </div>
             </div>
-            <div class="text-slate-400">
-              →
-            </div>
+            <div class="text-slate-400">→</div>
           </div>
         </div>
       </div>
