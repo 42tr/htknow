@@ -11,6 +11,7 @@ import SettingsPanel from './components/SettingsPanel.vue'
 import { api } from './api'
 
 const activeTab = ref('search')
+const knowledgeView = ref('bases')
 const searchResults = ref([])
 const isSearching = ref(false)
 const advancedState = reactive({
@@ -45,7 +46,6 @@ const tabs = [
   { id: 'search', name: '搜索', icon: '' },
   { id: 'dictionary', name: '词典', icon: '' },
   { id: 'knowledge', name: '知识库', icon: '' },
-  { id: 'graph', name: '知识图谱', icon: '' },
   { id: 'upload', name: '上传', icon: '' },
   { id: 'settings', name: '配置', icon: '' },
 ]
@@ -280,26 +280,38 @@ const clearAdvanced = () => {
         <SearchDictionaryManager />
       </div>
 
-      <!-- Knowledge Base Tab -->
-      <div v-if="activeTab === 'knowledge'" class="space-y-6">
-        <div class="page-heading mb-6">
+      <!-- Knowledge Workspace Tab -->
+      <div v-if="activeTab === 'knowledge'" class="knowledge-page space-y-6">
+        <div class="page-heading knowledge-heading">
           <div>
-            <h2 class="text-2xl font-semibold text-slate-800">知识库管理</h2>
-            <p class="text-slate-500 mt-1">管理您的知识库和文档</p>
+            <h2 class="text-2xl font-semibold text-slate-800">知识库</h2>
+            <p class="text-slate-500 mt-1">管理知识库、文档与知识图谱</p>
           </div>
         </div>
 
-        <KnowledgeBaseList />
-      </div>
-
-      <!-- Knowledge Graph Tab -->
-      <div v-if="activeTab === 'graph'" class="space-y-6">
-        <div class="page-heading mb-6">
-          <h2 class="text-2xl font-semibold text-slate-800 mb-1">知识图谱</h2>
-          <p class="text-slate-500">探索文档中的实体和关系</p>
+        <div class="knowledge-view-tabs" role="tablist" aria-label="知识库视图">
+          <button
+            type="button"
+            role="tab"
+            :aria-selected="knowledgeView === 'bases'"
+            :class="{ active: knowledgeView === 'bases' }"
+            @click="knowledgeView = 'bases'"
+          >
+            知识库
+          </button>
+          <button
+            type="button"
+            role="tab"
+            :aria-selected="knowledgeView === 'graph'"
+            :class="{ active: knowledgeView === 'graph' }"
+            @click="knowledgeView = 'graph'"
+          >
+            知识图谱
+          </button>
         </div>
 
-        <KnowledgeGraph />
+        <KnowledgeBaseList v-if="knowledgeView === 'bases'" />
+        <KnowledgeGraph v-else />
       </div>
 
       <!-- Upload Tab -->

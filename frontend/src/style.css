@@ -100,6 +100,44 @@ main h2 {
   max-width: 720px;
 }
 
+.knowledge-heading {
+  margin-bottom: 20px;
+}
+
+.knowledge-view-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 3px;
+  background: #f7f7f8;
+  border: 1px solid #e5e5e5;
+  border-radius: 9px;
+}
+
+.knowledge-view-tabs button {
+  min-height: 34px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: #737373;
+  font-size: 0.875rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, box-shadow 0.15s ease;
+}
+
+.knowledge-view-tabs button:hover {
+  color: #2f2f2f;
+  background: #eeeeee;
+}
+
+.knowledge-view-tabs button.active {
+  color: #2f2f2f;
+  background: #ffffff;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.08);
+}
+
 main .text-slate-500 {
   color: #737373 !important;
 }
@@ -167,13 +205,8 @@ main .rounded-xl {
   min-width: 170px;
 }
 
-.knowledge-workspace .file-section > .overflow-hidden > * + * {
+.knowledge-workspace .resource-stream .file-list > * + * {
   border-top: 1px solid #f1f1f1;
-}
-
-.knowledge-workspace .file-section > .overflow-hidden > .rounded-xl {
-  border: 0 !important;
-  border-radius: 0 !important;
 }
 
 main input,
@@ -233,6 +266,15 @@ footer {
 
   .page-heading {
     margin-bottom: 20px;
+  }
+
+  .knowledge-view-tabs {
+    display: flex;
+    width: 100%;
+  }
+
+  .knowledge-view-tabs button {
+    flex: 1;
   }
 
   .advanced-search-panel {

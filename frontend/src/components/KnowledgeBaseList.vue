@@ -1,12 +1,11 @@
 <script setup>
-import { ref, onMounted, computed, nextTick } from 'vue'
+import { ref, onMounted, onBeforeUnmount, computed, nextTick } from 'vue'
 import { api } from '../api'
 import FileCard from './FileCard.vue'
 import CreateKnowledgeBase from './CreateKnowledgeBase.vue'
 import FileStatusSummary from './FileStatusSummary.vue'
 import KnowledgeBaseExportModal from './KnowledgeBaseExportModal.vue'
 import KbPermissionModal from './KbPermissionModal.vue'
-import Pagination from './Pagination.vue'
 import { setCurrentKb } from '../store'
 
 // Reactive state for the current view
@@ -23,6 +22,9 @@ const childKbReparseLoading = ref({})
 const priorityDrafts = ref({})
 const prioritySaving = ref({})
 const locatedFileId = ref(null)
+const listSentinel = ref(null)
+const loadingMore = ref(false)
+let listObserver = null
 
 // Pagination / filter state for KB file list
 const currentPage = ref(1)
@@ -35,6 +37,10 @@ const fileFilterTag = ref('')
 const kbCurrentPage = ref(1)
 const kbPageSize = ref(12)
 const totalKbs = ref(0)
+
+const hasMoreKbs = computed(() => childrenKbs.value.length < totalKbs.value)
+const hasMoreFiles = computed(() => files.value.length < totalFiles.value)
+const hasMoreContent = computed(() => hasMoreKbs.value || hasMoreFiles.value)
 
 // Permission modal state
 const showPermissionModal = ref(false)
@@ -136,6 +142,8 @@ const fetchStats = async (kbId) => {
 
 const loadKbContent = async (kbId) => {
   const targetId = kbId ?? null
+  currentPage.value = 1
+  kbCurrentPage.value = 1
   loading.value = true
   error.value = ''
   try {
@@ -171,12 +179,6 @@ const loadKbContent = async (kbId) => {
       newCurrentKb = { id: data.id, name: data.name, description: data.description, kb_type: data.kb_type }
       breadcrumbs.value = data.path || []
     }
-    // 若当前页已没有知识库（如删除后），回退一页重新加载
-    if (childrenKbs.value.length === 0 && totalKbs.value > 0 && kbCurrentPage.value > 1) {
-      kbCurrentPage.value -= 1
-      await loadKbContent(targetId)
-      return
-    }
     const nextPriorityDrafts = {}
     for (const kb of childrenKbs.value) {
       nextPriorityDrafts[kb.id] = Number.isInteger(kb.parse_priority) ? kb.parse_priority : 50
@@ -189,6 +191,41 @@ const loadKbContent = async (kbId) => {
     error.value = e.message
   } finally {
     loading.value = false
+  }
+}
+
+const loadMoreContent = async () => {
+  if (loading.value || loadingMore.value || !hasMoreContent.value) return
+  loadingMore.value = true
+  try {
+    const targetId = getCurrentKbId()
+    if (hasMoreKbs.value) {
+      const nextPage = kbCurrentPage.value + 1
+      const data = await api.getKnowledgeBases(targetId, { page: nextPage, size: kbPageSize.value })
+      const nextItems = data.items || []
+      childrenKbs.value.push(...nextItems)
+      kbCurrentPage.value = nextPage
+      for (const kb of nextItems) {
+        priorityDrafts.value[kb.id] = Number.isInteger(kb.parse_priority) ? kb.parse_priority : 50
+      }
+      return
+    }
+
+    const nextPage = currentPage.value + 1
+    const data = targetId === null
+      ? await api.getFiles(null, null, { page: nextPage, size: pageSize.value })
+      : await api.getKnowledgeBaseFiles(targetId, {
+          page: nextPage,
+          size: pageSize.value,
+          filename: fileFilterName.value || undefined,
+          tag: fileFilterTag.value || undefined,
+        })
+    files.value.push(...(data.items || []))
+    currentPage.value = nextPage
+  } catch (err) {
+    error.value = err?.message || '加载更多内容失败'
+  } finally {
+    loadingMore.value = false
   }
 }
 
@@ -390,10 +427,17 @@ defineExpose({
 })
 
 // Initial load
-onMounted(() => {
-  loadKbContent(null)
+onMounted(async () => {
+  await loadKbContent(null)
   loadExportRecords()
+  listObserver = new IntersectionObserver((entries) => {
+    if (entries.some((entry) => entry.isIntersecting)) loadMoreContent()
+  }, { rootMargin: '240px 0px' })
+  await nextTick()
+  if (listSentinel.value) listObserver.observe(listSentinel.value)
 })
+
+onBeforeUnmount(() => listObserver?.disconnect())
 </script>
 
 <template>
@@ -495,16 +539,16 @@ onMounted(() => {
     </div>
 
     <!-- Grid for KBs and Files -->
-    <div v-else class="space-y-8">
+    <div v-else class="resource-stream overflow-hidden border-y border-slate-200 bg-white">
       <!-- Child KBs -->
-      <section v-if="childrenKbs.length > 0" class="space-y-4">
-        <div class="section-heading">
+      <section v-if="childrenKbs.length > 0" class="border-b border-slate-200">
+        <div class="section-heading px-4 py-3 lg:px-5">
           <div>
             <h3 class="text-base font-semibold text-slate-800">知识库</h3>
             <p class="mt-1 text-xs text-slate-500">共 {{ totalKbs }} 个，点击进入下一级</p>
           </div>
         </div>
-        <div class="kb-list overflow-hidden border-y border-slate-200 bg-white">
+        <div class="kb-list">
         <div
           v-for="kb in childrenKbs"
           :key="`kb-${kb.id}`"
@@ -604,19 +648,11 @@ onMounted(() => {
           </div>
         </div>
 
-        <Pagination
-          v-if="totalKbs > 0"
-          v-model:page="kbCurrentPage"
-          v-model:size="kbPageSize"
-          :total="totalKbs"
-          :sizes="[12, 24, 48]"
-          @change="loadKbContent(getCurrentKbId())"
-        />
       </section>
 
       <!-- Files -->
-      <section class="file-section space-y-3" v-if="files.length > 0 || currentKb?.id !== null">
-        <div class="section-heading flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+      <section class="file-section" v-if="files.length > 0 || currentKb?.id !== null">
+        <div class="section-heading flex-col gap-3 border-b border-slate-100 px-4 py-3 sm:flex-row sm:items-center sm:justify-between lg:px-5">
           <div>
             <h3 class="text-base font-semibold text-slate-800">文件</h3>
             <p class="mt-1 text-xs text-slate-500">共 {{ totalFiles }} 个文件</p>
@@ -646,7 +682,7 @@ onMounted(() => {
           </div>
         </div>
 
-        <div class="overflow-hidden rounded-xl border border-slate-200 bg-white">
+        <div class="file-list">
         <FileCard
             v-for="file in files"
             :key="`file-${file.id}`"
@@ -654,19 +690,17 @@ onMounted(() => {
             :file="file"
             :kb-type="currentKb?.kb_type"
             :highlighted="locatedFileId === file.id"
+            flat
             @updated="handleFileAction"
             @deleted="handleFileAction"
         />
         </div>
 
-        <Pagination
-          v-if="totalFiles > 0"
-          v-model:page="currentPage"
-          v-model:size="pageSize"
-          :total="totalFiles"
-          @change="loadKbContent(currentKb?.id ?? null)"
-        />
       </section>
+      <div ref="listSentinel" class="flex min-h-14 items-center justify-center border-t border-slate-100 text-xs text-slate-400">
+        <span v-if="loadingMore">正在加载更多内容...</span>
+        <span v-else-if="!hasMoreContent">已加载全部内容</span>
+      </div>
     </div>
 
     <!-- Permission Modal -->

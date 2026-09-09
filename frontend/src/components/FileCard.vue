@@ -18,6 +18,10 @@ const props = defineProps({
   highlighted: {
     type: Boolean,
     default: false
+  },
+  flat: {
+    type: Boolean,
+    default: false
   }
 })
 
@@ -242,7 +246,8 @@ const handleMoveToKb = async (kb) => {
 <template>
   <div
     :class="[
-      'bg-white rounded-xl border transition-all duration-300',
+      'bg-white border transition-all duration-300',
+      flat ? 'rounded-none border-x-0 border-t-0' : 'rounded-xl',
       highlighted
         ? 'border-blue-500 ring-4 ring-blue-100 shadow-md'
         : 'border-slate-200 hover:border-slate-300'
