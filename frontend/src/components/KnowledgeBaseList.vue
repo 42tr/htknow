@@ -144,7 +144,7 @@ const statsSubtitle = computed(() => {
   if (currentKb.value && currentKb.value.id !== null) {
     return `覆盖 ${currentKb.value.name} 及其子知识库`
   }
-  return '覆盖所有知识库（含未分配文件）'
+  return '覆盖所有知识库（含待归类文件）'
 })
 
 const getCurrentKbId = () => {
@@ -157,7 +157,7 @@ const fetchStats = async (kbId) => {
   try {
     const params = {}
     if (kbId === null || kbId === undefined) {
-      // 全局统计，后台默认包含未分配文件
+      // 全局统计，后台默认包含待归类文件
     } else {
       params.kbId = kbId
       params.includeDescendants = true
@@ -389,7 +389,7 @@ const handleTogglePublic = async (e, kbId, currentPublic) => {
 }
 
 const handleReparse = async () => {
-  if (!confirm('确定要重新解析所有知识库及未分配文件吗？')) return
+  if (!confirm('确定要重新解析所有知识库及待归类文件吗？')) return
 
   reparseLoading.value = true
   try {
@@ -413,7 +413,7 @@ const handleReparseFailedFiles = async () => {
 
   const isRootScope = !currentKb.value || currentKb.value.id === null
   const scopeLabel = isRootScope
-    ? '所有知识库及未分配文件中的失败文件'
+    ? '所有知识库及待归类文件中的失败文件'
     : `「${currentKb.value.name || '当前知识库'}」及其子知识库中的失败文件`
 
   if (!confirm(`确定要重新解析${scopeLabel}吗？`)) return
@@ -584,7 +584,7 @@ onBeforeUnmount(() => listObserver?.disconnect())
         @reparse="(kb) => handleReparseChildKb(null, kb)"
         @graph="openKbGraph"
       /><button class="directory-root" @click="openUnassigned">
-        未分配文件
+        待归类文件
       </button>
       <CreateKnowledgeBase
         ref="createKnowledgeBase"
@@ -691,7 +691,7 @@ onBeforeUnmount(() => listObserver?.disconnect())
               v-for="kb in childrenKbs"
               :key="`kb-${kb.id}`"
               @click="navigateToKb(kb.id)"
-              class="kb-row group grid cursor-pointer gap-4 px-4 py-4 transition-colors hover:bg-slate-50 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center lg:px-5"
+              class="kb-row kb-card group grid cursor-pointer gap-4 px-4 py-4 transition-all border border-transparent hover:border-slate-200 lg:grid-cols-[minmax(0,1fr)_auto] lg:items-center lg:px-5"
             >
               <div class="min-w-0">
                 <div class="min-w-0">
@@ -737,7 +737,7 @@ onBeforeUnmount(() => listObserver?.disconnect())
                         openKbGraph(kb)
                       }
                     "
-                    class="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 p-1.5 text-slate-400 hover:text-purple-500 hover:bg-purple-50 rounded-md transition-all"
+                    class=" p-1.5 text-slate-400 hover:text-purple-500 hover:bg-purple-50 rounded-md transition-all"
                     title="知识图谱"
                   >
                     <svg
@@ -895,7 +895,7 @@ onBeforeUnmount(() => listObserver?.disconnect())
                         openPermissionModal(kb)
                       }
                     "
-                    class="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 p-1.5 text-slate-400 hover:text-purple-500 hover:bg-purple-50 rounded-md transition-all"
+                    class=" p-1.5 text-slate-400 hover:text-purple-500 hover:bg-purple-50 rounded-md transition-all"
                     title="权限管理"
                   >
                     <svg
@@ -921,7 +921,7 @@ onBeforeUnmount(() => listObserver?.disconnect())
                     :disabled="
                       kb.kb_type === 'storage' || childKbReparseLoading[kb.id]
                     "
-                    class="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 p-1.5 text-slate-400 hover:text-blue-500 hover:bg-blue-50 rounded-md transition-all disabled:opacity-40 disabled:cursor-not-allowed"
+                    class=" p-1.5 text-slate-400 hover:text-blue-500 hover:bg-blue-50 rounded-md transition-all disabled:opacity-40 disabled:cursor-not-allowed"
                     :title="
                       kb.kb_type === 'storage'
                         ? '存储型知识库不参与解析'
@@ -947,7 +947,7 @@ onBeforeUnmount(() => listObserver?.disconnect())
                   <button
                     v-if="kb.current_user_permission === 'admin'"
                     @click="(e) => handleDeleteKb(e, kb.id)"
-                    class="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-md transition-all"
+                    class=" p-1.5 text-slate-400 hover:text-red-500 hover:bg-red-50 rounded-md transition-all"
                     title="删除"
                   >
                     <svg
@@ -976,11 +976,11 @@ onBeforeUnmount(() => listObserver?.disconnect())
           v-if="files.length > 0 || currentKb?.id !== null"
         >
           <div
-            class="section-heading flex-col gap-3 border-b border-slate-100 px-4 py-3 sm:flex-row sm:items-center sm:justify-between lg:px-5"
+            class="section-heading flex-col gap-3 border-b-2 border-slate-200 bg-slate-50/50 px-4 py-3 sm:flex-row sm:items-center sm:justify-between lg:px-5"
           >
             <div>
               <h3 class="text-base font-semibold text-slate-800">
-                {{ currentKb?.id == null ? '未分配文件' : '文件' }}
+                {{ currentKb?.id == null ? '待归类文件' : '文件' }}
               </h3>
               <p class="mt-1 text-xs text-slate-500">
                 共 {{ totalFiles }} 个文件

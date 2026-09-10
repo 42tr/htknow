@@ -96,7 +96,7 @@ watch(
         <p class="text-slate-500">
           {{ searched ? '没有找到相关内容' : '知识就在你的资料里' }}
         </p>
-        <p class="search-help">
+        <p class="text-sm text-slate-400 mt-2">
           {{
             searched
               ? '试试更简短的关键词，或扩大知识库范围。'
@@ -105,9 +105,10 @@ watch(
         </p>
       </div>
 
-      <p v-else-if="failed" class="empty-state">
+      <p v-else-if="failed" class="text-center py-12 text-slate-500">
         本次搜索未完成，请调整后重试。
       </p>
+
       <!-- Results -->
       <div v-else class="space-y-3">
         <p class="text-sm text-slate-500 mb-4">
@@ -117,22 +118,34 @@ watch(
         <div
           v-for="(result, index) in results"
           :key="index"
-          class="bg-white rounded-xl p-5 border border-slate-200 hover:border-slate-300 hover:shadow-md transition-all duration-200"
+          class="result-card bg-white rounded-xl p-5 border border-slate-200 cursor-pointer"
           @click="selected = result"
         >
           <div class="flex items-start gap-4">
             <div
-              class="w-10 h-10 bg-linear-to-br from-amber-100 to-orange-100 rounded-lg flex items-center justify-center shrink-0"
+              class="w-10 h-10 rounded-lg flex items-center justify-center shrink-0"
+              :class="isImageFile(result.file?.filename)
+                ? 'bg-linear-to-br from-purple-100 to-pink-100'
+                : 'bg-linear-to-br from-amber-100 to-orange-100'"
             >
               <span
-                class="text-[10px] font-semibold tracking-wide text-amber-700"
-                >{{ getFileEmoji(result.file?.filename) }}</span
-              >
+                class="text-[10px] font-semibold tracking-wide"
+                :class="isImageFile(result.file?.filename) ? 'text-purple-700' : 'text-amber-700'"
+              >{{ getFileEmoji(result.file?.filename) }}</span>
             </div>
             <div class="flex-1 min-w-0">
-              <h3 class="font-semibold text-slate-800 mb-1 truncate">
-                {{ result.file?.filename || '未命名文档' }}
-              </h3>
+              <div class="flex items-center justify-between gap-2 mb-1">
+                <h3 class="font-semibold text-slate-800 truncate">
+                  {{ result.file?.filename || '未命名文档' }}
+                </h3>
+                <svg
+                  class="w-4 h-4 text-slate-300 shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
+                  :class="selected === result ? '' : ''"
+                  fill="none" stroke="currentColor" viewBox="0 0 24 24"
+                >
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
+                </svg>
+              </div>
               <p
                 v-if="result.snippet"
                 class="text-slate-600 text-sm line-clamp-2 mb-2 search-snippet"
@@ -182,29 +195,8 @@ watch(
                       d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z"
                     />
                   </svg>
-                  上传时间: {{ formatDate(result.file.created_at) }}
+                  {{ formatDate(result.file.created_at) }}
                 </span>
-              </div>
-              <div class="mt-3">
-                <button
-                  class="inline-flex items-center gap-1 text-xs font-medium text-amber-700 bg-amber-50 px-2.5 py-1 rounded-full hover:bg-amber-100"
-                  @click.stop="selected = result"
-                >
-                  <span>查看内容与出处 →</span>
-                  <svg
-                    class="w-3.5 h-3.5"
-                    fill="none"
-                    stroke="currentColor"
-                    viewBox="0 0 24 24"
-                  >
-                    <path
-                      stroke-linecap="round"
-                      stroke-linejoin="round"
-                      stroke-width="2"
-                      d="M9 5l7 7-7 7"
-                    />
-                  </svg>
-                </button>
               </div>
             </div>
           </div>
@@ -223,8 +215,8 @@ watch(
 <style scoped>
 .search-snippet :deep(b) {
   font-weight: 600;
-  color: #b45309;
-  background-color: rgba(251, 191, 36, 0.25);
+  color: #3567dd;
+  background-color: rgba(53, 103, 221, 0.12);
   padding: 0 2px;
   border-radius: 2px;
 }

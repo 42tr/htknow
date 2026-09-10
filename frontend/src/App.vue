@@ -283,25 +283,28 @@ const clearAdvanced = () => {
     <aside class="app-sidebar">
       <a href="#search" class="brand" @click.prevent="activeTab = 'search'"
         ><span class="brand-mark">H</span
-        ><span>HTKnow<small>知识工作台</small></span></a
+        ><span>HTKnow</span></a
       >
-      <p class="nav-caption">工作空间</p>
-      <nav aria-label="主导航" class="side-nav">
-        <button
-          v-for="item in [
-            { id: 'search', name: '搜索', icon: '⌕' },
-            { id: 'knowledge', name: '知识库', icon: '▤' },
-          ]"
-          :key="item.id"
-          :class="{ active: activeTab === item.id }"
-          :aria-current="activeTab === item.id ? 'page' : undefined"
-          @click="activeTab = item.id"
-        >
-          <span aria-hidden="true">{{ item.icon }}</span
-          >{{ item.name }}
-        </button>
-      </nav>
-      <div class="sidebar-bottom">
+      <div class="sidebar-section">
+        <p class="nav-caption">工作空间</p>
+        <nav aria-label="主导航" class="side-nav">
+          <button
+            v-for="item in [
+              { id: 'search', name: '搜索', icon: '⌕' },
+              { id: 'knowledge', name: '知识库', icon: '▤' },
+            ]"
+            :key="item.id"
+            :class="{ active: activeTab === item.id }"
+            :aria-current="activeTab === item.id ? 'page' : undefined"
+            @click="activeTab = item.id"
+          >
+            <span aria-hidden="true">{{ item.icon }}</span
+            >{{ item.name }}
+          </button>
+        </nav>
+      </div>
+      <div class="sidebar-section">
+        <p class="nav-caption">管理</p>
         <nav class="side-nav">
           <button
             :class="{ active: activeTab === 'settings' }"
@@ -310,6 +313,22 @@ const clearAdvanced = () => {
             <span aria-hidden="true">⚙</span>管理设置
           </button>
         </nav>
+        <nav v-if="activeTab === 'settings'" class="side-nav side-nav-sub">
+          <button
+            :class="{ active: settingsView === 'services' }"
+            @click="settingsView = 'services'"
+          >
+            解析与服务
+          </button>
+          <button
+            :class="{ active: settingsView === 'dictionary' }"
+            @click="settingsView = 'dictionary'"
+          >
+            词表与同义词
+          </button>
+        </nav>
+      </div>
+      <div class="sidebar-bottom">
         <p>让资料成为可用的知识</p>
       </div>
     </aside>
@@ -365,19 +384,7 @@ const clearAdvanced = () => {
               <p>维护检索词表，配置文档解析与服务连接。</p>
             </div>
           </div>
-          <div class="view-tabs">
-            <button
-              :class="{ active: settingsView === 'services' }"
-              @click="settingsView = 'services'"
-            >
-              解析与服务</button
-            ><button
-              :class="{ active: settingsView === 'dictionary' }"
-              @click="settingsView = 'dictionary'"
-            >
-              词表与同义词
-            </button>
-          </div>
+          <!-- 子导航已移至侧边栏 -->
           <SettingsPanel
             v-if="settingsView === 'services'"
           /><SearchDictionaryManager v-else />

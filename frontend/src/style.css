@@ -1,5 +1,27 @@
 @import 'tailwindcss';
 :root {
+
+  /* === Design Tokens === */
+  --color-primary: #3567dd;
+  --color-primary-hover: #2855bf;
+  --color-primary-light: #e2eafa;
+  --color-primary-bg: #eef3fc;
+  --color-text: #243046;
+  --color-text-secondary: #6a778a;
+  --color-text-muted: #8492a7;
+  --color-border: #dfe5ed;
+  --color-border-light: #eef1f6;
+  --color-bg: #f7f8fa;
+  --color-bg-sidebar: #f1f3f7;
+  --color-surface: #ffffff;
+  --radius-sm: 6px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+  --shadow-card: 0 1px 3px rgba(0,0,0,.04), 0 1px 2px rgba(0,0,0,.06);
+  --shadow-elevated: 0 4px 16px rgba(0,0,0,.06), 0 1px 4px rgba(0,0,0,.04);
+  --shadow-modal: 0 24px 80px rgba(22,40,68,.12);
+
   font-family:
     Inter,
     ui-sans-serif,
@@ -9,8 +31,8 @@
     'PingFang SC',
     'Microsoft YaHei',
     sans-serif;
-  color: #243046;
-  background: #f7f8fa;
+  color: var(--color-text);
+  background: var(--color-bg);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   font-size: 14px;
@@ -47,17 +69,19 @@ textarea {
 button:focus-visible,
 a:focus-visible,
 summary:focus-visible {
-  outline: 2px solid #386bea;
+  outline: 2px solid var(--color-primary);
 }
 input,
 select,
 textarea {
-  accent-color: #386bea;
+  accent-color: var(--color-primary);
 }
 button {
   transition:
     background 0.15s,
-    color 0.15s;
+    color 0.15s,
+    transform 0.15s,
+    box-shadow 0.15s;
 }
 a {
   color: inherit;
@@ -75,8 +99,8 @@ p {
   width: 216px;
   position: fixed;
   inset: 0 auto 0 0;
-  background: #f1f3f7;
-  border-right: 1px solid #e3e7ed;
+  background: var(--color-bg-sidebar);
+  border-right: 1px solid var(--color-border);
   padding: 30px 18px;
   display: flex;
   flex-direction: column;
@@ -95,11 +119,11 @@ p {
 .brand-mark {
   width: 36px;
   height: 39px;
-  background: #3567dd;
+  background: var(--color-primary);
   color: white;
   display: grid;
   place-items: center;
-  border-radius: 10px;
+  border-radius: var(--radius-md);
   font-size: 23px;
 }
 .brand small {
@@ -118,21 +142,21 @@ p {
   gap: 8px;
   min-height: 38px;
   padding: 8px 15px;
-  border-radius: 7px;
+  border-radius: var(--radius-sm);
   font-weight: 500;
   white-space: nowrap;
 }
 .primary-button {
-  background: #3567dd;
+  background: var(--color-primary);
   color: #fff;
-  border: 1px solid #3567dd;
+  border: 1px solid var(--color-primary);
 }
 .primary-button:hover {
-  background: #2855bf;
+  background: var(--color-primary-hover);
 }
 .secondary-button {
   background: #fff;
-  border: 1px solid #dfe4ec;
+  border: 1px solid var(--color-border);
   color: #4d5c71;
 }
 .secondary-button:hover {
@@ -143,7 +167,7 @@ p {
   background: transparent;
   color: #65748b;
   padding: 6px 9px;
-  border-radius: 6px;
+  border-radius: var(--radius-sm);
 }
 .plain-button:hover {
   background: #edf1f7;
@@ -152,7 +176,7 @@ p {
   font-size: 10px;
   letter-spacing: 1.5px;
   color: #9aa5b5;
-  margin: 30px 14px 12px;
+  margin: 24px 14px 10px;
 }
 .side-nav {
   display: flex;
@@ -166,9 +190,9 @@ p {
   border: 0;
   background: transparent;
   padding: 12px 15px;
-  border-radius: 7px;
+  border-radius: var(--radius-md);
   text-align: left;
-  color: #6a778a;
+  color: var(--color-text-secondary);
 }
 .side-nav button > span {
   font-size: 21px;
@@ -176,8 +200,8 @@ p {
   width: 21px;
 }
 .side-nav button.active {
-  background: #e2eafa;
-  color: #2b5ed4;
+  background: var(--color-primary-light);
+  color: var(--color-primary);
   font-weight: 600;
 }
 .side-nav button:hover {
@@ -264,8 +288,8 @@ p {
   white-space: nowrap;
 }
 .view-tabs > button.active {
-  color: #3165d8;
-  border-color: #3165d8;
+  color: var(--color-primary);
+  border-color: var(--color-primary);
   font-weight: 600;
 }
 .view-tabs > .scope-caption {
@@ -300,9 +324,9 @@ p {
   max-width: none;
 }
 .search-composer {
-  border-radius: 12px !important;
-  border: 1px solid #dbe2ed !important;
-  box-shadow: 0 5px 20px #22335505 !important;
+  border-radius: var(--radius-lg) !important;
+  border: 1px solid var(--color-border) !important;
+  box-shadow: var(--shadow-elevated) !important;
 }
 .search-controls {
   display: flex;
@@ -1150,9 +1174,6 @@ p {
 .upload-dialog .upload-next {
   margin: 0 24px 24px;
 }
-.search-composer .bg-slate-900 {
-  background: #3567dd;
-}
 .action-menu summary::-webkit-details-marker {
   display: none;
 }
@@ -1179,11 +1200,11 @@ p {
 }
 .app-main button.bg-gradient-to-r,
 .app-main button.bg-linear-to-r {
-  background: #3567dd;
-  border-radius: 7px;
+  background: var(--color-primary);
+  border-radius: var(--radius-sm);
 }
 .file-list .bg-linear-to-br {
-  background: #eef3fc;
+  background: var(--color-primary-bg);
   color: #5d7eae;
 }
 @media (max-width: 700px) {
@@ -1269,7 +1290,7 @@ p {
 }
 .graph-view-toggle button.active {
   background: #fff;
-  color: #3165d8;
+  color: var(--color-primary);
   font-weight: 600;
 }
 .graph-list-controls {
@@ -1308,7 +1329,7 @@ p {
 }
 .graph-chip:hover {
   border-color: #cfdcf0;
-  color: #3165d8;
+  color: var(--color-primary);
 }
 .graph-chip.active {
   border-color: #a9c4f2;
@@ -1375,3 +1396,131 @@ p {
     display: none;
   }
 }
+
+/* === Sidebar section groups === */
+.sidebar-section {
+  margin-bottom: 4px;
+}
+.sidebar-section > .nav-caption {
+  margin-bottom: 6px;
+}
+/* === Sidebar sub-nav === */
+.side-nav-sub {
+  padding-left: 20px;
+  gap: 2px;
+}
+.side-nav-sub button {
+  padding: 8px 12px;
+  font-size: 13px;
+}
+.side-nav-sub button > span {
+  font-size: 16px;
+  width: 16px;
+}
+/* === Search scope chip === */
+.search-scope-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 3px 10px;
+  border-radius: 999px;
+  background: var(--color-primary-bg);
+  color: var(--color-primary);
+  font-size: 11px;
+  font-weight: 500;
+  cursor: pointer;
+  border: 1px solid transparent;
+  transition: border-color .15s, background .15s;
+}
+.search-scope-chip:hover {
+  border-color: var(--color-primary);
+  background: var(--color-primary-light);
+}
+/* === Enhanced result card hover === */
+.result-card {
+  transition: transform .15s, box-shadow .15s, border-color .15s;
+}
+.result-card:hover {
+  transform: translateY(-1px);
+  box-shadow: var(--shadow-elevated);
+  border-color: var(--color-primary-light);
+}
+/* === KB card always-visible actions === */
+.kb-card {
+  transition: transform .15s, box-shadow .15s, border-color .15s;
+}
+.kb-card:hover {
+  transform: translateY(-2px);
+  box-shadow: var(--shadow-elevated);
+}
+.kb-card-actions {
+  display: flex;
+  gap: 4px;
+  opacity: 1;
+}
+/* === Sticky bottom bar === */
+.sticky-bottom-bar {
+  position: sticky;
+  bottom: 0;
+  background: #fff;
+  border-top: 1px solid var(--color-border);
+  padding: 12px 24px;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  z-index: 10;
+  margin: 24px -24px -24px;
+  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
+}
+/* === Collapsible settings section === */
+.settings-section > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 20px;
+  cursor: pointer;
+  list-style: none;
+  border-radius: var(--radius-lg);
+  transition: background .15s;
+}
+.settings-section > summary::-webkit-details-marker { display: none; }
+.settings-section > summary:hover {
+  background: #f8fafc;
+}
+.settings-section[open] > summary {
+  background: #f8fafc;
+  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+}
+/* === Fade transition for tabs === */
+.tab-fade-enter-active,
+.tab-fade-leave-active {
+  transition: opacity .15s ease;
+}
+.tab-fade-enter-from,
+.tab-fade-leave-to {
+  opacity: 0;
+}
+/* === Search highlight in results === */
+.search-snippet :deep(b) {
+  font-weight: 600;
+  color: var(--color-primary);
+  background-color: rgba(53, 103, 221, 0.12);
+  padding: 0 2px;
+  border-radius: 2px;
+}
+
+/* === Details arrow rotation === */
+.settings-section > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+}
+.settings-section > summary::-webkit-details-marker { display: none; }
+.settings-section > summary:hover { background: #f8fafc; }
+.settings-section[open] > summary { border-bottom: 1px solid #eef1f6; }
+.settings-section[open] > summary .details-arrow { transform: rotate(180deg); }
+.details-arrow { transition: transform .2s; flex-shrink: 0; }

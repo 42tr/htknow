@@ -119,7 +119,7 @@ onBeforeUnmount(() => {
     </div>
     <div v-if="loading" class="empty-state" role="status">正在加载文档…</div>
     <template v-else-if="tab === 'preview'">
-      <div class="preview-toolbar">
+      <div class="preview-toolbar" style="position:sticky;top:0;z-index:5;background:#fff;padding:8px 0;">
         <select v-if="slices.length" v-model="selected" aria-label="定位段落">
           <option
             v-for="(slice, index) in slices"
@@ -154,7 +154,7 @@ onBeforeUnmount(() => {
       </div>
     </template>
     <div v-else-if="tab === 'content'" class="detail-content">
-      <div class="preview-toolbar">
+      <div class="preview-toolbar" style="position:sticky;top:0;z-index:5;background:#fff;padding:8px 0;">
         <span>{{ slices.length }} 个段落</span
         ><button v-if="slices.length" @click="editing = true">编辑段落</button>
       </div>

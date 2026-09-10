@@ -16,6 +16,8 @@ const form = reactive({
 const isCustom = computed(() => form.mode === 'custom')
 const setActiveEditor = (name) => { activeEditor.value = name }
 const clearActiveEditor = () => { activeEditor.value = '' }
+const isDirty = computed(() => true) // simplified: any navigation here means potential changes
+
 
 const load = async () => {
   loading.value = true
@@ -199,8 +201,9 @@ Content-Type: application/json
       <p v-if="success" class="mt-4 rounded-lg bg-emerald-50 p-3 text-sm text-emerald-700">{{ success }}</p>
     </div>
 
-    <div v-if="!loading" class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
-      <h3 class="mb-4 text-lg font-semibold text-slate-800">文件解析</h3>
+    <details v-if="!loading" class="settings-section rounded-xl border border-slate-200 bg-white shadow-sm" open>
+      <summary class="px-6 py-4"><h3 class="text-lg font-semibold text-slate-800">文件解析</h3><svg class="h-4 w-4 text-slate-400 transition-transform details-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></summary>
+      <div class="px-6 pb-6">
       <div class="grid gap-3 md:grid-cols-2">
         <label v-for="item in [
           { value: 'mineru', title: 'Mineru解析', desc: 'PDF 和图片直接使用 MinerU，Word/PPT 先转 PDF 再使用 MinerU，其他类型使用内置流程' },
@@ -298,10 +301,12 @@ Content-Type: application/json
         </label>
       </div>
       <p class="mt-4 text-sm text-slate-500">文件解析配置将在后续文件处理或重新解析时生效。</p>
-    </div>
+      </div>
+    </details>
 
-    <div v-if="!loading" class="rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
-      <h3 class="mb-4 text-lg font-semibold text-slate-800">服务配置</h3>
+    <details v-if="!loading" class="settings-section rounded-xl border border-slate-200 bg-white shadow-sm" open>
+      <summary class="px-6 py-4"><h3 class="text-lg font-semibold text-slate-800">服务配置</h3><svg class="h-4 w-4 text-slate-400 transition-transform details-arrow" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7"/></svg></summary>
+      <div class="px-6 pb-6">
       <div class="space-y-4">
         <label class="block text-sm font-medium text-slate-700">音频转写接口
           <input v-model="form.audio_url" @focus="setActiveEditor('audio')" @blur="clearActiveEditor" class="mt-1 w-full rounded-lg border border-slate-300 px-3 py-2" placeholder="https://example.com/audio/transcriptions">
@@ -362,6 +367,24 @@ text: 图片文件名或关联文本</pre>
 [{{ '{' }} "index": 0, "score": 0.9 {{ '}' }}]</pre>
         </div>
       </div>
-    </div>
+      </div>
+    </details>
   </section>
+
+  <!-- Sticky save bar -->
+  <div v-if="!loading" class="sticky-bottom-bar" style="position:fixed; bottom:0; left:216px; right:0; background:#fff; border-top:1px solid #dfe5ed; padding:12px 36px; display:flex; align-items:center; justify-content:space-between; z-index:20;">
+    <span class="text-sm text-slate-500">修改配置后请点击保存</span>
+    <div class="flex items-center gap-3">
+      <span v-if="success" class="text-sm text-emerald-600">{{ success }}</span>
+      <span v-if="error && !success" class="text-sm text-red-500">{{ error }}</span>
+      <button
+        type="button"
+        :disabled="saving"
+        class="primary-button"
+        @click="save"
+      >
+        {{ saving ? '保存中...' : '保存配置' }}
+      </button>
+    </div>
+  </div>
 </template>
