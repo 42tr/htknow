@@ -1,20 +1,17 @@
 <script setup>
 import { vDialog } from './dialog'
-import { computed, nextTick, reactive, ref, watch } from 'vue'
+import { nextTick, reactive, ref, watch } from 'vue'
 import SearchBar from './components/SearchBar.vue'
 import SearchResults from './components/SearchResults.vue'
 import KnowledgeBaseList from './components/KnowledgeBaseList.vue'
 import FileUpload from './components/FileUpload.vue'
-import KnowledgeGraph from './components/KnowledgeGraph.vue'
 import AdvancedSearchPanel from './components/AdvancedSearchPanel.vue'
 import SearchDictionaryManager from './components/SearchDictionaryManager.vue'
 import SettingsPanel from './components/SettingsPanel.vue'
 import { api } from './api'
-import TaskCenter from './components/TaskCenter.vue'
-import { currentKb } from './store'
 
 const activeTab = ref(
-  ['search', 'knowledge', 'tasks', 'settings'].includes(location.hash.slice(1))
+  ['search', 'knowledge', 'settings'].includes(location.hash.slice(1))
     ? location.hash.slice(1)
     : 'search',
 )
@@ -41,15 +38,6 @@ const kbList = ref(null)
 const uploadVersion = ref(0)
 const hasSearched = ref(false)
 const searchFailed = ref(false)
-const pageTitle = computed(
-  () =>
-    ({
-      search: '搜索',
-      knowledge: '知识库',
-      tasks: '任务中心',
-      settings: '管理设置',
-    })[activeTab.value],
-)
 const openUpload = () => {
   uploadVersion.value++
   uploadOpen.value = true
@@ -57,7 +45,6 @@ const openUpload = () => {
 const uploaded = () => {
   kbList.value?.refresh()
 }
-const knowledgeView = ref('bases')
 const searchResults = ref([])
 const isSearching = ref(false)
 const advancedState = reactive({
@@ -298,16 +285,12 @@ const clearAdvanced = () => {
         ><span class="brand-mark">H</span
         ><span>HTKnow<small>知识工作台</small></span></a
       >
-      <button class="primary-button sidebar-upload" @click="openUpload">
-        ＋ 上传文件
-      </button>
       <p class="nav-caption">工作空间</p>
       <nav aria-label="主导航" class="side-nav">
         <button
           v-for="item in [
             { id: 'search', name: '搜索', icon: '⌕' },
             { id: 'knowledge', name: '知识库', icon: '▤' },
-            { id: 'tasks', name: '任务中心', icon: '☷' },
           ]"
           :key="item.id"
           :class="{ active: activeTab === item.id }"
@@ -365,29 +348,15 @@ const clearAdvanced = () => {
           />
         </section>
         <section v-if="visited.knowledge" v-show="activeTab === 'knowledge'">
-          <div class="view-tabs">
-            <button
-              :class="{ active: knowledgeView === 'bases' }"
-              @click="knowledgeView = 'bases'"
-            >
-              文件与目录</button
-            ><button
-              :class="{ active: knowledgeView === 'graph' }"
-              @click="knowledgeView = 'graph'"
-            >
-              知识图谱</button
-            ><span class="scope-caption">{{ currentKb.name }}</span>
+          <div class="page-title">
+            <div>
+              <span class="eyebrow">KNOWLEDGE BASE</span>
+              <h1>知识库</h1>
+              <p>整理资料目录，上传文件，并从目录或文件打开知识图谱。</p>
+            </div>
           </div>
-          <KnowledgeBaseList
-            ref="kbList"
-            v-show="knowledgeView === 'bases'"
-            @upload="openUpload"
-          />
-          <KnowledgeGraph
-            v-if="knowledgeView === 'graph' && activeTab === 'knowledge'"
-          />
+          <KnowledgeBaseList ref="kbList" @upload="openUpload" />
         </section>
-        <TaskCenter v-if="activeTab === 'tasks'" />
         <section v-if="visited.settings" v-show="activeTab === 'settings'">
           <div class="page-title">
             <div>
@@ -447,12 +416,7 @@ const clearAdvanced = () => {
             :key="uploadVersion"
             @busy="uploadBusy = $event"
             @uploaded="uploaded"
-            @tasks="
-              () => {
-                uploadOpen = false
-                activeTab = 'tasks'
-              }
-            "
+            @done="uploadOpen = false"
           />
         </section></div
     ></Teleport>

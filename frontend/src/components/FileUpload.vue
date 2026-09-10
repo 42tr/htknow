@@ -2,7 +2,7 @@
 import { ref, computed, onMounted } from 'vue'
 import { api } from '../api'
 import { currentKb } from '../store'
-const emit = defineEmits(['uploaded', 'tasks', 'busy'])
+const emit = defineEmits(['uploaded', 'done', 'busy'])
 import KnowledgeBaseSelector from './KnowledgeBaseSelector.vue'
 
 const selectedKb = ref(
@@ -448,11 +448,11 @@ const handleUpload = async () => {
   <div v-if="uploadStatus" class="upload-next">
     <p>
       {{
-        isStorageKb ? '文件已保存。' : '文件已上传，可在任务中心查看处理状态。'
+        isStorageKb
+          ? '文件已保存。'
+          : '文件已上传，可在知识库顶部的文件状态条查看处理状态。'
       }}
     </p>
-    <button class="primary-button" @click="emit('tasks')">
-      查看处理状态 →
-    </button>
+    <button class="primary-button" @click="emit('done')">完成</button>
   </div>
 </template>

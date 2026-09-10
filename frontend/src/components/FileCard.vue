@@ -4,7 +4,7 @@ import { ref, computed } from 'vue'
 import { api } from '../api'
 import FileDetail from './FileDetail.vue'
 import FileSlices from './FileSlices.vue'
-import FileGraph from './FileGraph.vue'
+import KnowledgeGraph from './KnowledgeGraph.vue'
 import KnowledgeBaseSelector from './KnowledgeBaseSelector.vue'
 import ArchiveViewer from './ArchiveViewer.vue'
 import ResourceIcon from './ResourceIcon.vue'
@@ -802,7 +802,13 @@ const handleMoveToKb = async (kb) => {
     <FileSlices v-if="showSlices" :file="file" @close="showSlices = false" />
 
     <!-- Graph Modal -->
-    <FileGraph v-if="showGraph" :file="file" @close="showGraph = false" />
+    <KnowledgeGraph
+      v-if="showGraph"
+      :file-id="file.id"
+      title="文件知识图谱"
+      :subtitle="file.filename"
+      @close="showGraph = false"
+    />
 
     <KnowledgeBaseSelector
       v-if="showMoveKbSelector"

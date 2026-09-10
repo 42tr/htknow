@@ -7,7 +7,7 @@ const props = defineProps({
   selectedId: { default: null },
   depth: { default: 0 },
 })
-const emit = defineEmits(['select', 'create', 'reparse'])
+const emit = defineEmits(['select', 'create', 'reparse', 'graph'])
 const items = ref([]),
   expanded = ref({}),
   error = ref(''),
@@ -83,6 +83,9 @@ onMounted(load)
             ...
           </summary>
           <div class="directory-action-menu">
+            <button type="button" @click="runAction($event, 'graph', kb)">
+              知识图谱
+            </button>
             <button type="button" @click="runAction($event, 'create', kb)">
               新建知识库
             </button>
@@ -107,6 +110,7 @@ onMounted(load)
         @select="emit('select', $event)"
         @create="emit('create', $event)"
         @reparse="emit('reparse', $event)"
+        @graph="emit('graph', $event)"
       />
     </div>
     <p v-if="error" class="inline-error">

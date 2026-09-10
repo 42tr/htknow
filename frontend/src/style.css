@@ -110,9 +110,6 @@ p {
   color: #8190a6;
   margin-top: 3px;
 }
-.sidebar-upload {
-  margin: 32px 4px 26px;
-}
 .primary-button,
 .secondary-button {
   display: inline-flex;
@@ -155,7 +152,7 @@ p {
   font-size: 10px;
   letter-spacing: 1.5px;
   color: #9aa5b5;
-  margin: 0 14px 12px;
+  margin: 30px 14px 12px;
 }
 .side-nav {
   display: flex;
@@ -558,27 +555,6 @@ p {
   border-radius: 6px;
   margin-bottom: 15px;
 }
-.index-panel {
-  margin-top: 24px;
-  background: #fff;
-  border: 1px solid #e2e7ef;
-  border-radius: 10px;
-  padding: 0 20px 20px;
-}
-.index-panel .panel-heading {
-  padding-left: 0;
-  padding-right: 0;
-}
-.index-panel p {
-  font-size: 13px;
-  color: #8693a6;
-  margin: 16px 0;
-}
-.index-panel progress {
-  width: 100%;
-  height: 6px;
-  accent-color: #386ade;
-}
 .state-badge {
   border: 1px solid #e0e7f1;
   border-radius: 5px;
@@ -805,8 +781,35 @@ p {
   align-items: center;
   justify-content: space-between;
   gap: 12px;
-  padding: 14px !important;
-  border-radius: 8px !important;
+  padding: 13px 15px;
+  border: 1px solid #e0e6ef;
+  border-radius: 8px;
+  background: #fff;
+}
+.workspace-toolbar-summary {
+  min-width: 0;
+}
+.workspace-toolbar-summary h2 {
+  font-size: 15px;
+  font-weight: 600;
+  color: #33465f;
+}
+.workspace-toolbar-summary p {
+  margin-top: 3px;
+  font-size: 11px;
+  color: #92a0b4;
+}
+.workspace-toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: none;
+}
+.workspace-toolbar-actions > .primary-button,
+.workspace-toolbar-actions > .secondary-button {
+  min-height: 32px;
+  padding: 5px 12px;
+  font-size: 12px;
 }
 .status-strip {
   display: flex;
@@ -993,6 +996,10 @@ p {
     align-items: flex-start;
     flex-direction: column;
   }
+  .workspace-toolbar-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
   .file-list .p-4 > .flex {
     flex-wrap: wrap;
   }
@@ -1026,11 +1033,6 @@ p {
     width: 28px;
     height: 30px;
     font-size: 18px;
-  }
-  .sidebar-upload {
-    margin: 0 0 0 auto;
-    min-height: 32px;
-    font-size: 12px;
   }
   .app-sidebar > .side-nav {
     flex-direction: row;
@@ -1184,22 +1186,6 @@ p {
   background: #eef3fc;
   color: #5d7eae;
 }
-.index-panel progress {
-  appearance: none;
-  border: 0;
-  border-radius: 5px;
-  overflow: hidden;
-  background: #edf1f7;
-}
-.index-panel progress::-webkit-progress-bar {
-  background: #edf1f7;
-}
-.index-panel progress::-webkit-progress-value {
-  background: #4877dc;
-}
-.index-panel progress::-moz-progress-bar {
-  background: #4877dc;
-}
 @media (max-width: 700px) {
   .side-nav button {
     white-space: nowrap;
@@ -1229,5 +1215,163 @@ p {
   }
   .section-heading {
     align-items: flex-start;
+  }
+}
+.graph-dialog {
+  width: 1180px;
+  max-width: 100%;
+  max-height: 92vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 14px;
+  background: #fff;
+  box-shadow: 0 24px 90px #16284426;
+}
+.graph-dialog > .panel-heading {
+  flex: none;
+}
+.graph-dialog-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 18px 24px 24px;
+}
+.graph-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 16px;
+  margin-bottom: 16px;
+  font-size: 11px;
+  color: #8492a7;
+}
+.graph-summary b {
+  color: #33465f;
+  font-size: 13px;
+}
+.graph-build-status {
+  color: #5680cf;
+}
+.graph-view-toggle {
+  margin-left: auto;
+  display: flex;
+  gap: 3px;
+  padding: 3px;
+  border-radius: 7px;
+  background: #eef2f8;
+}
+.graph-view-toggle button {
+  padding: 5px 11px;
+  border-radius: 5px;
+  font-size: 11px;
+  color: #7b889c;
+}
+.graph-view-toggle button.active {
+  background: #fff;
+  color: #3165d8;
+  font-weight: 600;
+}
+.graph-list-controls {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.graph-list-controls input {
+  flex: 1;
+  min-width: 0;
+  padding: 8px 12px;
+  font-size: 12px;
+  border: 1px solid #dfe5ed;
+  border-radius: 7px;
+}
+.graph-entity-types {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  margin-bottom: 14px;
+}
+.graph-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border: 1px solid #e2e7ef;
+  border-radius: 999px;
+  background: #f7f9fc;
+  font-size: 11px;
+  color: #62728a;
+}
+.graph-chip b {
+  color: #97a4b6;
+  font-weight: 500;
+}
+.graph-chip:hover {
+  border-color: #cfdcf0;
+  color: #3165d8;
+}
+.graph-chip.active {
+  border-color: #a9c4f2;
+  background: #eaf1fd;
+  color: #2f5fca;
+}
+.graph-empty {
+  padding: 40px 0;
+  text-align: center;
+  font-size: 12px;
+  color: #97a4b6;
+}
+.graph-entity-list {
+  border: 1px solid #e6eaf1;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.graph-entity-list li + li {
+  border-top: 1px solid #eef1f6;
+}
+.graph-entity-row {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  width: 100%;
+  padding: 11px 14px;
+  text-align: left;
+}
+.graph-entity-row:hover {
+  background: #f5f8fd;
+}
+.graph-entity-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: #374b67;
+}
+.graph-entity-type {
+  flex: none;
+  padding: 2px 9px;
+  border-radius: 999px;
+  background: #eef3fa;
+  font-size: 11px;
+  color: #56739c;
+}
+.graph-entity-date {
+  flex: none;
+  font-size: 11px;
+  color: #9aa6b8;
+}
+.graph-entity-arrow {
+  flex: none;
+  color: #b3bdc9;
+}
+@media (max-width: 700px) {
+  .graph-dialog-body {
+    padding: 14px 15px 18px;
+  }
+  .graph-view-toggle {
+    margin-left: 0;
+  }
+  .graph-entity-date {
+    display: none;
   }
 }

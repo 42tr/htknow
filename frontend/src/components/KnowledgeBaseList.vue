@@ -8,6 +8,7 @@ import FileStatusSummary from './FileStatusSummary.vue'
 import KnowledgeBaseExportModal from './KnowledgeBaseExportModal.vue'
 import KbPermissionModal from './KbPermissionModal.vue'
 import ResourceIcon from './ResourceIcon.vue'
+import KnowledgeGraph from './KnowledgeGraph.vue'
 import { setCurrentKb } from '../store'
 
 const emit = defineEmits(['upload'])
@@ -58,6 +59,26 @@ const permissionModalKb = ref(null)
 const openPermissionModal = (kb) => {
   permissionModalKb.value = kb
   showPermissionModal.value = true
+}
+
+// Knowledge graph dialog state
+const graphScope = ref(null)
+
+const openWorkspaceGraph = () => {
+  const kbId = currentKb.value?.id ?? null
+  graphScope.value = {
+    kbId,
+    title: kbId ? '知识库知识图谱' : '全局知识图谱',
+    subtitle: kbId ? currentKb.value.name : '所有知识库的实体与关系',
+  }
+}
+
+const openKbGraph = (kb) => {
+  graphScope.value = {
+    kbId: kb.id,
+    title: '知识库知识图谱',
+    subtitle: kb.name,
+  }
 }
 
 // Export state
@@ -561,6 +582,7 @@ onBeforeUnmount(() => listObserver?.disconnect())
         @select="navigateToKb"
         @create="openCreateKnowledgeBase"
         @reparse="(kb) => handleReparseChildKb(null, kb)"
+        @graph="openKbGraph"
       /><button class="directory-root" @click="openUnassigned">
         未分配文件
       </button>
@@ -572,6 +594,20 @@ onBeforeUnmount(() => listObserver?.disconnect())
       />
     </aside>
     <div class="knowledge-workspace space-y-6">
+      <div class="workspace-toolbar">
+        <div class="workspace-toolbar-summary">
+          <h2>{{ currentKb?.name || '所有知识库' }}</h2>
+          <p>{{ totalKbs }} 个子知识库 · {{ totalFiles }} 个文件</p>
+        </div>
+        <div class="workspace-toolbar-actions">
+          <button class="secondary-button" @click="openWorkspaceGraph">
+            知识图谱
+          </button>
+          <button class="primary-button" @click="emit('upload')">
+            ＋ 上传文件
+          </button>
+        </div>
+      </div>
       <button
         class="status-strip"
         :aria-expanded="showStats"
@@ -692,6 +728,35 @@ onBeforeUnmount(() => listObserver?.disconnect())
                 class="flex flex-wrap items-center justify-between gap-2 lg:flex-nowrap lg:justify-end"
               >
                 <div class="flex items-center gap-0.5">
+                  <button
+                    v-if="kb.kb_type !== 'storage'"
+                    type="button"
+                    @click="
+                      (e) => {
+                        e.stopPropagation()
+                        openKbGraph(kb)
+                      }
+                    "
+                    class="opacity-100 sm:opacity-0 sm:group-hover:opacity-100 p-1.5 text-slate-400 hover:text-purple-500 hover:bg-purple-50 rounded-md transition-all"
+                    title="知识图谱"
+                  >
+                    <svg
+                      class="w-4 h-4"
+                      fill="none"
+                      stroke="currentColor"
+                      viewBox="0 0 24 24"
+                    >
+                      <circle cx="12" cy="12" r="3" />
+                      <circle cx="4" cy="8" r="2" />
+                      <circle cx="20" cy="8" r="2" />
+                      <circle cx="4" cy="16" r="2" />
+                      <circle cx="20" cy="16" r="2" />
+                      <line x1="6" y1="8" x2="9" y2="10" />
+                      <line x1="18" y1="8" x2="15" y2="10" />
+                      <line x1="6" y1="16" x2="9" y2="14" />
+                      <line x1="18" y1="16" x2="15" y2="14" />
+                    </svg>
+                  </button>
                   <button
                     v-if="kb.current_user_permission === 'admin'"
                     type="button"
@@ -986,6 +1051,14 @@ onBeforeUnmount(() => listObserver?.disconnect())
         :kb="permissionModalKb || {}"
         :show="showPermissionModal"
         @close="showPermissionModal = false"
+      />
+
+      <KnowledgeGraph
+        v-if="graphScope"
+        :kb-id="graphScope.kbId"
+        :title="graphScope.title"
+        :subtitle="graphScope.subtitle"
+        @close="graphScope = null"
       />
 
       <KnowledgeBaseExportModal
