@@ -1,14 +1,16 @@
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 use crate::{
-    AuthUser, api::{
-        error::{ApiError, ApiResult}, knowledge_base
-    }
+    AuthUser,
+    api::{
+        error::{ApiError, ApiResult},
+        knowledge_base,
+    },
 };
 
 /// 要求当前用户为 admin，否则返回 BadRequest。
 pub fn ensure_admin(auth_user: &AuthUser) -> ApiResult<()> {
-    if auth_user.is_admin() { Ok(()) } else { Err(ApiError::BadRequest("admin role required".to_string())) }
+    if auth_user.is_admin() { Ok(()) } else { Err(ApiError::Forbidden("admin role required".to_string())) }
 }
 
 /// 校验用户能否访问指定知识库（owner / public / 显式授权）。不存在或无权限返回 NotFound。
@@ -54,13 +56,17 @@ pub fn push_kb_access_filter_where<'a>(qb: &mut QueryBuilder<'a, Sqlite>, user_i
 /// 追加文件访问过滤条件。
 /// 生成 `(f.user_id = ? OR f.is_public = 1)`；调用方需自行在前面加 `AND `。
 pub fn push_file_access_filter<'a>(qb: &mut QueryBuilder<'a, Sqlite>, user_id: &'a str, alias: Option<&'a str>) {
-    let col_prefix = alias.map(|a| format!("{}.", a)).unwrap_or_default();
-    qb.push("(");
-    qb.push(format!("{}user_id", col_prefix));
-    qb.push(" = ");
+    let prefix = alias.map(|a| format!("{}.", a)).unwrap_or_default();
+    qb.push(format!("(({}kb_id IS NULL AND ({}user_id = ", prefix, prefix));
     qb.push_bind(user_id);
-    qb.push(format!(" OR {}is_public = 1", col_prefix));
-    qb.push(")");
+    qb.push(format!(
+        " OR {}is_public = 1)) OR {}kb_id IN (SELECT id FROM knowledge_bases WHERE user_id = ",
+        prefix, prefix
+    ));
+    qb.push_bind(user_id);
+    qb.push(" OR is_public=1 OR id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ");
+    qb.push_bind(user_id);
+    qb.push(")))");
 }
 
 /// 收集某个知识库的所有后代知识库 ID（包含自身）。

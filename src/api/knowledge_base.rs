@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use axum::{
-    Extension, extract::{Path, Query, State}, response::Json
+    Extension,
+    extract::{Path, Query, State},
+    response::Json,
 };
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -10,9 +12,12 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::file::{self, FileStatusBreakdown};
 use crate::{
-    AuthUser, api::{
-        common, error::{ApiError, ApiResult}
-    }, search::SearchEngine
+    AuthUser,
+    api::{
+        common,
+        error::{ApiError, ApiResult},
+    },
+    search::SearchEngine,
 };
 
 pub(crate) const KB_TYPE_ANALYSIS: &str = "analysis";
@@ -39,51 +44,7 @@ fn normalize_parse_priority(parse_priority: Option<i64>) -> Result<i64, ApiError
 // KB permission helpers
 // ---------------------------------------------------------------------------
 
-/// Get the highest permission level a user has on a knowledge base.
-/// Priority: global admin > owner > explicit permission > is_public.
-/// Returns None if the user has no access at all.
-pub async fn get_kb_permission(pool: &SqlitePool, kb_id: i64, user_id: &str, is_admin: bool) -> Option<String> {
-    if is_admin {
-        return Some("admin".to_string());
-    }
-
-    // 1. Check if owner
-    let owner: Option<String> = sqlx::query_scalar("SELECT user_id FROM knowledge_bases WHERE id = ?")
-        .bind(kb_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-    if owner.as_deref() == Some(user_id) {
-        return Some("admin".to_string());
-    }
-
-    // 2. Check explicit permission
-    let explicit: Option<String> =
-        sqlx::query_scalar("SELECT permission FROM kb_permissions WHERE kb_id = ? AND user_id = ?")
-            .bind(kb_id)
-            .bind(user_id)
-            .fetch_optional(pool)
-            .await
-            .ok()
-            .flatten();
-    if let Some(perm) = explicit {
-        return Some(perm);
-    }
-
-    // 3. Check if public
-    let is_public: Option<i64> = sqlx::query_scalar("SELECT is_public FROM knowledge_bases WHERE id = ?")
-        .bind(kb_id)
-        .fetch_optional(pool)
-        .await
-        .ok()
-        .flatten();
-    if is_public == Some(1) {
-        return Some("viewer".to_string());
-    }
-
-    None
-}
+pub use crate::kb_acl::{get_kb_permission, replace_coassist_permissions};
 
 /// Batch version of [`get_kb_permission`]: resolve permissions for many KBs in a fixed
 /// number of queries (2 instead of 3*N), avoiding the N+1 pattern in bulk operations.
@@ -361,8 +322,7 @@ pub struct TreeQuery {
         (status = 401, description = "未授权")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn list(
@@ -577,14 +537,28 @@ pub struct KnowledgeCreateReq {
         (status = 401, description = "未授权")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn create(
     State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
     Json(knowledge): Json<KnowledgeCreateReq>,
 ) -> ApiResult<Json<Knowledge>> {
+    if let Some(parent_id) = knowledge.parent_id {
+        common::ensure_kb_editor_or_admin(&pool, parent_id, &auth_user).await?;
+        let managed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM knowledge_bases WHERE id=? AND user_id='service:coassist')",
+        )
+        .bind(parent_id)
+        .fetch_one(&pool)
+        .await?;
+        if managed {
+            return Err(ApiError::Forbidden("Channel knowledge base hierarchy is managed by CoAssist".into()));
+        }
+    }
+    if auth_user.role == "service" && knowledge.is_public == Some(true) {
+        return Err(ApiError::Forbidden("Service knowledge bases must be private".into()));
+    }
     let is_public = if knowledge.is_public.unwrap_or(false) { 1 } else { 0 };
     let kb_type = normalize_kb_type(knowledge.kb_type)?;
     let parse_priority = normalize_parse_priority(knowledge.parse_priority)?;
@@ -638,14 +612,39 @@ pub struct KnowledgeUpdateReq {
         (status = 401, description = "未授权")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn update(
     Path(id): Path<i64>, State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
     Json(knowledge): Json<KnowledgeUpdateReq>,
 ) -> ApiResult<Json<Knowledge>> {
+    if knowledge.is_public == Some(true) {
+        let managed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM knowledge_bases WHERE id=? AND user_id='service:coassist')",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await?;
+        if managed {
+            return Err(ApiError::Forbidden("Channel knowledge bases must remain private".into()));
+        }
+    }
+    if let Some(parent) = knowledge.parent_id {
+        let managed: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM knowledge_bases WHERE (id=? OR id=?) AND user_id='service:coassist')",
+        )
+        .bind(id)
+        .bind(parent)
+        .fetch_one(&pool)
+        .await?;
+        if managed {
+            return Err(ApiError::Forbidden("Channel knowledge base hierarchy is managed by CoAssist".into()));
+        }
+        if let Some(parent_id) = parent {
+            common::ensure_kb_editor_or_admin(&pool, parent_id, &auth_user).await?;
+        }
+    }
     let is_admin = auth_user.is_admin();
     let user_perm = get_kb_permission(&pool, id, &auth_user.user_id, is_admin).await;
     let perm_str = user_perm.as_deref().unwrap_or("");
@@ -779,8 +778,7 @@ pub async fn update(
         (status = 404, description = "知识库不存在")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn get(
@@ -914,7 +912,7 @@ pub async fn get(
         (status = 401, description = "未授权"),
         (status = 404, description = "知识库不存在或无权限")
     ),
-    security(("x-user-id" = []), ("x-role" = []))
+    security(("bearerAuth" = []))
 )]
 pub async fn get_files(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Query(params): Query<KnowledgeBaseFilesQuery>,
@@ -998,7 +996,7 @@ pub async fn get_files(
         (status = 401, description = "未授权"),
         (status = 404, description = "知识库不存在或无权限")
     ),
-    security(("x-user-id" = []), ("x-role" = []))
+    security(("bearerAuth" = []))
 )]
 pub async fn get_tags(
     State(pool): State<SqlitePool>, Path(id): Path<i64>, Query(params): Query<KnowledgeBaseTagsQuery>,
@@ -1073,8 +1071,7 @@ pub async fn get_tags(
         (status = 404, description = "知识库不存在")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn delete(
@@ -1270,8 +1267,7 @@ async fn reset_reparse_scope(
         (status = 401, description = "未授权")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn reparse(
@@ -1340,8 +1336,7 @@ pub async fn reparse(
         (status = 401, description = "未授权")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn reparse_by_id(
@@ -1589,8 +1584,7 @@ fn assemble_tree(
         (status = 401, description = "未授权")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn tree(
@@ -1630,8 +1624,7 @@ pub struct BatchExportKbRequest {
         (status = 401, description = "未授权")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn batch_export_kb(
@@ -1707,8 +1700,7 @@ pub struct KbPermissionCreateReq {
         (status = 401, description = "未授权")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn list_permissions(
@@ -1747,14 +1739,21 @@ pub async fn list_permissions(
         (status = 401, description = "未授权")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn add_permission(
     Path(id): Path<i64>, State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
     Json(req): Json<KbPermissionCreateReq>,
 ) -> ApiResult<Json<KbPermissionItem>> {
+    let managed: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM knowledge_bases WHERE id=? AND user_id='service:coassist')")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+    if managed {
+        return Err(ApiError::Forbidden("Channel permissions are managed by CoAssist".into()));
+    }
     let is_admin = auth_user.is_admin();
     let user_perm = get_kb_permission(&pool, id, &auth_user.user_id, is_admin).await;
     if !meets_requirement(user_perm.as_deref(), "admin") {
@@ -1807,14 +1806,21 @@ pub async fn add_permission(
         (status = 401, description = "未授权")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn remove_permission(
     Path((id, target_user_id)): Path<(i64, String)>, State(pool): State<SqlitePool>,
     Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<()> {
+    let managed: bool =
+        sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM knowledge_bases WHERE id=? AND user_id='service:coassist')")
+            .bind(id)
+            .fetch_one(&pool)
+            .await?;
+    if managed {
+        return Err(ApiError::Forbidden("Channel permissions are managed by CoAssist".into()));
+    }
     let is_admin = auth_user.is_admin();
     let user_perm = get_kb_permission(&pool, id, &auth_user.user_id, is_admin).await;
     if !meets_requirement(user_perm.as_deref(), "admin") {

@@ -1,20 +1,15 @@
 const API_BASE = '/api/v1/knowledge'
 
-// 用户认证信息（实际应用中应该从登录获取）
-const USER_ID = 'user1'
-const USER_NAME = '42tr'
-const ROLE = 'admin'
-
-const getHeaders = (contentType = true) => {
-  const headers = {
-    'x-user-id': USER_ID,
-    'x-user-name': USER_NAME,
-    'x-role': ROLE,
+// Browser session is HttpOnly; no user-controlled identity headers.
+const getHeaders = (contentType = true) => contentType ? { 'Content-Type': 'application/json' } : {}
+const nativeFetch = window.fetch.bind(window)
+const fetch = async (...args) => {
+  const response = await nativeFetch(...args)
+  if (response.status === 401) {
+    window.location.assign('/api/auth/login')
+    throw new Error('登录已过期，请重新登录')
   }
-  if (contentType) {
-    headers['Content-Type'] = 'application/json'
-  }
-  return headers
+  return response
 }
 
 const readErrorMessage = async (response, fallback) => {

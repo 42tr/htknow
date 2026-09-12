@@ -1,10 +1,18 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet}, io::{Seek, Write}, path::Component, sync::{Arc, Mutex, OnceLock}, time::Instant
+    collections::{BTreeMap, HashMap, HashSet},
+    io::{Seek, Write},
+    path::Component,
+    sync::{Arc, Mutex, OnceLock},
+    time::Instant,
 };
 
 use anyhow::Result as AnyResult;
 use axum::{
-    Extension, body::Body, extract::{Multipart, Path, Query, State}, http::{StatusCode, header}, response::Json
+    Extension,
+    body::Body,
+    extract::{Multipart, Path, Query, State},
+    http::{StatusCode, header},
+    response::Json,
 };
 use bytes::Bytes;
 use log::{debug, error, info, warn};
@@ -13,14 +21,22 @@ use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use tempfile::NamedTempFile;
 use tokio::{
-    fs, io::AsyncWriteExt as _, spawn, sync::{OwnedSemaphorePermit, Semaphore}
+    fs,
+    io::AsyncWriteExt as _,
+    spawn,
+    sync::{OwnedSemaphorePermit, Semaphore},
 };
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    AuthUser, api::{
-        common, error::{ApiError, ApiResult}
-    }, archive::{self, ArchiveEntry, ExtractResult}, config, pdf_highlight, processor, search::SearchEngine
+    AuthUser,
+    api::{
+        common,
+        error::{ApiError, ApiResult},
+    },
+    archive::{self, ArchiveEntry, ExtractResult},
+    config, pdf_highlight, processor,
+    search::SearchEngine,
 };
 
 /// 以流式方式打开文件，返回 (字节数, Body)。
@@ -194,12 +210,8 @@ enum FileStatsScope {
     UnassignedOnly,
 }
 
-fn ensure_file_readable(file: &File, auth_user: &AuthUser) -> ApiResult<()> {
-    if auth_user.is_admin() || file.is_public || file.user_id == auth_user.user_id {
-        Ok(())
-    } else {
-        Err(ApiError::NotFound("File not found or permission denied".to_string()))
-    }
+async fn ensure_file_readable(pool: &SqlitePool, file: &File, user: &AuthUser) -> ApiResult<()> {
+    crate::kb_acl::ensure_file_readable(pool, file.kb_id, &file.user_id, file.is_public, user).await
 }
 
 async fn ensure_file_writable(pool: &SqlitePool, file: &File, auth_user: &AuthUser) -> ApiResult<()> {
@@ -403,8 +415,7 @@ pub struct SliceTypeOption {
         (status = 401, description = "未授权")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn slice_types() -> ApiResult<Json<Vec<SliceTypeOption>>> {
@@ -453,8 +464,7 @@ pub async fn slice_types() -> ApiResult<Json<Vec<SliceTypeOption>>> {
         (status = 401, description = "未授权")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn upload(
@@ -797,8 +807,7 @@ pub async fn upload(
         (status = 404, description = "文件不存在")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn get(
@@ -813,7 +822,7 @@ pub async fn get(
         Err(e) => return Err(e.into()),
     };
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
 
     file.content = crate::file_content::read(id).await?;
     Ok(Json(file))
@@ -913,8 +922,7 @@ pub struct ReparseFailedFilesResp {
         (status = 401, description = "未授权")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn update(
@@ -1034,8 +1042,7 @@ pub async fn update(
         (status = 404, description = "文件或知识库不存在")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn move_to_kb(
@@ -1138,8 +1145,7 @@ pub async fn move_to_kb(
         (status = 401, description = "未授权")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn batch_delete(
@@ -1165,8 +1171,7 @@ pub async fn batch_delete(
         (status = 404, description = "知识库不存在或无权限")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn reparse_failed(
@@ -1192,8 +1197,7 @@ pub async fn reparse_failed(
         (status = 404, description = "文件不存在")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn delete(
@@ -2147,8 +2151,7 @@ pub struct FileStatsQuery {
         (status = 401, description = "未授权")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn list(
@@ -2262,8 +2265,7 @@ pub async fn list(
         (status = 401, description = "未授权")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn stats(
@@ -2392,8 +2394,7 @@ pub async fn get_slices(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> 
         (status = 404, description = "文件或切片不存在")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn update_slices(
@@ -2528,8 +2529,7 @@ pub async fn update_slices(
         (status = 404, description = "文件或切片不存在")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn get_slice_highlight(
@@ -2540,7 +2540,7 @@ pub async fn get_slice_highlight(
         .fetch_one(&pool)
         .await?;
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
 
     let parse_file_id = effective_parse_file_id(&pool, id).await?;
     let slice: Option<(i64,)> =
@@ -2593,8 +2593,7 @@ pub async fn get_slice_highlight(
         (status = 404, description = "文件或切片不存在，或切片没有高亮位置")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn get_slice_highlight_page(
@@ -2605,7 +2604,7 @@ pub async fn get_slice_highlight_page(
         .fetch_one(&pool)
         .await?;
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
 
     let parse_file_id = effective_parse_file_id(&pool, id).await?;
     let slice: Option<(i64,)> =
@@ -2713,8 +2712,7 @@ pub async fn get_image_by_filename(
         (status = 404, description = "文件不存在")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn download(
@@ -2725,7 +2723,7 @@ pub async fn download(
         .fetch_one(&pool)
         .await?;
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
     let (len, body) = open_file_stream(std::path::Path::new(&file.path)).await?;
     let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().to_string();
     let content_disposition = format!("attachment; filename=\"{}\"", file.filename);
@@ -2763,8 +2761,7 @@ pub struct HighlightQuery {
         (status = 404, description = "文件不存在")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn get_highlighted_pdf(
@@ -2776,7 +2773,7 @@ pub async fn get_highlighted_pdf(
         .fetch_one(&pool)
         .await?;
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
 
     let parse_file_id = effective_parse_file_id(&pool, id).await?;
 
@@ -2929,8 +2926,7 @@ const EXCEL_MAX_ROWS_PER_SHEET: usize = 10000;
         (status = 404, description = "文件不存在")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn excel_data(
@@ -2942,7 +2938,7 @@ pub async fn excel_data(
         .fetch_one(&pool)
         .await?;
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
 
     let filename_lower = file.filename.to_lowercase();
     let is_excel = filename_lower.ends_with(".xls") || filename_lower.ends_with(".xlsx");
@@ -3042,8 +3038,7 @@ pub async fn excel_data(
         (status = 404, description = "文件不存在")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn archive_entries(
@@ -3054,7 +3049,7 @@ pub async fn archive_entries(
         .fetch_one(&pool)
         .await?;
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
 
     if !archive::is_archive_file(&file.filename) {
         return Err(ApiError::BadRequest("File is not an archive".to_string()));
@@ -3086,8 +3081,7 @@ pub async fn archive_entries(
         (status = 404, description = "文件不存在")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn archive_extract(
@@ -3099,7 +3093,7 @@ pub async fn archive_extract(
         .fetch_one(&pool)
         .await?;
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
 
     if !archive::is_archive_file(&file.filename) {
         return Err(ApiError::BadRequest("File is not an archive".to_string()));
@@ -3203,8 +3197,7 @@ pub async fn archive_extract(
         (status = 404, description = "文件不存在")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn archive_download(
@@ -3216,7 +3209,7 @@ pub async fn archive_download(
         .fetch_one(&pool)
         .await?;
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
 
     if !archive::is_archive_file(&file.filename) {
         return Err(ApiError::BadRequest("File is not an archive".to_string()));

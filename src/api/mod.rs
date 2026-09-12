@@ -1,11 +1,12 @@
 use axum::{
-    Extension, Router, routing::{delete, get, post, put}
+    Extension, Router,
+    routing::{delete, get, post, put},
 };
 use sqlx::SqlitePool;
 use utoipa::OpenApi;
 
 mod common;
-mod error;
+pub(crate) mod error;
 mod file;
 mod graph;
 mod knowledge_base;
@@ -14,7 +15,9 @@ mod system;
 // 重新导出 File 类型供其他模块使用
 pub use file::File;
 pub(crate) use file::{
-    FILE_COLS_NO_CONTENT, backfill_missing_image_meta_for_files, collect_image_paths_for_files, collect_image_raw_paths_for_files, effective_parse_file_id, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta
+    FILE_COLS_NO_CONTENT, backfill_missing_image_meta_for_files, collect_image_paths_for_files,
+    collect_image_raw_paths_for_files, effective_parse_file_id, find_reusable_parsed_file, remove_image_files,
+    resolve_image_storage_path, update_file_custom_image_meta,
 };
 
 use crate::search::SearchEngine;
@@ -194,7 +197,14 @@ pub struct ApiDoc;
 
 /// 获取 OpenAPI 文档
 pub fn openapi() -> utoipa::openapi::OpenApi {
-    ApiDoc::openapi()
+    let mut doc = ApiDoc::openapi();
+    doc.components.get_or_insert_with(Default::default).add_security_scheme(
+        "bearerAuth",
+        utoipa::openapi::security::SecurityScheme::Http(utoipa::openapi::security::Http::new(
+            utoipa::openapi::security::HttpAuthScheme::Bearer,
+        )),
+    );
+    doc
 }
 
 pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
@@ -207,6 +217,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/export", post(knowledge_base::batch_export_kb))
         .route("/tree", get(knowledge_base::tree))
         .route("/{id}", get(knowledge_base::get).put(knowledge_base::update).delete(knowledge_base::delete))
+        .route("/{id}/coassist-permissions", put(knowledge_base::replace_coassist_permissions))
         .route("/{id}/permissions", get(knowledge_base::list_permissions).post(knowledge_base::add_permission))
         .route("/{id}/permissions/{user_id}", delete(knowledge_base::remove_permission));
     let file_router = Router::new()

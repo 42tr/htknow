@@ -1,5 +1,7 @@
 use axum::{
-    Extension, Json, extract::{Query, State}, response::Response
+    Extension, Json,
+    extract::{Query, State},
+    response::Response,
 };
 use chrono::Utc;
 use serde::{Deserialize, Serialize};
@@ -7,9 +9,13 @@ use sqlx::SqlitePool;
 use utoipa::ToSchema;
 
 use crate::{
-    AuthUser, api::{
-        common, error::{ApiError, ApiResult}
-    }, search::{SearchEngine, tantivy_engine::ForceMergeStats}, settings::{self, SettingItem, UpdateSettingsRequest}
+    AuthUser,
+    api::{
+        common,
+        error::{ApiError, ApiResult},
+    },
+    search::{SearchEngine, tantivy_engine::ForceMergeStats},
+    settings::{self, SettingItem, UpdateSettingsRequest},
 };
 
 #[derive(Debug, Deserialize)]
@@ -222,8 +228,7 @@ pub async fn heap_profile_pdf() -> ApiResult<Response> {
         (status = 500, description = "LanceDB compact 失败")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn lancedb_compact(
@@ -257,8 +262,7 @@ pub async fn lancedb_compact(
         (status = 500, description = "Tantivy force merge 失败")
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn index_force_merge(
@@ -289,8 +293,7 @@ pub async fn index_force_merge(
         (status = 200, description = "成功返回索引重建状态", body = IndexRebuildStatus)
     ),
     security(
-        ("x-user-id" = []),
-        ("x-role" = [])
+        ("bearerAuth" = [])
     )
 )]
 pub async fn index_rebuild_status(
@@ -396,11 +399,14 @@ fn force_merge_index_stats(index: &str, stats: ForceMergeStats) -> TantivyForceM
 #[cfg(feature = "profiling")]
 async fn heap_profile_impl() -> ApiResult<Response> {
     use std::{
-        ffi::CString, io::Seek, time::{SystemTime, UNIX_EPOCH}
+        ffi::CString,
+        io::Seek,
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use axum::{
-        body::Body, http::{HeaderValue, header}
+        body::Body,
+        http::{HeaderValue, header},
     };
     use tempfile::NamedTempFile;
     use tikv_jemalloc_ctl::raw;
@@ -458,11 +464,14 @@ async fn heap_profile_impl() -> ApiResult<Response> {
 #[cfg(feature = "profiling")]
 async fn heap_profile_pdf_impl() -> ApiResult<Response> {
     use std::{
-        ffi::CString, process::Stdio, time::{SystemTime, UNIX_EPOCH}
+        ffi::CString,
+        process::Stdio,
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use axum::{
-        body::Body, http::{HeaderValue, header}
+        body::Body,
+        http::{HeaderValue, header},
     };
     use tempfile::NamedTempFile;
     use tikv_jemalloc_ctl::raw;

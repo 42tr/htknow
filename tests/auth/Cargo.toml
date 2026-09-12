@@ -1,0 +1,28 @@
+[package]
+name = "htknow-auth-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+anyhow = "1.0.100"
+axum = { version = "0.8.8", features = ["multipart"] }
+base64 = "0.22.1"
+hex = "0.4"
+jsonwebtoken = "9"
+log = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls-native-roots", "http2", "stream"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "chrono", "derive"] }
+tokio = { version = "1", features = ["full"] }
+uuid = { version = "1.19.0", features = ["v4"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

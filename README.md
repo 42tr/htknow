@@ -40,16 +40,10 @@ docker compose up -d
 > 使用 docker-compose 时，请将端口替换为 `8080`。
 
 ## API 认证
-`/api/v1/knowledge/*` 需要请求头：
-- `x-user-id`（必填）
-- `x-role`（必填）
-- `x-user-name`（可选）
 
-示例：
-```shell
-curl -H 'x-user-id: 1' -H 'x-role: admin' -H 'x-user-name: testuser' \
-  http://localhost:3000/api/v1/knowledge/knowledge_base/
-```
+默认使用 Keycloak OIDC。浏览器访问 `/api/auth/login` 建立 HttpOnly 会话；服务调用使用 `Authorization: Bearer <aud=htknow-api 的 Access Token>`。旧 `x-user-id/x-role` 仅在显式配置 `HTKNOW_AUTH_MODE=trusted_headers` 时可用，不适合直接暴露。
+
+部署、身份绑定、旧数据迁移及 CoAssist 接入见 [Keycloak 内网接入文档](docs/keycloak-integration.md)。未配置 OIDC 必需参数时，默认模式会拒绝启动。
 
 ## 启动 mineru
 ```shell
