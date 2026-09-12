@@ -93,6 +93,8 @@ pub struct ServicesConfig {
     pub image_embedding_url: Option<String>,
     /// Rerank 服务地址
     pub rerank_url: String,
+    /// 图片处理模式：none、ocr 或 custom
+    pub image_parse_mode: String,
     /// 图片文本化服务地址（可选）
     pub image_parse_url: Option<String>,
     /// OCR 图片文本服务地址（可选）
@@ -241,6 +243,15 @@ impl ServerConfig {
 
 impl ServicesConfig {
     fn from_env() -> Self {
+        let image_parse_url = env_optional("HTKNOW_IMAGE_PARSE_URL");
+        let image_ocr_url = env_optional("HTKNOW_IMAGE_OCR_URL");
+        let default_image_mode = if image_parse_url.is_some() {
+            "custom"
+        } else if image_ocr_url.is_some() {
+            "ocr"
+        } else {
+            "none"
+        };
         Self {
             mineru_url: env_or("HTKNOW_MINERU_URL", "http://192.168.0.46:10001/file_parse"),
             request_timeout_secs: env_or_parse("HTKNOW_REQUEST_TIMEOUT_SECS", 600),
@@ -256,8 +267,9 @@ impl ServicesConfig {
             embedding_url: env_or("HTKNOW_EMBEDDING_URL", "http://222.190.139.186:59700/v1/embeddings"),
             image_embedding_url: env_optional("HTKNOW_IMAGE_EMBEDDING_URL"),
             rerank_url: env_or("HTKNOW_RERANK_URL", "http://222.190.139.186:59600/v1/rerank"),
-            image_parse_url: env_optional("HTKNOW_IMAGE_PARSE_URL"),
-            image_ocr_url: env_optional("HTKNOW_IMAGE_OCR_URL"),
+            image_parse_mode: env_or("HTKNOW_IMAGE_PARSE_MODE", default_image_mode),
+            image_parse_url,
+            image_ocr_url,
             image_parse_timeout_secs: env_or_parse("HTKNOW_IMAGE_PARSE_TIMEOUT_SECS", 120),
             image_parse_concurrency: env_or_parse("HTKNOW_IMAGE_PARSE_CONCURRENCY", 5),
         }
@@ -501,6 +513,47 @@ mod tests {
         assert!(config.server.build_knowledge_graph);
         unsafe {
             std::env::remove_var("HTKNOW_BUILD_KNOWLEDGE_GRAPH");
+        }
+    }
+
+    #[test]
+    fn test_image_parse_mode_from_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let keys = ["HTKNOW_IMAGE_PARSE_MODE", "HTKNOW_IMAGE_PARSE_URL", "HTKNOW_IMAGE_OCR_URL"];
+        let original = keys.map(|key| std::env::var_os(key));
+        let cases = [
+            (None, None, None, "none"),
+            (None, Some("  "), Some(""), "none"),
+            (None, Some("http://parse"), None, "custom"),
+            (None, None, Some("http://ocr"), "ocr"),
+            (None, Some("http://parse"), Some("http://ocr"), "custom"),
+            (Some("ocr"), Some("http://parse"), Some("http://ocr"), "ocr"),
+            (Some("none"), Some("http://parse"), Some("http://ocr"), "none"),
+        ];
+        let results: Vec<_> = cases
+            .iter()
+            .map(|(mode, parse, ocr, expected)| {
+                for (key, value) in keys.iter().zip([mode, parse, ocr]) {
+                    unsafe {
+                        match value {
+                            Some(value) => std::env::set_var(key, value),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+                (ServicesConfig::from_env().image_parse_mode, *expected)
+            })
+            .collect();
+        for (key, value) in keys.iter().zip(original) {
+            unsafe {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+        for (actual, expected) in results {
+            assert_eq!(actual, expected);
         }
     }
 

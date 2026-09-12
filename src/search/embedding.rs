@@ -5,11 +5,11 @@ use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
-use crate::{config, settings};
+use crate::config;
 
 /// 判断图片 embedding 服务是否已配置。
 pub fn image_embedding_enabled() -> bool {
-    settings::image_embedding_url().is_some()
+    config::get().services.image_embedding_url.is_some()
 }
 
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(Client::new);
@@ -35,7 +35,7 @@ pub async fn get_image_embedding_from_path(path: &str, text: Option<&str>) -> Re
     let file_name = std::path::Path::new(path).file_name().and_then(|name| name.to_str()).unwrap_or("image");
     let mime = mime_guess::from_path(path).first_or_octet_stream();
     let cfg = config::get();
-    let url = settings::image_embedding_url()
+    let url = cfg.services.image_embedding_url.clone()
         .ok_or_else(|| anyhow::anyhow!("image embedding URL is not configured"))?;
 
     let part = reqwest::multipart::Part::file(path)
@@ -66,7 +66,7 @@ pub async fn get_image_embedding_from_bytes(
     file_name: &str, content_type: Option<&str>, bytes: Vec<u8>, text: Option<&str>,
 ) -> Result<Vec<f32>> {
     let cfg = config::get();
-    let url = settings::image_embedding_url()
+    let url = cfg.services.image_embedding_url.clone()
         .ok_or_else(|| anyhow::anyhow!("image embedding URL is not configured"))?;
     let mut part = reqwest::multipart::Part::bytes(bytes).file_name(file_name.to_string());
     if let Some(content_type) = content_type {
@@ -118,7 +118,9 @@ pub async fn get_embedding(text: &str) -> Result<Vec<f32>> {
     let request = EmbeddingRequest { model: cfg.ai.embedding_model.clone(), input: vec![query.to_string()] };
 
     let cfg = config::get();
-    let embedding_url = settings::embedding_url().ok_or_else(|| anyhow::anyhow!("services.embedding_url is not configured"))?;
+    let embedding_url = Some(cfg.services.embedding_url.clone())
+        .filter(|url| !url.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("services.embedding_url is not configured"))?;
     let response = HTTP_CLIENT
         .post(&embedding_url)
         .timeout(Duration::from_secs(cfg.search.embedding_timeout_secs))
@@ -168,7 +170,9 @@ pub async fn get_embeddings(texts: &[String]) -> Result<Vec<Vec<f32>>> {
 
 async fn get_embeddings_single_batch(texts: &[String]) -> Result<Vec<Vec<f32>>> {
     let cfg = config::get();
-    let embedding_url = settings::embedding_url().ok_or_else(|| anyhow::anyhow!("services.embedding_url is not configured"))?;
+    let embedding_url = Some(cfg.services.embedding_url.clone())
+        .filter(|url| !url.trim().is_empty())
+        .ok_or_else(|| anyhow::anyhow!("services.embedding_url is not configured"))?;
     let request = EmbeddingRequest { model: cfg.ai.embedding_model.clone(), input: texts.to_vec() };
 
     let response = HTTP_CLIENT

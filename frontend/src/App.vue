@@ -7,7 +7,6 @@ import KnowledgeBaseList from './components/KnowledgeBaseList.vue'
 import FileUpload from './components/FileUpload.vue'
 import AdvancedSearchPanel from './components/AdvancedSearchPanel.vue'
 import SearchDictionaryManager from './components/SearchDictionaryManager.vue'
-import SettingsPanel from './components/SettingsPanel.vue'
 import { api } from './api'
 
 const currentUser = inject('currentUser', { is_admin: false })
@@ -16,7 +15,7 @@ const logout = async () => {
   if (response.ok) window.location.assign('/?logged_out=1')
 }
 const activeTab = ref(
-  ['search', 'knowledge', 'settings'].includes(location.hash.slice(1))
+  ['search', 'knowledge', 'dictionary'].includes(location.hash.slice(1))
     ? location.hash.slice(1)
     : 'search',
 )
@@ -33,7 +32,6 @@ const visited = reactive({ [activeTab.value]: true })
 watch(activeTab, (value) => {
   visited[value] = true
 })
-const settingsView = ref('services')
 const uploadOpen = ref(false)
 const uploadBusy = ref(false)
 const closeUpload = () => {
@@ -312,24 +310,10 @@ const clearAdvanced = () => {
         <p v-if="currentUser.is_admin" class="nav-caption">管理</p>
         <nav v-if="currentUser.is_admin" class="side-nav">
           <button
-            :class="{ active: activeTab === 'settings' }"
-            @click="activeTab = 'settings'"
+            :class="{ active: activeTab === 'dictionary' }"
+            @click="activeTab = 'dictionary'"
           >
-            <span aria-hidden="true">⚙</span>管理设置
-          </button>
-        </nav>
-        <nav v-if="activeTab === 'settings'" class="side-nav side-nav-sub">
-          <button
-            :class="{ active: settingsView === 'services' }"
-            @click="settingsView = 'services'"
-          >
-            解析与服务
-          </button>
-          <button
-            :class="{ active: settingsView === 'dictionary' }"
-            @click="settingsView = 'dictionary'"
-          >
-            词表与同义词
+            <span aria-hidden="true">⚙</span>词表与同义词
           </button>
         </nav>
       </div>
@@ -383,18 +367,15 @@ const clearAdvanced = () => {
           </div>
           <KnowledgeBaseList ref="kbList" @upload="openUpload" />
         </section>
-        <section v-if="visited.settings" v-show="activeTab === 'settings'">
+        <section v-if="visited.dictionary" v-show="activeTab === 'dictionary'">
           <div class="page-title">
             <div>
               <span class="eyebrow">ADMINISTRATION</span>
-              <h1>管理设置</h1>
-              <p>维护检索词表，配置文档解析与服务连接。</p>
+              <h1>词表与同义词</h1>
+              <p>维护检索词表与同义词。</p>
             </div>
           </div>
-          <!-- 子导航已移至侧边栏 -->
-          <SettingsPanel
-            v-if="settingsView === 'services'"
-          /><SearchDictionaryManager v-else />
+          <SearchDictionaryManager />
         </section>
       </main>
     </div>

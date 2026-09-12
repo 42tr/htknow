@@ -20,7 +20,7 @@ use tokio::{
 use crate::{
     api::{
         FILE_COLS_NO_CONTENT, File, collect_image_paths_for_files, collect_image_raw_paths_for_files, effective_parse_file_id, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta
-    }, archive, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, image_description, image_parse, search::{self, SearchEngine, content_looks_like_image_reference, tantivy_engine}, settings
+    }, archive, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, image_description, image_parse, search::{self, SearchEngine, content_looks_like_image_reference, tantivy_engine}
 };
 
 /// 将本地文件构造为流式 multipart Part，避免大文件全量读入内存。
@@ -83,13 +83,13 @@ type RawImageJobs = (Vec<(String, String)>, HashMap<String, String>, Vec<String>
 async fn parse_images_to_descriptions(
     pool: &SqlitePool, file_id: i64, images: &HashMap<String, String>, source: &str,
 ) -> anyhow::Result<HashMap<String, String>> {
-    if settings::image_parse_mode() == "none" {
+    if config::get().services.image_parse_mode == "none" {
         return Ok(HashMap::new());
     }
     if images.is_empty() {
         return Ok(HashMap::new());
     }
-    let concurrency = settings::image_parse_concurrency().max(1);
+    let concurrency = config::get().services.image_parse_concurrency.max(1);
 
     let jobs: Vec<(String, String)> = images.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let mut stream = futures::stream::iter(jobs.into_iter().map(|(filename, base64)| {
@@ -134,7 +134,7 @@ async fn parse_images_to_descriptions(
 async fn load_or_parse_image_descriptions(
     pool: &SqlitePool, file_id: i64, image_names: &[String], source: &str,
 ) -> anyhow::Result<HashMap<String, String>> {
-    if settings::image_parse_mode() == "none" {
+    if config::get().services.image_parse_mode == "none" {
         return Ok(HashMap::new());
     }
     let mut desc_map = image_description::list_by_file(pool, file_id).await?;
@@ -869,7 +869,7 @@ impl FileProcessor {
         }
 
         let cfg = config::get();
-        let configured_concurrency = settings::file_parse_concurrency().max(1);
+        let configured_concurrency = cfg.server.process_concurrency.max(1);
         let db_safe_concurrency = (cfg.database.max_connections as usize).saturating_sub(2).max(1);
         let concurrency = configured_concurrency.min(db_safe_concurrency);
         if concurrency < configured_concurrency {
@@ -950,7 +950,7 @@ impl FileProcessor {
     }
 
     async fn try_reuse_existing_data(&self, file: &File) -> anyhow::Result<bool> {
-        if !settings::file_parse_reuse_duplicates() {
+        if !config::get().server.reuse_duplicate_files {
             return Ok(false);
         }
         let Some(source_file) =
@@ -1048,13 +1048,9 @@ impl FileProcessor {
             let is_presentation = filename_lower.ends_with(".ppt") || filename_lower.ends_with(".pptx");
             let is_excel = filename_lower.ends_with(".xls") || filename_lower.ends_with(".xlsx");
 
-            let custom_url = if settings::file_parse_mode() == "custom" {
-                settings::file_parse_custom_url()
-            } else {
-                None
-            };
-            let custom_reuse_url = if settings::file_parse_mode() == "custom" {
-                settings::file_parse_custom_reuse_url()
+            let custom_url = config::get().services.custom_parse_url.clone();
+            let custom_reuse_url = if custom_url.is_some() {
+                config::get().services.custom_parse_reuse_url.clone()
             } else {
                 None
             };
@@ -1663,7 +1659,7 @@ impl FileProcessor {
         let stored_pdf_path = pdf_dir.join(&pdf_filename);
         let temp_pdf_path = pdf_dir.join(format!(".{}.pdf.tmp", file.id));
         let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string();
-        let office_convert_url = settings::file_parse_office_convert_url()
+        let office_convert_url = Some(config::get().services.office_convert_url.clone()).filter(|url| !url.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("file_parse.office_convert_url is not configured"))?;
         let mut convert_url = reqwest::Url::parse(&office_convert_url)?;
         if !convert_url.query_pairs().any(|(key, _)| key == "target_format") {
@@ -2057,7 +2053,7 @@ impl FileProcessor {
         };
 
         // 上传的图片文件本身也需要被文本化，并生成一个图片切片。
-        if is_image && settings::image_parse_mode() != "none" && !file.filename.is_empty() {
+        if is_image && config::get().services.image_parse_mode != "none" && !file.filename.is_empty() {
             if !desc_map.contains_key(&file.filename) {
                 match image_parse::parse_image_file(Path::new(&file.path), &file.filename, None).await {
                     Ok(resp) => {
@@ -2142,7 +2138,7 @@ impl FileProcessor {
     async fn call_mineru_api(
         &self, file: &File, is_image: bool, mut timing: Option<&mut ParseTimingCtx>,
     ) -> anyhow::Result<Result> {
-        let max_pages = settings::file_parse_mineru_max_pages();
+        let max_pages = config::get().services.mineru_max_pages;
 
         if !is_image && max_pages > 0 {
             // lopdf 解析整个 PDF 是同步阻塞操作（仅用于获取页数），放到阻塞线程池
@@ -2228,7 +2224,7 @@ impl FileProcessor {
     async fn call_mineru_api_with_path(
         &self, file_path: &str, filename: &str, is_image: bool, start_page: Option<usize>, end_page: Option<usize>,
     ) -> anyhow::Result<Result> {
-        let mineru_url = settings::file_parse_mineru_url()
+        let mineru_url = Some(config::get().services.mineru_url.clone()).filter(|url| !url.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("file_parse.mineru_url is not configured"))?;
         let mineru_url = mineru_url.trim_end_matches('/');
 
@@ -2529,10 +2525,10 @@ impl FileProcessor {
         let form = multipart::Form::new().part("file", file_part);
 
         let client = self.services_http_client()?;
-        let audio_url = settings::audio_transcription_url()
+        let audio_url = Some(config::get().services.audio_transcription_url.clone()).filter(|url| !url.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("services.audio_transcription_url is not configured"))?;
         let mut req_builder = client.post(&audio_url).multipart(form);
-        if let Some(key) = settings::audio_transcription_key()
+        if let Some(key) = config::get().services.audio_transcription_key.clone()
             && !key.is_empty()
         {
             req_builder = req_builder.header("Authorization", format!("Bearer {}", key));
@@ -3249,7 +3245,7 @@ impl FileProcessor {
         }
 
         // 新结构只复制搜索投影，SQLite 中的切片/PDF 解析结果由 artifact 共享。
-        if settings::file_parse_reuse_duplicates() {
+        if config::get().server.reuse_duplicate_files {
             let source_file_id = effective_parse_file_id(&self.pool, source.id).await?;
             let mut source_for_reindex = source.clone();
             let full_content = if let Some(artifact_id) = source.artifact_id {

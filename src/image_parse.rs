@@ -12,7 +12,7 @@ use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::settings;
+use crate::config;
 
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(Client::new);
 
@@ -37,7 +37,7 @@ pub struct ImageParseResponse {
 pub async fn parse_image_file(
     path: &std::path::Path, filename: &str, surrounding_content: Option<&str>,
 ) -> Result<ImageParseResponse> {
-    if settings::image_parse_mode() == "none" {
+    if config::get().services.image_parse_mode == "none" {
         return Ok(ImageParseResponse { description: String::new(), raw_response: String::new() });
     }
     let bytes =
@@ -50,13 +50,13 @@ pub async fn parse_image_file(
 pub async fn parse_image_base64(
     filename: &str, image_base64: &str, surrounding_content: Option<&str>,
 ) -> Result<ImageParseResponse> {
-    match settings::image_parse_mode().as_str() {
+    match config::get().services.image_parse_mode.as_str() {
         "none" => return Ok(ImageParseResponse { description: String::new(), raw_response: String::new() }),
         "ocr" => return crate::image_ocr::parse_base64(image_base64).await,
         "custom" => {}
         mode => anyhow::bail!("unsupported image parse mode: {}", mode),
     }
-    let url = settings::image_parse_url().ok_or_else(|| anyhow::anyhow!("image parse URL is not configured"))?;
+    let url = config::get().services.image_parse_url.clone().ok_or_else(|| anyhow::anyhow!("image parse URL is not configured"))?;
 
     // 兼容 data:image/xxx;base64, 前缀以及空白字符
     let payload = image_base64
@@ -75,7 +75,7 @@ pub async fn parse_image_base64(
 
     let response = HTTP_CLIENT
         .post(&url)
-        .timeout(Duration::from_secs(settings::image_parse_timeout_secs()))
+        .timeout(Duration::from_secs(config::get().services.image_parse_timeout_secs))
         .json(&request)
         .send()
         .await

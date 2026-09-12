@@ -1443,8 +1443,9 @@ impl SearchEngine {
         }
 
         // 根据 URL 后缀判断使用哪种 rerank 接口格式
-        let rerank_url =
-            crate::settings::rerank_url().ok_or_else(|| anyhow!("services.rerank_url is not configured"))?;
+        let rerank_url = Some(config::get().services.rerank_url.clone())
+            .filter(|url| !url.trim().is_empty())
+            .ok_or_else(|| anyhow!("services.rerank_url is not configured"))?;
         let use_v1_format = rerank_url.ends_with("/v1/rerank");
 
         // 调用 BGE-Rerank API

@@ -15,7 +15,6 @@ pub mod pdf_content;
 pub mod pdf_highlight;
 pub mod processor;
 pub mod search;
-pub mod settings;
 pub mod slice_content;
 
 pub mod auth_user;

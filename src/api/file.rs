@@ -369,7 +369,7 @@ static BACKGROUND_REUSE_SEMAPHORE: OnceLock<Mutex<(usize, Arc<Semaphore>)>> = On
 
 fn background_reuse_semaphore() -> Arc<Semaphore> {
     let cfg = config::get();
-    let limit = crate::settings::file_parse_concurrency().max(1).min(cfg.database.max_connections as usize).max(1);
+    let limit = cfg.server.process_concurrency.max(1).min(cfg.database.max_connections as usize).max(1);
     let state = BACKGROUND_REUSE_SEMAPHORE.get_or_init(|| Mutex::new((limit, Arc::new(Semaphore::new(limit)))));
     let mut state = state.lock().expect("background reuse semaphore lock poisoned");
     if state.0 != limit {
@@ -475,7 +475,7 @@ pub async fn upload(
     let cfg = config::get();
     let dir = &cfg.storage.files_path;
     tokio::fs::create_dir_all(dir).await?;
-    let reuse_duplicates = crate::settings::file_parse_reuse_duplicates();
+    let reuse_duplicates = cfg.server.reuse_duplicate_files;
 
     let mut files_data: Vec<(String, String, String, i64)> = Vec::new();
     let mut slice_type = String::new();
@@ -741,7 +741,7 @@ pub async fn upload(
     if immediate_parse || sync {
         if sync {
             let reuse_already_tried = reuse_duplicates;
-            let concurrency = crate::settings::file_parse_concurrency().max(1);
+            let concurrency = config::get().server.process_concurrency.max(1);
             let semaphore = Arc::new(Semaphore::new(concurrency));
             let mut handles = Vec::with_capacity(parse_file_ids.len());
             for file_id in parse_file_ids {

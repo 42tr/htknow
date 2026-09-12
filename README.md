@@ -69,16 +69,9 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 ### 外部服务
 默认值为示例地址，请按实际部署环境调整。
 
-运行中的系统配置可以通过管理员前端“配置”页修改，也可以调用通用接口：
+配置在启动时从环境变量读取，未设置时使用默认值；修改环境变量后需重启服务。旧版页面保存的数据库配置不再读取。
 
-```shell
-GET /api/v1/knowledge/system/settings?group=image_parse
-PUT /api/v1/knowledge/system/settings
-```
-
-运行时配置优先级为：数据库配置 > 环境变量 > 默认值。原有 `HTKNOW_IMAGE_PARSE_URL` 仍作为自定义图片接口的默认配置兼容保留。
-
-图片处理模式使用 `image_parse.*` 配置项：`ocr` 调用 `image_parse.ocr_url` 外部 OCR 接口，`custom` 调用自定义 JSON 接口，`none` 不生成图片文本描述。OCR 接口请求为 `{ "figure_base64": "..." }`，响应为 `{ "data": "ocr结果" }`。
+图片处理模式通过 `HTKNOW_IMAGE_PARSE_MODE` 指定：`ocr` 调用 OCR 接口，`custom` 调用自定义 JSON 接口，`none` 不生成图片文本描述。未指定模式时，优先使用已配置的自定义图片接口，其次使用 OCR，均未配置则禁用。OCR 接口请求为 `{ "figure_base64": "..." }`，响应为 `{ "data": "ocr结果" }`。
 
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
@@ -91,9 +84,13 @@ PUT /api/v1/knowledge/system/settings
 | `HTKNOW_AUDIO_TRANSCRIPTION_URL` | `http://192.168.0.46:59805/api/v1/audio/transcriptions` | 音频转写服务 |
 | `HTKNOW_AUDIO_TRANSCRIPTION_KEY` | 空 | 音频转写服务 API Key |
 | `HTKNOW_EMBEDDING_URL` | `http://222.190.139.186:59700/v1/embeddings` | 文本向量服务 |
-| `HTKNOW_IMAGE_EMBEDDING_URL` | `http://192.168.0.46:59802/v1/embeddings/file` | 图片向量服务 |
+| `HTKNOW_IMAGE_EMBEDDING_URL` | 空 | 图片向量服务，未配置时禁用 |
 | `HTKNOW_RERANK_URL` | `http://222.190.139.186:59600/v1/rerank` | Rerank 服务 |
-| `HTKNOW_IMAGE_OCR_URL` | 空 | OCR 图片文本接口（也可通过系统配置页面设置） |
+| `HTKNOW_IMAGE_PARSE_MODE` | 按接口配置自动选择 | `none` / `ocr` / `custom` |
+| `HTKNOW_IMAGE_PARSE_URL` | 空 | 自定义图片文本化接口 |
+| `HTKNOW_IMAGE_OCR_URL` | 空 | OCR 图片文本接口 |
+| `HTKNOW_IMAGE_PARSE_TIMEOUT_SECS` | `120` | 图片文本化及 OCR 请求超时（秒） |
+| `HTKNOW_IMAGE_PARSE_CONCURRENCY` | `5` | 图片文本化并发数 |
 
 ### AI 模型
 | 环境变量 | 默认值 | 说明 |

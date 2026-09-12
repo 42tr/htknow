@@ -973,9 +973,6 @@ p {
   max-width: none;
   margin-top: 25px;
 }
-.settings-toolbar {
-  top: 0 !important;
-}
 .file-detail .fixed {
   z-index: 80;
 }
@@ -1404,19 +1401,6 @@ p {
 .sidebar-section > .nav-caption {
   margin-bottom: 6px;
 }
-/* === Sidebar sub-nav === */
-.side-nav-sub {
-  padding-left: 20px;
-  gap: 2px;
-}
-.side-nav-sub button {
-  padding: 8px 12px;
-  font-size: 13px;
-}
-.side-nav-sub button > span {
-  font-size: 16px;
-  width: 16px;
-}
 /* === Search scope chip === */
 .search-scope-chip {
   display: inline-flex;
@@ -1473,25 +1457,6 @@ p {
   margin: 24px -24px -24px;
   border-radius: 0 0 var(--radius-lg) var(--radius-lg);
 }
-/* === Collapsible settings section === */
-.settings-section > summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 16px 20px;
-  cursor: pointer;
-  list-style: none;
-  border-radius: var(--radius-lg);
-  transition: background .15s;
-}
-.settings-section > summary::-webkit-details-marker { display: none; }
-.settings-section > summary:hover {
-  background: #f8fafc;
-}
-.settings-section[open] > summary {
-  background: #f8fafc;
-  border-radius: var(--radius-lg) var(--radius-lg) 0 0;
-}
 /* === Fade transition for tabs === */
 .tab-fade-enter-active,
 .tab-fade-leave-active {
@@ -1509,18 +1474,3 @@ p {
   padding: 0 2px;
   border-radius: 2px;
 }
-
-/* === Details arrow rotation === */
-.settings-section > summary {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  cursor: pointer;
-  list-style: none;
-  user-select: none;
-}
-.settings-section > summary::-webkit-details-marker { display: none; }
-.settings-section > summary:hover { background: #f8fafc; }
-.settings-section[open] > summary { border-bottom: 1px solid #eef1f6; }
-.settings-section[open] > summary .details-arrow { transform: rotate(180deg); }
-.details-arrow { transition: transform .2s; flex-shrink: 0; }

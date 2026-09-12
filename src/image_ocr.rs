@@ -9,7 +9,7 @@ use reqwest::Client;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::settings;
+use crate::config;
 
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(Client::new);
 
@@ -19,7 +19,7 @@ struct OcrRequest {
 }
 
 pub async fn parse_base64(image_base64: &str) -> Result<crate::image_parse::ImageParseResponse> {
-    let url = settings::image_ocr_url().ok_or_else(|| anyhow::anyhow!("image OCR URL is not configured"))?;
+    let url = config::get().services.image_ocr_url.clone().ok_or_else(|| anyhow::anyhow!("image OCR URL is not configured"))?;
     let payload = image_base64
         .find("base64,")
         .map(|idx| &image_base64[idx + "base64,".len()..])
@@ -32,7 +32,7 @@ pub async fn parse_base64(image_base64: &str) -> Result<crate::image_parse::Imag
 
     let response = HTTP_CLIENT
         .post(&url)
-        .timeout(Duration::from_secs(settings::image_parse_timeout_secs()))
+        .timeout(Duration::from_secs(config::get().services.image_parse_timeout_secs))
         .json(&request)
         .send()
         .await
