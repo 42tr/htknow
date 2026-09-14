@@ -4,6 +4,3 @@ app.sqlite*
 *.log
 .DS_Store
 *.pdf
-
-# OIDC generated credentials and migration data
-keycloak-generated/

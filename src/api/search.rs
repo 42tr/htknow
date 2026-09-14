@@ -1,18 +1,12 @@
 use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet},
-    convert::Infallible,
-    time::Instant,
+    cmp::Ordering, collections::{HashMap, HashSet}, convert::Infallible, time::Instant
 };
 
 use anyhow::anyhow;
 use axum::{
-    Extension,
-    extract::{Multipart, Path, Query, State},
-    response::{
-        Json,
-        sse::{Event, KeepAlive, KeepAliveStream, Sse},
-    },
+    Extension, extract::{Multipart, Path, Query, State}, response::{
+        Json, sse::{Event, KeepAlive, KeepAliveStream, Sse}
+    }
 };
 use chrono::Utc;
 use log::{error, info, warn};
@@ -27,19 +21,13 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::File;
 use crate::{
-    AuthUser,
-    api::{
-        common,
-        error::{ApiError, ApiResult},
-    },
-    processor,
-    search::{
-        RebuildProgress, SearchEngine, SearchResultItem as EngineSearchResultItem,
-        advanced::{
-            ChunkRefiner, ChunkSegment, LlmClient, PlanAction, PlanStep, QueryPlanner, RefineOutcome, RelevanceJudge,
-            assemble_context_chunk,
-        },
-    },
+    AuthUser, api::{
+        common, error::{ApiError, ApiResult}
+    }, processor, search::{
+        RebuildProgress, SearchEngine, SearchResultItem as EngineSearchResultItem, advanced::{
+            ChunkRefiner, ChunkSegment, LlmClient, PlanAction, PlanStep, QueryPlanner, RefineOutcome, RelevanceJudge, assemble_context_chunk
+        }
+    }
 };
 
 #[derive(Debug, Deserialize, IntoParams)]
@@ -123,8 +111,7 @@ pub struct AdvancedSearchQuery {
 
 fn deserialize_id_list<'de, D>(deserializer: D) -> Result<Option<Vec<i64>>, D::Error>
 where
-    D: serde::Deserializer<'de>,
-{
+    D: serde::Deserializer<'de>, {
     let raw = Option::<String>::deserialize(deserializer)?;
     let Some(raw) = raw else {
         return Ok(None);
@@ -427,7 +414,8 @@ struct SynonymItemRow {
         (status = 400, description = "请求参数错误")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn search(
@@ -514,7 +502,8 @@ pub async fn search(
         (status = 200, description = "SSE 流式搜索结果")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn advanced_search_stream(
@@ -876,13 +865,6 @@ fn has_visibility_permission(
 fn has_permission(
     file: Option<&FileInfo>, kb: Option<&KbInfo>, user_id: &str, is_admin: bool, allowed_kb_ids: Option<&HashSet<i64>>,
 ) -> bool {
-    // Index entries may lag behind a move/delete; authorize the database resource.
-    let Some(actual_file) = file else {
-        return false;
-    };
-    if actual_file.kb_id != kb.map(|value| value.id) {
-        return false;
-    }
     has_visibility_permission(
         file.map(|f| (f.is_public, f.user_id.as_str())),
         kb.map(|k| (k.is_public, k.user_id.as_str(), k.id)),
@@ -1641,7 +1623,8 @@ fn preview_text(text: &str, max_chars: usize) -> String {
         (status = 400, description = "请求参数错误")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn search_full(
@@ -1764,7 +1747,8 @@ pub async fn search_full(
         (status = 400, description = "请求参数错误")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn search_summary(
@@ -1896,7 +1880,8 @@ pub async fn search_summary(
         (status = 400, description = "请求参数错误")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn search_with_graph(
@@ -1932,7 +1917,8 @@ pub async fn search_with_graph(
         (status = 400, description = "请求参数错误")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn search_image(
@@ -2016,7 +2002,8 @@ pub async fn search_image(
         (status = 500, description = "服务器内部错误")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn search_image_by_text(
@@ -2057,7 +2044,8 @@ pub async fn search_image_by_text(
         (status = 400, description = "请求参数错误")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn list_lexicons(
@@ -2115,7 +2103,8 @@ pub async fn list_lexicons(
         (status = 400, description = "请求参数错误")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn create_lexicon(
@@ -2166,7 +2155,8 @@ pub async fn create_lexicon(
         (status = 404, description = "词条不存在")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn update_lexicon(
@@ -2238,7 +2228,8 @@ pub async fn update_lexicon(
         (status = 404, description = "词条不存在")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn delete_lexicon(
@@ -2269,7 +2260,8 @@ pub async fn delete_lexicon(
         (status = 404, description = "词条不存在")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn toggle_lexicon_enabled(
@@ -2303,7 +2295,8 @@ pub async fn toggle_lexicon_enabled(
         (status = 200, description = "词表重载成功", body = ReloadLexiconResponse)
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn reload_lexicon(
@@ -2329,7 +2322,8 @@ pub async fn reload_lexicon(
         (status = 400, description = "已有重建任务在运行或权限不足")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn publish_lexicon(
@@ -2382,7 +2376,8 @@ pub async fn publish_lexicon(
         (status = 400, description = "请求参数错误")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn list_synonyms(
@@ -2447,7 +2442,8 @@ pub async fn list_synonyms(
         (status = 400, description = "请求参数错误")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn create_synonym(
@@ -2510,7 +2506,8 @@ pub async fn create_synonym(
         (status = 404, description = "同义词不存在")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn update_synonym(
@@ -2588,7 +2585,8 @@ pub async fn update_synonym(
         (status = 404, description = "同义词不存在")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn delete_synonym(
@@ -2621,7 +2619,8 @@ pub async fn delete_synonym(
         (status = 404, description = "同义词不存在")
     ),
     security(
-        ("bearerAuth" = [])
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn toggle_synonym_enabled(

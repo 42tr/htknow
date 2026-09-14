@@ -1,6 +1,6 @@
 <script setup>
 import { vDialog } from './dialog'
-import { inject, nextTick, reactive, ref, watch } from 'vue'
+import { nextTick, reactive, ref, watch } from 'vue'
 import SearchBar from './components/SearchBar.vue'
 import SearchResults from './components/SearchResults.vue'
 import KnowledgeBaseList from './components/KnowledgeBaseList.vue'
@@ -9,11 +9,6 @@ import AdvancedSearchPanel from './components/AdvancedSearchPanel.vue'
 import SearchDictionaryManager from './components/SearchDictionaryManager.vue'
 import { api } from './api'
 
-const currentUser = inject('currentUser', { is_admin: false })
-const logout = async () => {
-  const response = await fetch('/api/auth/logout', { method: 'POST' })
-  if (response.ok) window.location.assign('/?logged_out=1')
-}
 const activeTab = ref(
   ['search', 'knowledge', 'dictionary'].includes(location.hash.slice(1))
     ? location.hash.slice(1)
@@ -307,8 +302,8 @@ const clearAdvanced = () => {
         </nav>
       </div>
       <div class="sidebar-section">
-        <p v-if="currentUser.is_admin" class="nav-caption">管理</p>
-        <nav v-if="currentUser.is_admin" class="side-nav">
+        <p class="nav-caption">管理</p>
+        <nav class="side-nav">
           <button
             :class="{ active: activeTab === 'dictionary' }"
             @click="activeTab = 'dictionary'"
@@ -318,8 +313,6 @@ const clearAdvanced = () => {
         </nav>
       </div>
       <div class="sidebar-bottom">
-        <p>{{ currentUser.user_name || currentUser.user_id }}</p>
-        <button @click="logout">退出当前应用</button>
         <p>让资料成为可用的知识</p>
       </div>
     </aside>
