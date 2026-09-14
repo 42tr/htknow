@@ -1,5 +1,8 @@
 use axum::{
-    body::Body, http::{Request, StatusCode}, middleware::Next, response::{IntoResponse, Response}
+    body::Body,
+    http::{Request, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 
@@ -20,6 +23,7 @@ pub mod pdf_highlight;
 pub mod processor;
 pub mod search;
 pub mod slice_content;
+pub mod wiki;
 
 /// User authentication info extracted from request headers
 #[derive(Clone, Debug)]

@@ -1,7 +1,12 @@
 use std::{
-    collections::{HashMap, HashSet}, future::Future, path::Path, sync::{
-        Arc, atomic::{AtomicBool, AtomicU64, Ordering}
-    }, time::{Duration, Instant, SystemTime, UNIX_EPOCH}
+    collections::{HashMap, HashSet},
+    future::Future,
+    path::Path,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use aho_corasick::{AhoCorasick, MatchKind};
@@ -14,13 +19,21 @@ use reqwest::multipart;
 use serde::{Deserialize, Deserializer, Serialize};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 use tokio::{
-    fs, io::{AsyncBufReadExt, AsyncReadExt}, time
+    fs,
+    io::{AsyncBufReadExt, AsyncReadExt},
+    time,
 };
 
 use crate::{
     api::{
-        FILE_COLS_NO_CONTENT, File, collect_image_paths_for_files, collect_image_raw_paths_for_files, effective_parse_file_id, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta
-    }, archive, config, graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor}, image_description, image_parse, search::{self, SearchEngine, content_looks_like_image_reference, tantivy_engine}
+        FILE_COLS_NO_CONTENT, File, collect_image_paths_for_files, collect_image_raw_paths_for_files,
+        effective_parse_file_id, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path,
+        update_file_custom_image_meta,
+    },
+    archive, config,
+    graph::{graph_manager::KnowledgeGraph, llm_extractor::LLMGraphExtractor},
+    image_description, image_parse,
+    search::{self, SearchEngine, content_looks_like_image_reference, tantivy_engine},
 };
 
 /// 将本地文件构造为流式 multipart Part，避免大文件全量读入内存。
@@ -313,7 +326,8 @@ struct RawSlicePosition {
 
 fn deserialize_slice_positions<'de, D>(deserializer: D) -> std::result::Result<Vec<SlicePosition>, D::Error>
 where
-    D: Deserializer<'de>, {
+    D: Deserializer<'de>,
+{
     let raw_positions: Option<Vec<RawSlicePosition>> = Option::deserialize(deserializer)?;
     let mut positions = Vec::new();
     if let Some(raw_positions) = raw_positions {
@@ -507,7 +521,8 @@ impl ParseTimingCtx {
 
     async fn step<T, Fut>(&mut self, step: &'static str, fut: Fut) -> anyhow::Result<T>
     where
-        Fut: Future<Output=anyhow::Result<T>>, {
+        Fut: Future<Output = anyhow::Result<T>>,
+    {
         let (seq, started_at) = self.step_start(step);
         match fut.await {
             Ok(value) => {
@@ -522,11 +537,10 @@ impl ParseTimingCtx {
     }
 }
 
-async fn timed_step_opt<T, Fut>(
-    timing: Option<&mut ParseTimingCtx>, step: &'static str, fut: Fut,
-) -> anyhow::Result<T>
+async fn timed_step_opt<T, Fut>(timing: Option<&mut ParseTimingCtx>, step: &'static str, fut: Fut) -> anyhow::Result<T>
 where
-    Fut: Future<Output=anyhow::Result<T>>, {
+    Fut: Future<Output = anyhow::Result<T>>,
+{
     match timing {
         Some(ctx) => ctx.step(step, fut).await,
         None => fut.await,
@@ -1659,7 +1673,8 @@ impl FileProcessor {
         let stored_pdf_path = pdf_dir.join(&pdf_filename);
         let temp_pdf_path = pdf_dir.join(format!(".{}.pdf.tmp", file.id));
         let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().essence_str().to_string();
-        let office_convert_url = Some(config::get().services.office_convert_url.clone()).filter(|url| !url.trim().is_empty())
+        let office_convert_url = Some(config::get().services.office_convert_url.clone())
+            .filter(|url| !url.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("file_parse.office_convert_url is not configured"))?;
         let mut convert_url = reqwest::Url::parse(&office_convert_url)?;
         if !convert_url.query_pairs().any(|(key, _)| key == "target_format") {
@@ -2224,7 +2239,8 @@ impl FileProcessor {
     async fn call_mineru_api_with_path(
         &self, file_path: &str, filename: &str, is_image: bool, start_page: Option<usize>, end_page: Option<usize>,
     ) -> anyhow::Result<Result> {
-        let mineru_url = Some(config::get().services.mineru_url.clone()).filter(|url| !url.trim().is_empty())
+        let mineru_url = Some(config::get().services.mineru_url.clone())
+            .filter(|url| !url.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("file_parse.mineru_url is not configured"))?;
         let mineru_url = mineru_url.trim_end_matches('/');
 
@@ -2525,7 +2541,8 @@ impl FileProcessor {
         let form = multipart::Form::new().part("file", file_part);
 
         let client = self.services_http_client()?;
-        let audio_url = Some(config::get().services.audio_transcription_url.clone()).filter(|url| !url.trim().is_empty())
+        let audio_url = Some(config::get().services.audio_transcription_url.clone())
+            .filter(|url| !url.trim().is_empty())
             .ok_or_else(|| anyhow::anyhow!("services.audio_transcription_url is not configured"))?;
         let mut req_builder = client.post(&audio_url).multipart(form);
         if let Some(key) = config::get().services.audio_transcription_key.clone()
@@ -2686,8 +2703,14 @@ impl FileProcessor {
 
         self.search_engine.reload_readers()?;
 
-        timed_step_opt(timing, "build_knowledge_graph", async {
+        timed_step_opt(timing.as_deref_mut(), "build_knowledge_graph", async {
             self.maybe_build_knowledge_graph(file).await;
+            Ok(())
+        })
+        .await?;
+
+        timed_step_opt(timing, "enqueue_wiki", async {
+            self.maybe_enqueue_wiki(file).await;
             Ok(())
         })
         .await?;
@@ -3302,6 +3325,7 @@ impl FileProcessor {
             updated_file.content = Some(indexed_content);
             updated_file.summary = summary.clone();
             self.maybe_build_knowledge_graph(&updated_file).await;
+            self.maybe_enqueue_wiki(&updated_file).await;
             return Ok(());
         }
 
@@ -3376,6 +3400,7 @@ impl FileProcessor {
         updated_file.content = Some(full_content.clone());
         updated_file.summary = source.summary.clone();
         self.maybe_build_knowledge_graph(&updated_file).await;
+        self.maybe_enqueue_wiki(&updated_file).await;
 
         Ok(())
     }
@@ -3659,6 +3684,35 @@ impl FileProcessor {
         if let Err(e) = self.build_knowledge_graph(file).await {
             error!("Failed to build knowledge graph for file {}: {}", file.id, e);
             // 不影响主流程，仅记录错误
+        }
+    }
+
+    /// 文档解析完成后入队一次 Wiki 生成。
+    ///
+    /// 生成在独立的 `WikiWorker` 中异步执行，不阻塞解析主流程；入队失败只记录日志。
+    /// Wiki 是知识库级能力，没有归属知识库的文件不生成。
+    async fn maybe_enqueue_wiki(&self, file: &File) {
+        // 是否生成由知识库级开关决定（`HTKNOW_BUILD_WIKI` 只是未显式配置时的默认值）。
+        // 没有 LLM 地址时任务只会失败重试，直接跳过。
+        if !config::get().wiki.is_enabled() {
+            return;
+        }
+        let Some(kb_id) = file.kb_id else {
+            debug!("Wiki is knowledge-base scoped, skipping file {} without kb", file.id);
+            return;
+        };
+        match crate::wiki::resolve_config(&self.pool, kb_id).await {
+            Ok(Some(resolved)) if resolved.enabled => {}
+            Ok(_) => return,
+            Err(e) => {
+                warn!("Failed to resolve wiki config for kb {}: {}", kb_id, e);
+                return;
+            }
+        }
+        match crate::wiki::queue::enqueue_ingest(&self.pool, kb_id, file.id).await {
+            Ok(true) => info!("Enqueued wiki ingest for file {} in kb {}", file.id, kb_id),
+            Ok(false) => debug!("Wiki ingest already pending for file {}", file.id),
+            Err(e) => warn!("Failed to enqueue wiki ingest for file {}: {}", file.id, e),
         }
     }
 

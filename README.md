@@ -6,6 +6,7 @@ HTKnow 知识库管理系统，提供文档上传、检索与知识图谱能力�
 - 知识库管理、文件上传与解析
 - 全文/向量/图谱增强搜索
 - 知识图谱查询与可视化
+- 知识库 Wiki：文档解析后自动生成互相链接的条目页（摘要/实体/概念/索引）
 - 内置前端界面与 Swagger API 文档
 
 ## 快速开始
@@ -158,6 +159,31 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | `LLM_API_URL` | 空 | LLM API 地址 |
 | `LLM_API_KEY` | 空 | LLM API Key |
 | `LLM_MODEL` | `gpt-3.5-turbo` | LLM 模型 |
+
+### 知识库 Wiki（可选）
+开关是**知识库级**的：`HTKNOW_BUILD_WIKI` 只是知识库未显式配置时的默认值，可以在前端 Wiki 设置面板
+（`PUT /api/v1/knowledge/wiki/config`）里逐库打开或关闭。Wiki worker 始终运行，空闲时只是一次 SQLite 轮询。
+生成依赖 LLM 地址，未单独配置 `WIKI_LLM_*` 时复用上面的 `LLM_*`。设计细节见 `docs/wiki.md`。
+
+| 环境变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `HTKNOW_BUILD_WIKI` | `false` | 知识库 Wiki 的默认开关，知识库可单独覆盖 |
+| `HTKNOW_WIKI_WORKER_INTERVAL_SECS` | `10` | Wiki worker 基础轮询间隔（秒），空闲时自动翻倍 |
+| `HTKNOW_WIKI_BATCH_SIZE` | `5` | 单轮认领的任务数，同时是任务并发上限 |
+| `HTKNOW_WIKI_REDUCE_PARALLEL` | `4` | 单文档内条目页的并发写入数 |
+| `HTKNOW_WIKI_CITATION_PARALLEL` | `4` | 引用归类的批次并发数（仅图谱关闭时的模式 B） |
+| `HTKNOW_WIKI_MAX_INFLIGHT_PER_KB` | `2` | 每个知识库同时在途的任务数上限 |
+| `HTKNOW_WIKI_LLM_MAX_TOKENS` | `8192` | 单次生成调用的 max_tokens |
+| `HTKNOW_WIKI_FINALIZE_DELAY_SECS` | `20` | 索引/交叉链接收敛任务的防抖窗口（秒） |
+| `HTKNOW_WIKI_MAX_FAIL_RETRIES` | `5` | 任务失败重试上限，超过后丢弃并保留 `last_error` |
+| `HTKNOW_WIKI_CLAIM_STALE_SECS` | `5400` | 认领超时（秒），超时任务复位为待处理 |
+| `HTKNOW_WIKI_MAX_PAGES_PER_INGEST` | `0` | 单文档最多生成的条目页数，0 表示不限制 |
+| `HTKNOW_WIKI_MAX_SOURCE_CHARS` | `12000` | 送入模型的原文证据字符预算 |
+| `HTKNOW_WIKI_GRANULARITY` | `standard` | 默认抽取粒度：`focused` / `standard` / `exhaustive` |
+| `HTKNOW_WIKI_LANGUAGE` | `中文` | 默认生成语言 |
+| `WIKI_LLM_API_URL` | 空 | Wiki 专用 LLM API 地址 |
+| `WIKI_LLM_API_KEY` | 空 | Wiki 专用 LLM API Key |
+| `WIKI_LLM_MODEL` | 空 | Wiki 专用模型名 |
 
 ## 启用 etcd 配置
 `cargo build --features etcd`

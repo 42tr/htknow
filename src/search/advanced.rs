@@ -410,7 +410,8 @@ struct ChatMessage {
     content: String,
 }
 
-fn clean_json_like(input: &str) -> String {
+/// 去掉模型常见的 JSON 包装（```json 围栏、思考过程尾巴）。
+pub(crate) fn clean_json_like(input: &str) -> String {
     let mut text = input.trim();
     if let Some(rest) = text.split_once("</think>") {
         text = rest.1;

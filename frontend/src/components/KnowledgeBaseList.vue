@@ -9,6 +9,7 @@ import KnowledgeBaseExportModal from './KnowledgeBaseExportModal.vue'
 import KbPermissionModal from './KbPermissionModal.vue'
 import ResourceIcon from './ResourceIcon.vue'
 import KnowledgeGraph from './KnowledgeGraph.vue'
+import WikiBrowser from './WikiBrowser.vue'
 import { setCurrentKb } from '../store'
 
 const emit = defineEmits(['upload'])
@@ -78,6 +79,39 @@ const openKbGraph = (kb) => {
     kbId: kb.id,
     title: '知识库知识图谱',
     subtitle: kb.name,
+  }
+}
+
+// Wiki dialog state
+const wikiScope = ref(null)
+
+// 后端返回权限时按权限判断；未返回（例如根视图）时沿用前端默认的管理员身份。
+const canEditKb = (kb) => {
+  const permission = kb?.current_user_permission
+  if (!permission) return true
+  return permission === 'admin' || permission === 'editor'
+}
+
+const openWorkspaceWiki = () => {
+  const kb = currentKb.value
+  if (!kb?.id) {
+    alert('请先进入一个知识库再查看 Wiki')
+    return
+  }
+  wikiScope.value = {
+    kbId: kb.id,
+    title: '知识库 Wiki',
+    subtitle: kb.name,
+    canEdit: canEditKb(kb),
+  }
+}
+
+const openKbWiki = (kb) => {
+  wikiScope.value = {
+    kbId: kb.id,
+    title: '知识库 Wiki',
+    subtitle: kb.name,
+    canEdit: canEditKb(kb),
   }
 }
 
@@ -223,6 +257,7 @@ const loadKbContent = async (kbId) => {
         name: data.name,
         description: data.description,
         kb_type: data.kb_type,
+        current_user_permission: data.current_user_permission,
       }
       breadcrumbs.value = data.path || []
     }
@@ -583,6 +618,7 @@ onBeforeUnmount(() => listObserver?.disconnect())
         @create="openCreateKnowledgeBase"
         @reparse="(kb) => handleReparseChildKb(null, kb)"
         @graph="openKbGraph"
+        @wiki="openKbWiki"
       /><button class="directory-root" @click="openUnassigned">
         待归类文件
       </button>
@@ -600,6 +636,13 @@ onBeforeUnmount(() => listObserver?.disconnect())
           <p>{{ totalKbs }} 个子知识库 · {{ totalFiles }} 个文件</p>
         </div>
         <div class="workspace-toolbar-actions">
+          <button
+            v-if="currentKb"
+            class="secondary-button"
+            @click="openWorkspaceWiki"
+          >
+            知识库 Wiki
+          </button>
           <button class="secondary-button" @click="openWorkspaceGraph">
             知识图谱
           </button>
@@ -755,6 +798,32 @@ onBeforeUnmount(() => listObserver?.disconnect())
                       <line x1="18" y1="8" x2="15" y2="10" />
                       <line x1="6" y1="16" x2="9" y2="14" />
                       <line x1="18" y1="16" x2="15" y2="14" />
+                    </svg>
+                  </button>
+                  <button
+                    v-if="kb.kb_type !== 'storage'"
+                    type="button"
+                    @click="
+                      (e) => {
+                        e.stopPropagation()
+                        openKbWiki(kb)
+                      }
+                    "
+                    class="p-1.5 text-slate-400 hover:text-blue-500 hover:bg-blue-50 rounded-md transition-all"
+                    title="知识库 Wiki"
+                  >
+                    <svg
+                      class="w-4 h-4"
+                      fill="none"
+                      stroke="currentColor"
+                      stroke-width="1.8"
+                      stroke-linecap="round"
+                      stroke-linejoin="round"
+                      viewBox="0 0 24 24"
+                    >
+                      <path d="M5 5.5A2.5 2.5 0 0 1 7.5 3H19v14H7.5A2.5 2.5 0 0 0 5 19.5z" />
+                      <path d="M5 19.5A2.5 2.5 0 0 1 7.5 17H19v4H7.5A2.5 2.5 0 0 1 5 19.5z" />
+                      <path d="M9 7.5h6M9 11h4" />
                     </svg>
                   </button>
                   <button
@@ -1059,6 +1128,16 @@ onBeforeUnmount(() => listObserver?.disconnect())
         :title="graphScope.title"
         :subtitle="graphScope.subtitle"
         @close="graphScope = null"
+      />
+
+      <WikiBrowser
+        v-if="wikiScope"
+        :kb-id="wikiScope.kbId"
+        :title="wikiScope.title"
+        :subtitle="wikiScope.subtitle"
+        :can-edit="wikiScope.canEdit"
+        @close="wikiScope = null"
+        @locate-file="handleLocateFile"
       />
 
       <KnowledgeBaseExportModal

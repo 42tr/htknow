@@ -1,14 +1,19 @@
 #![allow(dead_code, unused_imports)]
 
 use std::{
-    fs, path::PathBuf, sync::{
-        OnceLock, atomic::{AtomicUsize, Ordering}
-    }, time::{SystemTime, UNIX_EPOCH}
+    fs,
+    path::PathBuf,
+    sync::{
+        OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{Router, extract::DefaultBodyLimit, middleware};
 pub use axum::{
-    body::Body, http::{Request, Response, StatusCode, header}
+    body::Body,
+    http::{Request, Response, StatusCode, header},
 };
 use htknow::{api, auth, db, search::SearchEngine, slice_content};
 pub use http_body_util::BodyExt;
@@ -43,6 +48,10 @@ pub fn setup_env() -> &'static TestEnv {
             std::env::set_var("HTKNOW_DB_INIT_DEFAULT_KBS", "false");
             std::env::set_var("HTKNOW_SERVER_UPLOAD_LIMIT_MB", "1");
             std::env::set_var("HTKNOW_SEARCH_LIMIT", "5");
+            // Wiki：全局默认关闭（由知识库级开关决定是否生成），但配置一个 LLM 地址，
+            // 这样重建接口的前置校验能通过。集成测试不启动 WikiWorker，不会产生真实调用。
+            std::env::set_var("HTKNOW_BUILD_WIKI", "false");
+            std::env::set_var("WIKI_LLM_API_URL", "http://127.0.0.1:9/wiki-llm");
         }
 
         TestEnv { data_dir: base_dir }

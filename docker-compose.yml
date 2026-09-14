@@ -19,6 +19,7 @@ services:
       - HTKNOW_SERVER_UPLOAD_LIMIT_MB=500
       - HTKNOW_SERVER_PROCESS_INTERVAL_SECS=10
       - HTKNOW_BUILD_KNOWLEDGE_GRAPH=false
+      - HTKNOW_BUILD_WIKI=false
       - "HTKNOW_LANCEDB_COMPACT_CRON=0 0 3 * * *"
       # 外部服务地址
       - HTKNOW_MINERU_URL=http://192.168.0.46:10001/file_parse
@@ -46,10 +47,14 @@ services:
       - HTKNOW_SEARCH_LIMIT=10
       - HTKNOW_TANTIVY_INDEX_PATH=data/tantivy_index
       - HTKNOW_TANTIVY_MEMORY_MB=50
-      # LLM 配置（可选，用于知识图谱构建）
+      # LLM 配置（可选，用于知识图谱构建与知识库 Wiki 生成）
       # - LLM_API_URL=https://api.openai.com/v1/chat/completions
       # - LLM_API_KEY=your-api-key
       # - LLM_MODEL=gpt-3.5-turbo
+      # Wiki 专用模型（可选，未设置时复用上面的 LLM_*）
+      # - WIKI_LLM_API_URL=https://api.openai.com/v1/chat/completions
+      # - WIKI_LLM_API_KEY=your-api-key
+      # - WIKI_LLM_MODEL=gpt-4o-mini
     restart: unless-stopped
     # Uncomment if you need to connect to other services
     # networks:

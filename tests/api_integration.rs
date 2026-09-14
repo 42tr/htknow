@@ -960,3 +960,207 @@ async fn kb_permission_search_filters_unauthorized_kb() {
         "viewer should now find the file"
     );
 }
+
+#[tokio::test]
+async fn wiki_endpoints_flow() {
+    let app = app().await;
+    let pool = get_pool().await;
+    let owner = TestUser::new("wiki-flow");
+    let kb_id = insert_kb(&pool, &owner, "wiki-kb", "analysis", None, false).await;
+
+    // 全局默认关闭时，未显式配置的知识库不生成 Wiki。
+    let res = app
+        .clone()
+        .oneshot(authed_empty_request("GET", format!("/api/v1/knowledge/wiki/config?kb_id={}", kb_id), &owner))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let config = response_json(res).await;
+    assert_eq!(config["enabled"].as_bool(), Some(false));
+    assert_eq!(config["llm_available"].as_bool(), Some(true));
+
+    // 关闭状态下重建会被拒绝，不会留下没人处理的任务。
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "POST",
+            "/api/v1/knowledge/wiki/rebuild",
+            &owner,
+            serde_json::json!({ "kb_id": kb_id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // 非法粒度直接 400，避免写入无法解析的配置。
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "PUT",
+            "/api/v1/knowledge/wiki/config",
+            &owner,
+            serde_json::json!({ "kb_id": kb_id, "granularity": "nope" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // 打开知识库级开关，并回读合并后的生效值。
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "PUT",
+            "/api/v1/knowledge/wiki/config",
+            &owner,
+            serde_json::json!({ "kb_id": kb_id, "enabled": true, "granularity": "focused", "max_pages_per_ingest": 3 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let config = response_json(res).await;
+    assert_eq!(config["enabled"].as_bool(), Some(true));
+    assert_eq!(config["granularity"].as_str(), Some("focused"));
+    assert_eq!(config["max_pages_per_ingest"].as_u64(), Some(3));
+
+    // 私有库的非成员：读接口 404（不泄露存在性），写接口 403。
+    let stranger = TestUser::with_role("wiki-stranger", "user");
+    let res = app
+        .clone()
+        .oneshot(authed_empty_request("GET", format!("/api/v1/knowledge/wiki/index?kb_id={}", kb_id), &stranger))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "PUT",
+            "/api/v1/knowledge/wiki/config",
+            &stranger,
+            serde_json::json!({ "kb_id": kb_id, "enabled": false }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    // 直接落一个页面，验证只读接口与「切片 → 用户可见文件」的换算。
+    let path = std::path::PathBuf::from("data/wiki-doc.md");
+    let file_id = insert_file(&pool, &owner, "wiki-doc.md", &path, Some(kb_id), vec![], false).await;
+    sqlx::query("UPDATE files SET status = 1 WHERE id = ?").bind(file_id).execute(&pool).await.unwrap();
+    let slice_id = insert_slice(&pool, file_id, "张三负责检索系统的索引与召回调优。").await;
+    htknow::wiki::page::upsert(
+        &pool,
+        &htknow::wiki::page::PageDraft {
+            kb_id,
+            slug: "entity/zhang-san".to_string(),
+            title: "张三".to_string(),
+            page_type: htknow::wiki::PAGE_TYPE_ENTITY.to_string(),
+            summary: "检索系统工程师".to_string(),
+            content: "张三 负责检索系统。".to_string(),
+            aliases: vec!["Zhang San".to_string()],
+            edit_source: htknow::wiki::EDIT_SOURCE_PIPELINE.to_string(),
+            editor_id: String::new(),
+        },
+        &[file_id],
+        &[slice_id],
+    )
+    .await
+    .unwrap();
+
+    let res = app
+        .clone()
+        .oneshot(authed_empty_request("GET", format!("/api/v1/knowledge/wiki/pages?kb_id={}", kb_id), &owner))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let pages = response_json(res).await;
+    assert_eq!(pages["items"][0]["slug"].as_str(), Some("entity/zhang-san"));
+    assert_eq!(pages["items"][0]["aliases"][0].as_str(), Some("Zhang San"));
+
+    let res = app
+        .clone()
+        .oneshot(authed_empty_request(
+            "GET",
+            format!("/api/v1/knowledge/wiki/page?kb_id={}&slug=entity/zhang-san", kb_id),
+            &owner,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let detail = response_json(res).await;
+    assert_eq!(detail["content"].as_str(), Some("张三 负责检索系统。"));
+    assert_eq!(detail["sources"][0]["file_id"].as_i64(), Some(file_id));
+    assert_eq!(detail["sources"][0]["filename"].as_str(), Some("wiki-doc.md"));
+    assert_eq!(detail["slices"][0]["slice_id"].as_i64(), Some(slice_id));
+    assert_eq!(detail["slices"][0]["file_id"].as_i64(), Some(file_id));
+
+    let res = app
+        .clone()
+        .oneshot(authed_empty_request(
+            "GET",
+            format!("/api/v1/knowledge/wiki/page?kb_id={}&slug=entity/missing", kb_id),
+            &owner,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    let res = app
+        .clone()
+        .oneshot(authed_empty_request(
+            "GET",
+            format!("/api/v1/knowledge/wiki/search?kb_id={}&q={}", kb_id, "%E5%BC%A0%E4%B8%89"),
+            &owner,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let search = response_json(res).await;
+    assert_eq!(search["items"].as_array().unwrap().len(), 1);
+
+    let res = app
+        .clone()
+        .oneshot(authed_empty_request("GET", format!("/api/v1/knowledge/wiki/index?kb_id={}", kb_id), &owner))
+        .await
+        .unwrap();
+    let index = response_json(res).await;
+    assert_eq!(index["groups"][0]["items"][0]["slug"].as_str(), Some("entity/zhang-san"));
+
+    let res = app
+        .clone()
+        .oneshot(authed_empty_request("GET", format!("/api/v1/knowledge/wiki/stats?kb_id={}", kb_id), &owner))
+        .await
+        .unwrap();
+    let stats = response_json(res).await;
+    assert_eq!(stats["total"].as_i64(), Some(1));
+    assert_eq!(stats["source_file_count"].as_i64(), Some(1));
+
+    let res = app
+        .clone()
+        .oneshot(authed_empty_request("GET", format!("/api/v1/knowledge/wiki/graph?kb_id={}", kb_id), &owner))
+        .await
+        .unwrap();
+    let graph = response_json(res).await;
+    assert_eq!(graph["nodes"].as_array().unwrap().len(), 1);
+
+    // 重建：为已完成解析的文件入队一条 ingest 任务（集成测试不启动 worker，任务留在队列里）。
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "POST",
+            "/api/v1/knowledge/wiki/rebuild",
+            &owner,
+            serde_json::json!({ "kb_id": kb_id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(response_json(res).await["enqueued"].as_i64(), Some(1));
+    let pending: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM wiki_tasks WHERE kb_id = ? AND task_type = 'wiki:ingest' AND status = 'pending'",
+    )
+    .bind(kb_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(pending, 1);
+}

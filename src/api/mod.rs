@@ -1,5 +1,6 @@
 use axum::{
-    Extension, Router, routing::{delete, get, post, put}
+    Extension, Router,
+    routing::{delete, get, post, put},
 };
 use sqlx::SqlitePool;
 use utoipa::OpenApi;
@@ -11,10 +12,13 @@ mod graph;
 mod knowledge_base;
 mod search;
 mod system;
+mod wiki;
 // 重新导出 File 类型供其他模块使用
 pub use file::File;
 pub(crate) use file::{
-    FILE_COLS_NO_CONTENT, backfill_missing_image_meta_for_files, collect_image_paths_for_files, collect_image_raw_paths_for_files, effective_parse_file_id, find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, update_file_custom_image_meta
+    FILE_COLS_NO_CONTENT, backfill_missing_image_meta_for_files, collect_image_paths_for_files,
+    collect_image_raw_paths_for_files, effective_parse_file_id, find_reusable_parsed_file, remove_image_files,
+    resolve_image_storage_path, update_file_custom_image_meta,
 };
 
 use crate::search::SearchEngine;
@@ -92,6 +96,17 @@ use crate::search::SearchEngine;
         system::lancedb_compact,
         system::index_force_merge,
         system::index_rebuild_status,
+        // Wiki
+        wiki::list_pages,
+        wiki::get_page,
+        wiki::get_index,
+        wiki::get_stats,
+        wiki::search_pages,
+        wiki::get_status,
+        wiki::get_graph,
+        wiki::get_config,
+        wiki::update_config,
+        wiki::rebuild,
     ),
     components(
         schemas(
@@ -170,6 +185,25 @@ use crate::search::SearchEngine;
             system::TantivyForceMergeIndexStats,
             system::TantivyForceMergeResponse,
             system::IndexRebuildStatus,
+            wiki::WikiPageItem,
+            wiki::WikiPageSource,
+            wiki::WikiSliceRef,
+            wiki::WikiPageDetail,
+            wiki::WikiPageListResponse,
+            wiki::WikiIndexGroup,
+            wiki::WikiIndexEntry,
+            wiki::WikiIndexResponse,
+            wiki::WikiGraphNode,
+            wiki::WikiGraphEdge,
+            wiki::WikiGraphResponse,
+            wiki::WikiBuildBreakdown,
+            wiki::WikiStatusResponse,
+            wiki::WikiConfigResponse,
+            wiki::WikiConfigUpdateReq,
+            wiki::WikiRebuildReq,
+            wiki::WikiRebuildResponse,
+            crate::wiki::page::WikiStats,
+            crate::wiki::page::TypeCount,
         )
     ),
     tags(
@@ -177,6 +211,7 @@ use crate::search::SearchEngine;
         (name = "file", description = "文件管理接口"),
         (name = "search", description = "搜索接口"),
         (name = "graph", description = "知识图谱接口"),
+        (name = "wiki", description = "知识库 Wiki 接口"),
         (name = "system", description = "系统监控接口")
     ),
     info(
@@ -250,12 +285,23 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/lancedb/compact", post(system::lancedb_compact))
         .route("/index/force-merge", post(system::index_force_merge))
         .route("/index/rebuild/status", get(system::index_rebuild_status));
+    let wiki_router = Router::new()
+        .route("/pages", get(wiki::list_pages))
+        .route("/page", get(wiki::get_page))
+        .route("/index", get(wiki::get_index))
+        .route("/stats", get(wiki::get_stats))
+        .route("/search", get(wiki::search_pages))
+        .route("/status", get(wiki::get_status))
+        .route("/graph", get(wiki::get_graph))
+        .route("/config", get(wiki::get_config).put(wiki::update_config))
+        .route("/rebuild", post(wiki::rebuild));
 
     Router::new()
         .nest("/knowledge_base/", knowledge_router)
         .nest("/files/", file_router)
         .nest("/search/", search_router)
         .nest("/graph/", graph_router)
+        .nest("/wiki/", wiki_router)
         .nest("/system/", system_router)
         .with_state(pool)
         .layer(Extension(search_engine))

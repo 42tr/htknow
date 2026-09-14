@@ -50,6 +50,12 @@ async fn main() -> anyhow::Result<()> {
     } else {
         log::warn!("HTKNOW_PARSE_ENABLED=false，后台文件解析已禁用，仅支持即时解析");
     }
+    // worker 始终启动：知识库可以单独打开 Wiki，`HTKNOW_BUILD_WIKI` 只是未配置时的默认值。
+    // 空闲时只是一次 SQLite 轮询，代价可忽略。
+    htknow::wiki::worker::WikiWorker::new(pool.clone()).start();
+    if cfg.wiki.api_url.is_none() {
+        log::info!("Wiki LLM 未配置（WIKI_LLM_API_URL / LLM_API_URL），开启 Wiki 的知识库不会生成页面");
+    }
     let cron = cfg.server.lancedb_compact_cron.trim();
     let _lancedb_compact_scheduler = if !cron.is_empty()
         && !cron.eq_ignore_ascii_case("off")

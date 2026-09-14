@@ -28,6 +28,14 @@ const readErrorMessage = async (response, fallback) => {
   return fallback
 }
 
+const buildQuery = (params) => {
+  const query = new URLSearchParams()
+  for (const [key, value] of Object.entries(params || {})) {
+    if (value !== null && value !== undefined && value !== '') query.set(key, value)
+  }
+  return query.toString()
+}
+
 export const api = {
   // 搜索
   async search(query, kbId = null, fileId = null, options = {}) {
@@ -756,6 +764,81 @@ export const api = {
       headers: getHeaders(),
     })
     if (!response.ok) throw new Error('获取图谱统计失败')
+    return response.json()
+  },
+
+  // 知识库 Wiki
+  async getWikiIndex(kbId, signal) {
+    const response = await fetch(`${API_BASE}/wiki/index?${buildQuery({ kb_id: kbId })}`, {
+      headers: getHeaders(),
+      signal,
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '加载 Wiki 目录失败'))
+    return response.json()
+  },
+
+  async getWikiPage(kbId, slug, signal) {
+    const response = await fetch(`${API_BASE}/wiki/page?${buildQuery({ kb_id: kbId, slug })}`, {
+      headers: getHeaders(),
+      signal,
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '加载 Wiki 页面失败'))
+    return response.json()
+  },
+
+  async listWikiPages(kbId, params = {}, signal) {
+    const response = await fetch(`${API_BASE}/wiki/pages?${buildQuery({ kb_id: kbId, ...params })}`, {
+      headers: getHeaders(),
+      signal,
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '加载 Wiki 页面列表失败'))
+    return response.json()
+  },
+
+  async searchWikiPages(kbId, q, limit = 20, signal) {
+    const response = await fetch(`${API_BASE}/wiki/search?${buildQuery({ kb_id: kbId, q, limit })}`, {
+      headers: getHeaders(),
+      signal,
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, 'Wiki 搜索失败'))
+    return response.json()
+  },
+
+  async getWikiStatus(kbId, signal) {
+    const response = await fetch(`${API_BASE}/wiki/status?${buildQuery({ kb_id: kbId })}`, {
+      headers: getHeaders(),
+      signal,
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '加载 Wiki 状态失败'))
+    return response.json()
+  },
+
+  async getWikiConfig(kbId, signal) {
+    const response = await fetch(`${API_BASE}/wiki/config?${buildQuery({ kb_id: kbId })}`, {
+      headers: getHeaders(),
+      signal,
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '加载 Wiki 配置失败'))
+    return response.json()
+  },
+
+  async updateWikiConfig(payload) {
+    const response = await fetch(`${API_BASE}/wiki/config`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify(payload),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '保存 Wiki 配置失败'))
+    return response.json()
+  },
+
+  async rebuildWiki(kbId, fileId = null) {
+    const response = await fetch(`${API_BASE}/wiki/rebuild`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ kb_id: kbId, file_id: fileId }),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '触发 Wiki 重建失败'))
     return response.json()
   },
 }

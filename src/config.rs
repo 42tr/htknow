@@ -43,6 +43,7 @@ pub struct AppConfig {
     pub search: SearchConfig,
     pub slice: SliceConfig,
     pub llm: LLMConfig,
+    pub wiki: WikiConfig,
 }
 
 /// 服务器配置
@@ -221,6 +222,7 @@ impl AppConfig {
             search: SearchConfig::from_env(),
             slice: SliceConfig::from_env(),
             llm: LLMConfig::from_env(),
+            wiki: WikiConfig::from_env(),
         }
     }
 }
@@ -371,6 +373,80 @@ impl LLMConfig {
     }
 }
 
+/// Wiki 生成配置
+#[derive(Debug, Clone)]
+pub struct WikiConfig {
+    /// 是否启用 Wiki 生成（全局默认，知识库可覆盖）
+    pub enabled: bool,
+    /// 后台 worker 轮询间隔（秒）
+    pub worker_interval_secs: u64,
+    /// 单次认领的任务数
+    pub batch_size: usize,
+    /// 单文档内 reduce（按 slug 写页面）的并发数
+    pub reduce_parallel: usize,
+    /// 引用归类批次的并发数（仅在独立抽取模式下使用）
+    pub citation_parallel: usize,
+    /// 每个知识库同时在途的批次上限
+    pub max_inflight_per_kb: usize,
+    /// 单次 LLM 调用的最大输出 token
+    pub llm_max_tokens: usize,
+    /// finalize 防抖延迟（秒），批量导入时把知识库级收敛合并成一次
+    pub finalize_delay_secs: u64,
+    /// 单个任务的最大重试次数，超过后丢弃并记录错误
+    pub max_fail_retries: u32,
+    /// 认领后多久视为失效可回收（秒）
+    pub claim_stale_secs: u64,
+    /// 单文档最多生成/更新的页面数，0 表示不限制
+    pub max_pages_per_ingest: usize,
+    /// 送入 LLM 的单页来源正文上限（字符）
+    pub max_source_chars: usize,
+    /// 默认抽取粒度：focused / standard / exhaustive
+    pub granularity: String,
+    /// 默认生成语言
+    pub default_language: String,
+    /// Wiki 专用 LLM 地址，未配置时回退到 LLM_API_URL
+    pub api_url: Option<String>,
+    /// Wiki 专用 LLM Key，未配置时回退到 LLM_API_KEY
+    pub api_key: Option<String>,
+    /// Wiki 专用模型，未配置时回退到 LLM_MODEL
+    pub model: Option<String>,
+}
+
+impl WikiConfig {
+    fn from_env() -> Self {
+        let llm = LLMConfig::from_env();
+        Self {
+            enabled: env_or_parse("HTKNOW_BUILD_WIKI", false),
+            worker_interval_secs: env_or_parse("HTKNOW_WIKI_WORKER_INTERVAL_SECS", 10),
+            batch_size: env_or_parse("HTKNOW_WIKI_BATCH_SIZE", 5),
+            reduce_parallel: env_or_parse("HTKNOW_WIKI_REDUCE_PARALLEL", 4),
+            citation_parallel: env_or_parse("HTKNOW_WIKI_CITATION_PARALLEL", 4),
+            max_inflight_per_kb: env_or_parse("HTKNOW_WIKI_MAX_INFLIGHT_PER_KB", 2),
+            llm_max_tokens: env_or_parse("HTKNOW_WIKI_LLM_MAX_TOKENS", 8192),
+            finalize_delay_secs: env_or_parse("HTKNOW_WIKI_FINALIZE_DELAY_SECS", 20),
+            max_fail_retries: env_or_parse("HTKNOW_WIKI_MAX_FAIL_RETRIES", 5),
+            claim_stale_secs: env_or_parse("HTKNOW_WIKI_CLAIM_STALE_SECS", 5400),
+            max_pages_per_ingest: env_or_parse("HTKNOW_WIKI_MAX_PAGES_PER_INGEST", 0),
+            max_source_chars: env_or_parse("HTKNOW_WIKI_MAX_SOURCE_CHARS", 12000),
+            granularity: env_or("HTKNOW_WIKI_GRANULARITY", "standard"),
+            default_language: env_or("HTKNOW_WIKI_LANGUAGE", "中文"),
+            api_url: env_optional("WIKI_LLM_API_URL").or(llm.api_url),
+            api_key: env_optional("WIKI_LLM_API_KEY").or(llm.api_key),
+            model: env_optional("WIKI_LLM_MODEL").or(Some(llm.model)),
+        }
+    }
+
+    /// 是否具备生成 Wiki 的条件（开关打开且配置了 LLM 地址）
+    pub fn is_enabled(&self) -> bool {
+        self.enabled && self.api_url.is_some()
+    }
+
+    /// 解析默认抽取粒度，非法值回退到 standard
+    pub fn default_granularity(&self) -> crate::wiki::Granularity {
+        crate::wiki::Granularity::parse(&self.granularity).unwrap_or_default()
+    }
+}
+
 /// 从环境变量读取字符串，如果不存在则返回默认值
 fn env_or(key: &str, default: &str) -> String {
     std::env::var(key).unwrap_or_else(|_| default.to_string())
@@ -395,7 +471,7 @@ fn env_or_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
 
 /// 配置加载器 trait
 #[allow(dead_code)]
-pub trait ConfigLoader: Send+Sync {
+pub trait ConfigLoader: Send + Sync {
     /// 加载配置
     fn load(&self) -> anyhow::Result<AppConfig>;
 }
@@ -428,7 +504,8 @@ impl EtcdConfigLoader {
     /// 启动 watch 监听配置变化
     pub async fn watch<F>(&self, _callback: F) -> anyhow::Result<()>
     where
-        F: Fn(AppConfig)+Send+Sync+'static, {
+        F: Fn(AppConfig) + Send + Sync + 'static,
+    {
         // TODO: 实现 etcd watch 逻辑
         // 1. 连接 etcd
         // 2. 监听 prefix 下的 key 变化
