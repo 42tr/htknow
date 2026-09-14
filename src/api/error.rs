@@ -1,7 +1,9 @@
 use std::{fmt, num::ParseIntError, result};
 
 use axum::{
-    Json, http::StatusCode, response::{IntoResponse, Response}
+    Json,
+    http::StatusCode,
+    response::{IntoResponse, Response},
 };
 use serde::Serialize;
 use sqlx;

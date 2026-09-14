@@ -1,9 +1,11 @@
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 use crate::{
-    AuthUser, api::{
-        error::{ApiError, ApiResult}, knowledge_base
-    }
+    AuthUser,
+    api::{
+        error::{ApiError, ApiResult},
+        knowledge_base,
+    },
 };
 
 /// 要求当前用户为 admin，否则返回 BadRequest。

@@ -56,7 +56,11 @@ pub async fn parse_image_base64(
         "custom" => {}
         mode => anyhow::bail!("unsupported image parse mode: {}", mode),
     }
-    let url = config::get().services.image_parse_url.clone().ok_or_else(|| anyhow::anyhow!("image parse URL is not configured"))?;
+    let url = config::get()
+        .services
+        .image_parse_url
+        .clone()
+        .ok_or_else(|| anyhow::anyhow!("image parse URL is not configured"))?;
 
     // 兼容 data:image/xxx;base64, 前缀以及空白字符
     let payload = image_base64

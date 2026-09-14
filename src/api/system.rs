@@ -1,8 +1,4 @@
-use axum::{
-    Extension, Json,
-    extract::State,
-    response::Response,
-};
+use axum::{Extension, Json, extract::State, response::Response};
 use chrono::Utc;
 use serde::Serialize;
 use sqlx::SqlitePool;
@@ -360,11 +356,14 @@ fn force_merge_index_stats(index: &str, stats: ForceMergeStats) -> TantivyForceM
 #[cfg(feature = "profiling")]
 async fn heap_profile_impl() -> ApiResult<Response> {
     use std::{
-        ffi::CString, io::Seek, time::{SystemTime, UNIX_EPOCH}
+        ffi::CString,
+        io::Seek,
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use axum::{
-        body::Body, http::{HeaderValue, header}
+        body::Body,
+        http::{HeaderValue, header},
     };
     use tempfile::NamedTempFile;
     use tikv_jemalloc_ctl::raw;
@@ -422,11 +421,14 @@ async fn heap_profile_impl() -> ApiResult<Response> {
 #[cfg(feature = "profiling")]
 async fn heap_profile_pdf_impl() -> ApiResult<Response> {
     use std::{
-        ffi::CString, process::Stdio, time::{SystemTime, UNIX_EPOCH}
+        ffi::CString,
+        process::Stdio,
+        time::{SystemTime, UNIX_EPOCH},
     };
 
     use axum::{
-        body::Body, http::{HeaderValue, header}
+        body::Body,
+        http::{HeaderValue, header},
     };
     use tempfile::NamedTempFile;
     use tikv_jemalloc_ctl::raw;

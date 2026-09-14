@@ -1,10 +1,18 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet}, io::{Seek, Write}, path::Component, sync::{Arc, Mutex, OnceLock}, time::Instant
+    collections::{BTreeMap, HashMap, HashSet},
+    io::{Seek, Write},
+    path::Component,
+    sync::{Arc, Mutex, OnceLock},
+    time::Instant,
 };
 
 use anyhow::Result as AnyResult;
 use axum::{
-    Extension, body::Body, extract::{Multipart, Path, Query, State}, http::{StatusCode, header}, response::Json
+    Extension,
+    body::Body,
+    extract::{Multipart, Path, Query, State},
+    http::{StatusCode, header},
+    response::Json,
 };
 use bytes::Bytes;
 use log::{debug, error, info, warn};
@@ -13,14 +21,22 @@ use sha2::{Digest, Sha256};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
 use tempfile::NamedTempFile;
 use tokio::{
-    fs, io::AsyncWriteExt as _, spawn, sync::{OwnedSemaphorePermit, Semaphore}
+    fs,
+    io::AsyncWriteExt as _,
+    spawn,
+    sync::{OwnedSemaphorePermit, Semaphore},
 };
 use utoipa::{IntoParams, ToSchema};
 
 use crate::{
-    AuthUser, api::{
-        common, error::{ApiError, ApiResult}
-    }, archive::{self, ArchiveEntry, ExtractResult}, config, pdf_highlight, processor, search::SearchEngine
+    AuthUser,
+    api::{
+        common,
+        error::{ApiError, ApiResult},
+    },
+    archive::{self, ArchiveEntry, ExtractResult},
+    config, pdf_highlight, processor,
+    search::SearchEngine,
 };
 
 /// 以流式方式打开文件，返回 (字节数, Body)。

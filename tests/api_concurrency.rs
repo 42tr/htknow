@@ -1,6 +1,7 @@
 mod common;
 use std::{
-    fs, time::{Duration, Instant}
+    fs,
+    time::{Duration, Instant},
 };
 
 use axum::http::StatusCode;

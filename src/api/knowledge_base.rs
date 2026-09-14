@@ -1,7 +1,9 @@
 use std::collections::HashMap;
 
 use axum::{
-    Extension, extract::{Path, Query, State}, response::Json
+    Extension,
+    extract::{Path, Query, State},
+    response::Json,
 };
 use log::warn;
 use serde::{Deserialize, Serialize};
@@ -10,9 +12,12 @@ use utoipa::{IntoParams, ToSchema};
 
 use super::file::{self, FileStatusBreakdown};
 use crate::{
-    AuthUser, api::{
-        common, error::{ApiError, ApiResult}
-    }, search::SearchEngine
+    AuthUser,
+    api::{
+        common,
+        error::{ApiError, ApiResult},
+    },
+    search::SearchEngine,
 };
 
 pub(crate) const KB_TYPE_ANALYSIS: &str = "analysis";

@@ -1,9 +1,11 @@
 use sqlx::{
-    SqlitePool, sqlite::{SqliteConnectOptions, SqlitePoolOptions}
+    SqlitePool,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
 };
 
 use super::{
-    Entity, EntityType, Relation, RelationType, graph_manager::{self, ExtractedChunk, KnowledgeGraph}
+    Entity, EntityType, Relation, RelationType,
+    graph_manager::{self, ExtractedChunk, KnowledgeGraph},
 };
 
 pub(crate) async fn database() -> SqlitePool {

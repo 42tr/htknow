@@ -4,7 +4,8 @@
 //! 7Z 和 RAR 格式暂不支持。
 
 use std::{
-    io::{Read, Write}, path::Path
+    io::{Read, Write},
+    path::Path,
 };
 
 use encoding_rs::GB18030;
