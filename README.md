@@ -6,7 +6,7 @@ HTKnow 知识库管理系统，提供文档上传、检索与知识图谱能力�
 - 知识库管理、文件上传与解析
 - 全文/向量/图谱增强搜索
 - 知识图谱查询与可视化
-- 知识库 Wiki：文档解析后自动生成互相链接的条目页（摘要/实体/概念/索引）
+- 知识库 Wiki：文档解析后自动生成互相链接的条目页（摘要/实体/概念/索引），支持人工编辑、版本回滚、归档与体检
 - 内置前端界面与 Swagger API 文档
 
 ## 快速开始
@@ -165,6 +165,10 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 （`PUT /api/v1/knowledge/wiki/config`）里逐库打开或关闭。Wiki worker 始终运行，空闲时只是一次 SQLite 轮询。
 生成依赖 LLM 地址，未单独配置 `WIKI_LLM_*` 时复用上面的 `LLM_*`。设计细节见 `docs/wiki.md`。
 
+人工编辑过的页面不会被后续自动生成覆盖（`last_edit_source` 为 `user`/`revert` 时管道只并入证据、不改正文），
+需要新稿就显式回滚到某个自动生成的版本；交叉链接维护是机械改写，对人工页面照常执行。
+不想让某个条目出现在目录里又不想丢内容，用「归档」而不是删除。
+
 | 环境变量 | 默认值 | 说明 |
 | --- | --- | --- |
 | `HTKNOW_BUILD_WIKI` | `false` | 知识库 Wiki 的默认开关，知识库可单独覆盖 |
@@ -179,6 +183,8 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | `HTKNOW_WIKI_CLAIM_STALE_SECS` | `5400` | 认领超时（秒），超时任务复位为待处理 |
 | `HTKNOW_WIKI_MAX_PAGES_PER_INGEST` | `0` | 单文档最多生成的条目页数，0 表示不限制 |
 | `HTKNOW_WIKI_MAX_SOURCE_CHARS` | `12000` | 送入模型的原文证据字符预算 |
+| `HTKNOW_WIKI_REVISION_SOFT_LIMIT` | `50` | 每页保留的**自动生成**版本数上限，0 表示不裁剪 |
+| `HTKNOW_WIKI_REVISION_HARD_LIMIT` | `200` | 每页保留的历史版本总数上限，0 表示不限制 |
 | `HTKNOW_WIKI_GRANULARITY` | `standard` | 默认抽取粒度：`focused` / `standard` / `exhaustive` |
 | `HTKNOW_WIKI_LANGUAGE` | `中文` | 默认生成语言 |
 | `WIKI_LLM_API_URL` | 空 | Wiki 专用 LLM API 地址 |

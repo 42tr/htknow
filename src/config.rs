@@ -400,6 +400,10 @@ pub struct WikiConfig {
     pub max_pages_per_ingest: usize,
     /// 送入 LLM 的单页来源正文上限（字符）
     pub max_source_chars: usize,
+    /// 每页保留的**管道生成**版本上限（软裁剪，0 表示不裁剪）
+    pub revision_soft_limit: usize,
+    /// 每页保留的历史版本总上限（硬裁剪，0 表示不限制）
+    pub revision_hard_limit: usize,
     /// 默认抽取粒度：focused / standard / exhaustive
     pub granularity: String,
     /// 默认生成语言
@@ -428,6 +432,8 @@ impl WikiConfig {
             claim_stale_secs: env_or_parse("HTKNOW_WIKI_CLAIM_STALE_SECS", 5400),
             max_pages_per_ingest: env_or_parse("HTKNOW_WIKI_MAX_PAGES_PER_INGEST", 0),
             max_source_chars: env_or_parse("HTKNOW_WIKI_MAX_SOURCE_CHARS", 12000),
+            revision_soft_limit: env_or_parse("HTKNOW_WIKI_REVISION_SOFT_LIMIT", 50),
+            revision_hard_limit: env_or_parse("HTKNOW_WIKI_REVISION_HARD_LIMIT", 200),
             granularity: env_or("HTKNOW_WIKI_GRANULARITY", "standard"),
             default_language: env_or("HTKNOW_WIKI_LANGUAGE", "中文"),
             api_url: env_optional("WIKI_LLM_API_URL").or(llm.api_url),

@@ -841,4 +841,81 @@ export const api = {
     if (!response.ok) throw new Error(await readErrorMessage(response, '触发 Wiki 重建失败'))
     return response.json()
   },
+
+  // 知识库 Wiki：人工编辑与版本管理
+  async updateWikiPage(payload) {
+    const response = await fetch(`${API_BASE}/wiki/page`, {
+      method: 'PUT',
+      headers: getHeaders(),
+      body: JSON.stringify(payload),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '保存 Wiki 页面失败'))
+    return response.json()
+  },
+
+  async createWikiPage(payload) {
+    const response = await fetch(`${API_BASE}/wiki/page`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify(payload),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '新建 Wiki 页面失败'))
+    return response.json()
+  },
+
+  async deleteWikiPage(kbId, slug) {
+    const response = await fetch(`${API_BASE}/wiki/page`, {
+      method: 'DELETE',
+      headers: getHeaders(),
+      body: JSON.stringify({ kb_id: kbId, slug }),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '删除 Wiki 页面失败'))
+  },
+
+  async listWikiRevisions(kbId, slug, limit = 50, signal) {
+    const response = await fetch(`${API_BASE}/wiki/revisions?${buildQuery({ kb_id: kbId, slug, limit })}`, {
+      headers: getHeaders(),
+      signal,
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '加载 Wiki 版本失败'))
+    return response.json()
+  },
+
+  async getWikiRevision(kbId, slug, version, signal) {
+    const response = await fetch(`${API_BASE}/wiki/revision?${buildQuery({ kb_id: kbId, slug, version })}`, {
+      headers: getHeaders(),
+      signal,
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '加载 Wiki 版本详情失败'))
+    return response.json()
+  },
+
+  async revertWikiPage(kbId, slug, version) {
+    const response = await fetch(`${API_BASE}/wiki/revert`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ kb_id: kbId, slug, version }),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '回滚 Wiki 页面失败'))
+    return response.json()
+  },
+
+  async lintWiki(kbId, signal) {
+    const response = await fetch(`${API_BASE}/wiki/lint?${buildQuery({ kb_id: kbId })}`, {
+      headers: getHeaders(),
+      signal,
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, 'Wiki 体检失败'))
+    return response.json()
+  },
+
+  async rebuildWikiLinks(kbId) {
+    const response = await fetch(`${API_BASE}/wiki/rebuild-links`, {
+      method: 'POST',
+      headers: getHeaders(),
+      body: JSON.stringify({ kb_id: kbId }),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '重建 Wiki 链接失败'))
+    return response.json()
+  },
 }

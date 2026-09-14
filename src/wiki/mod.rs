@@ -4,14 +4,17 @@
 //! `graph_node_sources`），因此默认不需要 WeKnora 那样的 chunk-citation pass。
 //! 图谱不可用时回退到独立的候选抽取 + 引用归类。
 
+pub mod edit;
 pub mod finalize;
 pub mod ingest;
 pub mod linkify;
+pub mod lint;
 pub mod llm;
 pub mod page;
 pub mod prompts;
 pub mod queue;
 pub mod retract;
+pub mod revision;
 pub mod worker;
 
 use serde::{Deserialize, Serialize};
@@ -223,15 +226,23 @@ pub fn slug_prefix(slug: &str) -> &str {
     slug.split_once('/').map(|(prefix, _)| prefix).unwrap_or("")
 }
 
-/// 版本 6 迁移。与图谱迁移一致：事务内抢占版本号，重复启动不重复执行。
+/// Wiki 相关迁移（版本 6 建表、版本 7 版本快照）。
+///
+/// 与图谱迁移一致：事务内抢占版本号，重复启动不重复执行。
 pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
-    let claimed = sqlx::query("INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (6, 'wiki_pages')")
-        .execute(&mut *tx)
-        .await?
-        .rows_affected();
-    if claimed != 0 {
-        sqlx::raw_sql(include_str!("migration.sql")).execute(&mut *tx).await?;
+    for (version, name, sql) in
+        [(6, "wiki_pages", include_str!("migration.sql")), (7, "wiki_page_revisions", include_str!("migration_v7.sql"))]
+    {
+        let claimed = sqlx::query("INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (?, ?)")
+            .bind(version)
+            .bind(name)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if claimed != 0 {
+            sqlx::raw_sql(sql).execute(&mut *tx).await?;
+        }
     }
     tx.commit().await?;
     Ok(())

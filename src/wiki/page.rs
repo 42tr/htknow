@@ -1,11 +1,12 @@
 //! Wiki 页面的持久化与查询。所有写入都是单行短事务，LLM 调用由上层负责放在事务之外。
 
 use anyhow::Result;
+use log::debug;
 use serde::Serialize;
 use sqlx::{Row, SqlitePool};
 use utoipa::ToSchema;
 
-use super::{EDIT_SOURCE_PIPELINE, STATUS_PUBLISHED, WikiPage};
+use super::{EDIT_SOURCE_PIPELINE, STATUS_ARCHIVED, STATUS_PUBLISHED, WikiPage, revision};
 
 const PAGE_COLUMNS: &str = "id, kb_id, slug, title, page_type, status, summary, content, aliases, \
                             out_links, in_links, version, last_edit_source, last_editor_id, \
@@ -77,6 +78,13 @@ pub struct UpsertOutcome {
     /// 内容是否发生变化（指纹不同）。false 表示只补记了来源关系。
     pub changed: bool,
     pub version: i64,
+    /// 页面被人工编辑过，本次自动生成的内容被丢弃（来源与切片证据仍会并入）。
+    pub skipped_manual: bool,
+}
+
+/// 人工编辑过的页面（含回滚结果）不被自动生成覆盖。
+pub fn is_manual_edit_source(edit_source: &str) -> bool {
+    edit_source == super::EDIT_SOURCE_USER || edit_source == super::EDIT_SOURCE_REVERT
 }
 
 /// 幂等写入页面：内容未变则只补记来源，不递增版本。
@@ -90,18 +98,25 @@ pub async fn upsert(
     let aliases = serde_json::to_string(&draft.aliases)?;
     let edit_source = if draft.edit_source.is_empty() { EDIT_SOURCE_PIPELINE } else { &draft.edit_source };
 
-    let existing: Option<(i64, String, i64)> =
-        sqlx::query_as("SELECT id, content_fingerprint, version FROM wiki_pages WHERE kb_id = ? AND slug = ?")
-            .bind(draft.kb_id)
-            .bind(&draft.slug)
-            .fetch_optional(pool)
-            .await?;
+    let existing: Option<(i64, String, i64, String)> = sqlx::query_as(
+        "SELECT id, content_fingerprint, version, last_edit_source FROM wiki_pages WHERE kb_id = ? AND slug = ?",
+    )
+    .bind(draft.kb_id)
+    .bind(&draft.slug)
+    .fetch_optional(pool)
+    .await?;
 
-    let (page_id, changed, version) = match existing {
-        Some((id, existing_fingerprint, existing_version)) => {
+    let (page_id, changed, version, skipped_manual) = match existing {
+        Some((id, existing_fingerprint, existing_version, existing_source)) => {
             if existing_fingerprint == fingerprint {
-                (id, false, existing_version)
+                (id, false, existing_version, false)
+            } else if is_manual_edit_source(&existing_source) && edit_source == EDIT_SOURCE_PIPELINE {
+                // 人工写过的内容不让管道悄悄改掉：证据照旧并入，需要新稿时由用户显式回滚到管道版本。
+                debug!("wiki upsert: {} is manually edited, keeping user content", draft.slug);
+                (id, false, existing_version, true)
             } else {
+                // 先快照当前版本，失败就不写新内容：宁可少一次更新，不可丢历史。
+                revision::snapshot_current(pool, id).await?;
                 let next = existing_version + 1;
                 sqlx::query(
                     "UPDATE wiki_pages
@@ -122,7 +137,8 @@ pub async fn upsert(
                 .bind(id)
                 .execute(pool)
                 .await?;
-                (id, true, next)
+                revision::prune_by_config(pool, id).await?;
+                (id, true, next, false)
             }
         }
         None => {
@@ -144,13 +160,79 @@ pub async fn upsert(
             .bind(&fingerprint)
             .fetch_one(pool)
             .await?;
-            (id, true, 1)
+            (id, true, 1, false)
         }
     };
 
     add_sources(pool, page_id, source_file_ids).await?;
     add_slice_refs(pool, page_id, slice_ids).await?;
-    Ok(UpsertOutcome { page_id, changed, version })
+    Ok(UpsertOutcome { page_id, changed, version, skipped_manual })
+}
+
+/// 就地改写正文与出链，返回是否真的变化。
+///
+/// 交叉链接维护与用户编辑共用这条路径：它同样走「先快照、再更新」，因此版本历史完整。
+/// `edit_source` 为 `None` 时保留页面原有归属——机械的链接注入不算改写作者。
+pub async fn update_content(
+    pool: &SqlitePool, page: &WikiPage, content: &str, out_links: &[String], edit_source: Option<(&str, &str)>,
+) -> Result<bool> {
+    let out_links_json = serde_json::to_string(out_links)?;
+    if page.content == content && page.out_links.as_slice() == out_links {
+        return Ok(false);
+    }
+
+    let fingerprint = PageDraft {
+        kb_id: page.kb_id,
+        slug: page.slug.clone(),
+        title: page.title.clone(),
+        page_type: page.page_type.clone(),
+        summary: page.summary.clone(),
+        content: content.to_string(),
+        aliases: page.aliases.clone(),
+        edit_source: String::new(),
+        editor_id: String::new(),
+    }
+    .fingerprint();
+
+    revision::snapshot_current(pool, page.id).await?;
+    // 绑定顺序必须与 SQL 里占位符出现的顺序一致，因此全部走 push_bind。
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new("UPDATE wiki_pages SET content = ");
+    qb.push_bind(content);
+    qb.push(", out_links = ");
+    qb.push_bind(&out_links_json);
+    qb.push(", content_fingerprint = ");
+    qb.push_bind(&fingerprint);
+    qb.push(", version = version + 1, updated_at = strftime('%s','now')");
+    if let Some((source, editor_id)) = edit_source {
+        qb.push(", last_edit_source = ");
+        qb.push_bind(source);
+        qb.push(", last_editor_id = ");
+        qb.push_bind(editor_id);
+    }
+    qb.push(" WHERE id = ");
+    qb.push_bind(page.id);
+    qb.build().execute(pool).await?;
+    revision::prune_by_config(pool, page.id).await?;
+    Ok(true)
+}
+
+/// 切换页面状态（归档/恢复/发布）。
+///
+/// 状态不是内容，不写版本快照、也不递增 version：归档后恢复不应产生一条「新版本」。
+pub async fn set_status(
+    pool: &SqlitePool, page_id: i64, status: &str, edit_source: &str, editor_id: &str,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE wiki_pages SET status = ?, last_edit_source = ?, last_editor_id = ?,
+                                updated_at = strftime('%s','now') WHERE id = ?",
+    )
+    .bind(status)
+    .bind(edit_source)
+    .bind(editor_id)
+    .bind(page_id)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn add_sources(pool: &SqlitePool, page_id: i64, file_ids: &[i64]) -> Result<()> {
@@ -213,9 +295,16 @@ pub async fn list(
         qb.push(" AND page_type = ");
         qb.push_bind(page_type);
     }
-    if let Some(status) = status {
-        qb.push(" AND status = ");
-        qb.push_bind(status);
+    match status {
+        Some(status) => {
+            qb.push(" AND status = ");
+            qb.push_bind(status);
+        }
+        // 未指定状态时隐藏归档页：目录、索引、图都不该再出现它们。
+        None => {
+            qb.push(" AND status != ");
+            qb.push_bind(STATUS_ARCHIVED);
+        }
     }
     if let Some(before_id) = before_id {
         qb.push(" AND id < ");
@@ -261,12 +350,19 @@ pub async fn search(pool: &SqlitePool, kb_id: i64, query: &str, limit: i64) -> R
     let pattern = format!("%{}%", query);
     let sql = format!(
         "SELECT {} FROM wiki_pages
-          WHERE kb_id = ? AND (title LIKE ? OR summary LIKE ? OR aliases LIKE ?)
+          WHERE kb_id = ? AND status != ? AND (title LIKE ? OR summary LIKE ? OR aliases LIKE ?)
           ORDER BY page_type = 'index' DESC, updated_at DESC LIMIT ?",
         PAGE_COLUMNS
     );
-    let rows =
-        sqlx::query(&sql).bind(kb_id).bind(&pattern).bind(&pattern).bind(&pattern).bind(limit).fetch_all(pool).await?;
+    let rows = sqlx::query(&sql)
+        .bind(kb_id)
+        .bind(STATUS_ARCHIVED)
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(&pattern)
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
     Ok(rows.iter().map(map_row).collect())
 }
 
@@ -304,6 +400,8 @@ pub struct WikiStats {
     pub kb_id: i64,
     pub total: i64,
     pub published: i64,
+    /// 已归档页面数：仍占存储、但不出现在目录与搜索里
+    pub archived: i64,
     pub by_type: Vec<TypeCount>,
     pub source_file_count: i64,
     pub link_count: i64,
@@ -316,17 +414,20 @@ pub struct TypeCount {
 }
 
 pub async fn stats(pool: &SqlitePool, kb_id: i64) -> Result<WikiStats> {
-    let rows: Vec<(String, i64, i64)> = sqlx::query_as(
-        "SELECT page_type, COUNT(*), SUM(CASE WHEN status = 'published' THEN 1 ELSE 0 END)
+    let rows: Vec<(String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT page_type, COUNT(*),
+                SUM(CASE WHEN status = 'published' THEN 1 ELSE 0 END),
+                SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END)
            FROM wiki_pages WHERE kb_id = ? GROUP BY page_type",
     )
     .bind(kb_id)
     .fetch_all(pool)
     .await?;
     let by_type: Vec<TypeCount> =
-        rows.iter().map(|(page_type, count, _)| TypeCount { page_type: page_type.clone(), count: *count }).collect();
-    let published = rows.iter().map(|(_, _, count)| count).sum();
-    let total: i64 = rows.iter().map(|(_, count, _)| count).sum();
+        rows.iter().map(|(page_type, count, _, _)| TypeCount { page_type: page_type.clone(), count: *count }).collect();
+    let published = rows.iter().map(|(_, _, count, _)| count).sum();
+    let archived = rows.iter().map(|(_, _, _, count)| count).sum();
+    let total: i64 = rows.iter().map(|(_, count, _, _)| count).sum();
     let source_file_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(DISTINCT s.file_id) FROM wiki_page_sources s
            JOIN wiki_pages p ON p.id = s.page_id WHERE p.kb_id = ?",
@@ -338,7 +439,7 @@ pub async fn stats(pool: &SqlitePool, kb_id: i64) -> Result<WikiStats> {
     let link_rows: Vec<(String,)> =
         sqlx::query_as("SELECT out_links FROM wiki_pages WHERE kb_id = ?").bind(kb_id).fetch_all(pool).await?;
     let link_count: i64 = link_rows.iter().map(|(raw,)| json_list(raw).len() as i64).sum();
-    Ok(WikiStats { kb_id, total, published, by_type, source_file_count, link_count })
+    Ok(WikiStats { kb_id, total, published, archived, by_type, source_file_count, link_count })
 }
 
 /// 全量重算知识库内的入链。

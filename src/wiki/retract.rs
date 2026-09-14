@@ -7,11 +7,13 @@ use anyhow::Result;
 use log::{debug, info};
 use sqlx::SqlitePool;
 
-use super::{page, queue};
+use super::{STATUS_ARCHIVED, page, queue};
 
 #[derive(Debug, Clone, Default)]
 pub struct RetractReport {
     pub pages_deleted: usize,
+    /// 人工写过的页面失去全部来源时归档而不是删除
+    pub pages_archived: usize,
     pub pages_queued_for_refresh: usize,
 }
 
@@ -29,7 +31,12 @@ pub async fn retract_pages(pool: &SqlitePool, page_ids: &[i64]) -> Result<Retrac
             continue;
         };
         let remaining = page::source_file_ids(pool, page.id).await?;
-        if remaining.is_empty() {
+        if remaining.is_empty() && page::is_manual_edit_source(&page.last_edit_source) {
+            // 证据没了但用户写的字还在：归档保留，历史版本也仍可回滚。
+            info!("wiki retract: page {} lost all sources, archiving manual page", page.slug);
+            page::set_status(pool, page.id, STATUS_ARCHIVED, &page.last_edit_source, &page.last_editor_id).await?;
+            report.pages_archived += 1;
+        } else if remaining.is_empty() {
             info!("wiki retract: page {} lost all sources, deleting", page.slug);
             page::delete_by_id(pool, page.id).await?;
             report.pages_deleted += 1;

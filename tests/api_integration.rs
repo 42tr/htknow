@@ -1164,3 +1164,376 @@ async fn wiki_endpoints_flow() {
     .unwrap();
     assert_eq!(pending, 1);
 }
+
+/// P2：人工编辑 → 版本快照 → 回滚 → 体检 → 链接收敛 → 归档 → 删除。
+#[tokio::test]
+async fn wiki_edit_and_revision_flow() {
+    let app = app().await;
+    let pool = get_pool().await;
+    let owner = TestUser::new("wiki-edit");
+    let kb_id = insert_kb(&pool, &owner, "wiki-edit-kb", "analysis", None, false).await;
+    // 公开库：非成员是 viewer，可读版本但不能改。
+    let public_kb = insert_kb(&pool, &owner, "wiki-public-kb", "analysis", None, true).await;
+
+    // 手工建页：slug 由标题派生，作者标记为 user。
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "POST",
+            "/api/v1/knowledge/wiki/page",
+            &owner,
+            serde_json::json!({
+                "kb_id": kb_id,
+                "title": "检索增强生成",
+                // 显式 slug 会被规范化并补上类型前缀；用 ASCII 省去 URL 编码。
+                "slug": "RAG Notes",
+                "summary": "一句话摘要",
+                "content": "初版正文",
+                "aliases": ["RAG", "RAG"],
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let created = response_json(res).await;
+    assert_eq!(created["page"]["slug"].as_str(), Some("concept/rag-notes"));
+    assert_eq!(created["page"]["page_type"].as_str(), Some("concept"));
+    assert_eq!(created["page"]["status"].as_str(), Some("published"));
+    assert_eq!(created["page"]["last_edit_source"].as_str(), Some("user"));
+    assert_eq!(created["page"]["version"].as_i64(), Some(1));
+    assert_eq!(created["page"]["aliases"].as_array().unwrap().len(), 1, "别名应去重");
+    let slug = "concept/rag-notes";
+    let uri = |tail: &str| format!("/api/v1/knowledge/wiki/{}kb_id={}&slug={}", tail, kb_id, slug);
+
+    // 同 slug 再建 → 400（冲突）。
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "POST",
+            "/api/v1/knowledge/wiki/page",
+            &owner,
+            serde_json::json!({ "kb_id": kb_id, "title": "另一个标题", "slug": "rag-notes" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // 摘要页由系统维护，不允许手工创建。
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "POST",
+            "/api/v1/knowledge/wiki/page",
+            &owner,
+            serde_json::json!({ "kb_id": kb_id, "title": "文档", "page_type": "summary" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // 局部编辑：只改正文与摘要，标题保持原样。
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "PUT",
+            "/api/v1/knowledge/wiki/page",
+            &owner,
+            serde_json::json!({
+                "kb_id": kb_id,
+                "slug": slug,
+                "summary": "改过的摘要",
+                "content": "第二版正文 [[concept/不存在|断链]]",
+            }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let edited = response_json(res).await;
+    assert_eq!(edited["content"].as_str(), Some("第二版正文 [[concept/不存在|断链]]"));
+    assert_eq!(edited["page"]["title"].as_str(), Some("检索增强生成"));
+    assert_eq!(edited["page"]["summary"].as_str(), Some("改过的摘要"));
+    assert_eq!(edited["page"]["version"].as_i64(), Some(2));
+    assert_eq!(edited["page"]["out_links"][0].as_str(), Some("concept/不存在"));
+
+    // 非法状态 → 400，不会留下半截写入。
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "PUT",
+            "/api/v1/knowledge/wiki/page",
+            &owner,
+            serde_json::json!({ "kb_id": kb_id, "slug": slug, "status": "bogus" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+    // 空编辑 → 400。
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "PUT",
+            "/api/v1/knowledge/wiki/page",
+            &owner,
+            serde_json::json!({ "kb_id": kb_id, "slug": slug }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+    // 版本列表：新→旧，且带当前版本号供前端标注「最新」。
+    let res = app.clone().oneshot(authed_empty_request("GET", uri("revisions?"), &owner)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let revisions = response_json(res).await;
+    assert_eq!(revisions["current_version"].as_i64(), Some(2));
+    let items = revisions["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1);
+    assert_eq!(items[0]["version"].as_i64(), Some(1));
+    assert_eq!(items[0]["edit_source"].as_str(), Some("user"));
+    assert_eq!(items[0]["content_length"].as_i64(), Some(4));
+    assert!(items[0].get("content").is_none(), "列表不该带正文");
+
+    // 版本详情：同时给出当前正文，前端一次请求就能 diff。
+    let res = app
+        .clone()
+        .oneshot(authed_empty_request("GET", format!("{}&version=1", uri("revision?")), &owner))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let snapshot = response_json(res).await;
+    assert_eq!(snapshot["revision"]["content"].as_str(), Some("初版正文"));
+    assert_eq!(snapshot["revision"]["summary"].as_str(), Some("一句话摘要"));
+    assert_eq!(snapshot["current_content"].as_str(), Some("第二版正文 [[concept/不存在|断链]]"));
+    assert_eq!(snapshot["current_version"].as_i64(), Some(2));
+
+    let res = app
+        .clone()
+        .oneshot(authed_empty_request("GET", format!("{}&version=99", uri("revision?")), &owner))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    // 体检：报出断链。
+    let res = app
+        .clone()
+        .oneshot(authed_empty_request("GET", format!("/api/v1/knowledge/wiki/lint?kb_id={}", kb_id), &owner))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let lint = response_json(res).await;
+    assert_eq!(lint["scanned"].as_u64(), Some(1));
+    let issues = lint["issues"].as_array().unwrap();
+    assert!(issues.iter().any(
+        |issue| issue["kind"].as_str() == Some("broken_link") && issue["target"].as_str() == Some("concept/不存在")
+    ));
+    assert!(lint["by_kind"].as_array().unwrap().iter().any(|kind| kind["kind"].as_str() == Some("broken_link")));
+
+    // 立即收敛：死链被清掉，出链同步清空。
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "POST",
+            "/api/v1/knowledge/wiki/rebuild-links",
+            &owner,
+            serde_json::json!({ "kb_id": kb_id }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let report = response_json(res).await;
+    assert_eq!(report["pages_scanned"].as_u64(), Some(1));
+    assert_eq!(report["pages_changed"].as_u64(), Some(1));
+    assert_eq!(report["dead_links_removed"].as_u64(), Some(1));
+
+    let res = app.clone().oneshot(authed_empty_request("GET", uri("page?"), &owner)).await.unwrap();
+    let healed = response_json(res).await;
+    assert_eq!(healed["content"].as_str(), Some("第二版正文 断链"));
+    assert!(healed["page"]["out_links"].as_array().unwrap().is_empty());
+    // 链接维护不改作者归属，人工页面不会被后续自动生成覆盖。
+    assert_eq!(healed["page"]["last_edit_source"].as_str(), Some("user"));
+    assert_eq!(healed["page"]["version"].as_i64(), Some(3));
+
+    // 回滚到第一版：内容回来，版本继续往前走。
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "POST",
+            "/api/v1/knowledge/wiki/revert",
+            &owner,
+            serde_json::json!({ "kb_id": kb_id, "slug": slug, "version": 1 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let reverted = response_json(res).await;
+    assert_eq!(reverted["content"].as_str(), Some("初版正文"));
+    assert_eq!(reverted["page"]["version"].as_i64(), Some(4));
+    assert_eq!(reverted["page"]["last_edit_source"].as_str(), Some("revert"));
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "POST",
+            "/api/v1/knowledge/wiki/revert",
+            &owner,
+            serde_json::json!({ "kb_id": kb_id, "slug": slug, "version": 99 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+
+    // 归档：退出目录与搜索，但按状态仍能列出，且随时可恢复。
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "PUT",
+            "/api/v1/knowledge/wiki/page",
+            &owner,
+            serde_json::json!({ "kb_id": kb_id, "slug": slug, "status": "archived" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(response_json(res).await["page"]["status"].as_str(), Some("archived"));
+
+    let res = app
+        .clone()
+        .oneshot(authed_empty_request("GET", format!("/api/v1/knowledge/wiki/pages?kb_id={}", kb_id), &owner))
+        .await
+        .unwrap();
+    assert!(response_json(res).await["items"].as_array().unwrap().is_empty());
+    let res = app
+        .clone()
+        .oneshot(authed_empty_request(
+            "GET",
+            format!("/api/v1/knowledge/wiki/pages?kb_id={}&status=archived", kb_id),
+            &owner,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_json(res).await["items"].as_array().unwrap().len(), 1);
+    let res = app
+        .clone()
+        .oneshot(authed_empty_request("GET", format!("/api/v1/knowledge/wiki/stats?kb_id={}", kb_id), &owner))
+        .await
+        .unwrap();
+    let stats = response_json(res).await;
+    assert_eq!(stats["archived"].as_i64(), Some(1));
+    assert_eq!(stats["published"].as_i64(), Some(0));
+    // 归档页仍可读、可回滚。
+    let res = app.clone().oneshot(authed_empty_request("GET", uri("page?"), &owner)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "PUT",
+            "/api/v1/knowledge/wiki/page",
+            &owner,
+            serde_json::json!({ "kb_id": kb_id, "slug": slug, "status": "published" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response_json(res).await["page"]["status"].as_str(), Some("published"));
+
+    // 权限：非成员读 404、写 403；公开库的 viewer 可读不可写。
+    let stranger = TestUser::with_role("wiki-edit-stranger", "user");
+    let res = app.clone().oneshot(authed_empty_request("GET", uri("revisions?"), &stranger)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "PUT",
+            "/api/v1/knowledge/wiki/page",
+            &stranger,
+            serde_json::json!({ "kb_id": kb_id, "slug": slug, "content": "x" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+
+    sqlx::query("UPDATE wiki_pages SET kb_id = ? WHERE kb_id = ?")
+        .bind(public_kb)
+        .bind(kb_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let viewer = TestUser::with_role("wiki-edit-viewer", "user");
+    let res = app
+        .clone()
+        .oneshot(authed_empty_request(
+            "GET",
+            format!("/api/v1/knowledge/wiki/revisions?kb_id={}&slug={}", public_kb, slug),
+            &viewer,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "POST",
+            "/api/v1/knowledge/wiki/revert",
+            &viewer,
+            serde_json::json!({ "kb_id": public_kb, "slug": slug, "version": 1 }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::FORBIDDEN);
+    sqlx::query("UPDATE wiki_pages SET kb_id = ? WHERE kb_id = ?")
+        .bind(kb_id)
+        .bind(public_kb)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // 删除：页面与历史一并清掉（外键级联）。
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "DELETE",
+            "/api/v1/knowledge/wiki/page",
+            &owner,
+            serde_json::json!({ "kb_id": kb_id, "slug": slug }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let res = app.clone().oneshot(authed_empty_request("GET", uri("page?"), &owner)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+    let revisions: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wiki_page_revisions").fetch_one(&pool).await.unwrap();
+    assert_eq!(revisions, 0);
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "DELETE",
+            "/api/v1/knowledge/wiki/page",
+            &owner,
+            serde_json::json!({ "kb_id": kb_id, "slug": slug }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::NOT_FOUND);
+}
+
+/// utoipa 的注册错误只在构建文档时暴露，这里直接构建一次并检查 Wiki 写接口都在。
+#[test]
+fn openapi_documents_wiki_write_endpoints() {
+    let doc = serde_json::to_value(htknow::api::openapi()).unwrap();
+    let paths = &doc["paths"];
+    for path in [
+        "/api/v1/knowledge/wiki/pages",
+        "/api/v1/knowledge/wiki/page",
+        "/api/v1/knowledge/wiki/revisions",
+        "/api/v1/knowledge/wiki/revision",
+        "/api/v1/knowledge/wiki/revert",
+        "/api/v1/knowledge/wiki/lint",
+        "/api/v1/knowledge/wiki/rebuild-links",
+    ] {
+        assert!(paths.get(path).is_some(), "missing path {} in openapi doc", path);
+    }
+    for method in ["get", "put", "post", "delete"] {
+        assert!(paths["/api/v1/knowledge/wiki/page"].get(method).is_some(), "missing {} /wiki/page", method);
+    }
+    for schema in ["WikiPageUpdateReq", "WikiRevisionResponse", "LintReport", "RevisionMeta"] {
+        assert!(doc["components"]["schemas"].get(schema).is_some(), "missing schema {}", schema);
+    }
+}

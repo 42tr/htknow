@@ -107,6 +107,14 @@ use crate::search::SearchEngine;
         wiki::get_config,
         wiki::update_config,
         wiki::rebuild,
+        wiki::update_page,
+        wiki::create_page,
+        wiki::delete_page,
+        wiki::list_revisions,
+        wiki::get_revision,
+        wiki::revert_page,
+        wiki::lint_kb,
+        wiki::rebuild_links,
     ),
     components(
         schemas(
@@ -202,8 +210,21 @@ use crate::search::SearchEngine;
             wiki::WikiConfigUpdateReq,
             wiki::WikiRebuildReq,
             wiki::WikiRebuildResponse,
+            wiki::WikiPageUpdateReq,
+            wiki::WikiPageCreateReq,
+            wiki::WikiPageDeleteReq,
+            wiki::WikiRevertReq,
+            wiki::WikiRevisionListResponse,
+            wiki::WikiRevisionResponse,
+            wiki::WikiRebuildLinksReq,
+            wiki::WikiRebuildLinksResponse,
             crate::wiki::page::WikiStats,
             crate::wiki::page::TypeCount,
+            crate::wiki::revision::RevisionMeta,
+            crate::wiki::revision::Revision,
+            crate::wiki::lint::LintReport,
+            crate::wiki::lint::LintIssue,
+            crate::wiki::lint::LintKindCount,
         )
     ),
     tags(
@@ -287,7 +308,12 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/index/rebuild/status", get(system::index_rebuild_status));
     let wiki_router = Router::new()
         .route("/pages", get(wiki::list_pages))
-        .route("/page", get(wiki::get_page))
+        .route("/page", get(wiki::get_page).put(wiki::update_page).post(wiki::create_page).delete(wiki::delete_page))
+        .route("/revisions", get(wiki::list_revisions))
+        .route("/revision", get(wiki::get_revision))
+        .route("/revert", post(wiki::revert_page))
+        .route("/lint", get(wiki::lint_kb))
+        .route("/rebuild-links", post(wiki::rebuild_links))
         .route("/index", get(wiki::get_index))
         .route("/stats", get(wiki::get_stats))
         .route("/search", get(wiki::search_pages))

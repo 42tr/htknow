@@ -66,25 +66,9 @@ pub async fn finalize_kb(pool: &SqlitePool, kb_id: i64) -> Result<FinalizeReport
             report.dead_links_removed += 1;
         }
         let outcome = linkifier.linkify(&cleaned, &page.slug);
-        let links_changed = outcome.out_links != page.out_links;
-        if outcome.changed || removed || links_changed {
-            if outcome.content != page.content {
-                let draft = PageDraft {
-                    kb_id,
-                    slug: page.slug.clone(),
-                    title: page.title.clone(),
-                    page_type: page.page_type.clone(),
-                    summary: page.summary.clone(),
-                    content: outcome.content.clone(),
-                    aliases: page.aliases.clone(),
-                    // 链接维护不算「内容被编辑」，但指纹变了仍会递增 version；
-                    // 这里保留 pipeline 来源，前端据此区分人工编辑。
-                    edit_source: EDIT_SOURCE_PIPELINE.to_string(),
-                    editor_id: String::new(),
-                };
-                page::upsert(pool, &draft, &[], &[]).await?;
-            }
-            page::set_out_links(pool, page.id, &outcome.out_links).await?;
+        // 链接维护是机械改写：正文与出链一起更新，但保留页面原有的作者归属，
+        // 否则人工编辑过的页面会被标成 pipeline，下次 ingest 就能覆盖掉用户内容。
+        if page::update_content(pool, page, &outcome.content, &outcome.out_links, None).await? {
             report.pages_changed += 1;
         }
     }

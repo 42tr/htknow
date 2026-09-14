@@ -107,8 +107,9 @@ Wiki 是知识库级别的可选能力（`knowledge_bases.indexing_strategy.wiki
 
 ### 分期
 
-- **P1 可浏览的 Wiki**：数据模型 + 任务队列 + 生成管道（summary/entity/concept/index）+ 只读 API + 前端浏览器
-- **P2 可维护**：人工编辑、版本快照/diff/回滚、目录树、linkify 交叉链接、lint
+- **P1 可浏览的 Wiki**（已完成）：数据模型 + 任务队列 + 生成管道（summary/entity/concept/index）+ 只读 API + 前端浏览器
+- **P2 可维护**（已完成）：人工编辑、版本快照/diff/回滚、归档、lint、链接收敛入口；
+  `wiki_folders` 目录树、页面去重合并、Agent 工具链仍延后（见「四、实现状态」）
 - **P3 融入检索**：wiki 页进 Tantivy/LanceDB、结果加权、高级搜索引用 wiki 页
 
 ### 3.1 数据模型（migration 6，`src/wiki/migration.sql`）
@@ -153,23 +154,22 @@ CREATE TABLE wiki_page_slice_refs (
     PRIMARY KEY (page_id, slice_id)
 );
 
--- 版本快照（P2）：先写快照再更新页面，(page_id, version) 唯一保证幂等
+-- 版本快照（migration 7，src/wiki/migration_v7.sql）：存**被覆盖前**的整份内容，
+-- 当前版本永远在 wiki_pages 里；(page_id, version) 唯一 + INSERT OR IGNORE 让「先快照再更新」幂等
 CREATE TABLE wiki_page_revisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    page_id INTEGER NOT NULL REFERENCES wiki_pages(id) ON DELETE CASCADE,
     kb_id INTEGER NOT NULL,
-    page_id INTEGER NOT NULL,
-    slug TEXT NOT NULL,
     version INTEGER NOT NULL,
+    slug TEXT NOT NULL DEFAULT '',
     title TEXT NOT NULL DEFAULT '',
-    page_type TEXT NOT NULL DEFAULT 'summary',
-    status TEXT NOT NULL DEFAULT 'published',
-    content TEXT NOT NULL DEFAULT '',
+    page_type TEXT NOT NULL DEFAULT '',
     summary TEXT NOT NULL DEFAULT '',
+    content TEXT NOT NULL DEFAULT '',
     aliases TEXT NOT NULL DEFAULT '[]',
-    edit_source TEXT NOT NULL DEFAULT '',
+    edit_source TEXT NOT NULL DEFAULT 'pipeline',  -- 被快照那一版的作者类型
     editor_id TEXT NOT NULL DEFAULT '',
-    edited_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
-    created_at INTEGER DEFAULT (strftime('%s','now')),
+    created_at INTEGER NOT NULL DEFAULT (strftime('%s','now')),
     UNIQUE (page_id, version)
 );
 
@@ -277,14 +277,31 @@ P1（已实现，`src/api/wiki.rs`）：
 - `GET|PUT /wiki/config?kb_id=`：读取合并后的生效配置 / 写入知识库级覆盖
 - `POST /wiki/rebuild`：整库或单文件重建，只写 `wiki_tasks`
 
-P2：
+P2（已实现，与 P1 一致用查询参数而不是路径参数）：
 
-- `POST/PUT/DELETE /wiki/pages/{slug}`、`PUT /wiki/pages/{slug}/move`
-- `GET /wiki/revisions/{slug}`、`GET /wiki/revisions/{slug}?version=N`、`POST /wiki/revert`
-- `GET/POST/PUT/DELETE /wiki/folders`
-- `GET /wiki/lint`、`POST /wiki/auto-fix`、`POST /wiki/rebuild-links`
+- `PUT /wiki/page`：局部编辑（`title`/`summary`/`content`/`aliases`/`status` 任选，省略字段保持原值）
+- `POST /wiki/page`：手工建页（`page_type` 只能是 `entity`/`concept`；`slug` 省略时由标题派生）
+- `DELETE /wiki/page`：彻底删除（历史版本随外键级联清掉）
+- `GET /wiki/revisions?kb_id=&slug=&limit=`：版本元数据列表（不含正文）
+- `GET /wiki/revision?kb_id=&slug=&version=`：某个版本的正文 + 当前正文，前端一次请求即可 diff
+- `POST /wiki/revert`：回滚到指定版本（作为新版本写入，历史只追加）
+- `GET /wiki/lint`：体检报告（断链/空正文/缺摘要/孤儿页/来源失效/标题重复）
+- `POST /wiki/rebuild-links`：立即执行一次 KB 级收敛，与后台 `wiki:finalize` 同一份逻辑，返回其报告
+- 未实现：`PUT /wiki/pages/{slug}/move`（改 slug 会牵连全部入链，收益低）、`/wiki/folders`、`POST /wiki/auto-fix`
 
-权限：读沿用 KB viewer 判定，写要求 editor/admin，与 `kb_permissions` 语义一致。
+权限：读沿用 KB viewer 判定（公开库的非成员是 viewer，可读版本但改不了），写要求 editor/admin，与 `kb_permissions` 语义一致。
+
+编辑与生成管道的边界（`src/wiki/edit.rs`、`src/wiki/page.rs`）：
+
+- 人工编辑过的页面（`last_edit_source` 为 `user`/`revert`）**不会被自动生成的内容覆盖**：
+  `page::upsert` 遇到管道草稿时直接跳过内容写入（`UpsertOutcome.skipped_manual = true`），但仍并入来源与切片证据。
+  想要新稿就显式回滚到某个管道版本。
+- 交叉链接维护走 `page::update_content(..., edit_source = None)`：改正文与出链、写版本快照、递增 version，
+  但**保留原有作者归属**，所以人工页面既不会链接腐烂，也不会因此变成「管道页」而被覆盖。
+- 状态切换（归档/恢复）不写快照、不递增 version：归档再恢复不该凭空多出一个版本。
+- 归档页退出目录、搜索、`list_surfaces`（linkify 候选）与图，指向它的内链由 finalize 当死链清掉；
+  正文与历史都还在，`GET /wiki/pages?status=archived` 可以列出来并恢复。
+- 文档删除触发 retract 时，人工页面失去全部来源只归档不删除（`RetractReport.pages_archived`）。
 
 ### 3.5 检索集成（P3）
 
@@ -296,13 +313,17 @@ P2：
 ### 3.6 前端
 
 - 依赖：新增 `marked` + `dompurify`（WeKnora 同款组合），暂不需要 katex / highlight.js。
-- 组件：`WikiBrowser.vue`（左侧目录/搜索 + 右侧正文 + 相关链接 + 来源证据 + 设置面板）。
-  P2 再补 `WikiRevisionDrawer.vue`（版本/diff/回滚）与独立的 Wiki 图视图（后端 `/wiki/graph` 已就绪，可直接复用 `GraphVisualization.vue`）。
+- 组件：`WikiBrowser.vue`（左侧目录/搜索 + 右侧正文 + 相关链接 + 来源证据 + 设置面板；
+  P2 增加编辑表单、新建条目、体检面板、「已归档」列表与页面操作条）。
+  `WikiRevisionDrawer.vue`（版本列表 + 行级 diff + 回滚）已落地；独立的 Wiki 图视图仍待做
+  （后端 `/wiki/graph` 已就绪，可直接复用 `GraphVisualization.vue`）。
 - 入口：`KnowledgeBaseList.vue` 工具栏「知识库 Wiki」按钮、知识库卡片图标、`KnowledgeDirectory.vue` 的目录菜单项（新增 `wiki` 事件）。
 - `[[slug|显示名]]` 在渲染前改写为 `[显示名](#wiki/<slug>)` 并跳过代码围栏，点击时拦截走内部跳转而不是外链；
   渲染结果统一过 dompurify。改写逻辑由 `WikiBrowser.test.mjs` 用 `node --test` 覆盖。
 - 生成中每 5 秒轮询 `/wiki/status`，收敛后自动刷新目录与当前页。
-- 行级 diff（P2）可直接移植 WeKnora 的 `wikiLineDiff.ts`（90 行）与 `wikiRevisionDiff.ts`（43 行），落成 `.mjs` 以配合现有 `node --test` 测试方式。
+- 行级 diff 落在 `frontend/src/wikiDiff.js`（参考 WeKnora 的 `wikiLineDiff.ts`）：削公共前后缀 + LCS 动态规划，
+  超过 400 万 DP 单元时退化为「整段替换」，`foldDiff` 再把未变化的长段折叠成 `gap` 行。
+  由 `wikiDiff.test.mjs` 与 `WikiRevisionDrawer.test.mjs` 用 `node --test` 覆盖（后者用 vm 跑组件里真实的 diff 逻辑）。
 
 ### 3.7 配置
 
@@ -319,13 +340,16 @@ HTKNOW_WIKI_MAX_FAIL_RETRIES=5
 HTKNOW_WIKI_CLAIM_STALE_SECS=5400
 HTKNOW_WIKI_MAX_PAGES_PER_INGEST=0      # 0 表示不限制
 HTKNOW_WIKI_MAX_SOURCE_CHARS=12000      # 送入模型的原文证据预算
+HTKNOW_WIKI_REVISION_SOFT_LIMIT=50      # 每页保留的**管道生成**版本上限，0 表示不裁剪
+HTKNOW_WIKI_REVISION_HARD_LIMIT=200     # 每页保留的历史版本总上限，0 表示不限制
 HTKNOW_WIKI_GRANULARITY=standard
 HTKNOW_WIKI_LANGUAGE=中文
 WIKI_LLM_API_URL / WIKI_LLM_API_KEY / WIKI_LLM_MODEL   # 可选，未设则复用 LLM_*
 ```
 
 KB 级 `knowledge_bases.wiki_config`（JSON）覆盖全局：`enabled` / `granularity` / `language` / `model` / `max_pages_per_ingest`，
-前端设置面板走 `PUT /wiki/config`。版本快照的保留上限（软/硬裁剪）属于 P2，暂未引入对应环境变量。
+前端设置面板走 `PUT /wiki/config`。版本快照的保留上限是全局的（`HTKNOW_WIKI_REVISION_*`），不做知识库级覆盖：
+软限额只裁 `edit_source = pipeline` 的版本，人工编辑与回滚留下的版本只受硬限额约束，因此用户历史不会被自动生成挤掉。
 
 开关是两级的，但**以知识库为准**：`HTKNOW_BUILD_WIKI` 只是 `enabled` 的默认值，知识库可以单独打开或关闭。
 worker 始终运行（空闲轮询代价可忽略），因此关掉全局默认也不影响某个库单独启用；
@@ -367,7 +391,7 @@ worker 始终运行（空闲轮询代价可忽略），因此关掉全局默认�
 | worker：自适应轮询、每知识库在途上限、暂停让位索引维护 | `src/wiki/worker.rs` |
 | 生成管道：map（模式 A 图谱复用 / 模式 B 抽取+引用归类）→ reduce（按 slug 加锁合并） | `src/wiki/ingest.rs` |
 | KB 级收敛：索引页目录 + 导言、交叉链接注入、死链清理 | `src/wiki/finalize.rs`、`src/wiki/linkify.rs` |
-| 回撤：删除文件后无来源页面直接删除，多来源页面按剩余证据确定性重建 | `src/wiki/retract.rs` |
+| 回撤：删除文件后无来源页面直接删除（人工页面改为归档），多来源页面按剩余证据确定性重建 | `src/wiki/retract.rs` |
 | 只读 API + 配置 + 重建入口 | `src/api/wiki.rs` |
 | 前端浏览器（目录、搜索、Markdown 正文、内链跳转、来源与原文高亮、设置面板） | `frontend/src/components/WikiBrowser.vue` |
 
@@ -377,19 +401,61 @@ worker 始终运行（空闲轮询代价可忽略），因此关掉全局默认�
 已用 mock LLM 跑通的完整链路：单文档 ingest → 摘要/实体/概念页 → finalize（导言、交叉链接、死链清理、索引目录）
 → 第二篇文档并入同一实体页（来源与切片证据累加）→ 删除首篇文档后回撤（摘要页删除、实体页按剩余证据重建、索引更新）。
 
-### 尚未做（P2/P3）
+### P2 已完成
 
-- 人工编辑、版本快照/diff/回滚、`wiki_folders` 目录树、lint/auto-fix、Agent 工具链
-- 页面去重（FTS5 trigram 预筛 + Jaccard）与同义词合并
+| 部分 | 位置 |
+| --- | --- |
+| 迁移 7（`wiki_page_revisions`，页面删除时级联） | `src/wiki/migration_v7.sql`、`src/wiki/mod.rs` |
+| 版本快照：`snapshot_current` / `list` / `get` / 两级 `prune`（软限额只裁管道版本） | `src/wiki/revision.rs` |
+| 写入路径统一「先快照再更新」：`page::upsert` 与 `page::update_content` | `src/wiki/page.rs` |
+| 人工编辑：局部改写、手工建页、回滚、归档/恢复、删除，含输入校验与 slug 锁 | `src/wiki/edit.rs` |
+| 人工内容保护：管道草稿不覆盖 `user`/`revert` 页面，链接维护保留作者归属 | `src/wiki/page.rs`、`src/wiki/finalize.rs` |
+| 归档语义：退出列表/搜索/linkify 候选，`stats.archived` 单独计数，仍可读可回滚 | `src/wiki/page.rs` |
+| 体检：断链、空正文、缺摘要、孤儿页、来源失效、标题重复（只报告不改写） | `src/wiki/lint.rs` |
+| 写接口 + 版本接口 + 体检/链接收敛接口 | `src/api/wiki.rs`、`src/api/mod.rs` |
+| 前端：编辑表单、新建条目、体检面板、归档列表、历史抽屉（行级 diff + 回滚） | `frontend/src/components/WikiBrowser.vue`、`frontend/src/components/WikiRevisionDrawer.vue`、`frontend/src/wikiDiff.js` |
+
+编辑链路已用集成测试覆盖（`tests/api_integration.rs::wiki_edit_and_revision_flow`）：
+建页 → 局部编辑 → 版本列表/详情 → 体检报出断链 → `rebuild-links` 清掉死链且不改作者归属 → 回滚 →
+归档（退出目录与搜索、按状态仍可列出）→ 恢复 → 删除（历史级联清空），并校验 404/403/400 分支。
+
+### 尚未做（P2 余项 / P3）
+
+- `wiki_folders` 目录树与页面移动（改 slug 会牵连全部入链）
+- 页面去重（FTS5 trigram 预筛 + Jaccard）与同义词合并；`lint` 目前只报「标题重复」提示，不做自动合并
+- lint 的 auto-fix（补写摘要之类要过模型，成本高于收益，暂由用户在编辑表单里手工处理）
+- Agent 工具链（把 Wiki 页面作为 Agent 可读写的知识载体）
+- 独立的 Wiki 图视图（后端 `/wiki/graph` 已就绪，前端复用 `GraphVisualization.vue` 即可）
 - 检索集成：wiki 页进 Tantivy/LanceDB、结果加权、高级搜索引用 wiki 页
 
 ### 验证命令
 
 ```sh
-cargo test --lib wiki                                  # 迁移、队列、slug、配置合并、模式 A 候选、删除触发器
+cargo test --lib wiki                                  # 迁移、队列、slug、配置合并、模式 A 候选、删除触发器、
+                                                       # 版本快照/裁剪、人工编辑保护、回滚、归档、lint
+cargo test --test api_integration wiki                 # 只读接口流程 + 编辑/版本/体检/归档/删除流程
 node --test frontend/src/components/WikiBrowser.test.mjs   # [[slug|名称]] 改写与代码围栏保护
+node --test frontend/src/wikiDiff.test.mjs                 # 行级 diff：增删改、行号、折叠、超大规模退化
+node --test frontend/src/components/WikiRevisionDrawer.test.mjs  # 版本抽屉里的 diff 与标签逻辑
 npm run build --prefix frontend
 cargo check --all-targets
+```
+
+手工验证编辑与版本链路（不需要 LLM，任意知识库都能试）：
+
+```sh
+curl -H 'x-user-id: user1' -H 'x-role: admin' -X POST -H 'Content-Type: application/json' \
+  -d '{"kb_id":1,"title":"检索增强生成","content":"初版正文"}' \
+  http://127.0.0.1:3000/api/v1/knowledge/wiki/page
+curl -H 'x-user-id: user1' -H 'x-role: admin' -X PUT -H 'Content-Type: application/json' \
+  -d '{"kb_id":1,"slug":"concept/检索增强生成","content":"第二版正文"}' \
+  http://127.0.0.1:3000/api/v1/knowledge/wiki/page
+curl -H 'x-user-id: user1' -H 'x-role: admin' \
+  'http://127.0.0.1:3000/api/v1/knowledge/wiki/revisions?kb_id=1&slug=concept/检索增强生成'
+curl -H 'x-user-id: user1' -H 'x-role: admin' -X POST -H 'Content-Type: application/json' \
+  -d '{"kb_id":1,"slug":"concept/检索增强生成","version":1}' \
+  http://127.0.0.1:3000/api/v1/knowledge/wiki/revert
+curl -H 'x-user-id: user1' -H 'x-role: admin' 'http://127.0.0.1:3000/api/v1/knowledge/wiki/lint?kb_id=1'
 ```
 
 手工验证（无需真实 LLM，用任意 OpenAI 兼容端点即可）：

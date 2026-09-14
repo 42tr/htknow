@@ -15,8 +15,11 @@ use utoipa::{IntoParams, ToSchema};
 
 use crate::{
     AuthUser,
-    api::{common, error::ApiResult},
-    wiki::{self, Granularity, PAGE_TYPE_INDEX, WikiPage, page},
+    api::{
+        common,
+        error::{ApiError, ApiResult},
+    },
+    wiki::{self, Granularity, PAGE_TYPE_INDEX, WikiPage, edit, lint, page, revision},
 };
 
 /// 列表项：不含正文，避免目录浏览时传输大量 Markdown。
@@ -231,7 +234,7 @@ fn bounded_limit(value: Option<i64>, default: i64, max: i64) -> ApiResult<i64> {
     match value {
         None => Ok(default),
         Some(limit) if (1..=max).contains(&limit) => Ok(limit),
-        Some(_) => Err(crate::api::error::ApiError::BadRequest(format!("limit must be between 1 and {}", max))),
+        Some(_) => Err(ApiError::BadRequest(format!("limit must be between 1 and {}", max))),
     }
 }
 
@@ -311,12 +314,12 @@ pub async fn get_page(
 ) -> ApiResult<Json<WikiPageDetail>> {
     common::ensure_kb_accessible(&pool, params.kb_id, &user.user_id, user.is_admin()).await?;
     if params.slug.trim().is_empty() {
-        return Err(crate::api::error::ApiError::BadRequest("slug is required".to_string()));
+        return Err(ApiError::BadRequest("slug is required".to_string()));
     }
     let found = page::get_by_slug(&pool, params.kb_id, params.slug.trim()).await?;
     match found {
         Some(page) => Ok(Json(build_detail(&pool, page).await?)),
-        None => Err(crate::api::error::ApiError::NotFound("Wiki page not found".to_string())),
+        None => Err(ApiError::NotFound("Wiki page not found".to_string())),
     }
 }
 
@@ -368,7 +371,7 @@ pub async fn search_pages(
     common::ensure_kb_accessible(&pool, params.kb_id, &user.user_id, user.is_admin()).await?;
     let query = params.q.trim();
     if query.is_empty() {
-        return Err(crate::api::error::ApiError::BadRequest("q is required".to_string()));
+        return Err(ApiError::BadRequest("q is required".to_string()));
     }
     let limit = bounded_limit(params.limit, 20, 100)?;
     let pages = page::search(&pool, params.kb_id, query, limit).await?;
@@ -383,11 +386,13 @@ pub async fn get_status(
     let resolved = wiki::resolve_config(&pool, params.kb_id).await?;
     let enabled = resolved.is_some_and(|config| config.enabled);
     let pending_tasks = wiki::queue::pending_count(&pool, params.kb_id).await?;
-    let page_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wiki_pages WHERE kb_id = ? AND page_type != ?")
-        .bind(params.kb_id)
-        .bind(PAGE_TYPE_INDEX)
-        .fetch_one(&pool)
-        .await?;
+    let page_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM wiki_pages WHERE kb_id = ? AND page_type != ? AND status != ?")
+            .bind(params.kb_id)
+            .bind(PAGE_TYPE_INDEX)
+            .bind(wiki::STATUS_ARCHIVED)
+            .fetch_one(&pool)
+            .await?;
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT b.status, COUNT(*) FROM wiki_builds b JOIN files f ON f.id = b.file_id
           WHERE f.kb_id = ? GROUP BY b.status",
@@ -426,7 +431,7 @@ pub async fn get_graph(
     let selected: HashSet<String> = match params.center.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
         Some(center) => {
             if !by_slug.contains_key(center) {
-                return Err(crate::api::error::ApiError::NotFound("center page not found".to_string()));
+                return Err(ApiError::NotFound("center page not found".to_string()));
             }
             let depth = params.depth.unwrap_or(1).clamp(1, 3) as usize;
             ego_slugs(center, depth, &by_slug)
@@ -497,7 +502,7 @@ pub async fn get_config(
     common::ensure_kb_accessible(&pool, params.kb_id, &user.user_id, user.is_admin()).await?;
     let resolved = wiki::resolve_config(&pool, params.kb_id).await?;
     let Some(resolved) = resolved else {
-        return Err(crate::api::error::ApiError::NotFound("Knowledge base not found".to_string()));
+        return Err(ApiError::NotFound("Knowledge base not found".to_string()));
     };
     Ok(Json(WikiConfigResponse {
         kb_id: params.kb_id,
@@ -517,16 +522,14 @@ pub async fn update_config(
     common::ensure_kb_editor_or_admin(&pool, req.kb_id, &user).await?;
     if let Some(granularity) = req.granularity.as_deref().filter(|v| !v.trim().is_empty()) {
         if Granularity::parse(granularity).is_none() {
-            return Err(crate::api::error::ApiError::BadRequest(
-                "granularity must be one of focused / standard / exhaustive".to_string(),
-            ));
+            return Err(ApiError::BadRequest("granularity must be one of focused / standard / exhaustive".to_string()));
         }
     }
     let raw: Option<String> = sqlx::query_scalar("SELECT wiki_config FROM knowledge_bases WHERE id = ?")
         .bind(req.kb_id)
         .fetch_optional(&pool)
         .await?;
-    let raw = raw.ok_or_else(|| crate::api::error::ApiError::NotFound("Knowledge base not found".to_string()))?;
+    let raw = raw.ok_or_else(|| ApiError::NotFound("Knowledge base not found".to_string()))?;
     let mut config = wiki::KbWikiConfig::parse(Some(raw.as_str()));
     if let Some(enabled) = req.enabled {
         config.enabled = Some(enabled);
@@ -558,14 +561,14 @@ pub async fn rebuild(
     common::ensure_kb_editor_or_admin(&pool, req.kb_id, &user).await?;
     let resolved = wiki::resolve_config(&pool, req.kb_id).await?;
     let Some(resolved) = resolved else {
-        return Err(crate::api::error::ApiError::NotFound("Knowledge base not found".to_string()));
+        return Err(ApiError::NotFound("Knowledge base not found".to_string()));
     };
     if !resolved.enabled {
-        return Err(crate::api::error::ApiError::BadRequest("Wiki is disabled for this knowledge base".to_string()));
+        return Err(ApiError::BadRequest("Wiki is disabled for this knowledge base".to_string()));
     }
     if crate::config::get().wiki.api_url.is_none() {
         // 没有 LLM 地址时入队的任务只会失败重试，直接给出可操作的错误。
-        return Err(crate::api::error::ApiError::BadRequest(
+        return Err(ApiError::BadRequest(
             "Wiki LLM is not configured: set WIKI_LLM_API_URL or LLM_API_URL".to_string(),
         ));
     }
@@ -579,7 +582,7 @@ pub async fn rebuild(
                     .fetch_one(&pool)
                     .await?;
             if !belongs {
-                return Err(crate::api::error::ApiError::NotFound("File not found or not completed".to_string()));
+                return Err(ApiError::NotFound("File not found or not completed".to_string()));
             }
             // 清掉指纹，否则「内容未变」会被直接跳过，重建等于空操作。
             sqlx::query("UPDATE wiki_builds SET status = 'pending', fingerprint = '' WHERE file_id = ?")
@@ -615,4 +618,231 @@ pub async fn rebuild(
     };
     wiki::queue::enqueue_finalize(&pool, req.kb_id).await?;
     Ok(Json(WikiRebuildResponse { enqueued }))
+}
+
+// ============================================================================
+// P2：人工编辑、版本快照/回滚、归档、体检
+// ============================================================================
+
+impl From<edit::EditError> for ApiError {
+    fn from(error: edit::EditError) -> Self {
+        match error {
+            edit::EditError::NotFound(message) => ApiError::NotFound(message),
+            edit::EditError::Invalid(message) => ApiError::BadRequest(message),
+            // slug 冲突属于「换个名字再来」，按 400 返回比 409 更贴合现有前端处理
+            edit::EditError::Conflict(message) => ApiError::BadRequest(message),
+            edit::EditError::Internal(error) => ApiError::Internal(format!("Internal error: {}", error)),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct WikiPageUpdateReq {
+    pub kb_id: i64,
+    pub slug: String,
+    /// 省略的字段保持原值
+    pub title: Option<String>,
+    pub summary: Option<String>,
+    pub content: Option<String>,
+    pub aliases: Option<Vec<String>>,
+    /// draft / published / archived
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct WikiPageCreateReq {
+    pub kb_id: i64,
+    pub title: String,
+    /// entity / concept，默认 concept；summary 与 index 由系统维护
+    pub page_type: Option<String>,
+    /// 省略时由标题派生
+    pub slug: Option<String>,
+    pub summary: Option<String>,
+    pub content: Option<String>,
+    pub aliases: Option<Vec<String>>,
+    /// 省略时直接发布
+    pub status: Option<String>,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct WikiPageDeleteReq {
+    pub kb_id: i64,
+    pub slug: String,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct WikiRevertReq {
+    pub kb_id: i64,
+    pub slug: String,
+    /// 要回滚到的历史版本号
+    pub version: i64,
+}
+
+#[derive(Debug, Default, Deserialize, IntoParams)]
+pub struct WikiRevisionListParams {
+    pub kb_id: i64,
+    pub slug: String,
+    /// 1-200，默认 50
+    pub limit: Option<i64>,
+}
+
+#[derive(Debug, Default, Deserialize, IntoParams)]
+pub struct WikiRevisionParams {
+    pub kb_id: i64,
+    pub slug: String,
+    pub version: i64,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct WikiRevisionListResponse {
+    pub kb_id: i64,
+    pub slug: String,
+    /// 当前版本号，前端据此标注「最新」
+    pub current_version: i64,
+    pub last_edit_source: String,
+    pub items: Vec<revision::RevisionMeta>,
+}
+
+#[derive(Debug, Clone, Serialize, ToSchema)]
+pub struct WikiRevisionResponse {
+    pub revision: revision::Revision,
+    /// 当前版本正文，前端可直接做行级 diff，不必再取一次页面
+    pub current_content: String,
+    pub current_version: i64,
+}
+
+#[derive(Debug, Deserialize, ToSchema)]
+pub struct WikiRebuildLinksReq {
+    pub kb_id: i64,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct WikiRebuildLinksResponse {
+    pub kb_id: i64,
+    pub pages_scanned: usize,
+    pub pages_changed: usize,
+    pub dead_links_removed: usize,
+    pub index_updated: bool,
+}
+
+/// slug → 页面。归档页也可读、可回滚，因此这里不按状态过滤。
+async fn require_page(pool: &SqlitePool, kb_id: i64, slug: &str) -> ApiResult<WikiPage> {
+    page::get_by_slug(pool, kb_id, slug)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("Wiki page '{}' not found", slug)))
+}
+
+#[utoipa::path(put, path="/api/v1/knowledge/wiki/page", operation_id="wiki_update_page", tag="wiki", request_body=WikiPageUpdateReq, responses((status=200, body=WikiPageDetail)))]
+pub async fn update_page(
+    State(pool): State<SqlitePool>, Extension(user): Extension<AuthUser>, Json(req): Json<WikiPageUpdateReq>,
+) -> ApiResult<Json<WikiPageDetail>> {
+    common::ensure_kb_editor_or_admin(&pool, req.kb_id, &user).await?;
+    let edit = edit::PageEdit {
+        title: req.title,
+        summary: req.summary,
+        content: req.content,
+        aliases: req.aliases,
+        status: req.status,
+        editor_id: user.user_id.clone(),
+    };
+    let page = edit::apply_user_edit(&pool, req.kb_id, &req.slug, &edit).await?;
+    Ok(Json(build_detail(&pool, page).await?))
+}
+
+#[utoipa::path(post, path="/api/v1/knowledge/wiki/page", operation_id="wiki_create_page", tag="wiki", request_body=WikiPageCreateReq, responses((status=200, body=WikiPageDetail)))]
+pub async fn create_page(
+    State(pool): State<SqlitePool>, Extension(user): Extension<AuthUser>, Json(req): Json<WikiPageCreateReq>,
+) -> ApiResult<Json<WikiPageDetail>> {
+    common::ensure_kb_editor_or_admin(&pool, req.kb_id, &user).await?;
+    let new = edit::NewPage {
+        title: req.title,
+        page_type: req.page_type,
+        slug: req.slug,
+        summary: req.summary.unwrap_or_default(),
+        content: req.content.unwrap_or_default(),
+        aliases: req.aliases.unwrap_or_default(),
+        status: req.status,
+        editor_id: user.user_id.clone(),
+    };
+    let page = edit::create_user_page(&pool, req.kb_id, &new).await?;
+    Ok(Json(build_detail(&pool, page).await?))
+}
+
+#[utoipa::path(delete, path="/api/v1/knowledge/wiki/page", operation_id="wiki_delete_page", tag="wiki", request_body=WikiPageDeleteReq, responses((status=200, description="已删除")))]
+pub async fn delete_page(
+    State(pool): State<SqlitePool>, Extension(user): Extension<AuthUser>, Json(req): Json<WikiPageDeleteReq>,
+) -> ApiResult<()> {
+    common::ensure_kb_editor_or_admin(&pool, req.kb_id, &user).await?;
+    edit::delete_page(&pool, req.kb_id, &req.slug).await?;
+    Ok(())
+}
+
+#[utoipa::path(get, path="/api/v1/knowledge/wiki/revisions", operation_id="wiki_list_revisions", tag="wiki", params(WikiRevisionListParams), responses((status=200, body=WikiRevisionListResponse)))]
+pub async fn list_revisions(
+    Query(params): Query<WikiRevisionListParams>, State(pool): State<SqlitePool>, Extension(user): Extension<AuthUser>,
+) -> ApiResult<Json<WikiRevisionListResponse>> {
+    common::ensure_kb_accessible(&pool, params.kb_id, &user.user_id, user.is_admin()).await?;
+    let limit = bounded_limit(params.limit, 50, 200)?;
+    let page = require_page(&pool, params.kb_id, &params.slug).await?;
+    let items = revision::list(&pool, page.id, limit).await?;
+    Ok(Json(WikiRevisionListResponse {
+        kb_id: params.kb_id,
+        slug: page.slug.clone(),
+        current_version: page.version,
+        last_edit_source: page.last_edit_source.clone(),
+        items,
+    }))
+}
+
+#[utoipa::path(get, path="/api/v1/knowledge/wiki/revision", operation_id="wiki_get_revision", tag="wiki", params(WikiRevisionParams), responses((status=200, body=WikiRevisionResponse)))]
+pub async fn get_revision(
+    Query(params): Query<WikiRevisionParams>, State(pool): State<SqlitePool>, Extension(user): Extension<AuthUser>,
+) -> ApiResult<Json<WikiRevisionResponse>> {
+    common::ensure_kb_accessible(&pool, params.kb_id, &user.user_id, user.is_admin()).await?;
+    let page = require_page(&pool, params.kb_id, &params.slug).await?;
+    let Some(snapshot) = revision::get(&pool, page.id, params.version).await? else {
+        return Err(ApiError::NotFound(format!("Revision {} not found", params.version)));
+    };
+    Ok(Json(WikiRevisionResponse {
+        revision: snapshot,
+        current_content: page.content.clone(),
+        current_version: page.version,
+    }))
+}
+
+#[utoipa::path(post, path="/api/v1/knowledge/wiki/revert", operation_id="wiki_revert_page", tag="wiki", request_body=WikiRevertReq, responses((status=200, body=WikiPageDetail)))]
+pub async fn revert_page(
+    State(pool): State<SqlitePool>, Extension(user): Extension<AuthUser>, Json(req): Json<WikiRevertReq>,
+) -> ApiResult<Json<WikiPageDetail>> {
+    common::ensure_kb_editor_or_admin(&pool, req.kb_id, &user).await?;
+    let page = edit::revert(&pool, req.kb_id, &req.slug, req.version, &user.user_id).await?;
+    Ok(Json(build_detail(&pool, page).await?))
+}
+
+#[utoipa::path(get, path="/api/v1/knowledge/wiki/lint", operation_id="wiki_lint", tag="wiki", params(WikiKbParams), responses((status=200, body=lint::LintReport)))]
+pub async fn lint_kb(
+    Query(params): Query<WikiKbParams>, State(pool): State<SqlitePool>, Extension(user): Extension<AuthUser>,
+) -> ApiResult<Json<lint::LintReport>> {
+    common::ensure_kb_accessible(&pool, params.kb_id, &user.user_id, user.is_admin()).await?;
+    Ok(Json(lint::lint_kb(&pool, params.kb_id).await?))
+}
+
+/// 立即执行一次知识库收敛（交叉链接、死链清理、入链重算、索引目录），
+/// 与后台 `wiki:finalize` 是同一份逻辑，只是不等防抖。
+#[utoipa::path(post, path="/api/v1/knowledge/wiki/rebuild-links", operation_id="wiki_rebuild_links", tag="wiki", request_body=WikiRebuildLinksReq, responses((status=200, body=WikiRebuildLinksResponse)))]
+pub async fn rebuild_links(
+    State(pool): State<SqlitePool>, Extension(user): Extension<AuthUser>, Json(req): Json<WikiRebuildLinksReq>,
+) -> ApiResult<Json<WikiRebuildLinksResponse>> {
+    common::ensure_kb_editor_or_admin(&pool, req.kb_id, &user).await?;
+    if wiki::resolve_config(&pool, req.kb_id).await?.is_none() {
+        return Err(ApiError::NotFound("Knowledge base not found".to_string()));
+    }
+    let report = wiki::finalize::finalize_kb(&pool, req.kb_id).await?;
+    Ok(Json(WikiRebuildLinksResponse {
+        kb_id: req.kb_id,
+        pages_scanned: report.pages_scanned,
+        pages_changed: report.pages_changed,
+        dead_links_removed: report.dead_links_removed,
+        index_updated: report.index_updated,
+    }))
 }

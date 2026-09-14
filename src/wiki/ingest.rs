@@ -483,12 +483,15 @@ pub(crate) async fn candidates_from_graph(
 async fn candidates_from_llm(
     pool: &SqlitePool, llm: &WikiLlm, config: &ResolvedWikiConfig, kb_id: i64, slices: &[(i64, String)],
 ) -> Result<Vec<Candidate>> {
-    let existing_slugs: Vec<(String,)> =
-        sqlx::query_as("SELECT slug FROM wiki_pages WHERE kb_id = ? AND page_type != 'index' ORDER BY slug LIMIT ?")
-            .bind(kb_id)
-            .bind(MAX_AVAILABLE_PAGES as i64)
-            .fetch_all(pool)
-            .await?;
+    // 归档页不参与链接：告诉模型它们「已有」只会生成断链。
+    let existing_slugs: Vec<(String,)> = sqlx::query_as(
+        "SELECT slug FROM wiki_pages WHERE kb_id = ? AND page_type != 'index' AND status != 'archived'
+         ORDER BY slug LIMIT ?",
+    )
+    .bind(kb_id)
+    .bind(MAX_AVAILABLE_PAGES as i64)
+    .fetch_all(pool)
+    .await?;
     let existing = if existing_slugs.is_empty() {
         "(暂无)".to_string()
     } else {
