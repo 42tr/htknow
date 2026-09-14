@@ -6,8 +6,12 @@ import FileSlices from './FileSlices.vue'
 const props = defineProps({
   file: { type: Object, required: true },
   sliceId: { default: null },
+  position: { type: Number, default: 0 },
+  total: { type: Number, default: 0 },
+  hasPrevious: Boolean,
+  hasNext: Boolean,
 })
-const emit = defineEmits(['close'])
+const emit = defineEmits(['close', 'previous', 'next'])
 const tab = ref('preview')
 const slices = ref([])
 const selected = ref(null)
@@ -91,13 +95,12 @@ onBeforeUnmount(() => {
         <span class="eyebrow">DOCUMENT</span>
         <h2 :title="filename">{{ filename }}</h2>
       </div>
-      <button
-        class="plain-button"
-        @click="emit('close')"
-        aria-label="关闭文件详情"
-      >
-        ✕
-      </button>
+      <div class="detail-navigation">
+        <span v-if="total">{{ position }} / {{ total }}</span>
+        <button v-if="total" class="plain-button" :disabled="!hasPrevious" @click="emit('previous')" aria-label="上一条结果">‹</button>
+        <button v-if="total" class="plain-button" :disabled="!hasNext" @click="emit('next')" aria-label="下一条结果">›</button>
+        <button class="plain-button" @click="emit('close')" aria-label="关闭文件详情">✕</button>
+      </div>
     </div>
     <div class="view-tabs detail-tabs">
       <button

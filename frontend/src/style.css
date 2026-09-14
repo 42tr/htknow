@@ -175,7 +175,7 @@ p {
 .nav-caption {
   font-size: 10px;
   letter-spacing: 1.5px;
-  color: #9aa5b5;
+  color: #718096;
   margin: 24px 14px 10px;
 }
 .side-nav {
@@ -269,7 +269,7 @@ p {
 }
 .eyebrow {
   font-size: 10px;
-  color: #8b9bb4;
+  color: #718096;
   letter-spacing: 2px;
   font-weight: 600;
 }
@@ -377,6 +377,25 @@ p {
   margin: 30px auto 0;
   max-width: 1400px;
 }
+.result-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-bottom: 14px;
+  color: var(--color-text-secondary);
+  font-size: 13px;
+}
+.result-toolbar p { margin: 0 auto 0 0; }
+.result-toolbar select {
+  border: 1px solid var(--color-border);
+  border-radius: 6px;
+  background: #fff;
+  color: var(--color-text-secondary);
+  padding: 6px 9px;
+  font-size: 12px;
+}
+.detail-navigation { display: flex; align-items: center; gap: 2px; color: var(--color-text-muted); font-size: 11px; }
 .search-results .bg-linear-to-br {
   background: #edf2fc;
   color: #567bbd;
@@ -606,6 +625,11 @@ p {
   justify-content: flex-end;
   gap: 10px;
 }
+.danger-button { background: #b83b45 !important; border-color: #b83b45 !important; }
+.batch-toolbar { display:flex; align-items:center; flex-wrap:wrap; gap:8px; padding:8px 10px; border:1px solid #dbe5f5; border-radius:7px; background:#f5f8fd; color:#5e718d; font-size:12px; }
+.batch-toolbar button { border:1px solid #d5deeb; background:#fff; border-radius:5px; padding:4px 9px; color:#4e6480; }
+.batch-toolbar button:hover { background:#edf3fb; }
+.pending-changes { margin-top:8px; display:inline-flex; padding:4px 8px; border-radius:5px; background:#fff6df; border:1px solid #f2dfab; color:#8a651d; font-size:12px; }
 .library-layout {
   display: grid;
   grid-template-columns: 200px minmax(0, 1fr);
@@ -1041,6 +1065,10 @@ p {
     border-right: 0;
     border-bottom: 1px solid #e0e6ef;
   }
+  /* Flatten sidebar sections so both navigation groups can share a compact row. */
+  .app-sidebar .sidebar-section {
+    display: contents;
+  }
   .brand {
     padding: 0;
     font-size: 18px;
@@ -1055,11 +1083,16 @@ p {
     height: 30px;
     font-size: 18px;
   }
-  .app-sidebar > .side-nav {
+  .app-sidebar .side-nav {
     flex-direction: row;
     order: 3;
     flex: 1;
     gap: 4px;
+    min-width: 0;
+  }
+  .app-sidebar .sidebar-section + .sidebar-section {
+    border-left: 1px solid #dfe5ed;
+    padding-left: 8px;
   }
   .side-nav button {
     padding: 8px 10px;
@@ -1072,6 +1105,11 @@ p {
   .sidebar-bottom {
     margin: 0;
     order: 4;
+  }
+  /* Action controls must remain discoverable on touch devices (no hover state). */
+  .directory-actions {
+    opacity: 1;
+    pointer-events: auto;
   }
   .app-body {
     margin-left: 0;
@@ -1428,6 +1466,14 @@ p {
   transform: translateY(-1px);
   box-shadow: var(--shadow-elevated);
   border-color: var(--color-primary-light);
+}
+.result-card.is-selected {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px rgba(53, 103, 221, 0.12);
+}
+.result-card:focus-visible {
+  border-color: var(--color-primary);
+  box-shadow: 0 0 0 3px rgba(53, 103, 221, 0.2);
 }
 /* === KB card always-visible actions === */
 .kb-card {

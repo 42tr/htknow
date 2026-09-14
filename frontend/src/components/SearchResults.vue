@@ -1,7 +1,10 @@
 <script setup>
-import { ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import FileDetail from './FileDetail.vue'
 const selected = ref(null)
+const kbFilter = ref('')
+const typeFilter = ref('')
+const sortBy = ref('relevance')
 
 const formatDate = (timestamp) => {
   if (!timestamp) return '-'
@@ -35,6 +38,24 @@ const props = defineProps({
     default: false,
   },
 })
+const knowledgeBases = computed(() => [...new Set(props.results.map((item) => item.kb?.name).filter(Boolean))].sort())
+const resultScore = (item) => Number(item.score ?? item.judge_score ?? item.relevance ?? 0)
+const filteredResults = computed(() => {
+  const items = props.results.filter((item) => {
+    if (kbFilter.value && item.kb?.name !== kbFilter.value) return false
+    if (typeFilter.value === 'image' && !isImageFile(item.file?.filename)) return false
+    if (typeFilter.value === 'document' && isImageFile(item.file?.filename)) return false
+    return true
+  })
+  return [...items].sort((a, b) => sortBy.value === 'newest'
+    ? Number(b.file?.created_at || 0) - Number(a.file?.created_at || 0)
+    : resultScore(b) - resultScore(a))
+})
+const selectedIndex = computed(() => filteredResults.value.indexOf(selected.value))
+const selectOffset = (offset) => {
+  const next = selectedIndex.value + offset
+  if (next >= 0 && next < filteredResults.value.length) selected.value = filteredResults.value[next]
+}
 watch(
   () => props.results,
   () => {
@@ -111,15 +132,26 @@ watch(
 
       <!-- Results -->
       <div v-else class="space-y-3">
-        <p class="text-sm text-slate-500 mb-4">
-          找到 {{ results.length }} 个结果
-        </p>
+        <div class="result-toolbar">
+          <p>显示 {{ filteredResults.length }} / {{ results.length }} 个结果</p>
+          <select v-model="kbFilter" aria-label="按知识库筛选"><option value="">所有知识库</option><option v-for="name in knowledgeBases" :key="name" :value="name">{{ name }}</option></select>
+          <select v-model="typeFilter" aria-label="按文件类型筛选"><option value="">所有类型</option><option value="document">文档</option><option value="image">图片</option></select>
+          <select v-model="sortBy" aria-label="结果排序"><option value="relevance">相关度优先</option><option value="newest">最新上传</option></select>
+        </div>
+
+        <div v-if="!filteredResults.length" class="empty-state">当前筛选条件下没有结果。</div>
 
         <div
-          v-for="(result, index) in results"
-          :key="index"
-          class="result-card bg-white rounded-xl p-5 border border-slate-200 cursor-pointer"
+          v-for="result in filteredResults"
+          :key="result.id || `${result.file?.id || 'file'}-${result.slice_id || result.slice_ids?.[0] || result.sliceIds?.[0] || result.receivedAt || result.file?.filename || 'result'}`"
+          class="result-card group bg-white rounded-xl p-5 border border-slate-200 cursor-pointer"
+          :class="{ 'is-selected': selected === result }"
+          role="button"
+          tabindex="0"
+          :aria-label="`查看 ${result.file?.filename || '未命名文档'} 的详情`"
           @click="selected = result"
+          @keydown.enter="selected = result"
+          @keydown.space.prevent="selected = result"
         >
           <div class="flex items-start gap-4">
             <div
@@ -206,7 +238,13 @@ watch(
     <FileDetail
       v-if="selected?.file"
       :file="selected.file"
-      :slice-id="selected.id"
+      :slice-id="selected.slice_id || selected.slice_ids?.[0] || selected.sliceIds?.[0] || selected.id"
+      :position="selectedIndex + 1"
+      :total="filteredResults.length"
+      :has-previous="selectedIndex > 0"
+      :has-next="selectedIndex >= 0 && selectedIndex < filteredResults.length - 1"
+      @previous="selectOffset(-1)"
+      @next="selectOffset(1)"
       @close="selected = null"
     />
   </div>

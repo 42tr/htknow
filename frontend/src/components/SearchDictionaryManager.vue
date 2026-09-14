@@ -1,6 +1,7 @@
 <script setup>
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import { api } from '../api'
+import { vDialog } from '../dialog'
 
 const loading = ref(false)
 const statusLoading = ref(false)
@@ -8,6 +9,15 @@ const busy = ref(false)
 const publishLoading = ref(false)
 const error = ref('')
 const success = ref('')
+const pendingChanges = ref(Number(localStorage.getItem('htknow_lexicon_pending') || 0))
+const selectedLexicons = ref([])
+const selectedSynonyms = ref([])
+const batchProgress = ref(null)
+const confirmDialog = ref(null)
+const markLexiconChanged = () => {
+  pendingChanges.value++
+  localStorage.setItem('htknow_lexicon_pending', String(pendingChanges.value))
+}
 
 const lexiconQuery = ref('')
 const lexiconEnabledFilter = ref('all')
@@ -27,6 +37,9 @@ const newSynonymValue = ref('')
 const newSynonymWeight = ref('1')
 const newSynonymBidirectional = ref(true)
 const newSynonymEnabled = ref(true)
+
+const editDialog = ref(null)
+const editForm = ref({ term: '', synonym: '', freq: '', tag: '', weight: 1, bidirectional: true, enabled: true })
 
 const rebuildStatus = ref({
   job_id: null,
@@ -174,6 +187,7 @@ const submitLexicon = async () => {
     newLexiconTag.value = ''
     newLexiconEnabled.value = true
     success.value = '词条已保存（待发布后生效）'
+    markLexiconChanged()
     await refreshLexicons()
   } catch (e) {
     error.value = e?.message || '新增词条失败'
@@ -182,44 +196,53 @@ const submitLexicon = async () => {
   }
 }
 
-const editLexicon = async (item) => {
-  if (busy.value) return
+const editLexicon = (item) => {
   clearTips()
-  const term = window.prompt('词条', item.term)
-  if (term === null) return
-  const freqInput = window.prompt('词频（留空表示不修改）', item.freq ?? '')
-  if (freqInput === null) return
-  const tagInput = window.prompt('词性（留空表示清空）', item.tag ?? '')
-  if (tagInput === null) return
-  const nextEnabled = window.confirm('点击“确定”启用，点击“取消”停用。')
+  editDialog.value = { type: 'lexicon', item }
+  editForm.value = { term: item.term || '', freq: item.freq ?? '', tag: item.tag || '', enabled: Boolean(item.enabled) }
+}
 
-  const payload = {
-    term: term.trim(),
-    enabled: nextEnabled,
-    tag: tagInput,
-  }
-  const freqValue = String(freqInput).trim()
-  if (freqValue) {
-    const parsed = Number(freqValue)
-    if (!Number.isInteger(parsed) || parsed <= 0) {
-      error.value = '词频必须是正整数'
-      return
-    }
-    payload.freq = parsed
-  }
+const editSynonym = (item) => {
+  clearTips()
+  editDialog.value = { type: 'synonym', item }
+  editForm.value = { term: item.term || '', synonym: item.synonym || '', weight: item.weight ?? 1, bidirectional: Boolean(item.bidirectional), enabled: Boolean(item.enabled) }
+}
 
+const closeEditDialog = () => { if (!busy.value) editDialog.value = null }
+
+const submitEdit = async () => {
+  if (!editDialog.value || busy.value) return
+  const form = editForm.value
+  if (!String(form.term || '').trim()) { error.value = '原词不能为空'; return }
   busy.value = true
   try {
-    await api.updateLexicon(item.id, payload)
-    success.value = '词条已更新（待发布后生效）'
-    await refreshLexicons()
+    if (editDialog.value.type === 'lexicon') {
+      const payload = { term: String(form.term).trim(), enabled: Boolean(form.enabled), tag: String(form.tag || '').trim() }
+      if (String(form.freq || '').trim()) {
+        const freq = Number(form.freq)
+        if (!Number.isInteger(freq) || freq <= 0) { error.value = '词频必须是正整数'; busy.value = false; return }
+        payload.freq = freq
+      }
+      await api.updateLexicon(editDialog.value.item.id, payload)
+      success.value = '词条已更新（待发布后生效）'
+      markLexiconChanged()
+      await refreshLexicons()
+    } else {
+      const synonym = String(form.synonym || '').trim()
+      const weight = Number(form.weight)
+      if (!synonym) { error.value = '同义词不能为空'; busy.value = false; return }
+      if (!Number.isFinite(weight) || weight <= 0) { error.value = '权重必须大于 0'; busy.value = false; return }
+      await api.updateSynonym(editDialog.value.item.id, { term: String(form.term).trim(), synonym, weight, bidirectional: Boolean(form.bidirectional), enabled: Boolean(form.enabled) })
+      success.value = '同义词已更新'
+      await refreshSynonyms()
+    }
+    editDialog.value = null
   } catch (e) {
-    error.value = e?.message || '更新词条失败'
+    error.value = e?.message || '更新失败'
   } finally {
     busy.value = false
   }
 }
-
 const toggleLexicon = async (item) => {
   if (busy.value) return
   clearTips()
@@ -227,6 +250,7 @@ const toggleLexicon = async (item) => {
   try {
     await api.toggleLexiconEnabled(item.id, !item.enabled)
     success.value = '词条状态已更新（待发布后生效）'
+    markLexiconChanged()
     await refreshLexicons()
   } catch (e) {
     error.value = e?.message || '更新状态失败'
@@ -235,14 +259,13 @@ const toggleLexicon = async (item) => {
   }
 }
 
-const removeLexicon = async (item) => {
-  if (busy.value) return
-  if (!window.confirm(`确定删除词条 "${item.term}" 吗？`)) return
+const deleteLexicon = async (item) => {
   clearTips()
   busy.value = true
   try {
     await api.deleteLexicon(item.id)
     success.value = '词条已删除（待发布后生效）'
+    markLexiconChanged()
     await refreshLexicons()
   } catch (e) {
     error.value = e?.message || '删除词条失败'
@@ -289,40 +312,6 @@ const submitSynonym = async () => {
   }
 }
 
-const editSynonym = async (item) => {
-  if (busy.value) return
-  clearTips()
-  const term = window.prompt('原词', item.term)
-  if (term === null) return
-  const synonym = window.prompt('同义词', item.synonym)
-  if (synonym === null) return
-  const weightInput = window.prompt('权重', item.weight)
-  if (weightInput === null) return
-  const weight = Number(weightInput)
-  if (!Number.isFinite(weight) || weight <= 0) {
-    error.value = '权重必须大于 0'
-    return
-  }
-  const bidirectional = window.confirm('点击“确定”设为双向；点击“取消”设为单向。')
-  const enabled = window.confirm('点击“确定”启用；点击“取消”停用。')
-
-  busy.value = true
-  try {
-    await api.updateSynonym(item.id, {
-      term: term.trim(),
-      synonym: synonym.trim(),
-      weight,
-      bidirectional,
-      enabled,
-    })
-    success.value = '同义词已更新'
-    await refreshSynonyms()
-  } catch (e) {
-    error.value = e?.message || '更新同义词失败'
-  } finally {
-    busy.value = false
-  }
-}
 
 const toggleSynonym = async (item) => {
   if (busy.value) return
@@ -339,9 +328,7 @@ const toggleSynonym = async (item) => {
   }
 }
 
-const removeSynonym = async (item) => {
-  if (busy.value) return
-  if (!window.confirm(`确定删除同义词 "${item.term} -> ${item.synonym}" 吗？`)) return
+const deleteSynonym = async (item) => {
   clearTips()
   busy.value = true
   try {
@@ -355,6 +342,69 @@ const removeSynonym = async (item) => {
   }
 }
 
+const requestDelete = (type, item) => {
+  confirmDialog.value = {
+    title: type === 'lexicon' ? '删除词条' : '删除同义词',
+    message: type === 'lexicon' ? `确定删除“${item.term}”吗？` : `确定删除“${item.term} → ${item.synonym}”吗？`,
+    action: () => type === 'lexicon' ? deleteLexicon(item) : deleteSynonym(item),
+  }
+}
+const confirmAction = async () => {
+  const action = confirmDialog.value?.action
+  confirmDialog.value = null
+  await action?.()
+}
+
+const batchSetEnabled = async (type, enabled) => {
+  const ids = type === 'lexicon' ? selectedLexicons.value : selectedSynonyms.value
+  if (!ids.length || busy.value) return
+  busy.value = true
+  batchProgress.value = { done: 0, total: 0, action: enabled ? '启用' : '停用' }
+  clearTips()
+  try {
+    const items = (type === 'lexicon' ? lexicons.value : synonyms.value).filter((item) => ids.includes(item.id) && item.enabled !== enabled)
+    batchProgress.value.total = items.length
+    const outcomes = await Promise.allSettled(items.map((item) => {
+      const task = type === 'lexicon' ? api.toggleLexiconEnabled(item.id, enabled) : api.toggleSynonymEnabled(item.id, enabled)
+      return task.finally(() => { batchProgress.value.done++ })
+    }))
+    const failed = outcomes.filter((result) => result.status === 'rejected').length
+    const succeeded = items.length - failed
+    if (type === 'lexicon' && succeeded) { pendingChanges.value += succeeded; localStorage.setItem('htknow_lexicon_pending', String(pendingChanges.value)) }
+    selectedLexicons.value = []
+    selectedSynonyms.value = []
+    await (type === 'lexicon' ? refreshLexicons() : refreshSynonyms())
+    success.value = `已${enabled ? '启用' : '停用'} ${succeeded} 条记录${failed ? `，${failed} 条失败` : ''}`
+  } catch (e) { error.value = e?.message || '批量操作失败' }
+  finally { busy.value = false; setTimeout(() => { batchProgress.value = null }, 1200) }
+}
+const requestBatchDelete = (type) => {
+  const count = type === 'lexicon' ? selectedLexicons.value.length : selectedSynonyms.value.length
+  if (!count) return
+  confirmDialog.value = { title: `批量删除${type === 'lexicon' ? '词条' : '同义词'}`, message: `确定删除选中的 ${count} 条记录吗？`, action: () => batchDelete(type) }
+}
+const batchDelete = async (type) => {
+  const ids = [...(type === 'lexicon' ? selectedLexicons.value : selectedSynonyms.value)]
+  if (!ids.length || busy.value) return
+  busy.value = true
+  batchProgress.value = { done: 0, total: ids.length, action: '删除' }
+  clearTips()
+  try {
+    const outcomes = await Promise.allSettled(ids.map((id) => {
+      const task = type === 'lexicon' ? api.deleteLexicon(id) : api.deleteSynonym(id)
+      return task.finally(() => { batchProgress.value.done++ })
+    }))
+    const failed = outcomes.filter((result) => result.status === 'rejected').length
+    const succeeded = ids.length - failed
+    if (type === 'lexicon' && succeeded) { pendingChanges.value += succeeded; localStorage.setItem('htknow_lexicon_pending', String(pendingChanges.value)) }
+    selectedLexicons.value = []
+    selectedSynonyms.value = []
+    await (type === 'lexicon' ? refreshLexicons() : refreshSynonyms())
+    success.value = `已删除 ${succeeded} 条记录${failed ? `，${failed} 条失败` : ''}`
+  } catch (e) { error.value = e?.message || '批量删除失败' }
+  finally { busy.value = false; setTimeout(() => { batchProgress.value = null }, 1200) }
+}
+
 const publishLexicon = async () => {
   if (publishLoading.value) return
   clearTips()
@@ -362,6 +412,8 @@ const publishLexicon = async () => {
   try {
     const resp = await api.publishLexicon()
     success.value = `发布成功，已启动重建任务 #${resp.job_id}`
+    pendingChanges.value = 0
+    localStorage.removeItem('htknow_lexicon_pending')
     await refreshStatus()
   } catch (e) {
     error.value = e?.message || '发布失败'
@@ -405,6 +457,7 @@ onBeforeUnmount(() => {
         <div>
           <h3 class="text-xl font-semibold text-slate-800">词表发布与索引重建</h3>
           <p class="text-slate-500 text-sm mt-1">词表改动在“发布”后生效，发布会暂停解析并重建索引。</p>
+          <p v-if="pendingChanges" class="pending-changes">{{ pendingChanges }} 项修改等待发布</p>
         </div>
         <div class="flex items-center gap-2">
           <button
@@ -416,7 +469,7 @@ onBeforeUnmount(() => {
           </button>
           <button
             @click="publishLexicon"
-            :disabled="publishLoading || isRebuilding"
+            :disabled="publishLoading || isRebuilding || !pendingChanges"
             class="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed"
           >
             {{ publishLoading ? '发布中...' : '发布并重建索引' }}
@@ -526,10 +579,13 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
-        <div class="border border-slate-200 rounded-xl overflow-hidden">
+        <div v-if="selectedLexicons.length" class="batch-toolbar"><span>已选择 {{ selectedLexicons.length }} 项</span><span v-if="batchProgress">{{ batchProgress.action }}中 {{ batchProgress.done }} / {{ batchProgress.total }}</span><button :disabled="busy" @click="batchSetEnabled('lexicon', true)">启用</button><button :disabled="busy" @click="batchSetEnabled('lexicon', false)">停用</button><button class="text-red-600" :disabled="busy" @click="requestBatchDelete('lexicon')">删除</button><button :disabled="busy" @click="selectedLexicons = []">取消选择</button></div>
+
+        <div class="dictionary-table border border-slate-200 rounded-xl overflow-auto">
           <table class="w-full text-sm">
             <thead class="bg-slate-50 text-slate-500">
               <tr>
+                <th class="px-3 py-2"><input type="checkbox" aria-label="选择全部词条" :checked="lexicons.length > 0 && selectedLexicons.length === lexicons.length" @change="selectedLexicons = $event.target.checked ? lexicons.map(item => item.id) : []" /></th>
                 <th class="text-left px-3 py-2">term</th>
                 <th class="text-left px-3 py-2">freq</th>
                 <th class="text-left px-3 py-2">tag</th>
@@ -539,9 +595,10 @@ onBeforeUnmount(() => {
             </thead>
             <tbody>
               <tr v-if="lexicons.length === 0">
-                <td colspan="5" class="px-3 py-6 text-center text-slate-400">暂无词表数据</td>
+                <td colspan="6" class="px-3 py-6 text-center text-slate-400">暂无词表数据</td>
               </tr>
               <tr v-for="item in lexicons" :key="item.id" class="border-t border-slate-100">
+                <td class="px-3 py-2"><input v-model="selectedLexicons" type="checkbox" :value="item.id" :aria-label="`选择词条 ${item.term}`" /></td>
                 <td class="px-3 py-2 text-slate-800 break-all">{{ item.term }}</td>
                 <td class="px-3 py-2 text-slate-600">{{ item.freq ?? '-' }}</td>
                 <td class="px-3 py-2 text-slate-600">{{ item.tag || '-' }}</td>
@@ -561,7 +618,7 @@ onBeforeUnmount(() => {
                     <button @click="toggleLexicon(item)" class="px-2 py-1 text-xs border border-slate-200 rounded hover:bg-slate-50">
                       {{ item.enabled ? '停用' : '启用' }}
                     </button>
-                    <button @click="removeLexicon(item)" class="px-2 py-1 text-xs border border-red-200 text-red-600 rounded hover:bg-red-50">删除</button>
+                    <button @click="requestDelete('lexicon', item)" class="px-2 py-1 text-xs border border-red-200 text-red-600 rounded hover:bg-red-50">删除</button>
                   </div>
                 </td>
               </tr>
@@ -617,10 +674,13 @@ onBeforeUnmount(() => {
           </button>
         </div>
 
-        <div class="border border-slate-200 rounded-xl overflow-hidden">
+        <div v-if="selectedSynonyms.length" class="batch-toolbar"><span>已选择 {{ selectedSynonyms.length }} 项</span><span v-if="batchProgress">{{ batchProgress.action }}中 {{ batchProgress.done }} / {{ batchProgress.total }}</span><button :disabled="busy" @click="batchSetEnabled('synonym', true)">启用</button><button :disabled="busy" @click="batchSetEnabled('synonym', false)">停用</button><button class="text-red-600" :disabled="busy" @click="requestBatchDelete('synonym')">删除</button><button :disabled="busy" @click="selectedSynonyms = []">取消选择</button></div>
+
+        <div class="dictionary-table border border-slate-200 rounded-xl overflow-auto">
           <table class="w-full text-sm">
             <thead class="bg-slate-50 text-slate-500">
               <tr>
+                <th class="px-3 py-2"><input type="checkbox" aria-label="选择全部同义词" :checked="synonyms.length > 0 && selectedSynonyms.length === synonyms.length" @change="selectedSynonyms = $event.target.checked ? synonyms.map(item => item.id) : []" /></th>
                 <th class="text-left px-3 py-2">term</th>
                 <th class="text-left px-3 py-2">synonym</th>
                 <th class="text-left px-3 py-2">权重</th>
@@ -631,9 +691,10 @@ onBeforeUnmount(() => {
             </thead>
             <tbody>
               <tr v-if="synonyms.length === 0">
-                <td colspan="6" class="px-3 py-6 text-center text-slate-400">暂无同义词数据</td>
+                <td colspan="7" class="px-3 py-6 text-center text-slate-400">暂无同义词数据</td>
               </tr>
               <tr v-for="item in synonyms" :key="item.id" class="border-t border-slate-100">
+                <td class="px-3 py-2"><input v-model="selectedSynonyms" type="checkbox" :value="item.id" :aria-label="`选择同义词 ${item.term}`" /></td>
                 <td class="px-3 py-2 text-slate-800 break-all">{{ item.term }}</td>
                 <td class="px-3 py-2 text-slate-700 break-all">{{ item.synonym }}</td>
                 <td class="px-3 py-2 text-slate-600">{{ item.weight }}</td>
@@ -654,7 +715,7 @@ onBeforeUnmount(() => {
                     <button @click="toggleSynonym(item)" class="px-2 py-1 text-xs border border-slate-200 rounded hover:bg-slate-50">
                       {{ item.enabled ? '停用' : '启用' }}
                     </button>
-                    <button @click="removeSynonym(item)" class="px-2 py-1 text-xs border border-red-200 text-red-600 rounded hover:bg-red-50">删除</button>
+                    <button @click="requestDelete('synonym', item)" class="px-2 py-1 text-xs border border-red-200 text-red-600 rounded hover:bg-red-50">删除</button>
                   </div>
                 </td>
               </tr>
@@ -664,4 +725,27 @@ onBeforeUnmount(() => {
       </section>
     </div>
   </div>
+  <Teleport to="body">
+    <div v-if="editDialog" class="upload-overlay" @click.self="closeEditDialog" @keydown.esc="closeEditDialog">
+      <section v-dialog class="upload-dialog max-w-lg" role="dialog" aria-modal="true" aria-label="编辑词条">
+        <div class="panel-heading"><div><h2>编辑{{ editDialog.type === 'lexicon' ? '词条' : '同义词' }}</h2><p>修改后保存即可，发布索引后生效。</p></div><button class="plain-button" @click="closeEditDialog" :disabled="busy" aria-label="关闭">✕</button></div>
+        <form class="p-6 space-y-4" @submit.prevent="submitEdit">
+          <label class="block text-sm text-slate-600">原词<input v-model="editForm.term" class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg" required /></label>
+          <label v-if="editDialog.type === 'synonym'" class="block text-sm text-slate-600">同义词<input v-model="editForm.synonym" class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg" required /></label>
+          <div v-if="editDialog.type === 'lexicon'" class="grid grid-cols-2 gap-3"><label class="text-sm text-slate-600">词频<input v-model="editForm.freq" type="number" min="1" class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg" /></label><label class="text-sm text-slate-600">词性<input v-model="editForm.tag" class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg" /></label></div>
+          <label v-else class="block text-sm text-slate-600">权重<input v-model="editForm.weight" type="number" min="0.01" step="0.01" class="mt-1 w-full px-3 py-2 border border-slate-200 rounded-lg" /></label>
+          <div class="flex flex-wrap gap-4 text-sm text-slate-600"><label><input v-model="editForm.enabled" type="checkbox" class="mr-2" />启用</label><label v-if="editDialog.type === 'synonym'"><input v-model="editForm.bidirectional" type="checkbox" class="mr-2" />双向</label></div>
+          <div class="dialog-actions"><button type="button" class="secondary-button" @click="closeEditDialog">取消</button><button type="submit" class="primary-button" :disabled="busy">保存</button></div>
+        </form>
+      </section>
+    </div>
+  </Teleport>
+  <Teleport to="body">
+    <div v-if="confirmDialog" class="upload-overlay" @click.self="confirmDialog = null" @keydown.esc="confirmDialog = null">
+      <section v-dialog class="confirm-dialog" role="alertdialog" aria-modal="true" aria-label="确认删除">
+        <h2>{{ confirmDialog.title }}</h2><p>{{ confirmDialog.message }} 此操作无法撤销。</p>
+        <div class="dialog-actions"><button class="secondary-button" @click="confirmDialog = null">取消</button><button class="primary-button danger-button" @click="confirmAction">删除</button></div>
+      </section>
+    </div>
+  </Teleport>
 </template>
