@@ -42,23 +42,22 @@ pub async fn finalize_kb(pool: &SqlitePool, kb_id: i64) -> Result<FinalizeReport
         debug!("wiki finalize: kb {} not found", kb_id);
         return Ok(FinalizeReport::default());
     };
+    let _kb_lock = super::ingest::acquire_slug_lock(format!("kb-finalize:{kb_id}")).await;
     let mut report = FinalizeReport::default();
 
     let pages = page::list(pool, kb_id, None, Some(STATUS_PUBLISHED), MAX_PAGES_PER_FINALIZE as i64, None).await?;
-    let surfaces: Vec<page::PageSurface> = pages
-        .iter()
-        .filter(|p| !p.is_index())
-        .map(|p| page::PageSurface {
-            slug: p.slug.clone(),
-            title: p.title.clone(),
-            page_type: p.page_type.clone(),
-            aliases: p.aliases.clone(),
-        })
-        .collect();
+    let surfaces = page::list_surfaces(pool, kb_id).await?;
     let live_slugs: HashSet<String> = surfaces.iter().map(|s| s.slug.clone()).collect();
     let linkifier = Linkifier::new(&surfaces);
 
     for page in pages.iter().filter(|p| !p.is_index()) {
+        let _lock = super::ingest::acquire_slug_lock(format!("{}:{}", kb_id, page.slug)).await;
+        let Some(page) = page::get_by_id(pool, page.id).await? else {
+            continue;
+        };
+        if page.status != STATUS_PUBLISHED {
+            continue;
+        }
         report.pages_scanned += 1;
         // 先抹掉指向已删除页面的链接，再注入新的交叉链接。
         let (cleaned, removed) = linkify::strip_dead_links(&page.content, &live_slugs);
@@ -68,7 +67,7 @@ pub async fn finalize_kb(pool: &SqlitePool, kb_id: i64) -> Result<FinalizeReport
         let outcome = linkifier.linkify(&cleaned, &page.slug);
         // 链接维护是机械改写：正文与出链一起更新，但保留页面原有的作者归属，
         // 否则人工编辑过的页面会被标成 pipeline，下次 ingest 就能覆盖掉用户内容。
-        if page::update_content(pool, page, &outcome.content, &outcome.out_links, None).await? {
+        if page::update_content(pool, &page, &outcome.content, &outcome.out_links, None).await? {
             report.pages_changed += 1;
         }
     }
@@ -131,6 +130,12 @@ async fn rebuild_index(
         edit_source: EDIT_SOURCE_PIPELINE.to_string(),
         editor_id: String::new(),
     };
+    let _lock = super::ingest::acquire_slug_lock(format!("{}:{}", kb_id, INDEX_SLUG)).await;
+    let current = page::list(pool, kb_id, None, Some(STATUS_PUBLISHED), MAX_PAGES_PER_FINALIZE as i64, None).await?;
+    anyhow::ensure!(
+        render_directory(&current.iter().filter(|p| !p.is_index()).collect::<Vec<_>>()) == directory,
+        "Wiki pages changed during index generation; retry finalize"
+    );
     let outcome = page::upsert(pool, &draft, &[], &[]).await?;
     Ok(outcome.changed)
 }

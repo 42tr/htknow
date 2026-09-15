@@ -226,14 +226,16 @@ pub fn slug_prefix(slug: &str) -> &str {
     slug.split_once('/').map(|(prefix, _)| prefix).unwrap_or("")
 }
 
-/// Wiki 相关迁移（版本 6 建表、版本 7 版本快照）。
+/// Wiki 相关迁移（版本 6 建表、7 版本快照、8 增量索引与跨库回撤）。
 ///
 /// 与图谱迁移一致：事务内抢占版本号，重复启动不重复执行。
 pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     let mut tx = pool.begin().await?;
-    for (version, name, sql) in
-        [(6, "wiki_pages", include_str!("migration.sql")), (7, "wiki_page_revisions", include_str!("migration_v7.sql"))]
-    {
+    for (version, name, sql) in [
+        (6, "wiki_pages", include_str!("migration.sql")),
+        (7, "wiki_page_revisions", include_str!("migration_v7.sql")),
+        (8, "wiki_index_changes", include_str!("migration_v8.sql")),
+    ] {
         let claimed = sqlx::query("INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (?, ?)")
             .bind(version)
             .bind(name)

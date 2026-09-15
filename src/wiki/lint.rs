@@ -163,7 +163,7 @@ pub async fn lint_kb(pool: &SqlitePool, kb_id: i64) -> Result<LintReport> {
            FROM wiki_page_sources s
            JOIN wiki_pages p ON p.id = s.page_id
            LEFT JOIN files f ON f.id = s.file_id
-          WHERE p.kb_id = ? AND p.status != 'archived' AND (f.id IS NULL OR f.status != 1)",
+          WHERE p.kb_id = ? AND p.status NOT IN ('archived', 'withdrawn') AND (f.id IS NULL OR f.status != 1)",
     )
     .bind(kb_id)
     .fetch_all(pool)

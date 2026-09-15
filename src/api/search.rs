@@ -982,7 +982,7 @@ async fn merge_wiki_results(
         if file_ids.is_some_and(|ids| !detail.sources.iter().any(|source| ids.contains(&source.file_id))) {
             continue;
         }
-        let score = 1.3 / (61.0 + wiki_results.len() as f32);
+        let score = 1.3 / (1.0 + wiki_results.len() as f32);
         wiki_results.push(SearchResultItem {
             id: candidate.id,
             file_id: 0,
@@ -999,9 +999,19 @@ async fn merge_wiki_results(
         return Ok(());
     }
     for (rank, item) in results.iter_mut().enumerate() {
-        item.score = 1.0 / (61.0 + rank as f32);
+        item.score = 1.0 / (1.0 + rank as f32);
     }
     results.extend(wiki_results);
+    let texts: Vec<_> = results.iter().map(|item| item.content.clone()).collect();
+    // Score the mixed candidate set together, then apply the modest Wiki preference.
+    // If reranking is unavailable, reciprocal ranks interleave the two recall lists.
+    if let Ok(scores) = engine.compute_rerank_scores_for_texts(query, &texts).await {
+        if scores.len() == results.len() && scores.iter().all(|s| s.is_some_and(f32::is_finite)) {
+            for (item, score) in results.iter_mut().zip(scores) {
+                item.score = score.unwrap().max(0.0) * if item.wiki.is_some() { 1.3 } else { 1.0 };
+            }
+        }
+    }
     results.sort_by(|a, b| b.score.total_cmp(&a.score));
     results.truncate(crate::config::get().search.limit);
     Ok(())
@@ -1204,7 +1214,7 @@ async fn run_advanced_plan_steps(
     pool: &SqlitePool, search_engine: &SearchEngine, params: &AdvancedSearchQuery, kb_ids: Option<&Vec<i64>>,
     planner: &QueryPlanner, judge: &RelevanceJudge, chunk_refiner: &ChunkRefiner, slice_limit: usize,
     context_chars: usize, user_id: &str, is_admin: bool, tx: Option<&mpsc::Sender<Result<Event, Infallible>>>,
-    request_id: &str, log_prefix: &str, wiki_results_emitted: bool,
+    request_id: &str, log_prefix: &str, _wiki_results_emitted: bool,
 ) -> anyhow::Result<Option<AdvancedSelectedSliceResult>> {
     let planning_started = Instant::now();
     maybe_send_status_event(tx, "初始化", "生成执行计划").await?;
@@ -1342,7 +1352,7 @@ async fn run_advanced_plan_steps(
                         file: Some(finalized.file.clone()),
                         kb: finalized.kb.clone(),
                         slice_ids: slice_ids.clone(),
-                        score: if wiki_results_emitted { 1.0 / 61.0 } else { finalized.base_score },
+                        score: finalized.base_score,
                         judge_score: finalized.judge_score,
                         judge_reason: finalized.judge_reason.clone(),
                         refine_reason: finalized.refine_reason.clone(),

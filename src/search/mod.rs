@@ -1435,7 +1435,7 @@ impl SearchEngine {
         self.compute_rerank_scores_for_texts(query, &documents).await
     }
 
-    async fn compute_rerank_scores_for_texts(
+    pub(crate) async fn compute_rerank_scores_for_texts(
         &self, query: &str, source_documents: &[String],
     ) -> anyhow::Result<Vec<Option<f32>>> {
         let cfg = config::get();

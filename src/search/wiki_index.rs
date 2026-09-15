@@ -35,7 +35,7 @@ pub struct WikiIndex {
     schema: Schema,
     reader: IndexReader,
     writer: Arc<tantivy_engine::IndexWriterHandle>,
-    known: Mutex<HashMap<i64, String>>,
+    cursors: Mutex<HashMap<i64, Arc<Mutex<i64>>>>,
 }
 
 impl WikiIndex {
@@ -50,44 +50,58 @@ impl WikiIndex {
         }
         let reader = super::build_reader(&index, "wiki_index");
         let writer = tantivy_engine::IndexWriterHandle::open(index, schema.clone(), "wiki_index".into()).await?;
-        Ok(Self { schema, reader, writer, known: Mutex::new(HashMap::new()) })
+        Ok(Self { schema, reader, writer, cursors: Mutex::new(HashMap::new()) })
     }
 
     pub async fn rebuild(&self, pool: &SqlitePool) -> Result<()> {
-        for value in self.known.lock().await.values_mut() {
-            value.clear();
+        for cursor in self.cursors.lock().await.values() {
+            *cursor.lock().await = 0;
         }
-        self.sync(pool).await?;
+        self.sync_scoped(pool, None).await?;
         Ok(())
     }
 
-    pub async fn sync(&self, pool: &SqlitePool) -> Result<Vec<IndexedPage>> {
-        let mut known = self.known.lock().await;
-        let pages = published_pages(pool).await?;
-        let expected: HashMap<_, _> = pages.iter().map(|p| (p.id, p.fingerprint())).collect();
-        let removed: Vec<_> = known.keys().filter(|id| !expected.contains_key(id)).copied().collect();
-        let changed: Vec<_> = pages.iter().filter(|p| known.get(&p.id) != expected.get(&p.id)).collect();
-        let mut replace = removed;
-        replace.extend(changed.iter().map(|p| p.id));
-        if !replace.is_empty() {
-            self.writer.delete_by_field("id", &replace).await?;
-            for chunk in changed.chunks(100) {
-                self.writer
-                    .write_batch(
-                        chunk
-                            .iter()
-                            .map(|p| {
-                                // Reuse the numeric filter slot for page IDs in this isolated index.
-                                tantivy_engine::Document::new(p.id, p.id, Some(p.kb_id), p.text())
-                            })
-                            .collect(),
-                    )
-                    .await?;
+    // Only dirty pages in the requested KBs are hydrated. Per-KB cursors serialize
+    // reconciliation without holding a global mutex across database reads.
+    pub async fn sync_scoped(&self, pool: &SqlitePool, kb_ids: Option<&Vec<i64>>) -> Result<usize> {
+        let ids = match kb_ids {
+            Some(ids) => ids.clone(),
+            None => sqlx::query_scalar("SELECT DISTINCT kb_id FROM wiki_index_changes").fetch_all(pool).await?,
+        };
+        let mut hydrated = 0;
+        for kb_id in ids {
+            let lock = self.cursors.lock().await.entry(kb_id).or_default().clone();
+            let mut cursor = lock.lock().await;
+            loop {
+                let changes: Vec<(i64, i64)> = sqlx::query_as(
+                    "SELECT seq, page_id FROM wiki_index_changes WHERE kb_id = ? AND seq > ? ORDER BY seq LIMIT 100",
+                )
+                .bind(kb_id)
+                .bind(*cursor)
+                .fetch_all(pool)
+                .await?;
+                if changes.is_empty() {
+                    break;
+                }
+                let page_ids: Vec<_> = changes.iter().map(|(_, id)| *id).collect();
+                let pages = load_pages(pool, &page_ids).await?;
+                hydrated += pages.len();
+                self.writer.delete_by_field("id", &page_ids).await?;
+                if !pages.is_empty() {
+                    self.writer
+                        .write_batch(
+                            pages
+                                .iter()
+                                .map(|p| tantivy_engine::Document::new(p.id, p.id, Some(p.kb_id), p.text()))
+                                .collect(),
+                        )
+                        .await?;
+                }
+                self.reader.reload()?;
+                *cursor = changes.last().unwrap().0;
             }
-            self.reader.reload()?;
         }
-        *known = expected;
-        Ok(pages)
+        Ok(hydrated)
     }
 
     pub async fn recall(
@@ -96,7 +110,7 @@ impl WikiIndex {
         if query.trim().is_empty() || kb_ids.is_some_and(Vec::is_empty) || file_ids.is_some_and(Vec::is_empty) {
             return Ok(Vec::new());
         }
-        let pages = self.sync(pool).await?;
+        self.sync_scoped(pool, kb_ids).await?;
         let page_ids: Option<Vec<i64>> = if let Some(ids) = file_ids {
             let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
                 "SELECT DISTINCT page_id FROM wiki_page_sources WHERE file_id IN (",
@@ -111,17 +125,6 @@ impl WikiIndex {
             None
         };
         if page_ids.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(Vec::new());
-        }
-        let by_id: HashMap<_, _> = pages
-            .into_iter()
-            .filter(|p| {
-                page_ids.as_ref().is_none_or(|ids| ids.contains(&p.id))
-                    && kb_ids.is_none_or(|ids| ids.contains(&p.kb_id))
-            })
-            .map(|p| (p.id, p))
-            .collect();
-        if by_id.is_empty() {
             return Ok(Vec::new());
         }
         let lexical = tantivy_engine::search_sync_with_limit(
@@ -139,18 +142,17 @@ impl WikiIndex {
         for (rank, hit) in lexical.iter().enumerate() {
             *scores.entry(hit.id).or_default() += 1.0 / (60.0 + rank as f32 + 1.0);
         }
-        match super::wiki_vector::search(query, page_ids.as_ref(), kb_ids, limit).await {
+        match super::wiki_vector::search(pool, query, page_ids.as_ref(), kb_ids, limit).await {
             Ok(hits) => {
-                for (rank, (id, fingerprint)) in hits.into_iter().enumerate() {
-                    if by_id.get(&id).is_some_and(|p| p.fingerprint() == fingerprint) {
-                        *scores.entry(id).or_default() += 1.0 / (60.0 + rank as f32 + 1.0);
-                    }
+                for (rank, (id, _)) in hits.into_iter().enumerate() {
+                    *scores.entry(id).or_default() += 1.0 / (60.0 + rank as f32 + 1.0);
                 }
             }
             Err(err) => log::warn!("Wiki vector recall unavailable; using full text: {}", err),
         }
-        let mut results: Vec<_> = by_id
-            .into_values()
+        let pages = load_pages(pool, &scores.keys().copied().collect::<Vec<_>>()).await?;
+        let mut results: Vec<_> = pages
+            .into_iter()
             .filter_map(|p| {
                 if kb_ids.is_some_and(|ids| !ids.contains(&p.kb_id)) {
                     return None;
@@ -164,14 +166,21 @@ impl WikiIndex {
     }
 }
 
-pub async fn published_pages(pool: &SqlitePool) -> Result<Vec<IndexedPage>> {
-    Ok(sqlx::query_as(
-        "SELECT p.id, p.kb_id, p.slug, p.title, p.summary, p.content, p.aliases, p.version \
-         FROM wiki_pages p JOIN knowledge_bases kb ON kb.id = p.kb_id \
-         WHERE p.status = 'published' AND p.page_type != 'index' ORDER BY p.id",
-    )
-    .fetch_all(pool)
-    .await?)
+pub(super) async fn load_pages(pool: &SqlitePool, ids: &[i64]) -> Result<Vec<IndexedPage>> {
+    let mut pages = Vec::new();
+    for ids in ids.chunks(500) {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT p.id, p.kb_id, p.slug, p.title, p.summary, p.content, p.aliases, p.version \
+             FROM wiki_pages p WHERE p.status = 'published' AND p.page_type != 'index' AND p.id IN (",
+        );
+        let mut list = qb.separated(",");
+        for id in ids {
+            list.push_bind(id);
+        }
+        list.push_unseparated(")");
+        pages.extend(qb.build_query_as::<IndexedPage>().fetch_all(pool).await?);
+    }
+    Ok(pages)
 }
 
 impl SearchEngine {
@@ -196,8 +205,8 @@ impl SearchEngine {
 
     pub async fn sync_wiki_indexes(&self) -> Result<()> {
         let pool = self.pool.as_ref().ok_or_else(|| anyhow::anyhow!("search engine db pool not set"))?;
-        let pages = self.wiki_index.sync(pool).await?;
-        super::wiki_vector::sync(&pages).await
+        self.wiki_index.sync_scoped(pool, None).await?;
+        super::wiki_vector::sync(pool).await
     }
 
     pub fn start_wiki_indexer(&self) {
@@ -205,19 +214,60 @@ impl SearchEngine {
         tokio::spawn(async move {
             loop {
                 if !crate::processor::is_parse_paused() {
-                    if let Some(pool) = &engine.pool {
-                        match engine.wiki_index.sync(pool).await {
-                            Ok(pages) => {
-                                if let Err(err) = super::wiki_vector::sync(&pages).await {
-                                    log::warn!("Wiki vector reconciliation will retry: {}", err);
-                                }
-                            }
-                            Err(err) => log::warn!("Wiki index reconciliation will retry: {}", err),
-                        }
+                    if let Err(err) = engine.sync_wiki_indexes().await {
+                        log::warn!("Wiki index reconciliation will retry: {}", err);
                     }
                 }
                 tokio::time::sleep(Duration::from_secs(10)).await;
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn wiki_reconciliation_only_hydrates_scoped_changes() {
+        let pool = sqlx::sqlite::SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        sqlx::raw_sql(include_str!("../init.sql")).execute(&pool).await.unwrap();
+        crate::graph::graph_manager::migrate(&pool).await.unwrap();
+        crate::wiki::migrate(&pool).await.unwrap();
+        for id in [1, 2] {
+            sqlx::query("INSERT INTO knowledge_bases(id, user_id, name) VALUES(?, 'owner', 'kb')")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO wiki_pages(id, kb_id, slug, content, status) VALUES(?, ?, 'concept/test', 'originaltoken', 'published')")
+                .bind(id).bind(id).execute(&pool).await.unwrap();
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let index = WikiIndex::open(dir.path().to_str().unwrap()).await.unwrap();
+        assert_eq!(index.sync_scoped(&pool, Some(&vec![1])).await.unwrap(), 1);
+        assert_eq!(index.sync_scoped(&pool, Some(&vec![1])).await.unwrap(), 0);
+        assert_eq!(index.sync_scoped(&pool, Some(&vec![2])).await.unwrap(), 1);
+        sqlx::query("UPDATE wiki_pages SET content = 'replacementtoken', version = version + 1 WHERE id = 2")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(index.sync_scoped(&pool, Some(&vec![1])).await.unwrap(), 0);
+        // Holding another KB's reconciliation lock must not block an unrelated query.
+        let lock = index.cursors.lock().await.get(&2).unwrap().clone();
+        let guard = lock.lock().await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), index.sync_scoped(&pool, Some(&vec![1])))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+        drop(guard);
+        assert_eq!(index.sync_scoped(&pool, Some(&vec![2])).await.unwrap(), 1);
+        assert_eq!(index.recall(&pool, "replacementtoken", None, Some(&vec![2]), 10).await.unwrap().len(), 1);
+        sqlx::query("DELETE FROM wiki_pages WHERE id = 2").execute(&pool).await.unwrap();
+        assert!(index.recall(&pool, "replacementtoken", None, Some(&vec![2]), 10).await.unwrap().is_empty());
+        assert_eq!(index.sync_scoped(&pool, None).await.unwrap(), 0);
     }
 }

@@ -15,6 +15,8 @@ async fn wiki_search_lifecycle_permissions_and_vectors() {
     setup_env();
     let requests = Arc::new(AtomicUsize::new(0));
     let fail_embedding = Arc::new(AtomicBool::new(false));
+    let fail_rerank = Arc::new(AtomicBool::new(true));
+    let rerank_failure = fail_rerank.clone();
     let counter = requests.clone();
     let failure = fail_embedding.clone();
     let mock = Router::new().route(
@@ -46,15 +48,28 @@ async fn wiki_search_lifecycle_permissions_and_vectors() {
             }
         }),
     );
+    let mock = mock.route("/rerank", post(move |Json(body): Json<Value>| {
+        let failure = rerank_failure.clone();
+        async move {
+            if failure.load(Ordering::Relaxed) {
+                return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"rerank unavailable"})));
+            }
+            let scores: Vec<_> = body["texts"].as_array().unwrap().iter().enumerate()
+                .map(|(index, text)| json!({"index": index, "score": if text.as_str().unwrap().contains("evidence") {0.95} else {0.05}}))
+                .collect();
+            (StatusCode::OK, Json(json!(scores)))
+        }
+    }));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let endpoint = format!("http://{}/embeddings", listener.local_addr().unwrap());
+    let rerank_endpoint = format!("http://{}/rerank", listener.local_addr().unwrap());
     let server = tokio::spawn(async move {
         axum::serve(listener, mock).await.unwrap();
     });
     unsafe {
         std::env::set_var("HTKNOW_EMBEDDING_URL", endpoint);
         std::env::set_var("HTKNOW_EMBEDDING_DIM", "2");
-        std::env::set_var("HTKNOW_RERANK_URL", "http://127.0.0.1:9/rerank");
+        std::env::set_var("HTKNOW_RERANK_URL", rerank_endpoint);
         std::env::set_var("LLM_API_URL", "");
     }
     let pool = db::init().await.unwrap();
@@ -138,6 +153,25 @@ async fn wiki_search_lifecycle_permissions_and_vectors() {
         let res = app.clone().oneshot(authed_empty_request("GET", &uri, &outsider)).await.unwrap();
         assert!(response_json(res).await["results"].as_array().unwrap().is_empty());
     }
+    // More Wiki candidates than the result limit must not crowd out the best slice.
+    let mut extra_ids = Vec::new();
+    for i in 0..5 {
+        let res = app.clone().oneshot(create(kb, &format!("extra-{i}"), "orbital generic explanation")).await.unwrap();
+        extra_ids.push(response_json(res).await["page"]["id"].as_i64().unwrap());
+    }
+    let uri = format!("/api/v1/knowledge/search/?query=orbital&kb_id={kb}");
+    let result = response_json(app.clone().oneshot(authed_empty_request("GET", &uri, &owner)).await.unwrap()).await;
+    assert!(
+        result["results"].as_array().unwrap().iter().any(|item| item["file_id"] == source_id),
+        "fallback fusion: {result}"
+    );
+    fail_rerank.store(false, Ordering::Relaxed);
+    let result = response_json(app.clone().oneshot(authed_empty_request("GET", &uri, &owner)).await.unwrap()).await;
+    assert_eq!(result["results"][0]["file_id"], source_id, "common relevance must outweigh Wiki boost: {result}");
+    fail_rerank.store(true, Ordering::Relaxed);
+    for id in extra_ids {
+        htknow::wiki::page::delete_by_id(&pool, id).await.unwrap();
+    }
     let sse = app
         .clone()
         .oneshot(authed_empty_request("GET", "/api/v1/knowledge/search/advanced/stream?query=orbital", &owner))
@@ -210,5 +244,36 @@ async fn wiki_search_lifecycle_permissions_and_vectors() {
         6,
         "Wiki endpoint limit must override global search limit: {body}"
     );
+    // Stale nearest vectors must not hide a valid page beyond the first top-k.
+    let refill_kb = insert_kb(&pool, &owner, "refill", "analysis", None, false).await;
+    let mut stale_ids = Vec::new();
+    for i in 0..7 {
+        let res =
+            app.clone().oneshot(create(refill_kb, &format!("stale-{i}"), "orbital nearest vector")).await.unwrap();
+        stale_ids.push(response_json(res).await["page"]["id"].as_i64().unwrap());
+    }
+    let res = app.clone().oneshot(create(refill_kb, "valid-distant", "distant valid material")).await.unwrap();
+    let valid_id = response_json(res).await["page"]["id"].as_i64().unwrap();
+    // Bounded background batches can require multiple cycles for a backlog.
+    for _ in 0..4 {
+        engine.sync_wiki_indexes().await.unwrap();
+    }
+    for (i, id) in stale_ids.into_iter().enumerate() {
+        if i % 3 == 0 {
+            htknow::wiki::page::delete_by_id(&pool, id).await.unwrap();
+        } else if i % 3 == 1 {
+            htknow::wiki::page::set_status(&pool, id, "archived", "user", &owner.id).await.unwrap();
+        } else {
+            sqlx::query("UPDATE wiki_pages SET content = 'modified stale vector', version = version + 1 WHERE id = ?")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
+    let before = requests.load(Ordering::Relaxed);
+    let hits = engine.search_wiki("cosmic", Some(&vec![refill_kb])).await.unwrap();
+    assert_eq!(hits.iter().map(|(p, _)| p.id).collect::<Vec<_>>(), vec![valid_id]);
+    assert_eq!(requests.load(Ordering::Relaxed), before + 1, "refill embeds the query once");
     server.abort();
 }

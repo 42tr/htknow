@@ -223,7 +223,7 @@ async fn run_ingest(
 
     let mut report = IngestReport { mode, candidates: candidates.len(), ..Default::default() };
 
-    // 摘要页是文档入库后的头号产物，失败即整体失败并重试；条目页失败只跳过该页。
+    // 摘要页是文档入库后的头号产物，失败即整体失败并重试；条目页部分失败也标记失败，让队列重试补全。
     match write_summary_page(pool, llm, config, kb_id, file_id, filename, slices, &available).await {
         Ok(changed) => {
             report.pages_written += 1;
@@ -263,16 +263,21 @@ async fn run_ingest(
     }
     let outcomes: Vec<Result<bool>> = stream::iter(pending).buffer_unordered(parallel).collect().await;
 
+    let mut failures = Vec::new();
     for outcome in outcomes {
         match outcome {
             Ok(changed) => {
                 report.pages_written += 1;
                 report.pages_changed += changed as usize;
             }
-            Err(error) => warn!("wiki ingest: page generation failed for file {}: {}", file_id, error),
+            Err(error) => {
+                warn!("wiki ingest: page generation failed for file {}: {}", file_id, error);
+                failures.push(error.to_string());
+            }
         }
     }
 
+    anyhow::ensure!(failures.is_empty(), "{} Wiki candidate pages failed: {}", failures.len(), failures.join("; "));
     info!(
         "wiki ingest: file {} mode={} candidates={} pages={} changed={}",
         file_id, report.mode, report.candidates, report.pages_written, report.pages_changed
@@ -303,6 +308,7 @@ fn build_fingerprint(model: &str, config: &ResolvedWikiConfig, slices: &[(i64, S
     digest.update(model.as_bytes());
     digest.update(config.granularity.as_str().as_bytes());
     digest.update(config.language.as_bytes());
+    digest.update((config.max_pages_per_ingest as u64).to_le_bytes());
     for (id, content) in slices {
         digest.update(id.to_le_bytes());
         digest.update((content.len() as u64).to_le_bytes());
@@ -485,7 +491,7 @@ async fn candidates_from_llm(
 ) -> Result<Vec<Candidate>> {
     // 归档页不参与链接：告诉模型它们「已有」只会生成断链。
     let existing_slugs: Vec<(String,)> = sqlx::query_as(
-        "SELECT slug FROM wiki_pages WHERE kb_id = ? AND page_type != 'index' AND status != 'archived'
+        "SELECT slug FROM wiki_pages WHERE kb_id = ? AND page_type != 'index' AND status NOT IN ('archived', 'withdrawn')
          ORDER BY slug LIMIT ?",
     )
     .bind(kb_id)
@@ -684,8 +690,11 @@ async fn write_summary_page(
     };
     // 摘要页是整篇文档的产物，把全部切片登记为证据，前端才能从摘要页直接跳到原文高亮。
     let slice_ids: Vec<i64> = slices.iter().map(|(slice_id, _)| *slice_id).collect();
+    let _lock = acquire_slug_lock(format!("{}:{}", kb_id, slug)).await;
     let outcome = page::upsert(pool, &draft, &[file_id], &slice_ids).await?;
-    page::set_out_links(pool, outcome.page_id, &super::linkify::out_links(&content, &slug)).await?;
+    if !outcome.skipped_manual {
+        page::set_out_links(pool, outcome.page_id, &super::linkify::out_links(&content, &slug)).await?;
+    }
     Ok(outcome.changed)
 }
 
@@ -792,7 +801,9 @@ async fn write_candidate_page(
             editor_id: String::new(),
         };
         let outcome = page::upsert(pool, &draft, &[file_id], &ordered).await?;
-        page::set_out_links(pool, outcome.page_id, &super::linkify::out_links(&content, &slug)).await?;
+        if !outcome.skipped_manual {
+            page::set_out_links(pool, outcome.page_id, &super::linkify::out_links(&content, &slug)).await?;
+        }
         Ok(outcome.changed)
     }
 }
@@ -802,10 +813,25 @@ async fn write_candidate_page(
 /// 不让模型「减去某个文档的贡献」——那既难验证也容易把仍然成立的内容删掉。
 /// 直接按剩余证据重写，结果只取决于当前还活着的来源。
 pub async fn refresh_page(pool: &SqlitePool, kb_id: i64, slug: &str) -> Result<bool> {
+    let _lock = acquire_slug_lock(format!("{}:{}", kb_id, slug)).await;
     let Some(existing) = page::get_by_slug(pool, kb_id, slug).await? else {
         debug!("wiki refresh: page {} not found in kb {}", slug, kb_id);
         return Ok(false);
     };
+    if page::is_manual_edit_source(&existing.last_edit_source) {
+        if page::source_file_ids(pool, existing.id).await?.is_empty() {
+            page::set_status(
+                pool,
+                existing.id,
+                super::STATUS_ARCHIVED,
+                &existing.last_edit_source,
+                &existing.last_editor_id,
+            )
+            .await?;
+            return Ok(true);
+        }
+        return Ok(false);
+    }
     let source_ids = page::source_file_ids(pool, existing.id).await?;
     let slice_ids = page::slice_ref_ids(pool, existing.id).await?;
     if source_ids.is_empty() || slice_ids.is_empty() {
@@ -857,7 +883,6 @@ pub async fn refresh_page(pool: &SqlitePool, kb_id: i64, slug: &str) -> Result<b
         bail!("wiki refresh: generated empty body for {}", slug);
     }
 
-    let _lock = acquire_slug_lock(format!("{}:{}", kb_id, slug)).await;
     {
         let draft = PageDraft {
             kb_id,
@@ -870,7 +895,7 @@ pub async fn refresh_page(pool: &SqlitePool, kb_id: i64, slug: &str) -> Result<b
             edit_source: EDIT_SOURCE_PIPELINE.to_string(),
             editor_id: String::new(),
         };
-        let outcome = page::upsert(pool, &draft, &[], &[]).await?;
+        let outcome = page::upsert(pool, &draft, &source_ids, &slice_ids).await?;
         page::set_slice_refs(pool, outcome.page_id, &slice_ids).await?;
         page::set_out_links(pool, outcome.page_id, &super::linkify::out_links(&content, slug)).await?;
         Ok(outcome.changed)

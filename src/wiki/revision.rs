@@ -55,6 +55,11 @@ fn aliases(raw: &str) -> Vec<String> {
 ///
 /// 页面不存在或该版本已快照过时返回 `None`（幂等）。
 pub async fn snapshot_current(pool: &SqlitePool, page_id: i64) -> Result<Option<i64>> {
+    let mut conn = pool.acquire().await?;
+    snapshot_current_in_conn(&mut conn, page_id).await
+}
+
+pub(super) async fn snapshot_current_in_conn(conn: &mut sqlx::SqliteConnection, page_id: i64) -> Result<Option<i64>> {
     let row: Option<(i64,)> = sqlx::query_as(
         "INSERT OR IGNORE INTO wiki_page_revisions
              (page_id, kb_id, version, slug, title, page_type, summary, content, aliases,
@@ -65,7 +70,7 @@ pub async fn snapshot_current(pool: &SqlitePool, page_id: i64) -> Result<Option<
          RETURNING version",
     )
     .bind(page_id)
-    .fetch_optional(pool)
+    .fetch_optional(conn)
     .await?;
     Ok(row.map(|(version,)| version))
 }

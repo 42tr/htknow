@@ -1098,6 +1098,14 @@ pub async fn move_to_kb(
 
     let image_paths = collect_image_paths_for_files(&pool, &[id]).await?;
 
+    let _wiki_lock = crate::wiki::ingest::acquire_slug_lock(format!("kb-finalize:{}", file.kb_id.unwrap_or(0))).await;
+    let affected: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT kb_id, slug FROM wiki_pages WHERE id IN (SELECT page_id FROM wiki_page_sources WHERE file_id = ?) ORDER BY kb_id, slug"
+    ).bind(id).fetch_all(&pool).await?;
+    let mut _page_locks = Vec::new();
+    for (kb_id, slug) in affected {
+        _page_locks.push(crate::wiki::ingest::acquire_slug_lock(format!("{kb_id}:{slug}")).await);
+    }
     let mut tx = pool.begin().await?;
     let update_result = sqlx::query(
         "UPDATE files SET kb_id = ?, status = ?, log = ?, updated_at = strftime('%s','now') WHERE id = ? AND status != 2 AND updated_at = ?",

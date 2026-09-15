@@ -399,13 +399,14 @@ pub async fn get_status(
     let resolved = wiki::resolve_config(&pool, params.kb_id).await?;
     let enabled = resolved.is_some_and(|config| config.enabled);
     let pending_tasks = wiki::queue::pending_count(&pool, params.kb_id).await?;
-    let page_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM wiki_pages WHERE kb_id = ? AND page_type != ? AND status != ?")
-            .bind(params.kb_id)
-            .bind(PAGE_TYPE_INDEX)
-            .bind(wiki::STATUS_ARCHIVED)
-            .fetch_one(&pool)
-            .await?;
+    let page_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM wiki_pages WHERE status != 'withdrawn' AND kb_id = ? AND page_type != ? AND status != ?",
+    )
+    .bind(params.kb_id)
+    .bind(PAGE_TYPE_INDEX)
+    .bind(wiki::STATUS_ARCHIVED)
+    .fetch_one(&pool)
+    .await?;
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT b.status, COUNT(*) FROM wiki_builds b JOIN files f ON f.id = b.file_id
           WHERE f.kb_id = ? GROUP BY b.status",

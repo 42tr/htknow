@@ -96,7 +96,7 @@ Wiki 是知识库级别的可选能力（`knowledge_bases.indexing_strategy.wiki
 | 名称检索 | `graph_node_names` FTS5 trigram 虚表（`src/graph/migration.sql:78`） | 可替代 pg_trgm 做去重预筛 |
 | 检索 | Tantivy 双索引（默认 + full）+ LanceDB `documents`/`file_summaries` + rerank + 图谱扩展（`src/search/mod.rs:1746`） | 加一路 wiki 索引即可 |
 | 权限 | `kb_permissions`（`src/init.sql:244`）+ `x-user-id`/`x-role` 中间件（`src/lib.rs:48`） | 页面继承 KB 权限 |
-| 迁移机制 | `schema_migrations` 版本 1–4（`src/db.rs:104`），图谱占用版本 5（`src/graph/graph_manager.rs:8`） | Wiki 用版本 6 |
+| 迁移机制 | `schema_migrations` 版本 1–4（`src/db.rs:104`），图谱占用版本 5（`src/graph/graph_manager.rs:8`） | Wiki 用版本 6–8 |
 | 前端 Markdown | 无渲染器，`frontend/package.json` 只有 vue + pdfjs-dist | 缺口，需引入 marked + dompurify |
 | 目录树 / 图可视化 | `KnowledgeDirectory.vue`、`GraphVisualization.vue` | 可复用 |
 | Agent 框架 | 无 | Agent 维护 Wiki 这部分短期不做 |
@@ -442,6 +442,15 @@ worker 始终运行（空闲轮询代价可忽略），因此关掉全局默认�
 - `tests/wiki_search.rs` 使用本地 mock embedding 服务覆盖正文/纯语义召回、服务失败回退与重试、文件范围、
   私有/公开知识库权限、编辑后的旧向量排除、归档/草稿/恢复/删除和普通/图谱增强/高级搜索入口。
 
+### 实现问题修复
+
+- **跨库移动**：迁移 8 的触发器在文件移动事务内撤下受影响页面和旧目录。旧正文（包括人工编辑）及历史保留为内部 `withdrawn` 页面，原 slug 释放，所有页面/版本/目录/图/体检/搜索接口均不可读取隔离页。旧库剩余来源文件重新入队生成，旧构建指纹失效；升级时也会隔离修复旧版本已经遗留的跨库来源页面。正在生成的内容写入时再次校验来源所属库。隔离内容目前仅可由管理员从数据库恢复，不能通过普通“恢复归档”重新发布。
+- **人工编辑保护**：finalize 与编辑共用 slug 锁，取得锁后重读页面；正文更新校验版本和状态，快照与更新处于同一事务。旧快照不覆盖新正文，也不产生错误的历史版本。摘要、刷新路径同样遵守人工保护。
+- **部分失败重试**：摘要成功但任一候选条目失败时，构建标记失败并由任务队列重试；只有完整成功的构建才能复用指纹。生成条目上限也进入指纹。
+- **混合排序**：Wiki 和切片候选在同一次 rerank 中获得可比分数，再对 Wiki 应用 1.3 权重；服务不可用时按 `1 / (rank + 1)` 交错合并，避免固定的 60 偏移让 Wiki 占满前排。SSE 切片保留自身分数。
+- **向量补召回**：检索过滤失效指纹、归档和删除结果后，逐步扩大候选范围，直到得到足量有效页面或耗尽候选；查询只生成一次 embedding。
+- **增量同步**：`wiki_index_changes` 为每页保留最新变更序号及删除记录。全文同步按知识库独立推进游标，只加载变化页面；查询不再全库扫描正文。向量后台每轮最多处理 16 条变化，成功后才确认，失败轮转重试；启动时用持久指纹复用已有向量。删除记录不随页面/知识库级联消失，以便重启后清理旧索引。
+
 ### 尚未做（P2 余项 / 后续优化）
 
 - `wiki_folders` 目录树与页面移动（改 slug 会牵连全部入链）
@@ -449,12 +458,13 @@ worker 始终运行（空闲轮询代价可忽略），因此关掉全局默认�
 - lint 的 auto-fix（补写摘要之类要过模型，成本高于收益，暂由用户在编辑表单里手工处理）
 - Agent 工具链（把 Wiki 页面作为 Agent 可读写的知识载体）
 - 独立的 Wiki 图视图（后端 `/wiki/graph` 已就绪，前端复用 `GraphVisualization.vue` 即可）
-- 大规模索引优化：增量变更队列、Wiki 向量近似索引和专用 compact
+- 大规模索引优化：Wiki 向量近似索引、专用 compact 与删除变更记录的安全回收
 - 显式恢复人工页面的自动生成（目前回滚仍保留人工保护）
 
 ### 验证命令
 
 ```sh
+cargo test --test wiki_regressions                    # 跨库隔离、历史、旧快照拒绝、候选失败后重试
 cargo test --test wiki_search                          # P3 检索与同步、权限、来源、mock 向量服务
 cargo test --lib wiki                                  # 迁移、队列、slug、配置合并、模式 A 候选、删除触发器、
                                                        # 版本快照/裁剪、人工编辑保护、回滚、归档、lint

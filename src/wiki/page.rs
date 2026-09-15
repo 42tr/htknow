@@ -94,6 +94,16 @@ pub fn is_manual_edit_source(edit_source: &str) -> bool {
 pub async fn upsert(
     pool: &SqlitePool, draft: &PageDraft, source_file_ids: &[i64], slice_ids: &[i64],
 ) -> Result<UpsertOutcome> {
+    // Acquire the SQLite writer before reading; deferred read/write upgrades can fail with BUSY_SNAPSHOT.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    for file_id in source_file_ids {
+        let valid: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM files WHERE id = ? AND kb_id = ?)")
+            .bind(file_id)
+            .bind(draft.kb_id)
+            .fetch_one(&mut *tx)
+            .await?;
+        anyhow::ensure!(valid, "Wiki source file {file_id} moved or was deleted; discard generated content");
+    }
     let fingerprint = draft.fingerprint();
     let aliases = serde_json::to_string(&draft.aliases)?;
     let edit_source = if draft.edit_source.is_empty() { EDIT_SOURCE_PIPELINE } else { &draft.edit_source };
@@ -103,7 +113,7 @@ pub async fn upsert(
     )
     .bind(draft.kb_id)
     .bind(&draft.slug)
-    .fetch_optional(pool)
+    .fetch_optional(&mut *tx)
     .await?;
 
     let (page_id, changed, version, skipped_manual) = match existing {
@@ -116,7 +126,7 @@ pub async fn upsert(
                 (id, false, existing_version, true)
             } else {
                 // 先快照当前版本，失败就不写新内容：宁可少一次更新，不可丢历史。
-                revision::snapshot_current(pool, id).await?;
+                revision::snapshot_current_in_conn(&mut tx, id).await?;
                 let next = existing_version + 1;
                 sqlx::query(
                     "UPDATE wiki_pages
@@ -135,9 +145,8 @@ pub async fn upsert(
                 .bind(&draft.editor_id)
                 .bind(&fingerprint)
                 .bind(id)
-                .execute(pool)
+                .execute(&mut *tx)
                 .await?;
-                revision::prune_by_config(pool, id).await?;
                 (id, true, next, false)
             }
         }
@@ -158,14 +167,30 @@ pub async fn upsert(
             .bind(edit_source)
             .bind(&draft.editor_id)
             .bind(&fingerprint)
-            .fetch_one(pool)
+            .fetch_one(&mut *tx)
             .await?;
             (id, true, 1, false)
         }
     };
 
-    add_sources(pool, page_id, source_file_ids).await?;
-    add_slice_refs(pool, page_id, slice_ids).await?;
+    for file_id in source_file_ids {
+        sqlx::query("INSERT OR IGNORE INTO wiki_page_sources(page_id, file_id) VALUES(?, ?)")
+            .bind(page_id)
+            .bind(file_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    for slice_id in slice_ids {
+        sqlx::query("INSERT OR IGNORE INTO wiki_page_slice_refs(page_id, slice_id) VALUES(?, ?)")
+            .bind(page_id)
+            .bind(slice_id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    if changed {
+        revision::prune_by_config(pool, page_id).await?;
+    }
     Ok(UpsertOutcome { page_id, changed, version, skipped_manual })
 }
 
@@ -194,7 +219,21 @@ pub async fn update_content(
     }
     .fingerprint();
 
-    revision::snapshot_current(pool, page.id).await?;
+    // Acquire the SQLite writer before reading; deferred read/write upgrades can fail with BUSY_SNAPSHOT.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let current: bool = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM wiki_pages WHERE id = ? AND version = ? AND status = ? AND slug = ?)",
+    )
+    .bind(page.id)
+    .bind(page.version)
+    .bind(&page.status)
+    .bind(&page.slug)
+    .fetch_one(&mut *tx)
+    .await?;
+    if !current {
+        return Ok(false);
+    }
+    revision::snapshot_current_in_conn(&mut tx, page.id).await?;
     // 绑定顺序必须与 SQL 里占位符出现的顺序一致，因此全部走 push_bind。
     let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new("UPDATE wiki_pages SET content = ");
     qb.push_bind(content);
@@ -211,7 +250,13 @@ pub async fn update_content(
     }
     qb.push(" WHERE id = ");
     qb.push_bind(page.id);
-    qb.build().execute(pool).await?;
+    qb.push(" AND version = ").push_bind(page.version);
+    qb.push(" AND status = ").push_bind(&page.status);
+    let changed = qb.build().execute(&mut *tx).await?.rows_affected() != 0;
+    tx.commit().await?;
+    if !changed {
+        return Ok(false);
+    }
     revision::prune_by_config(pool, page.id).await?;
     Ok(true)
 }
@@ -224,7 +269,7 @@ pub async fn set_status(
 ) -> Result<()> {
     sqlx::query(
         "UPDATE wiki_pages SET status = ?, last_edit_source = ?, last_editor_id = ?,
-                                updated_at = strftime('%s','now') WHERE id = ?",
+                                updated_at = strftime('%s','now') WHERE id = ? AND status != 'withdrawn'",
     )
     .bind(status)
     .bind(edit_source)
@@ -273,13 +318,13 @@ pub async fn set_slice_refs(pool: &SqlitePool, page_id: i64, slice_ids: &[i64]) 
 }
 
 pub async fn get_by_slug(pool: &SqlitePool, kb_id: i64, slug: &str) -> Result<Option<WikiPage>> {
-    let sql = format!("SELECT {} FROM wiki_pages WHERE kb_id = ? AND slug = ?", PAGE_COLUMNS);
+    let sql = format!("SELECT {} FROM wiki_pages WHERE status != 'withdrawn' AND kb_id = ? AND slug = ?", PAGE_COLUMNS);
     let row = sqlx::query(&sql).bind(kb_id).bind(slug).fetch_optional(pool).await?;
     Ok(row.as_ref().map(map_row))
 }
 
 pub async fn get_by_id(pool: &SqlitePool, page_id: i64) -> Result<Option<WikiPage>> {
-    let sql = format!("SELECT {} FROM wiki_pages WHERE id = ?", PAGE_COLUMNS);
+    let sql = format!("SELECT {} FROM wiki_pages WHERE status != 'withdrawn' AND id = ?", PAGE_COLUMNS);
     let row = sqlx::query(&sql).bind(page_id).fetch_optional(pool).await?;
     Ok(row.as_ref().map(map_row))
 }
@@ -288,8 +333,10 @@ pub async fn get_by_id(pool: &SqlitePool, page_id: i64) -> Result<Option<WikiPag
 pub async fn list(
     pool: &SqlitePool, kb_id: i64, page_type: Option<&str>, status: Option<&str>, limit: i64, before_id: Option<i64>,
 ) -> Result<Vec<WikiPage>> {
-    let mut qb =
-        sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!("SELECT {} FROM wiki_pages WHERE kb_id = ", PAGE_COLUMNS));
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
+        "SELECT {} FROM wiki_pages WHERE status != 'withdrawn' AND kb_id = ",
+        PAGE_COLUMNS
+    ));
     qb.push_bind(kb_id);
     if let Some(page_type) = page_type {
         qb.push(" AND page_type = ");
@@ -350,7 +397,7 @@ pub async fn search(pool: &SqlitePool, kb_id: i64, query: &str, limit: i64) -> R
     let pattern = format!("%{}%", query);
     let sql = format!(
         "SELECT {} FROM wiki_pages
-          WHERE kb_id = ? AND status != ? AND (title LIKE ? OR summary LIKE ? OR aliases LIKE ?)
+          WHERE status != 'withdrawn' AND kb_id = ? AND status != ? AND (title LIKE ? OR summary LIKE ? OR aliases LIKE ?)
           ORDER BY page_type = 'index' DESC, updated_at DESC LIMIT ?",
         PAGE_COLUMNS
     );
@@ -418,7 +465,7 @@ pub async fn stats(pool: &SqlitePool, kb_id: i64) -> Result<WikiStats> {
         "SELECT page_type, COUNT(*),
                 SUM(CASE WHEN status = 'published' THEN 1 ELSE 0 END),
                 SUM(CASE WHEN status = 'archived' THEN 1 ELSE 0 END)
-           FROM wiki_pages WHERE kb_id = ? GROUP BY page_type",
+           FROM wiki_pages WHERE status != 'withdrawn' AND kb_id = ? GROUP BY page_type",
     )
     .bind(kb_id)
     .fetch_all(pool)
@@ -430,14 +477,17 @@ pub async fn stats(pool: &SqlitePool, kb_id: i64) -> Result<WikiStats> {
     let total: i64 = rows.iter().map(|(_, count, _, _)| count).sum();
     let source_file_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(DISTINCT s.file_id) FROM wiki_page_sources s
-           JOIN wiki_pages p ON p.id = s.page_id WHERE p.kb_id = ?",
+           JOIN wiki_pages p ON p.id = s.page_id WHERE p.kb_id = ? AND p.status != 'withdrawn'",
     )
     .bind(kb_id)
     .fetch_one(pool)
     .await?;
     // 不依赖 JSON1：出链数量在应用侧累加，页面数量级下开销可忽略。
     let link_rows: Vec<(String,)> =
-        sqlx::query_as("SELECT out_links FROM wiki_pages WHERE kb_id = ?").bind(kb_id).fetch_all(pool).await?;
+        sqlx::query_as("SELECT out_links FROM wiki_pages WHERE status != 'withdrawn' AND kb_id = ?")
+            .bind(kb_id)
+            .fetch_all(pool)
+            .await?;
     let link_count: i64 = link_rows.iter().map(|(raw,)| json_list(raw).len() as i64).sum();
     Ok(WikiStats { kb_id, total, published, archived, by_type, source_file_count, link_count })
 }

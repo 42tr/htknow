@@ -721,3 +721,100 @@ async fn finalize_rebuilds_index_directory_and_skips_llm_when_unchanged() {
     let index = page::get_by_slug(&pool, 1, INDEX_SLUG).await.unwrap().unwrap();
     assert!(!index.content.contains("entity/张三"), "{}", index.content);
 }
+
+#[tokio::test]
+async fn migrate_v8_withdraws_legacy_cross_kb_sources() {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(SqliteConnectOptions::new().in_memory(true).foreign_keys(true))
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../init.sql")).execute(&pool).await.unwrap();
+    crate::graph::graph_manager::migrate(&pool).await.unwrap();
+    sqlx::raw_sql(include_str!("migration.sql")).execute(&pool).await.unwrap();
+    sqlx::raw_sql(include_str!("migration_v7.sql")).execute(&pool).await.unwrap();
+    sqlx::raw_sql("INSERT INTO schema_migrations(version, name) VALUES(6,'wiki_pages'),(7,'wiki_page_revisions')")
+        .execute(&pool)
+        .await
+        .unwrap();
+    seed_kb(&pool, 1).await;
+    seed_kb(&pool, 2).await;
+    seed_file(&pool, 10, Some(2), "already-moved.txt").await;
+    seed_file(&pool, 11, Some(1), "remaining.txt").await;
+    sqlx::raw_sql("INSERT INTO wiki_pages(id,kb_id,slug,status,content) VALUES(1,1,'concept/secret','published','secret');
+        INSERT INTO wiki_pages(id,kb_id,slug,status,page_type,content) VALUES(2,1,'index','published','index','secret directory');
+        INSERT INTO wiki_page_sources(page_id,file_id) VALUES(1,10),(1,11)")
+        .execute(&pool).await.unwrap();
+    super::migrate(&pool).await.unwrap();
+    assert!(super::page::get_by_slug(&pool, 1, "concept/secret").await.unwrap().is_none());
+    assert!(super::page::get_by_slug(&pool, 1, "index").await.unwrap().is_none());
+    assert_eq!(super::page::stats(&pool, 1).await.unwrap().total, 0);
+    let pending: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM wiki_tasks WHERE task_type = 'wiki:ingest' AND file_id = 11")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pending, 1);
+    let changes: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wiki_index_changes").fetch_one(&pool).await.unwrap();
+    assert_eq!(changes, 2);
+    super::migrate(&pool).await.unwrap();
+    let queued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM wiki_tasks").fetch_one(&pool).await.unwrap();
+    assert_eq!(queued, 2, "repeated migration must not enqueue another rebuild");
+}
+
+#[tokio::test]
+async fn concurrent_wiki_upserts_keep_atomic_versions_without_busy_snapshots() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = SqlitePoolOptions::new()
+        .max_connections(8)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(dir.path().join("concurrent.db"))
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+                .busy_timeout(std::time::Duration::from_secs(10))
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    sqlx::raw_sql(include_str!("../init.sql")).execute(&pool).await.unwrap();
+    crate::graph::graph_manager::migrate(&pool).await.unwrap();
+    super::migrate(&pool).await.unwrap();
+    seed_kb(&pool, 1).await;
+    let barrier = std::sync::Arc::new(tokio::sync::Barrier::new(8));
+    let mut tasks = Vec::new();
+    for i in 0..8 {
+        let pool = pool.clone();
+        let barrier = barrier.clone();
+        tasks.push(tokio::spawn(async move {
+            barrier.wait().await;
+            super::page::upsert(
+                &pool,
+                &super::page::PageDraft {
+                    kb_id: 1,
+                    slug: "concept/concurrent".into(),
+                    title: "Concurrent".into(),
+                    page_type: "concept".into(),
+                    summary: String::new(),
+                    content: format!("Content {i}"),
+                    aliases: vec![],
+                    edit_source: "pipeline".into(),
+                    editor_id: String::new(),
+                },
+                &[],
+                &[],
+            )
+            .await
+            .unwrap()
+        }));
+    }
+    let mut versions = Vec::new();
+    for task in tasks {
+        versions.push(task.await.unwrap().version);
+    }
+    versions.sort_unstable();
+    assert_eq!(versions, (1..=8).collect::<Vec<_>>());
+    let page = super::page::get_by_slug(&pool, 1, "concept/concurrent").await.unwrap().unwrap();
+    assert_eq!(page.version, 8);
+    assert_eq!(super::revision::count(&pool, page.id).await.unwrap(), 7);
+}
