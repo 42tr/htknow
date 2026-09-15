@@ -59,9 +59,9 @@ pub struct SearchQuery {
     pub advanced: bool,
 }
 
-/// 全文搜索查询参数
+/// 文件摘要搜索查询参数
 #[derive(Debug, Deserialize, IntoParams)]
-pub struct FullSearchQuery {
+pub struct SummarySearchQuery {
     /// 搜索关键词（当 filename 传入时可不填）
     #[serde(default)]
     pub query: String,
@@ -196,24 +196,6 @@ pub struct SearchResultItem {
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SearchResult {
     pub results: Vec<SearchResultItem>,
-}
-
-/// 全文搜索结果项
-#[derive(Debug, Serialize, ToSchema)]
-pub struct FullSearchResultItem {
-    /// 命中片段（HTML，包含<b>高亮）
-    pub snippet: String,
-    /// 搜索得分
-    pub score: f32,
-    /// 文件信息
-    pub file: Option<File>,
-    /// 知识库信息
-    pub kb: Option<KbInfo>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-pub struct FullSearchResult {
-    pub results: Vec<FullSearchResultItem>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -1740,137 +1722,13 @@ fn preview_text(text: &str, max_chars: usize) -> String {
     buf
 }
 
-/// 全文搜索（仅 Tantivy 全文索引）
-#[utoipa::path(
-    get,
-    path = "/api/v1/knowledge/search/full",
-    operation_id = "search_full",
-    tag = "search",
-    params(FullSearchQuery),
-    responses(
-        (status = 200, description = "全文搜索成功", body = FullSearchResult),
-        (status = 400, description = "请求参数错误")
-    ),
-    security(
-        ("x-user-id" = []),
-        ("x-role" = [])
-    )
-)]
-pub async fn search_full(
-    State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
-    Query(params): Query<FullSearchQuery>, Extension(auth_user): Extension<AuthUser>,
-) -> ApiResult<Json<FullSearchResult>> {
-    let (is_admin, user_id, kb_ids_to_search) =
-        resolve_scope_for_user(&pool, &auth_user, params.kb_id.as_ref()).await?;
-    if no_accessible_kb_scope(kb_ids_to_search.as_deref()) {
-        return Ok(Json(FullSearchResult { results: vec![] }));
-    }
-
-    let allowed_kb_ids: HashSet<i64> = if is_admin {
-        HashSet::new()
-    } else {
-        crate::api::knowledge_base::get_user_viewable_kb_ids(&pool, &user_id, false).await.into_iter().collect()
-    };
-    let allowed_ref = if is_admin { None } else { Some(&allowed_kb_ids) };
-
-    let file_ids = if let Some(filename) = params.filename.as_ref().filter(|f| !f.is_empty()) {
-        let matched_ids =
-            search_file_ids_by_name(&pool, filename, kb_ids_to_search.as_ref(), &user_id, is_admin).await?;
-        if matched_ids.is_empty() {
-            return Ok(Json(FullSearchResult { results: vec![] }));
-        }
-        match params.file_id {
-            Some(ref explicit_ids) if !explicit_ids.is_empty() => {
-                let explicit_set: HashSet<i64> = explicit_ids.iter().copied().collect();
-                let intersected: Vec<i64> = matched_ids.into_iter().filter(|id| explicit_set.contains(id)).collect();
-                if intersected.is_empty() {
-                    return Ok(Json(FullSearchResult { results: vec![] }));
-                }
-                Some(intersected)
-            }
-            _ => Some(matched_ids),
-        }
-    } else {
-        params.file_id.clone()
-    };
-
-    let results = if params.query.trim().is_empty() {
-        if file_ids.is_none() {
-            return Ok(Json(FullSearchResult { results: vec![] }));
-        }
-        let ids = file_ids.unwrap_or_default();
-        if ids.is_empty() {
-            return Ok(Json(FullSearchResult { results: vec![] }));
-        }
-        let file_map = get_full_files_by_ids(&pool, &ids).await?;
-        let kb_ids_in_files: Vec<i64> = file_map.values().filter_map(|f| f.kb_id).collect();
-        let kb_map =
-            if !kb_ids_in_files.is_empty() { get_kbs_by_ids(&pool, &kb_ids_in_files).await? } else { HashMap::new() };
-        file_map
-            .values()
-            .filter_map(|f| {
-                if !has_visibility_permission(
-                    Some((f.is_public, f.user_id.as_str())),
-                    f.kb_id.and_then(|kid| kb_map.get(&kid)).map(|k| (k.is_public, k.user_id.as_str(), k.id)),
-                    &user_id,
-                    is_admin,
-                    allowed_ref,
-                ) {
-                    return None;
-                }
-                Some(FullSearchResultItem {
-                    snippet: String::new(),
-                    score: 0.0,
-                    file: Some(f.clone()),
-                    kb: f.kb_id.and_then(|kid| kb_map.get(&kid).cloned()),
-                })
-            })
-            .collect::<Vec<_>>()
-    } else {
-        let raw_results = search_engine
-            .search_full(&params.query, file_ids.as_ref(), kb_ids_to_search.as_ref())
-            .await
-            .map_err(|e| crate::api::error::ApiError::internal(format!("Full search failed: {}", e)))?;
-
-        if raw_results.is_empty() {
-            return Ok(Json(FullSearchResult { results: vec![] }));
-        }
-
-        let file_ids: Vec<i64> = raw_results.iter().map(|r| r.file_id).collect();
-        let kb_ids: Vec<i64> = raw_results.iter().filter_map(|r| r.kb_id).collect();
-        let file_map = get_full_files_by_ids(&pool, &file_ids).await?;
-        let kb_map = if !kb_ids.is_empty() { get_kbs_by_ids(&pool, &kb_ids).await? } else { HashMap::new() };
-
-        raw_results
-            .into_iter()
-            .filter_map(|r| {
-                let file = file_map.get(&r.file_id).cloned();
-                let kb = r.kb_id.and_then(|kb_id| kb_map.get(&kb_id).cloned());
-                if has_visibility_permission(
-                    file.as_ref().map(|f| (f.is_public, f.user_id.as_str())),
-                    kb.as_ref().map(|k| (k.is_public, k.user_id.as_str(), k.id)),
-                    &user_id,
-                    is_admin,
-                    allowed_ref,
-                ) {
-                    Some(FullSearchResultItem { snippet: r.snippet, score: r.score, file, kb })
-                } else {
-                    None
-                }
-            })
-            .collect()
-    };
-
-    Ok(Json(FullSearchResult { results }))
-}
-
 /// 文件摘要语义搜索
 #[utoipa::path(
     get,
     path = "/api/v1/knowledge/search/summary",
     operation_id = "search_summary",
     tag = "search",
-    params(FullSearchQuery),
+    params(SummarySearchQuery),
     responses(
         (status = 200, description = "文件摘要搜索成功", body = SummarySearchResult),
         (status = 400, description = "请求参数错误")
@@ -1882,7 +1740,7 @@ pub async fn search_full(
 )]
 pub async fn search_summary(
     State(pool): State<SqlitePool>, Extension(search_engine): Extension<SearchEngine>,
-    Query(params): Query<FullSearchQuery>, Extension(auth_user): Extension<AuthUser>,
+    Query(params): Query<SummarySearchQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<SummarySearchResult>> {
     let (is_admin, user_id, kb_ids_to_search) =
         resolve_scope_for_user(&pool, &auth_user, params.kb_id.as_ref()).await?;
@@ -3041,6 +2899,7 @@ async fn get_full_files_by_ids(pool: &SqlitePool, file_ids: &[i64]) -> Result<Ha
             Err(e) => warn!("Failed to read content file for file {}: {}", file.id, e),
         }
     }
+    crate::wiki::file_status::populate(pool, &mut files).await?;
     Ok(files.into_iter().map(|f| (f.id, f)).collect())
 }
 

@@ -2,6 +2,7 @@
 import { vDialog } from '../dialog'
 import { ref, computed } from 'vue'
 import { api } from '../api'
+import { wikiStatusInfo } from '../fileStatus'
 import FileDetail from './FileDetail.vue'
 import FileSlices from './FileSlices.vue'
 import KnowledgeGraph from './KnowledgeGraph.vue'
@@ -57,6 +58,8 @@ const isArchive = computed(() => {
 })
 
 const statusInfo = computed(() => {
+  const wiki = wikiStatusInfo(props.file)
+  if (wiki) return wiki
   switch (props.file.status) {
     case 0:
       return {
@@ -336,10 +339,10 @@ const handleMoveToKb = async (kb) => {
 
           <!-- Error Log -->
           <div
-            v-if="file.status === -1 && file.log"
+            v-if="(file.status === -1 && file.log) || file.wiki_error"
             class="mt-2 p-2 bg-red-50 rounded-lg"
           >
-            <p class="text-xs text-red-600">{{ file.log }}</p>
+            <p class="text-xs text-red-600">{{ file.wiki_error || file.log }}</p>
           </div>
         </div>
 

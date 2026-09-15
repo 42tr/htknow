@@ -27,9 +27,8 @@ pub mod wiki_index;
 mod wiki_vector;
 
 pub use lancedb::schedule_startup_index_maintenance;
-pub use tantivy_engine::{FullSearchResultItem, SearchResultItem};
+pub use tantivy_engine::SearchResultItem;
 
-const FULL_SNIPPET_MAX_CHARS: usize = 400;
 const MAX_QUERY_TERMS_FOR_SYNONYM_LOOKUP: usize = 100;
 const DEFAULT_REBUILD_BATCH_SIZE: i64 = 100;
 static RERANK_HTTP_CLIENT: Lazy<Client> = Lazy::new(Client::new);
@@ -126,13 +125,6 @@ struct RebuildLanceDbSliceRow {
     path: String,
 }
 
-#[derive(Debug, sqlx::FromRow)]
-struct RebuildFullMetaRow {
-    id: i64,
-    kb_id: Option<i64>,
-    filename: String,
-}
-
 #[derive(Debug, Clone)]
 pub struct RebuildProgress {
     pub phase: String,
@@ -208,10 +200,6 @@ pub struct SearchEngine {
     index_reader: IndexReader,
     index_write_lock: Arc<Mutex<()>>,
     index_writer: Arc<tantivy_engine::IndexWriterHandle>,
-    full_schema: Schema,
-    full_index_reader: IndexReader,
-    full_index_write_lock: Arc<Mutex<()>>,
-    full_index_writer: Arc<tantivy_engine::IndexWriterHandle>,
     rebuild_lock: Arc<Mutex<()>>,
     pool: Option<SqlitePool>,
     synonym_cache: Arc<tokio::sync::RwLock<Option<SynonymCache>>>,
@@ -229,30 +217,15 @@ impl SearchEngine {
         let (schema, index) = tantivy_engine::init().unwrap();
         info!("Search init substep: tantivy_engine::init() took {}ms", t1.elapsed().as_millis());
 
-        let t2 = Instant::now();
-        let (full_schema, full_index) = tantivy_engine::init_full().unwrap();
-        info!("Search init substep: tantivy_engine::init_full() took {}ms", t2.elapsed().as_millis());
-
         let t3 = Instant::now();
         let index_reader = build_reader(&index, "index");
         info!("Search init substep: build_reader(index) took {}ms", t3.elapsed().as_millis());
-
-        let t4 = Instant::now();
-        let full_index_reader = build_reader(&full_index, "full_index");
-        info!("Search init substep: build_reader(full_index) took {}ms", t4.elapsed().as_millis());
 
         let t5 = Instant::now();
         let index_writer = tantivy_engine::IndexWriterHandle::open(index, schema.clone(), "index".to_string())
             .await
             .expect("open tantivy index writer failed");
         info!("Search init substep: open index writer took {}ms", t5.elapsed().as_millis());
-
-        let t6 = Instant::now();
-        let full_index_writer =
-            tantivy_engine::IndexWriterHandle::open(full_index, full_schema.clone(), "full_index".to_string())
-                .await
-                .expect("open tantivy full index writer failed");
-        info!("Search init substep: open full index writer took {}ms", t6.elapsed().as_millis());
 
         let wiki_index = Arc::new(
             wiki_index::WikiIndex::open(&format!("{}_wiki", config::get().search.tantivy_index_path))
@@ -265,10 +238,6 @@ impl SearchEngine {
             index_reader,
             index_write_lock: Arc::new(Mutex::new(())),
             index_writer,
-            full_schema,
-            full_index_reader,
-            full_index_write_lock: Arc::new(Mutex::new(())),
-            full_index_writer,
             rebuild_lock: Arc::new(Mutex::new(())),
             pool: None,
             synonym_cache: Arc::new(tokio::sync::RwLock::new(None)),
@@ -691,9 +660,7 @@ impl SearchEngine {
         )
         .fetch_one(pool)
         .await?;
-        let total_full_docs: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM files WHERE status = 1").fetch_one(pool).await?;
-        let total_docs = total_slices + total_full_docs;
+        let total_docs = total_slices;
         let mut processed_docs = 0_i64;
         on_progress(RebuildProgress { phase: "prepare".to_string(), total_docs, processed_docs }).await;
 
@@ -704,30 +671,19 @@ impl SearchEngine {
             .unwrap_or(DEFAULT_REBUILD_BATCH_SIZE);
         let tag = sanitize_job_tag(job_tag);
         let slice_live_path = cfg.search.tantivy_index_path.clone();
-        let full_live_path = cfg.search.tantivy_full_index_path.clone();
         let slice_temp_path = format!("{}.rebuild.{}", slice_live_path, tag);
-        let full_temp_path = format!("{}.rebuild.{}", full_live_path, tag);
         let slice_backup_path = format!("{}.backup.{}", slice_live_path, tag);
-        let full_backup_path = format!("{}.backup.{}", full_live_path, tag);
 
         cleanup_dir_if_exists(&slice_temp_path)?;
-        cleanup_dir_if_exists(&full_temp_path)?;
         cleanup_dir_if_exists(&slice_backup_path)?;
-        cleanup_dir_if_exists(&full_backup_path)?;
 
         let rebuild_result: anyhow::Result<()> = async {
             let (slice_schema, slice_temp_index) = tantivy_engine::init_with_path(&slice_temp_path)
                 .with_context(|| format!("init temp slice index failed: {}", slice_temp_path))?;
-            let (full_schema, full_temp_index) = tantivy_engine::init_with_path(&full_temp_path)
-                .with_context(|| format!("init temp full index failed: {}", full_temp_path))?;
             let mut slice_writer = tantivy_engine::create_rebuild_writer(&slice_temp_index, "rebuild_slice")
                 .await
                 .context("create temp slice writer failed")?;
-            let mut full_writer = tantivy_engine::create_rebuild_writer(&full_temp_index, "rebuild_full")
-                .await
-                .context("create temp full writer failed")?;
             let mut total_slice_docs = 0_usize;
-            let mut total_full_docs = 0_usize;
 
             on_progress(RebuildProgress { phase: "build_slice".to_string(), total_docs, processed_docs }).await;
             let mut last_slice_id = 0_i64;
@@ -771,82 +727,22 @@ impl SearchEngine {
             tantivy_engine::commit_writer(&mut slice_writer, "rebuild_slice", total_slice_docs)
                 .context("commit temp slice writer failed")?;
 
-            on_progress(RebuildProgress { phase: "build_full".to_string(), total_docs, processed_docs }).await;
-            let mut last_file_id = 0_i64;
-            loop {
-                let meta_rows: Vec<RebuildFullMetaRow> = sqlx::query_as(
-                    "SELECT id, kb_id, filename \
-                     FROM files \
-                     WHERE status = 1 AND id > ? \
-                     ORDER BY id ASC \
-                     LIMIT ?",
-                )
-                .bind(last_file_id)
-                .bind(rebuild_batch_size)
-                .fetch_all(pool)
-                .await?;
-                if meta_rows.is_empty() {
-                    break;
-                }
-                last_file_id = meta_rows.last().map(|row| row.id).unwrap_or(last_file_id);
-                let batch_size = meta_rows.len() as i64;
-
-                let ids: Vec<i64> = meta_rows.iter().map(|row| row.id).collect();
-                let content_by_id = fetch_file_contents_by_ids(pool, &ids).await?;
-
-                let docs: Vec<tantivy_engine::Document> = meta_rows
-                    .into_iter()
-                    .map(|row| {
-                        let full_content = content_by_id.get(&row.id).cloned().unwrap_or_default();
-                        let index_content = if full_content.trim().is_empty() {
-                            row.filename
-                        } else {
-                            format!("{}\n\n{}", row.filename, full_content)
-                        };
-                        tantivy_engine::Document::new(row.id, row.id, row.kb_id, index_content)
-                    })
-                    .collect();
-                total_full_docs += tantivy_engine::add_documents(&mut full_writer, &full_schema, docs)?;
-                processed_docs += batch_size;
-                on_progress(RebuildProgress { phase: "build_full".to_string(), total_docs, processed_docs }).await;
-            }
-            tantivy_engine::commit_writer(&mut full_writer, "rebuild_full", total_full_docs)
-                .context("commit temp full writer failed")?;
-
             drop(slice_writer);
-            drop(full_writer);
 
             drop(slice_temp_index);
-            drop(full_temp_index);
 
             let _slice_write_guard = self.index_write_lock.lock().await;
-            let _full_write_guard = self.full_index_write_lock.lock().await;
             on_progress(RebuildProgress { phase: "swap".to_string(), total_docs, processed_docs }).await;
 
             if let Err(err) = swap_index_dir(&slice_live_path, &slice_temp_path, &slice_backup_path) {
                 return Err(err.context("swap slice index failed"));
             }
 
-            if let Err(err) = swap_index_dir(&full_live_path, &full_temp_path, &full_backup_path) {
-                if let Err(rb_err) = restore_backup_dir(&slice_live_path, &slice_backup_path) {
-                    warn!("rollback slice index failed after full swap failure: {}", rb_err);
-                }
-                return Err(err.context("swap full index failed"));
-            }
-
             if let Err(err) = reload_reader(&self.index_reader, "index") {
-                let _ = restore_backup_dir(&full_live_path, &full_backup_path);
                 let _ = restore_backup_dir(&slice_live_path, &slice_backup_path);
                 return Err(err).context("reload slice reader after swap failed");
             }
-            if let Err(err) = reload_reader(&self.full_index_reader, "full_index") {
-                let _ = restore_backup_dir(&full_live_path, &full_backup_path);
-                let _ = restore_backup_dir(&slice_live_path, &slice_backup_path);
-                return Err(err).context("reload full reader after swap failed");
-            }
-
             cleanup_dir_if_exists(&slice_backup_path)?;
-            cleanup_dir_if_exists(&full_backup_path)?;
             processed_docs = total_docs;
             on_progress(RebuildProgress { phase: "completed".to_string(), total_docs, processed_docs }).await;
             Ok(())
@@ -856,7 +752,6 @@ impl SearchEngine {
         if rebuild_result.is_err() {
             // 清理临时重建目录（重建过程中的中间产物）
             let _ = cleanup_dir_if_exists(&slice_temp_path);
-            let _ = cleanup_dir_if_exists(&full_temp_path);
             // 保留 backup 目录不删除——如果 swap 后 reload 失败且 restore 也失败，
             // backup 是恢复到上一次可用索引的唯一手段。
             // 这些 backup 会在下次成功重建后被覆盖，或通过手动清理。
@@ -917,15 +812,6 @@ impl SearchEngine {
         Ok(())
     }
 
-    /// 写入全文索引。注意：写入后不会自动 reload reader，调用方需在完成全部写入后调用 [`reload_readers`]。
-    pub async fn write_full(&self, doc: tantivy_engine::Document) -> anyhow::Result<()> {
-        {
-            let _guard = self.full_index_write_lock.lock().await;
-            self.full_index_writer.write_batch(vec![doc]).await?;
-        }
-        Ok(())
-    }
-
     pub async fn write_summary(&self, file_id: i64, kb_id: Option<i64>, summary: String) -> anyhow::Result<()> {
         lancedb::write_summary(lancedb::SummaryDocument::new(file_id, kb_id, summary)).await
     }
@@ -973,29 +859,8 @@ impl SearchEngine {
         Ok(())
     }
 
-    /// 更新指定文件在全文索引中的内容。
-    ///
-    /// 会先删除该 file_id 对应的旧全文文档，再写入 `filename\n\nfull_content`。
-    pub async fn update_full_index_for_file(
-        &self, file_id: i64, kb_id: Option<i64>, filename: String, full_content: String,
-    ) -> anyhow::Result<()> {
-        let index_content =
-            if full_content.trim().is_empty() { filename } else { format!("{}\n\n{}", filename, full_content) };
-
-        {
-            let _guard = self.full_index_write_lock.lock().await;
-            self.full_index_writer.delete_by_field("file_id", &[file_id]).await?;
-            self.full_index_writer
-                .write_batch(vec![tantivy_engine::Document::new(file_id, file_id, kb_id, index_content)])
-                .await?;
-            reload_reader(&self.full_index_reader, "full_index")?;
-        }
-        Ok(())
-    }
-
     pub fn reload_readers(&self) -> anyhow::Result<()> {
         reload_reader(&self.index_reader, "index")?;
-        reload_reader(&self.full_index_reader, "full_index")?;
         Ok(())
     }
 
@@ -1046,37 +911,9 @@ impl SearchEngine {
                 anyhow::Ok(())
             };
 
-            let tantivy_full_delete = async {
-                let lock_wait_start = Instant::now();
-                {
-                    let _guard = self.full_index_write_lock.lock().await;
-                    let locked_at = Instant::now();
-                    debug!(
-                        "search_delete file_count={} tantivy_full_lock_wait_ms={}",
-                        file_ids.len(),
-                        lock_wait_start.elapsed().as_millis()
-                    );
-                    self.full_index_writer.delete_by_field("file_id", file_ids).await?;
-                    debug!(
-                        "search_delete file_count={} tantivy_full_inner_ms={}",
-                        file_ids.len(),
-                        locked_at.elapsed().as_millis()
-                    );
-                }
-                reload_reader(&self.full_index_reader, "full_index")?;
-                debug!(
-                    "search_delete file_count={} tantivy_full {}ms",
-                    file_ids.len(),
-                    lock_wait_start.elapsed().as_millis()
-                );
-                anyhow::Ok(())
-            };
-
-            let (tantivy_result, lancedb_result, tantivy_full_result) =
-                tokio::join!(tantivy_delete, lancedb_delete, tantivy_full_delete);
+            let (tantivy_result, lancedb_result) = tokio::join!(tantivy_delete, lancedb_delete);
             tantivy_result?;
             lancedb_result?;
-            tantivy_full_result?;
         }
         if let Some(kb_ids) = kb_ids.filter(|ids| !ids.is_empty()) {
             let tantivy_delete = async {
@@ -1113,37 +950,9 @@ impl SearchEngine {
                 anyhow::Ok(())
             };
 
-            let tantivy_full_delete = async {
-                let lock_wait_start = Instant::now();
-                {
-                    let _guard = self.full_index_write_lock.lock().await;
-                    let locked_at = Instant::now();
-                    debug!(
-                        "search_delete kb_count={} tantivy_full_lock_wait_ms={}",
-                        kb_ids.len(),
-                        lock_wait_start.elapsed().as_millis()
-                    );
-                    self.full_index_writer.delete_by_field("kb_id", kb_ids).await?;
-                    debug!(
-                        "search_delete kb_count={} tantivy_full_inner_ms={}",
-                        kb_ids.len(),
-                        locked_at.elapsed().as_millis()
-                    );
-                }
-                reload_reader(&self.full_index_reader, "full_index")?;
-                debug!(
-                    "search_delete kb_count={} tantivy_full {}ms",
-                    kb_ids.len(),
-                    lock_wait_start.elapsed().as_millis()
-                );
-                anyhow::Ok(())
-            };
-
-            let (tantivy_result, lancedb_result, tantivy_full_result) =
-                tokio::join!(tantivy_delete, lancedb_delete, tantivy_full_delete);
+            let (tantivy_result, lancedb_result) = tokio::join!(tantivy_delete, lancedb_delete);
             tantivy_result?;
             lancedb_result?;
-            tantivy_full_result?;
         }
         debug!(
             "search_delete total {}ms file_count={:?} kb_count={:?}",
@@ -1270,30 +1079,6 @@ impl SearchEngine {
 
         debug!("Search candidates total {}ms", total_start.elapsed().as_millis());
         Ok(merged_results)
-    }
-
-    pub async fn search_full(
-        &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
-    ) -> anyhow::Result<Vec<FullSearchResultItem>> {
-        let synonym_map = match self.load_query_synonyms(query).await {
-            Ok(map) => map,
-            Err(e) => {
-                warn!("Failed to load query synonyms for '{}': {}", query, e);
-                HashMap::new()
-            }
-        };
-        let synonym_ref = if synonym_map.is_empty() { None } else { Some(&synonym_map) };
-        tantivy_engine::search_with_snippet(
-            &self.full_index_reader,
-            &self.full_schema,
-            query,
-            file_ids,
-            kb_ids,
-            None,
-            FULL_SNIPPET_MAX_CHARS,
-            synonym_ref,
-        )
-        .await
     }
 
     pub async fn search_summary(
@@ -1634,22 +1419,12 @@ impl SearchEngine {
     }
 
     /// 强制合并 Tantivy segment，减少碎片与已删除文档 tombstone。
-    pub async fn force_merge_tantivy_indexes(
-        &self,
-    ) -> anyhow::Result<(tantivy_engine::ForceMergeStats, tantivy_engine::ForceMergeStats)> {
+    pub async fn force_merge_tantivy_indexes(&self) -> anyhow::Result<tantivy_engine::ForceMergeStats> {
         let _rebuild_guard = self.rebuild_lock.lock().await;
-        let (slice_stats, full_stats) = {
-            let _slice_write_guard = self.index_write_lock.lock().await;
-            let _full_write_guard = self.full_index_write_lock.lock().await;
-            let slice_stats = self.index_writer.force_merge().await?;
-            let full_stats = self.full_index_writer.force_merge().await?;
-            (slice_stats, full_stats)
-        };
-
+        let _write_guard = self.index_write_lock.lock().await;
+        let stats = self.index_writer.force_merge().await?;
         reload_reader(&self.index_reader, "index")?;
-        reload_reader(&self.full_index_reader, "full_index")?;
-
-        Ok((slice_stats, full_stats))
+        Ok(stats)
     }
 
     /// 确保同义词缓存新鲜（TTL 内复用，过期则重载全部 enabled 行）。
@@ -1821,20 +1596,6 @@ impl SearchEngine {
         results.truncate(config::get().search.limit.max(1));
         Ok(results)
     }
-}
-
-async fn fetch_file_contents_by_ids(_pool: &SqlitePool, ids: &[i64]) -> anyhow::Result<HashMap<i64, String>> {
-    if ids.is_empty() {
-        return Ok(HashMap::new());
-    }
-
-    let mut map = HashMap::with_capacity(ids.len());
-    for id in ids {
-        if let Some(content) = crate::file_content::read(*id).await? {
-            map.insert(*id, content);
-        }
-    }
-    Ok(map)
 }
 
 fn sanitize_job_tag(input: &str) -> String {

@@ -451,7 +451,7 @@ const handleReparseFailedFiles = async () => {
     ? '所有知识库及待归类文件中的失败文件'
     : `「${currentKb.value.name || '当前知识库'}」及其子知识库中的失败文件`
 
-  if (!confirm(`确定要重新解析${scopeLabel}吗？`)) return
+  if (!confirm(`确定要重试${scopeLabel}吗？原文解析成功的文件只重试 Wiki。`)) return
 
   reparseFailedLoading.value = true
   try {
@@ -464,12 +464,12 @@ const handleReparseFailedFiles = async () => {
     const count = result?.file_count ?? 0
     alert(
       count > 0
-        ? `已提交 ${count} 个失败文件重新解析`
-        : '当前范围内没有可重新解析的失败文件',
+        ? `已提交 ${count} 个失败文件重试`
+        : '当前范围内没有可重试的失败文件',
     )
     await loadKbContent(getCurrentKbId())
   } catch (e) {
-    alert('重新解析失败文件失败：' + e.message)
+    alert('重试失败文件失败：' + e.message)
   } finally {
     reparseFailedLoading.value = false
   }
@@ -558,7 +558,39 @@ defineExpose({
 })
 
 // Initial load
+let statusTimer = null
+let refreshingStatus = false
+const refreshProcessingStatus = async () => {
+  if (document.hidden || loading.value || loadingMore.value || refreshingStatus) return
+  if (!stats.value.pending && !stats.value.processing) return
+  const request = navigationRequest
+  const kbId = getCurrentKbId()
+  const pageCount = currentPage.value
+  refreshingStatus = true
+  try {
+    const pages = Array.from({ length: pageCount }, (_, i) => {
+      const params = { page: i + 1, size: pageSize.value,
+        filename: fileFilterName.value || undefined, tag: fileFilterTag.value || undefined }
+      return kbId === null ? api.getFiles(null, null, params) : api.getKnowledgeBaseFiles(kbId, params)
+    })
+    const [nextStats, ...results] = await Promise.all([
+      api.getFileStats(kbId === null ? {} : { kbId, includeDescendants: true }), ...pages,
+    ])
+    if (request !== navigationRequest || pageCount !== currentPage.value) return
+    const updates = new Map(results.flatMap((result) => result.items || []).map((file) => [file.id, file]))
+    for (const file of files.value) {
+      if (updates.has(file.id)) Object.assign(file, updates.get(file.id))
+    }
+    stats.value = nextStats
+  } catch {
+    // 临时网络错误留给下一轮重试，保留当前列表。
+  } finally {
+    refreshingStatus = false
+  }
+}
+
 onMounted(async () => {
+  statusTimer = window.setInterval(refreshProcessingStatus, 5000)
   await loadKbContent(null)
   loadExportRecords()
   listObserver = new IntersectionObserver(
@@ -575,7 +607,11 @@ watch(listSentinel, (el, old) => {
   if (old) listObserver?.unobserve(old)
   if (el) listObserver?.observe(el)
 })
-onBeforeUnmount(() => listObserver?.disconnect())
+onBeforeUnmount(() => {
+  navigationRequest += 1
+  window.clearInterval(statusTimer)
+  listObserver?.disconnect()
+})
 </script>
 
 <template>

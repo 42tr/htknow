@@ -170,8 +170,6 @@ pub struct SearchConfig {
     pub limit: usize,
     /// Tantivy 索引路径
     pub tantivy_index_path: String,
-    /// Tantivy 全文索引路径
-    pub tantivy_full_index_path: String,
     /// Tantivy 索引内存（MB）
     pub tantivy_memory_mb: usize,
     /// Tantivy 重建批次大小
@@ -333,10 +331,6 @@ impl SearchConfig {
         Self {
             limit: env_or_parse("HTKNOW_SEARCH_LIMIT", 10),
             tantivy_index_path: env_or("HTKNOW_TANTIVY_INDEX_PATH", &format!("{}/tantivy_index", data_dir)),
-            tantivy_full_index_path: env_or(
-                "HTKNOW_TANTIVY_FULL_INDEX_PATH",
-                &format!("{}/tantivy_full_index", data_dir),
-            ),
             tantivy_memory_mb: env_or_parse("HTKNOW_TANTIVY_MEMORY_MB", 50),
             tantivy_rebuild_batch_size: env_or_parse("HTKNOW_SEARCH_TANTIVY_REBUILD_BATCH_SIZE", 100),
             lancedb_rebuild_batch_size: env_or_parse("HTKNOW_SEARCH_LANCEDB_REBUILD_BATCH_SIZE", 1000),

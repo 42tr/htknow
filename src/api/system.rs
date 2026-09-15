@@ -91,7 +91,7 @@ pub struct IndexRebuildStatus {
 /// 单个 Tantivy 索引 force merge 统计信息
 #[derive(Debug, Serialize, ToSchema)]
 pub struct TantivyForceMergeIndexStats {
-    /// 索引名称：index/full_index
+    /// 索引名称：index
     pub index: String,
     /// merge 前 segment 数
     pub before_segments: usize,
@@ -120,8 +120,6 @@ pub struct TantivyForceMergeIndexStats {
 pub struct TantivyForceMergeResponse {
     /// 普通切片索引统计
     pub index: TantivyForceMergeIndexStats,
-    /// 全文索引统计
-    pub full_index: TantivyForceMergeIndexStats,
     /// 总耗时（毫秒）
     pub total_duration_ms: u128,
 }
@@ -227,14 +225,13 @@ pub async fn index_force_merge(
     common::ensure_admin(&auth_user)?;
 
     let start = std::time::Instant::now();
-    let (index_stats, full_index_stats) = search_engine
+    let index_stats = search_engine
         .force_merge_tantivy_indexes()
         .await
         .map_err(|e| ApiError::internal(format!("Tantivy force merge failed: {}", e)))?;
 
     Ok(Json(TantivyForceMergeResponse {
         index: force_merge_index_stats("index", index_stats),
-        full_index: force_merge_index_stats("full_index", full_index_stats),
         total_duration_ms: start.elapsed().as_millis(),
     }))
 }

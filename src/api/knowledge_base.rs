@@ -293,7 +293,14 @@ pub struct FileWithoutContent {
     pub path: String,
     pub size: i64,
     pub tags: String,
+    /// 原文解析状态；整体处理状态使用 processing_status。
     pub status: i32,
+    #[sqlx(default)]
+    pub processing_status: Option<i32>,
+    #[sqlx(default)]
+    pub wiki_status: Option<String>,
+    #[sqlx(default)]
+    pub wiki_error: Option<String>,
     pub log: String,
     pub slice_type: String,
     pub kb_id: Option<i64>,
@@ -967,7 +974,9 @@ pub async fn get_files(
             })
             .collect();
         let total = filtered.len() as i64;
-        let items = filtered.into_iter().skip(offset as usize).take(limit as usize).collect();
+        let mut items: Vec<FileWithoutContent> =
+            filtered.into_iter().skip(offset as usize).take(limit as usize).collect();
+        populate_file_progress(&pool, &mut items).await?;
         return Ok(Json(KnowledgeBaseFilesResponse { total, items }));
     }
 
@@ -983,9 +992,23 @@ pub async fn get_files(
     push_filters(&mut list_qb);
     list_qb.push(" ORDER BY updated_at DESC LIMIT ").push_bind(limit);
     list_qb.push(" OFFSET ").push_bind(offset);
-    let items: Vec<FileWithoutContent> = list_qb.build_query_as().fetch_all(&pool).await?;
+    let mut items: Vec<FileWithoutContent> = list_qb.build_query_as().fetch_all(&pool).await?;
 
+    populate_file_progress(&pool, &mut items).await?;
     Ok(Json(KnowledgeBaseFilesResponse { total, items }))
+}
+
+async fn populate_file_progress(pool: &SqlitePool, files: &mut [FileWithoutContent]) -> Result<(), sqlx::Error> {
+    let ids: Vec<i64> = files.iter().map(|f| f.id).collect();
+    let mut progress = crate::wiki::file_status::load(pool, &ids).await?;
+    for file in files {
+        if let Some(row) = progress.remove(&file.id) {
+            file.processing_status = Some(row.processing_status);
+            file.wiki_status = row.wiki_status;
+            file.wiki_error = row.wiki_error;
+        }
+    }
+    Ok(())
 }
 
 /// 获取知识库文件标签及其文件数量

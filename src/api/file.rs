@@ -142,7 +142,19 @@ pub struct File {
     #[sqlx(default)]
     pub content: Option<String>,
     pub tags: String,
+    /// 原文解析状态；整体完成状态使用 processing_status。
     pub status: i32,
+    /// 整体处理状态，沿用 status 的数值；Wiki 未完成时为 2，最终失败为 -1。
+    #[sqlx(default)]
+    #[serde(default)]
+    pub processing_status: Option<i32>,
+    /// pending / running / retrying / completed / skipped / failed；无需 Wiki 时为空。
+    #[sqlx(default)]
+    #[serde(default)]
+    pub wiki_status: Option<String>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub wiki_error: Option<String>,
     pub log: String,
     pub slice_type: String,
     pub kb_id: Option<i64>,
@@ -258,7 +270,10 @@ async fn query_file_status_breakdown(
         qb.push(") ");
     }
 
-    qb.push("SELECT COALESCE(f.status, -99) AS status, COUNT(*) AS cnt FROM files f WHERE 1=1");
+    qb.push(format!(
+        "SELECT p.processing_status AS status, COUNT(*) AS cnt FROM files f JOIN {} p ON p.id = f.id WHERE 1=1",
+        crate::wiki::file_status::relation()
+    ));
 
     match scope {
         FileStatsScope::Global { include_unassigned } => {
@@ -282,7 +297,7 @@ async fn query_file_status_breakdown(
         qb.push(" AND (f.user_id = ").push_bind(user_id).push(" OR f.is_public = 1)");
     }
 
-    qb.push(" GROUP BY f.status");
+    qb.push(" GROUP BY p.processing_status");
 
     let rows = qb.build().fetch_all(pool).await?;
     let mut breakdown = FileStatusBreakdown::default();
@@ -310,8 +325,9 @@ async fn fetch_status_files_for_scope(
          FROM files f \
          LEFT JOIN knowledge_bases kb ON kb.id = f.kb_id \
          LEFT JOIN kb_paths ON kb_paths.id = f.kb_id \
-         WHERE f.status = ",
+         ",
     );
+    qb.push(format!(" JOIN {} p ON p.id = f.id WHERE p.processing_status = ", crate::wiki::file_status::relation()));
     qb.push_bind(status);
 
     match scope {
@@ -796,6 +812,7 @@ pub async fn upload(
         }
     }
 
+    crate::wiki::file_status::populate(&pool, &mut uploaded_files).await?;
     Ok(Json(uploaded_files))
 }
 
@@ -832,6 +849,7 @@ pub async fn get(
     ensure_file_readable(&file, &auth_user)?;
 
     file.content = crate::file_content::read(id).await?;
+    crate::wiki::file_status::populate(&pool, std::slice::from_mut(&mut file)).await?;
     Ok(Json(file))
 }
 
@@ -1029,7 +1047,8 @@ pub async fn update(
         qb.build().execute(&pool).await?;
     }
 
-    let file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+    let mut file = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+    crate::wiki::file_status::populate(&pool, std::slice::from_mut(&mut file)).await?;
     Ok(Json(file))
 }
 
@@ -1064,7 +1083,7 @@ pub async fn move_to_kb(
         return Err(ApiError::BadRequest("Invalid target_kb_id".to_string()));
     }
 
-    let file: File = sqlx::query_as::<_, File>("SELECT * FROM files WHERE id = ?")
+    let mut file: File = sqlx::query_as::<_, File>("SELECT * FROM files WHERE id = ?")
         .bind(id)
         .fetch_optional(&pool)
         .await?
@@ -1077,6 +1096,7 @@ pub async fn move_to_kb(
     }
 
     if file.kb_id == req.target_kb_id {
+        crate::wiki::file_status::populate(&pool, std::slice::from_mut(&mut file)).await?;
         return Ok(Json(file));
     }
 
@@ -1145,7 +1165,8 @@ pub async fn move_to_kb(
         warn!("Failed to delete slice content file after file move for file {}: {}", id, e);
     }
 
-    let moved: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+    let mut moved: File = sqlx::query_as("SELECT * FROM files WHERE id = ?").bind(id).fetch_one(&pool).await?;
+    crate::wiki::file_status::populate(&pool, std::slice::from_mut(&mut moved)).await?;
     Ok(Json(moved))
 }
 
@@ -1402,9 +1423,12 @@ async fn query_failed_file_ids_for_reparse(
     pool: &SqlitePool, auth_user: &AuthUser, req: &ReparseFailedFilesReq,
 ) -> ApiResult<Vec<i64>> {
     let is_admin = auth_user.is_admin();
+    let progress = crate::wiki::file_status::relation();
 
     if req.unassigned_only {
-        let mut qb = QueryBuilder::<Sqlite>::new("SELECT f.id FROM files f WHERE f.status = -1 AND f.kb_id IS NULL");
+        let mut qb = QueryBuilder::<Sqlite>::new(format!(
+            "SELECT f.id FROM files f JOIN {progress} p ON p.id = f.id WHERE p.processing_status = -1 AND f.kb_id IS NULL"
+        ));
         if !is_admin {
             qb.push(" AND f.user_id = ").push_bind(&auth_user.user_id);
         }
@@ -1440,7 +1464,9 @@ async fn query_failed_file_ids_for_reparse(
             if allowed_kb_ids.is_empty() {
                 return Ok(Vec::new());
             }
-            let mut qb2 = QueryBuilder::<Sqlite>::new("SELECT f.id FROM files f WHERE f.status = -1 AND f.kb_id IN (");
+            let mut qb2 = QueryBuilder::<Sqlite>::new(format!(
+                "SELECT f.id FROM files f JOIN {progress} p ON p.id = f.id WHERE p.processing_status = -1 AND f.kb_id IN ("
+            ));
             let mut sep = qb2.separated(", ");
             for id in &allowed_kb_ids {
                 sep.push_bind(id);
@@ -1450,11 +1476,11 @@ async fn query_failed_file_ids_for_reparse(
             return Ok(ids);
         }
 
-        let mut qb = QueryBuilder::<Sqlite>::new(
-            "SELECT f.id FROM files f \
+        let mut qb = QueryBuilder::<Sqlite>::new(format!(
+            "SELECT f.id FROM files f JOIN {progress} p ON p.id = f.id \
              JOIN knowledge_bases kb ON kb.id = f.kb_id \
-             WHERE f.status = -1 AND f.kb_id = ",
-        );
+             WHERE p.processing_status = -1 AND f.kb_id = "
+        ));
         qb.push_bind(kb_id);
         qb.push(" AND kb.kb_type != ").push_bind("storage");
         if !is_admin {
@@ -1466,11 +1492,11 @@ async fn query_failed_file_ids_for_reparse(
     }
 
     // Global reparse-failed: only user's own files + files in KBs where user has editor permission
-    let mut qb = QueryBuilder::<Sqlite>::new(
-        "SELECT f.id, f.kb_id FROM files f \
+    let mut qb = QueryBuilder::<Sqlite>::new(format!(
+        "SELECT f.id, f.kb_id FROM files f JOIN {progress} p ON p.id = f.id \
          LEFT JOIN knowledge_bases kb ON kb.id = f.kb_id \
-         WHERE f.status = -1 AND (f.kb_id IS NULL OR kb.kb_type != ",
-    );
+         WHERE p.processing_status = -1 AND (f.kb_id IS NULL OR kb.kb_type != "
+    ));
     qb.push_bind("storage");
     qb.push(")");
     if !req.include_unassigned {
@@ -1524,9 +1550,34 @@ async fn remove_converted_pdfs(file_ids: &[i64]) {
 async fn execute_reparse_failed(
     pool: &SqlitePool, search_engine: &SearchEngine, auth_user: &AuthUser, req: ReparseFailedFilesReq,
 ) -> ApiResult<ReparseFailedFilesResp> {
-    let file_ids = query_failed_file_ids_for_reparse(pool, auth_user, &req).await?;
+    let mut file_ids = query_failed_file_ids_for_reparse(pool, auth_user, &req).await?;
     if file_ids.is_empty() {
         return Ok(ReparseFailedFilesResp { file_count: 0 });
+    }
+
+    // Wiki 失败只重试 Wiki，保留已经可用的原文、切片和向量。
+    let mut wiki_retried = 0_i64;
+    let mut parse_failed_ids = Vec::new();
+    for batch in file_ids.chunks(500) {
+        let mut query = QueryBuilder::<Sqlite>::new("SELECT id, kb_id, status FROM files WHERE id IN (");
+        crate::db::push_i64_list(&mut query, batch);
+        query.push(")");
+        let rows: Vec<(i64, Option<i64>, i32)> = query.build_query_as().fetch_all(pool).await?;
+        for (id, kb_id, status) in rows {
+            if status == -1 {
+                parse_failed_ids.push(id);
+            } else if status == 1
+                && let Some(kb_id) = kb_id
+            {
+                if crate::wiki::queue::enqueue_ingest(pool, kb_id, id).await? {
+                    wiki_retried += 1;
+                }
+            }
+        }
+    }
+    file_ids = parse_failed_ids;
+    if file_ids.is_empty() {
+        return Ok(ReparseFailedFilesResp { file_count: wiki_retried });
     }
 
     let image_paths = collect_image_paths_for_files(pool, &file_ids).await?;
@@ -1557,7 +1608,7 @@ async fn execute_reparse_failed(
         }
     }
 
-    Ok(ReparseFailedFilesResp { file_count: updated })
+    Ok(ReparseFailedFilesResp { file_count: updated + wiki_retried })
 }
 
 pub(crate) async fn cleanup_deleted_files(
@@ -2222,7 +2273,7 @@ pub async fn list(
             }
         });
         let total = files.len() as i64;
-        let items = files
+        let mut items: Vec<File> = files
             .into_iter()
             .skip(offset as usize)
             .take(limit as usize)
@@ -2231,6 +2282,7 @@ pub async fn list(
                 file
             })
             .collect();
+        crate::wiki::file_status::populate(&pool, &mut items).await?;
         return Ok(Json(FileListResponse { total, items }));
     }
 
@@ -2272,6 +2324,7 @@ pub async fn list(
         file.content = None;
     }
 
+    crate::wiki::file_status::populate(&pool, &mut items).await?;
     Ok(Json(FileListResponse { total, items }))
 }
 
@@ -2521,15 +2574,8 @@ pub async fn update_slices(
         .filter(|(_, content)| !content.is_empty())
         .collect();
 
-    let (slice_index_result, full_index_result) = tokio::join!(
-        search_engine.update_slices(id, file.kb_id, updates),
-        search_engine.update_full_index_for_file(id, file.kb_id, file.filename.clone(), full_content)
-    );
-    if let Err(e) = slice_index_result {
+    if let Err(e) = search_engine.update_slices(id, file.kb_id, updates).await {
         warn!("Failed to update slice search index for file {}: {}", id, e);
-    }
-    if let Err(e) = full_index_result {
-        warn!("Failed to update full search index for file {}: {}", id, e);
     }
 
     // 8. 返回更新后的切片列表

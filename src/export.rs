@@ -76,7 +76,6 @@ pub struct ExportManifest {
     pub mention_count: usize,
     pub snapshot_count: usize,
     pub tantivy_doc_count: usize,
-    pub tantivy_full_doc_count: usize,
     pub lancedb_row_count: usize,
 }
 
@@ -95,7 +94,6 @@ impl Default for ExportManifest {
             mention_count: 0,
             snapshot_count: 0,
             tantivy_doc_count: 0,
-            tantivy_full_doc_count: 0,
             lancedb_row_count: 0,
         }
     }
@@ -164,7 +162,6 @@ pub async fn export_knowledge_bases(
     let contents_dir = export_dir.join("contents");
     let slice_contents_dir = export_dir.join("slice_contents");
     let tantivy_dir = export_dir.join("tantivy_index");
-    let tantivy_full_dir = export_dir.join("tantivy_full_index");
     let lancedb_dir = export_dir.join("lancedb_data");
 
     tokio::fs::create_dir_all(&files_dir).await?;
@@ -173,7 +170,6 @@ pub async fn export_knowledge_bases(
     tokio::fs::create_dir_all(&contents_dir).await?;
     tokio::fs::create_dir_all(&slice_contents_dir).await?;
     tokio::fs::create_dir_all(&tantivy_dir).await?;
-    tokio::fs::create_dir_all(&tantivy_full_dir).await?;
     tokio::fs::create_dir_all(&lancedb_dir).await?;
     info!("[step] Create directories: {}ms", step_start.elapsed().as_millis());
 
@@ -206,14 +202,12 @@ pub async fn export_knowledge_bases(
     let file_ids_for_copy = file_ids.clone();
     let file_ids_for_count = file_ids.clone();
     let target_kb_ids_for_tantivy = target_kb_ids.clone();
-    let target_kb_ids_for_tantivy_full = target_kb_ids.clone();
     let target_kb_ids_for_lancedb = target_kb_ids.clone();
     let target_kb_ids_for_stats = target_kb_ids.clone();
     let pool_clone = pool.clone();
 
     // 提前取出各 future 需要的路径（owned），避免 async move 各自去移动同一个 Arc<AppConfig> 的字段
     let tantivy_index_path = cfg.search.tantivy_index_path.clone();
-    let tantivy_full_index_path = cfg.search.tantivy_full_index_path.clone();
     let lancedb_path = cfg.storage.lancedb_path.clone();
 
     let copy_files_future = async move {
@@ -234,22 +228,6 @@ pub async fn export_knowledge_bases(
                     0
                 });
         info!("[step] Export Tantivy slice index: {}ms", s.elapsed().as_millis());
-        count
-    };
-
-    let tantivy_full_future = async move {
-        let s = std::time::Instant::now();
-        let count = export_tantivy_index(
-            &tantivy_full_index_path,
-            &tantivy_full_dir.to_string_lossy(),
-            &target_kb_ids_for_tantivy_full,
-        )
-        .await
-        .unwrap_or_else(|e| {
-            warn!("Failed to export Tantivy full index: {}", e);
-            0
-        });
-        info!("[step] Export Tantivy full index: {}ms", s.elapsed().as_millis());
         count
     };
 
@@ -274,8 +252,8 @@ pub async fn export_knowledge_bases(
         (slice_count, node_count, edge_count, mention_count, snapshot_count)
     };
 
-    let (copy_result, tantivy_doc_count, tantivy_full_doc_count, lancedb_row_count, stats) =
-        tokio::join!(copy_files_future, tantivy_future, tantivy_full_future, lancedb_future, stats_future,);
+    let (copy_result, tantivy_doc_count, lancedb_row_count, stats) =
+        tokio::join!(copy_files_future, tantivy_future, lancedb_future, stats_future,);
 
     copy_result?;
     let (slice_count, node_count, edge_count, mention_count, snapshot_count) = stats;
@@ -298,7 +276,6 @@ pub async fn export_knowledge_bases(
         mention_count,
         snapshot_count,
         tantivy_doc_count,
-        tantivy_full_doc_count,
         lancedb_row_count,
     };
 

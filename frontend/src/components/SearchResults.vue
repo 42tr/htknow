@@ -203,12 +203,7 @@ watch(
                   <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7" />
                 </svg>
               </div>
-              <p
-                v-if="result.snippet"
-                class="text-slate-600 text-sm line-clamp-2 mb-2 search-snippet"
-                v-html="result.snippet"
-              ></p>
-              <p v-else class="text-slate-600 text-sm line-clamp-2 mb-2">
+              <p class="text-slate-600 text-sm line-clamp-2 mb-2">
                 {{
                   result.content ||
                   (isImageFile(result.file?.filename)
@@ -285,13 +280,3 @@ watch(
     />
   </div>
 </template>
-
-<style scoped>
-.search-snippet :deep(b) {
-  font-weight: 600;
-  color: #3567dd;
-  background-color: rgba(53, 103, 221, 0.12);
-  padding: 0 2px;
-  border-radius: 2px;
-}
-</style>

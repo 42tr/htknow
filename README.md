@@ -4,7 +4,7 @@ HTKnow 知识库管理系统，提供文档上传、检索与知识图谱能力�
 
 ## 功能概览
 - 知识库管理、文件上传与解析
-- 全文/向量/图谱增强搜索
+- 段落混合搜索（关键词、向量与 Wiki）/图谱增强搜索
 - 知识图谱查询与可视化
 - 知识库 Wiki：文档解析后自动生成互相链接的条目页（摘要/实体/概念/索引），支持人工编辑、版本回滚、归档与体检
 - 内置前端界面与 Swagger API 文档
@@ -137,7 +137,6 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | --- | --- | --- |
 | `HTKNOW_SEARCH_LIMIT` | `10` | 搜索结果限制 |
 | `HTKNOW_TANTIVY_INDEX_PATH` | `data/tantivy_index` | Tantivy 索引路径 |
-| `HTKNOW_TANTIVY_FULL_INDEX_PATH` | `data/tantivy_full_index` | Tantivy 全文索引 |
 | `HTKNOW_TANTIVY_MEMORY_MB` | `50` | Tantivy 内存（MB） |
 | `HTKNOW_SEARCH_TANTIVY_REBUILD_BATCH_SIZE` | `100` | Tantivy 索引重建批次大小 |
 | `HTKNOW_SEARCH_LANCEDB_REBUILD_BATCH_SIZE` | `100` | LanceDB 从 SQLite 重建批次大小 |
@@ -204,7 +203,7 @@ RUST_LOG=warn,htknow::search=debug ./htknow
 ```
 
 ## 问题处理
-1. 全文索引 tantivy 异常
+1. Tantivy 切片索引异常
 可能是异常停止导致的，报错
 thread 'main' (1) panicked at src/search/mod.rs:903:29:failed to create tantivy index reader: Failed to open file for read: 'FileDoestiotExist("/app/data/tantivy index/eafseaef4f2340...
 run with 'RuST_BAcKTRAcE=l environment variable to display a backtrace
@@ -216,13 +215,16 @@ run with 'RuST_BAcKTRAcE=l environment variable to display a backtrace
 先去掉原本的索引使应用正常启动
 ```shell
 mv tantivy_index tantivy_index_bak0423
-mv tantivy_full_index tantivy_full_index_bak0423
 docker start htknow
 ```
-然后在词典可以重建全文检索的索引
+然后在词典管理中重建搜索索引
 
 ### 文件解析时 embedding 请求失败
 
 批量文本向量请求同时受条数和字符预算约束，建立连接最多等待 5 秒，推理超时独立配置。超时或 HTTP 413 会拆小多条批次；单条超时、连接故障、HTTP 408/429/5xx 最多退避重试两次。认证错误及其他不可重试的错误直接报告。响应条数和 `index` 必须与输入对应，避免向量与切片错配。
 
 长文档可使用 `HTKNOW_EMBEDDING_BATCH_TIMEOUT_SECS=120`、`HTKNOW_EMBEDDING_BATCH_MAX_CHARS=16000`（默认值）；旧版本尚未支持这两个变量时，可临时设置 `HTKNOW_EMBEDDING_BATCH_SIZE=2`、`HTKNOW_SEARCH_EMBEDDING_TIMEOUT_SECS=120`，后者也会延长搜索请求超时。环境变量修改后需重启服务，再重试失败文件。单条文本超过模型上下文限制时仍需调整切片大小；字符预算不会截断原文，也不等同于模型 token 上限。
+
+### 搜索入口
+
+搜索界面默认使用「段落」，混合检索原文切片与 Wiki；另提供「图片」和「高级」。独立的文档全文搜索入口及 `/search/full` API 已移除，不再创建、写入、重建或导出文档全文索引，原 `HTKNOW_TANTIVY_FULL_INDEX_PATH` 配置不再使用。旧版本留下的索引目录不会自动删除，可在确认升级后自行清理。原文存储、文件预览、切片关键词检索及 `/search/summary` 摘要接口继续使用。

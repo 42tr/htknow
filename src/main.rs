@@ -86,13 +86,11 @@ async fn main() -> anyhow::Result<()> {
                         );
 
                         match search_engine.force_merge_tantivy_indexes().await {
-                            Ok((index_stats, full_index_stats)) => {
+                            Ok(index_stats) => {
                                 log::info!(
-                                    "Tantivy auto force-merge done: index_segments={}->{}, full_index_segments={}->{}",
+                                    "Tantivy auto force-merge done: index_segments={}->{}",
                                     index_stats.before_segments,
                                     index_stats.after_segments,
-                                    full_index_stats.before_segments,
-                                    full_index_stats.after_segments,
                                 );
                             }
                             Err(e) => {

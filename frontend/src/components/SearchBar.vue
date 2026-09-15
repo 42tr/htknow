@@ -24,11 +24,11 @@ try {
     .slice(0, 6)
 } catch {}
 const error = ref('')
-const searchMode = ref('full')
+const searchMode = ref('slice')
 const retrievalMode = computed({
   get: () => (searchMode.value === 'advanced' ? 'advanced' : 'normal'),
   set: (value) => {
-    searchMode.value = value === 'advanced' ? 'advanced' : 'full'
+    searchMode.value = value === 'advanced' ? 'advanced' : 'slice'
   },
 })
 const imageFile = ref(null)
@@ -130,12 +130,9 @@ const handleSearch = async () => {
         localSelectedKb.value?.id,
       )
     } else {
-      results =
-        searchMode.value === 'slice'
-          ? await api.search(query.value, localSelectedKb.value?.id, null, {
-              advanced: sliceOptions.value.useAdvancedFlow,
-            })
-          : await api.searchFull(query.value, localSelectedKb.value?.id)
+      results = await api.search(query.value, localSelectedKb.value?.id, null, {
+        advanced: sliceOptions.value.useAdvancedFlow,
+      })
     }
     emit('search', results)
   } catch (e) {
@@ -240,19 +237,14 @@ const closeAdvanced = () => {
         <!-- Search mode pills -->
         <div class="flex items-center gap-1">
           <button
-            v-for="mode in [
-              { id: 'full', label: '全文' },
-              { id: 'slice', label: '段落' },
-            ]"
-            :key="mode.id"
             type="button"
             class="rounded-full px-3 py-1.5 text-xs font-medium transition"
-            :class="searchMode === mode.id
+            :class="searchMode === 'slice'
               ? 'bg-slate-900 text-white'
               : 'text-slate-500 hover:bg-slate-200 hover:text-slate-700'"
-            @click="searchMode = mode.id"
+            @click="searchMode = 'slice'"
           >
-            {{ mode.label }}
+            段落
           </button>
           <span class="mx-0.5 h-4 w-px bg-slate-300" aria-hidden="true"></span>
           <button

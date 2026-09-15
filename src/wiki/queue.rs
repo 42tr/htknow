@@ -142,6 +142,22 @@ pub async fn mark_failed(pool: &SqlitePool, task: &WikiTask, error: &str) -> Res
             "wiki task {} ({}) for kb {} exceeded retry budget ({}), dropping: {}",
             task.id, task.task_type, task.kb_id, fail_count, error
         );
+        if task.task_type == TASK_INGEST
+            && let Some(file_id) = task.file_id
+        {
+            let is_latest: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM wiki_tasks WHERE id = ?) AND NOT EXISTS(
+                   SELECT 1 FROM wiki_tasks WHERE file_id = ? AND task_type = 'wiki:ingest' AND id > ?)",
+            )
+            .bind(task.id)
+            .bind(file_id)
+            .bind(task.id)
+            .fetch_one(pool)
+            .await?;
+            if is_latest {
+                super::file_status::record_failure(pool, task.kb_id, file_id, error).await?;
+            }
+        }
         sqlx::query("DELETE FROM wiki_tasks WHERE id = ?").bind(task.id).execute(pool).await?;
         return Ok(());
     }

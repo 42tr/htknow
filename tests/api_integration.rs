@@ -654,15 +654,16 @@ async fn graph_endpoints_flow() {
 }
 
 #[tokio::test]
-async fn search_full_empty_and_image_requires_file() {
+async fn removed_full_search_and_image_requires_file() {
     let app = app().await;
     let user = TestUser::new("search");
 
     let full_req = authed_empty_request("GET", "/api/v1/knowledge/search/full?query=missing", &user);
     let full_res = app.clone().oneshot(full_req).await.unwrap();
-    assert_eq!(full_res.status(), StatusCode::OK);
-    let full_json = response_json(full_res).await;
-    assert_eq!(full_json["results"].as_array().map(|v| v.len()), Some(0));
+    assert_eq!(full_res.status(), StatusCode::NOT_FOUND);
+    let spec = serde_json::to_value(htknow::api::openapi()).unwrap();
+    assert!(spec["paths"].get("/api/v1/knowledge/search/full").is_none());
+    assert!(spec["paths"].get("/api/v1/knowledge/search/summary").is_some());
 
     let boundary = format!("boundary-{}", next_seq());
     let body = multipart_body(&boundary, &[("text", "sample")]);
@@ -905,12 +906,15 @@ async fn kb_permission_search_filters_unauthorized_kb() {
     fs::write(&test_file, b"secret content about dragons").unwrap();
     let file_id = insert_file(&pool, &owner, "secret-perm.txt", &test_file, Some(kb_id), vec![], false).await;
 
-    // Set file as completed so it appears in full search
-    sqlx::query("UPDATE files SET status = 1 WHERE id = ?").bind(file_id).execute(&pool).await.unwrap();
+    sqlx::query("UPDATE files SET status = 1, summary = 'secret content about dragons' WHERE id = ?")
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .unwrap();
 
-    // Owner can use full-search filename filter and find the file
+    // Owner can use the summary-search filename filter and find the file
     let owner_search_req =
-        authed_empty_request("GET", "/api/v1/knowledge/search/full?filename=secret-perm.txt", &owner);
+        authed_empty_request("GET", "/api/v1/knowledge/search/summary?filename=secret-perm.txt", &owner);
     let owner_search_res = app.clone().oneshot(owner_search_req).await.unwrap();
     assert_eq!(owner_search_res.status(), StatusCode::OK);
     let owner_json = response_json(owner_search_res).await;
@@ -922,7 +926,7 @@ async fn kb_permission_search_filters_unauthorized_kb() {
 
     // Other user without permission cannot see the result
     let other_search_req =
-        authed_empty_request("GET", "/api/v1/knowledge/search/full?filename=secret-perm.txt", &other);
+        authed_empty_request("GET", "/api/v1/knowledge/search/summary?filename=secret-perm.txt", &other);
     let other_search_res = app.clone().oneshot(other_search_req).await.unwrap();
     assert_eq!(other_search_res.status(), StatusCode::OK);
     let other_json = response_json(other_search_res).await;
@@ -950,7 +954,7 @@ async fn kb_permission_search_filters_unauthorized_kb() {
     assert_eq!(get_json["current_user_permission"].as_str(), Some("viewer"));
 
     let granted_search_req =
-        authed_empty_request("GET", "/api/v1/knowledge/search/full?filename=secret-perm.txt", &other);
+        authed_empty_request("GET", "/api/v1/knowledge/search/summary?filename=secret-perm.txt", &other);
     let granted_search_res = app.clone().oneshot(granted_search_req).await.unwrap();
     assert_eq!(granted_search_res.status(), StatusCode::OK);
     let granted_json = response_json(granted_search_res).await;
@@ -1536,4 +1540,100 @@ fn openapi_documents_wiki_write_endpoints() {
     for schema in ["WikiPageUpdateReq", "WikiRevisionResponse", "LintReport", "RevisionMeta"] {
         assert!(doc["components"]["schemas"].get(schema).is_some(), "missing schema {}", schema);
     }
+}
+
+#[tokio::test]
+async fn wiki_file_progress_is_visible_in_lists_details_stats_and_retry() {
+    let app = app().await;
+    let pool = get_pool().await;
+    let owner = TestUser::with_role("wiki-progress-owner", "user");
+    let outsider = TestUser::with_role("wiki-progress-outsider", "user");
+    let kb_id = insert_kb(&pool, &owner, "Wiki progress", "analysis", None, false).await;
+    sqlx::query("UPDATE knowledge_bases SET wiki_config = '{\"enabled\":true}' WHERE id = ?")
+        .bind(kb_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let path = setup_env().data_dir.join(format!("wiki-progress-{}.txt", next_seq()));
+    fs::write(&path, "A document whose original parsing has already completed.").unwrap();
+    let file_id =
+        insert_file(&pool, &owner, "wiki-progress.txt", &path, Some(kb_id), vec!["progress".into()], false).await;
+    sqlx::query("UPDATE files SET status = 1 WHERE id = ?").bind(file_id).execute(&pool).await.unwrap();
+    let slice_id = insert_slice(&pool, file_id, "original content must survive a Wiki retry").await;
+
+    for url in [
+        format!("/api/v1/knowledge/knowledge_base/{kb_id}/files"),
+        format!("/api/v1/knowledge/knowledge_base/{kb_id}/files?tag=progress"),
+        format!("/api/v1/knowledge/files/?kb_id={kb_id}"),
+        format!("/api/v1/knowledge/files/?kb_id={kb_id}&tag=progress"),
+    ] {
+        let res = app.clone().oneshot(authed_empty_request("GET", &url, &owner)).await.unwrap();
+        assert_eq!(res.status(), StatusCode::OK, "{url}");
+        let body = response_json(res).await;
+        let file = body["items"].as_array().unwrap().iter().find(|f| f["id"] == file_id).unwrap();
+        assert_eq!(file["status"], 1); // 原文仍可检索和预览。
+        assert_eq!(file["processing_status"], 2);
+        assert_eq!(file["wiki_status"], "pending");
+    }
+    let stats_url = format!("/api/v1/knowledge/files/stats?kb_id={kb_id}");
+    let res = app.clone().oneshot(authed_empty_request("GET", &stats_url, &owner)).await.unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let stats = response_json(res).await;
+    assert_eq!(stats["completed"], 0);
+    assert_eq!(stats["processing"], 1);
+    assert_eq!(stats["processing_files"][0]["id"], file_id);
+
+    sqlx::query("INSERT INTO wiki_builds(file_id, status, error) VALUES(?, 'failed', 'upstream unavailable')")
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let detail_url = format!("/api/v1/knowledge/files/{file_id}");
+    let res = app.clone().oneshot(authed_empty_request("GET", &detail_url, &owner)).await.unwrap();
+    let file = response_json(res).await;
+    assert_eq!(file["processing_status"], -1);
+    assert_eq!(file["wiki_status"], "failed");
+    assert_eq!(file["wiki_error"], "upstream unavailable");
+    let denied = app.clone().oneshot(authed_empty_request("GET", &detail_url, &outsider)).await.unwrap();
+    assert_ne!(denied.status(), StatusCode::OK);
+    let request = serde_json::json!({"kb_id": kb_id, "include_descendants": true});
+    let denied = app
+        .clone()
+        .oneshot(authed_json_request("POST", "/api/v1/knowledge/files/reparse-failed", &outsider, request.clone()))
+        .await
+        .unwrap();
+    assert_ne!(denied.status(), StatusCode::OK);
+    let res = app
+        .clone()
+        .oneshot(authed_json_request("POST", "/api/v1/knowledge/files/reparse-failed", &owner, request))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    assert_eq!(response_json(res).await["file_count"], 1);
+    let status: i32 =
+        sqlx::query_scalar("SELECT status FROM files WHERE id = ?").bind(file_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(status, 1);
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM slices WHERE id = ?)")
+        .bind(slice_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(exists);
+    let res = app.clone().oneshot(authed_empty_request("GET", &detail_url, &owner)).await.unwrap();
+    assert_eq!(response_json(res).await["wiki_status"], "pending");
+
+    sqlx::query("UPDATE wiki_builds SET status = 'completed', page_count = 1, error = '' WHERE file_id = ?")
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("DELETE FROM wiki_tasks WHERE file_id = ? AND task_type = 'wiki:ingest'")
+        .bind(file_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let res = app.clone().oneshot(authed_empty_request("GET", &stats_url, &owner)).await.unwrap();
+    let stats = response_json(res).await;
+    assert_eq!(stats["completed"], 1);
+    assert_eq!(stats["processing"], 0);
 }

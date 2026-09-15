@@ -155,5 +155,5 @@ Debug builds use jemalloc as the global allocator. With the `profiling` feature,
 ## Notes
 
 - LanceDB auto-compact runs on a cron schedule (`HTKNOW_LANCEDB_COMPACT_CRON`, default `0 0 3 * * *`). Compaction holds a lock to prevent concurrent writes.
-- If Tantivy indexes become corrupted (e.g., from an unclean shutdown), the app will panic on startup. Recovery: back up and remove the `tantivy_index` and `tantivy_full_index` directories, then trigger a rebuild via the system endpoints.
+- If Tantivy indexes become corrupted (e.g., from an unclean shutdown), the app will panic on startup. Recovery: back up and remove the `tantivy_index` directory, then trigger a rebuild via the system endpoints.
 - The `cargo build --features etcd` flag enables etcd as a config center, but the etcd integration is optional and not enabled by default.

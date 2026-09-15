@@ -9,7 +9,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use aho_corasick::{AhoCorasick, AhoCorasickBuilder, MatchKind};
 use log::{debug, info, warn};
 use serde::Serialize;
 use tantivy::{
@@ -56,15 +55,6 @@ pub struct SearchResultItem {
     pub score: f32,         // 搜索得分
 }
 
-/// 全文索引搜索结果项
-#[derive(Debug, Clone, Serialize)]
-pub struct FullSearchResultItem {
-    pub file_id: i64,       // 文件 ID
-    pub kb_id: Option<i64>, // 知识库 ID
-    pub snippet: String,    // 高亮片段
-    pub score: f32,         // 搜索得分
-}
-
 #[derive(Debug, Clone, Serialize)]
 pub struct ForceMergeStats {
     pub before_segments: usize,
@@ -96,11 +86,6 @@ impl Document {
 pub fn init() -> Result<(Schema, Index)> {
     let cfg = config::get();
     init_with_path(&cfg.search.tantivy_index_path)
-}
-
-pub fn init_full() -> Result<(Schema, Index)> {
-    let cfg = config::get();
-    init_with_path(&cfg.search.tantivy_full_index_path)
 }
 
 pub fn init_with_path(path: &str) -> Result<(Schema, Index)> {
@@ -541,73 +526,6 @@ pub async fn search(
     search_sync(reader, schema, query, file_ids, kb_ids, filter_is_image, synonym_map)
 }
 
-#[allow(clippy::too_many_arguments)]
-pub fn search_with_snippet_sync(
-    reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
-    filter_is_image: Option<bool>, max_chars: usize, synonym_map: Option<&SynonymMap>,
-) -> anyhow::Result<Vec<FullSearchResultItem>> {
-    let cfg = config::get();
-    let searcher = reader.searcher();
-    let tantivy_query = build_query(query, file_ids, kb_ids, filter_is_image, schema, synonym_map)?;
-    let search_start = Instant::now();
-    let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(cfg.search.limit))?;
-    debug!("Tantivy full searcher.search {}ms", search_start.elapsed().as_millis());
-
-    let terms = build_snippet_terms(query, synonym_map);
-    let matcher = build_matcher(&terms);
-
-    let mut results = vec![];
-    let mut doc_total_ms: u128 = 0;
-    let mut doc_max_ms: u128 = 0;
-    let mut doc_count: usize = 0;
-    for (score, doc_address) in top_docs {
-        let doc_start = Instant::now();
-        let retrieved_doc: TantivyDocument = searcher.doc(doc_address)?;
-        let doc_elapsed = doc_start.elapsed().as_millis();
-        doc_total_ms += doc_elapsed;
-        if doc_elapsed > doc_max_ms {
-            doc_max_ms = doc_elapsed;
-        }
-        doc_count += 1;
-        let file_id = retrieved_doc.get_first(get_field(schema, "file_id")).and_then(|v| v.as_i64()).unwrap_or(0);
-        let kb_id = retrieved_doc.get_first(get_field(schema, "kb_id")).and_then(|v| v.as_i64());
-        let content = retrieved_doc.get_first(get_field(schema, "content")).and_then(|v| v.as_str()).unwrap_or("");
-        let snippet = build_best_snippet(content, matcher.as_ref(), terms.len(), max_chars);
-        results.push(FullSearchResultItem { file_id, kb_id, snippet, score });
-    }
-    debug!("Tantivy full searcher.doc total={}ms max={}ms count={}", doc_total_ms, doc_max_ms, doc_count);
-
-    Ok(results)
-}
-
-#[allow(clippy::too_many_arguments)]
-pub async fn search_with_snippet(
-    reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
-    filter_is_image: Option<bool>, max_chars: usize, synonym_map: Option<&SynonymMap>,
-) -> anyhow::Result<Vec<FullSearchResultItem>> {
-    // 搜索 + 取文档 + 生成 snippet 均为 CPU 密集的同步操作，放到阻塞线程池执行，避免阻塞异步运行时。
-    let reader = reader.clone();
-    let schema = schema.clone();
-    let query = query.to_string();
-    let file_ids = file_ids.cloned();
-    let kb_ids = kb_ids.cloned();
-    let synonym_map = synonym_map.cloned();
-    tokio::task::spawn_blocking(move || {
-        search_with_snippet_sync(
-            &reader,
-            &schema,
-            &query,
-            file_ids.as_ref(),
-            kb_ids.as_ref(),
-            filter_is_image,
-            max_chars,
-            synonym_map.as_ref(),
-        )
-    })
-    .await
-    .map_err(|e| anyhow::anyhow!("search_with_snippet task panicked: {e}"))?
-}
-
 fn garbage_collect_index_files(writer: &tantivy::IndexWriter, label: &str) -> anyhow::Result<(usize, usize)> {
     let start = Instant::now();
     let gc_result = writer.garbage_collect_files().wait()?;
@@ -748,43 +666,6 @@ fn build_schema() -> Schema {
     schema_builder.build()
 }
 
-#[derive(Debug, Clone, Copy)]
-struct MatchInfo {
-    start_char: usize,
-    end_char: usize,
-    term_idx: usize,
-}
-
-fn build_snippet_terms(query: &str, synonym_map: Option<&SynonymMap>) -> Vec<String> {
-    let mut terms = Vec::new();
-    let mut seen = HashSet::new();
-    let segmented = perform_segmentation(query, chinese_tokenizer::SegmentationMode::Search);
-    for term in segmented.into_iter().chain(std::iter::once(query.trim().to_string())) {
-        let trimmed = term.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if seen.insert(trimmed.to_string()) {
-            terms.push(trimmed.to_string());
-        }
-        if let Some(map) = synonym_map
-            && let Some(synonyms) = map.get(trimmed)
-        {
-            for synonym in synonyms {
-                let syn = synonym.term.trim();
-                if syn.is_empty() {
-                    continue;
-                }
-                if seen.insert(syn.to_string()) {
-                    terms.push(syn.to_string());
-                }
-            }
-        }
-    }
-    terms.sort_by_key(|b| std::cmp::Reverse(b.len()));
-    terms
-}
-
 #[derive(Debug, Clone)]
 struct QueryTerm {
     term: String,
@@ -839,188 +720,4 @@ fn build_query_terms(input: &str, synonym_map: Option<&SynonymMap>) -> Vec<Query
     }
 
     terms
-}
-
-fn build_matcher(terms: &[String]) -> Option<AhoCorasick> {
-    if terms.is_empty() {
-        return None;
-    }
-    AhoCorasickBuilder::new().ascii_case_insensitive(true).match_kind(MatchKind::LeftmostLongest).build(terms).ok()
-}
-
-fn build_best_snippet(content: &str, matcher: Option<&AhoCorasick>, term_count: usize, max_chars: usize) -> String {
-    if content.is_empty() {
-        return String::new();
-    }
-    let char_to_byte = build_char_index(content);
-    let char_len = char_to_byte.len().saturating_sub(1);
-    let max_chars = max_chars.max(1);
-
-    if char_len <= max_chars {
-        return highlight_range(content, matcher, &char_to_byte, 0, char_len, false, false);
-    }
-
-    let matches =
-        if let Some(matcher) = matcher { collect_matches(content, matcher, &char_to_byte) } else { Vec::new() };
-
-    if matches.is_empty() {
-        return highlight_range(content, matcher, &char_to_byte, 0, max_chars, false, true);
-    }
-
-    let (best_left, best_right) = select_best_window(&matches, term_count, max_chars);
-    let left_start = matches[best_left].start_char;
-    let right_end = matches[best_right].end_char;
-    let span = right_end.saturating_sub(left_start);
-    let extra = max_chars.saturating_sub(span);
-    let desired_start = left_start.saturating_sub(extra / 2);
-    let lower_bound = right_end.saturating_sub(max_chars);
-    let upper_bound = left_start.min(char_len.saturating_sub(max_chars));
-    let start = desired_start.clamp(lower_bound, upper_bound);
-    let end = start.saturating_add(max_chars).min(char_len);
-
-    highlight_range(content, matcher, &char_to_byte, start, end, start > 0, end < char_len)
-}
-
-fn collect_matches(content: &str, matcher: &AhoCorasick, char_to_byte: &[usize]) -> Vec<MatchInfo> {
-    let mut matches = Vec::new();
-    for m in matcher.find_iter(content) {
-        let start_char = byte_to_char_start(char_to_byte, m.start());
-        let end_char = byte_to_char_end(char_to_byte, m.end());
-        if end_char > start_char {
-            matches.push(MatchInfo { start_char, end_char, term_idx: m.pattern().as_usize() });
-        }
-    }
-    matches
-}
-
-fn select_best_window(matches: &[MatchInfo], term_count: usize, max_chars: usize) -> (usize, usize) {
-    let mut counts = vec![0usize; term_count];
-    let mut unique = 0usize;
-    let mut right = 0usize;
-    let mut best_left = 0usize;
-    let mut best_right = 0usize;
-    let mut best_unique = 0usize;
-    let mut best_total = 0usize;
-    let mut best_span = usize::MAX;
-
-    for left in 0..matches.len() {
-        if right < left {
-            right = left;
-        }
-        let window_start = matches[left].start_char;
-        let window_end = window_start.saturating_add(max_chars);
-        while right < matches.len() && matches[right].end_char <= window_end {
-            let term_idx = matches[right].term_idx;
-            if term_idx < term_count {
-                if counts[term_idx] == 0 {
-                    unique += 1;
-                }
-                counts[term_idx] += 1;
-            }
-            right += 1;
-        }
-        let total = right.saturating_sub(left);
-        if total > 0 {
-            let rightmost_end = matches[right - 1].end_char;
-            let span = rightmost_end.saturating_sub(matches[left].start_char);
-            let better = unique > best_unique
-                || (unique == best_unique && total > best_total)
-                || (unique == best_unique && total == best_total && span < best_span)
-                || (unique == best_unique
-                    && total == best_total
-                    && span == best_span
-                    && matches[left].start_char < matches[best_left].start_char);
-            if better {
-                best_unique = unique;
-                best_total = total;
-                best_span = span;
-                best_left = left;
-                best_right = right - 1;
-            }
-        }
-        let term_idx = matches[left].term_idx;
-        if term_idx < term_count {
-            counts[term_idx] = counts[term_idx].saturating_sub(1);
-            if counts[term_idx] == 0 {
-                unique = unique.saturating_sub(1);
-            }
-        }
-    }
-
-    (best_left, best_right)
-}
-
-fn build_char_index(text: &str) -> Vec<usize> {
-    let mut char_to_byte = Vec::with_capacity(text.chars().count() + 1);
-    for (byte_idx, _) in text.char_indices() {
-        char_to_byte.push(byte_idx);
-    }
-    char_to_byte.push(text.len());
-    char_to_byte
-}
-
-fn byte_to_char_start(char_to_byte: &[usize], byte_idx: usize) -> usize {
-    match char_to_byte.binary_search(&byte_idx) {
-        Ok(idx) => idx,
-        Err(idx) => idx.saturating_sub(1),
-    }
-}
-
-fn byte_to_char_end(char_to_byte: &[usize], byte_idx: usize) -> usize {
-    match char_to_byte.binary_search(&byte_idx) {
-        Ok(idx) => idx,
-        Err(idx) => idx,
-    }
-}
-
-fn highlight_range(
-    content: &str, matcher: Option<&AhoCorasick>, char_to_byte: &[usize], start_char: usize, end_char: usize,
-    prefix: bool, suffix: bool,
-) -> String {
-    let start = *char_to_byte.get(start_char).unwrap_or(&0);
-    let end = *char_to_byte.get(end_char).unwrap_or(&content.len());
-    let slice = &content[start..end.min(content.len())];
-
-    let mut output = String::new();
-    if prefix {
-        output.push_str("...");
-    }
-    if let Some(matcher) = matcher {
-        let mut last = 0usize;
-        for m in matcher.find_iter(slice) {
-            let start_idx = m.start();
-            let end_idx = m.end();
-            if start_idx > last {
-                output.push_str(&escape_html(&slice[last..start_idx]));
-            }
-            output.push_str("<b>");
-            output.push_str(&escape_html(&slice[start_idx..end_idx]));
-            output.push_str("</b>");
-            last = end_idx;
-        }
-        if last < slice.len() {
-            output.push_str(&escape_html(&slice[last..]));
-        }
-    } else {
-        output.push_str(&escape_html(slice));
-    }
-    if suffix {
-        output.push_str("...");
-    }
-    output
-}
-
-fn escape_html(input: &str) -> String {
-    let mut escaped = String::with_capacity(input.len());
-    for ch in input.chars() {
-        match ch {
-            '&' => escaped.push_str("&amp;"),
-            '<' => escaped.push_str("&lt;"),
-            '>' => escaped.push_str("&gt;"),
-            '"' => escaped.push_str("&quot;"),
-            '\'' => escaped.push_str("&#39;"),
-            _ => escaped.push(ch),
-        }
-    }
-    escaped
 }

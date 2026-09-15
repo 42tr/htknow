@@ -66,7 +66,6 @@ use crate::search::SearchEngine;
         file::archive_download,
         // Search
         search::search,
-        search::search_full,
         search::search_summary,
         search::search_with_graph,
         search::search_image,
@@ -159,8 +158,6 @@ use crate::search::SearchEngine;
             crate::archive::ExtractResult,
             search::SearchResult,
             search::SearchResultItem,
-            search::FullSearchResult,
-            search::FullSearchResultItem,
             search::SummarySearchResult,
             search::SummarySearchResultItem,
             search::FileInfo,
@@ -280,7 +277,6 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/{id}/archive-download", get(file::archive_download));
     let search_router = Router::new()
         .route("/", get(search::search))
-        .route("/full", get(search::search_full))
         .route("/summary", get(search::search_summary))
         .route("/graph", get(search::search_with_graph))
         .route("/image", post(search::search_image))

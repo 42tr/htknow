@@ -1151,7 +1151,7 @@ impl FileProcessor {
                     return Ok(());
                 }
                 // 处理 PDF 或图片文件
-                self.process_pdf_file(file, None, false, None, Some(&mut timing)).await?;
+                self.process_pdf_file(file, None, false, Some(&mut timing)).await?;
             } else if is_image {
                 timing.set_pipeline("image");
                 if !self.ensure_file_exists(file.id, "before image embedding").await? {
@@ -1593,7 +1593,6 @@ impl FileProcessor {
             embeddings,
             &derived_full_content,
             "Custom parse processed successfully",
-            None,
             summary,
             timing,
         )
@@ -1758,7 +1757,7 @@ impl FileProcessor {
         temp_file.filename = format!("{}.pdf", file.id);
 
         // 使用 process_pdf_file 处理转换后的 PDF
-        self.process_pdf_file(&temp_file, None, false, Some(file.filename.as_str()), timing).await
+        self.process_pdf_file(&temp_file, None, false, timing).await
     }
 
     /// 处理 Excel 文件，按 sheet+行 生成切片
@@ -1780,6 +1779,7 @@ impl FileProcessor {
                 Ok(())
             })
             .await?;
+            self.maybe_enqueue_wiki(file).await;
             return Ok(());
         }
 
@@ -1792,7 +1792,6 @@ impl FileProcessor {
             embeddings,
             &full_content,
             "Excel processed successfully",
-            None,
             None,
             timing,
         )
@@ -1922,7 +1921,6 @@ impl FileProcessor {
             &full_content,
             "Image processed successfully",
             None,
-            None,
             timing,
         )
         .await
@@ -1930,7 +1928,7 @@ impl FileProcessor {
 
     /// 处理 PDF 文件，调用 MinerU API
     async fn process_pdf_file(
-        &self, file: &File, image_embedding: Option<Arc<Vec<f32>>>, is_image: bool, index_filename: Option<&str>,
+        &self, file: &File, image_embedding: Option<Arc<Vec<f32>>>, is_image: bool,
         mut timing: Option<&mut ParseTimingCtx>,
     ) -> anyhow::Result<()> {
         if !self.ensure_file_exists(file.id, "pdf processing start").await? {
@@ -2137,17 +2135,8 @@ impl FileProcessor {
 
         let slice_count = slices.len();
         let embeddings = vec![image_embedding.clone(); slice_count];
-        self.finish_file_processing(
-            file,
-            slices,
-            embeddings,
-            &full_content,
-            "PDF processed successfully",
-            index_filename,
-            None,
-            timing,
-        )
-        .await
+        self.finish_file_processing(file, slices, embeddings, &full_content, "PDF processed successfully", None, timing)
+            .await
     }
 
     async fn call_mineru_api(
@@ -2591,7 +2580,7 @@ impl FileProcessor {
             })
             .collect();
         let embeddings = vec![None; wrapped.len()];
-        self.finish_file_processing(file, wrapped, embeddings, &content, log_message, None, None, timing).await
+        self.finish_file_processing(file, wrapped, embeddings, &content, log_message, None, timing).await
     }
 
     /// 标记文件处理失败
@@ -2611,8 +2600,7 @@ impl FileProcessor {
     #[allow(clippy::too_many_arguments)]
     async fn finish_file_processing(
         &self, file: &File, slices: Vec<SliceWithPositions>, embeddings: Vec<Option<Arc<Vec<f32>>>>,
-        full_content: &str, log_message: &str, index_name_override: Option<&str>, summary: Option<&str>,
-        mut timing: Option<&mut ParseTimingCtx>,
+        full_content: &str, log_message: &str, summary: Option<&str>, mut timing: Option<&mut ParseTimingCtx>,
     ) -> anyhow::Result<()> {
         if !self.ensure_file_exists(file.id, "before writing slices").await? {
             return Ok(());
@@ -2651,19 +2639,6 @@ impl FileProcessor {
             })
             .await?;
         }
-
-        if !self.ensure_file_exists(file.id, "before writing full index").await? {
-            return Ok(());
-        }
-        let index_name = index_name_override.unwrap_or(&file.filename);
-        let index_full_content = format!("{}\n\n{}", index_name, full_content);
-        timed_step_opt(timing.as_deref_mut(), "write_full_index", async {
-            self.search_engine
-                .write_full(tantivy_engine::Document::new(file.id, file.id, file.kb_id, index_full_content))
-                .await?;
-            Ok(())
-        })
-        .await?;
 
         if !self.ensure_file_exists(file.id, "before updating status").await? {
             return Ok(());
@@ -3650,14 +3625,6 @@ impl FileProcessor {
                 .join("\n\n")
         };
 
-        let index_full_content = if full_content.is_empty() {
-            target.filename.clone()
-        } else {
-            format!("{}\n\n{}", target.filename, full_content)
-        };
-        self.search_engine
-            .write_full(tantivy_engine::Document::new(target.id, target.id, target.kb_id, index_full_content))
-            .await?;
         self.persist_file_summary(target.id, target.kb_id, source.summary.as_deref()).await?;
 
         Ok(full_content)
@@ -3689,14 +3656,10 @@ impl FileProcessor {
 
     /// 文档解析完成后入队一次 Wiki 生成。
     ///
-    /// 生成在独立的 `WikiWorker` 中异步执行，不阻塞解析主流程；入队失败只记录日志。
+    /// 生成在独立的 `WikiWorker` 中异步执行；整体文件状态等待 Wiki 完成。
     /// Wiki 是知识库级能力，没有归属知识库的文件不生成。
     async fn maybe_enqueue_wiki(&self, file: &File) {
         // 是否生成由知识库级开关决定（`HTKNOW_BUILD_WIKI` 只是未显式配置时的默认值）。
-        // 没有 LLM 地址时任务只会失败重试，直接跳过。
-        if !config::get().wiki.is_enabled() {
-            return;
-        }
         let Some(kb_id) = file.kb_id else {
             debug!("Wiki is knowledge-base scoped, skipping file {} without kb", file.id);
             return;
@@ -3712,7 +3675,15 @@ impl FileProcessor {
         match crate::wiki::queue::enqueue_ingest(&self.pool, kb_id, file.id).await {
             Ok(true) => info!("Enqueued wiki ingest for file {} in kb {}", file.id, kb_id),
             Ok(false) => debug!("Wiki ingest already pending for file {}", file.id),
-            Err(e) => warn!("Failed to enqueue wiki ingest for file {}: {}", file.id, e),
+            Err(e) => {
+                warn!("Failed to enqueue wiki ingest for file {}: {}", file.id, e);
+                if let Err(record_error) =
+                    crate::wiki::file_status::record_failure(&self.pool, kb_id, file.id, &format!("Wiki 入队失败: {e}"))
+                        .await
+                {
+                    warn!("Failed to persist wiki enqueue error for file {}: {}", file.id, record_error);
+                }
+            }
         }
     }
 

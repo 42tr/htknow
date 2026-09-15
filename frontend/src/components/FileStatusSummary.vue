@@ -117,7 +117,7 @@ const formatTimestamp = (timestamp) => {
           :disabled="retryFailedLoading"
           @click="emit('reparse-failed')"
         >
-          {{ retryFailedLoading ? '提交中...' : `重新解析失败文件 (${normalizedStats.failed})` }}
+          {{ retryFailedLoading ? '提交中...' : `重试失败文件 (${normalizedStats.failed})` }}
         </button>
       </div>
 

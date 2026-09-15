@@ -5,6 +5,7 @@
 //! 图谱不可用时回退到独立的候选抽取 + 引用归类。
 
 pub mod edit;
+pub(crate) mod file_status;
 pub mod finalize;
 pub mod ingest;
 pub mod linkify;
@@ -235,6 +236,7 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         (6, "wiki_pages", include_str!("migration.sql")),
         (7, "wiki_page_revisions", include_str!("migration_v7.sql")),
         (8, "wiki_index_changes", include_str!("migration_v8.sql")),
+        (9, "wiki_file_progress", include_str!("migration_v9.sql")),
     ] {
         let claimed = sqlx::query("INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (?, ?)")
             .bind(version)

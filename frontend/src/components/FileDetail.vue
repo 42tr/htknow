@@ -1,6 +1,7 @@
 <script setup>
 import { computed, ref, watch, onBeforeUnmount } from 'vue'
 import { api } from '../api'
+import { fileStatusText } from '../fileStatus'
 import GraphVisualization from './GraphVisualization.vue'
 import FileSlices from './FileSlices.vue'
 const props = defineProps({
@@ -191,16 +192,12 @@ onBeforeUnmount(() => {
       <dd>{{ filename }}</dd>
       <dt>处理状态</dt>
       <dd>
-        {{
-          {
-            '-1': '处理失败',
-            0: '等待处理',
-            1: '已完成',
-            2: '处理中',
-            3: '不解析',
-          }[file.status] || '未知状态'
-        }}
+        {{ fileStatusText(file) }}
       </dd>
+      <template v-if="file.wiki_error">
+        <dt>Wiki 错误</dt>
+        <dd>{{ file.wiki_error }}</dd>
+      </template>
       <dt>可见性</dt>
       <dd>{{ file.is_public ? '公开' : '私有' }}</dd>
       <dt>切片方式</dt>
