@@ -483,11 +483,27 @@ pub fn search_sync(
     reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     filter_is_image: Option<bool>, synonym_map: Option<&SynonymMap>,
 ) -> anyhow::Result<Vec<SearchResultItem>> {
-    let cfg = config::get();
+    search_sync_with_limit(
+        reader,
+        schema,
+        query,
+        file_ids,
+        kb_ids,
+        filter_is_image,
+        synonym_map,
+        config::get().search.limit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn search_sync_with_limit(
+    reader: &IndexReader, schema: &Schema, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
+    filter_is_image: Option<bool>, synonym_map: Option<&SynonymMap>, limit: usize,
+) -> anyhow::Result<Vec<SearchResultItem>> {
     let searcher = reader.searcher();
     let tantivy_query = build_query(query, file_ids, kb_ids, filter_is_image, schema, synonym_map)?;
     let search_start = Instant::now();
-    let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(cfg.search.limit))?;
+    let top_docs = searcher.search(&tantivy_query, &TopDocs::with_limit(limit.max(1)))?;
     debug!("Tantivy searcher.search {}ms", search_start.elapsed().as_millis());
 
     let mut results = vec![];

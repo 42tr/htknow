@@ -268,7 +268,7 @@ async fn slice_refs(pool: &SqlitePool, source_ids: &[i64], slice_ids: &[i64]) ->
         .collect())
 }
 
-async fn build_detail(pool: &SqlitePool, page: WikiPage) -> ApiResult<WikiPageDetail> {
+pub(super) async fn build_detail(pool: &SqlitePool, page: WikiPage) -> ApiResult<WikiPageDetail> {
     let source_ids = page::source_file_ids(pool, page.id).await?;
     let mut sources = Vec::with_capacity(source_ids.len());
     if !source_ids.is_empty() {
@@ -367,6 +367,7 @@ pub async fn get_stats(
 #[utoipa::path(get, path="/api/v1/knowledge/wiki/search", operation_id="wiki_search_pages", tag="wiki", params(WikiSearchParams), responses((status=200, body=WikiPageListResponse)))]
 pub async fn search_pages(
     Query(params): Query<WikiSearchParams>, State(pool): State<SqlitePool>, Extension(user): Extension<AuthUser>,
+    Extension(engine): Extension<crate::search::SearchEngine>,
 ) -> ApiResult<Json<WikiPageListResponse>> {
     common::ensure_kb_accessible(&pool, params.kb_id, &user.user_id, user.is_admin()).await?;
     let query = params.q.trim();
@@ -374,7 +375,19 @@ pub async fn search_pages(
         return Err(ApiError::BadRequest("q is required".to_string()));
     }
     let limit = bounded_limit(params.limit, 20, 100)?;
-    let pages = page::search(&pool, params.kb_id, query, limit).await?;
+    let hits = engine
+        .search_wiki_limited(query, Some(&vec![params.kb_id]), limit as usize)
+        .await
+        .map_err(|e| ApiError::internal(format!("Wiki search failed: {e}")))?;
+    let mut pages = Vec::new();
+    for (candidate, _) in hits.into_iter().take(limit as usize) {
+        if let Some(page) = page::get_by_id(&pool, candidate.id).await? {
+            if page.status == wiki::STATUS_PUBLISHED && page.version == candidate.version && page.kb_id == params.kb_id
+            {
+                pages.push(page);
+            }
+        }
+    }
     Ok(Json(WikiPageListResponse { items: pages.into_iter().map(Into::into).collect(), next_before_id: None }))
 }
 

@@ -188,6 +188,9 @@ pub struct SearchResultItem {
     /// 图片文本化描述（仅图片相关搜索结果）
     #[serde(skip_serializing_if = "Option::is_none")]
     pub image_content: Option<String>,
+    /// Wiki 命中：id 为页面 ID，file_id 为 0，通过 wiki.page.slug 打开。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wiki: Option<super::wiki::WikiPageDetail>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -470,7 +473,7 @@ pub async fn search(
             format_id_filter(params.file_id.as_deref()),
             summarize_kb_scope(kb_ids_to_search.as_deref())
         );
-        let advanced_results = run_advanced_slice_search_non_stream(
+        let mut advanced_results = run_advanced_slice_search_non_stream(
             &pool,
             &search_engine,
             &auth_user,
@@ -480,6 +483,16 @@ pub async fn search(
         )
         .await
         .map_err(|e| ApiError::internal(format!("Advanced search failed: {}", e)))?;
+        merge_wiki_results(
+            &pool,
+            &search_engine,
+            &auth_user,
+            &params.query,
+            params.file_id.as_ref(),
+            kb_ids_to_search.as_ref(),
+            &mut advanced_results,
+        )
+        .await?;
         return Ok(Json(SearchResult { results: advanced_results }));
     }
 
@@ -489,7 +502,17 @@ pub async fn search(
         .map_err(|e| crate::api::error::ApiError::internal(format!("Search failed: {}", e)))?;
 
     let assemble_started = Instant::now();
-    let results = build_slice_results_from_raw(&pool, raw_results, &auth_user, true).await?;
+    let mut results = build_slice_results_from_raw(&pool, raw_results, &auth_user, true).await?;
+    merge_wiki_results(
+        &pool,
+        &search_engine,
+        &auth_user,
+        &params.query,
+        params.file_id.as_ref(),
+        kb_ids_to_search.as_ref(),
+        &mut results,
+    )
+    .await?;
     info!(
         "search request completed: user_id={}, query=\"{}\", advanced=false, file_filter={}, kb_scope={}, final_results={}, assemble_elapsed_ms={}, elapsed_ms={}",
         user_id,
@@ -667,6 +690,26 @@ async fn run_advanced_search_logic(
         return Ok(());
     }
 
+    let mut wiki_results = Vec::new();
+    merge_wiki_results(
+        &pool,
+        &search_engine,
+        &auth_user,
+        &params.query,
+        params.file_id.as_ref(),
+        kb_ids.as_ref(),
+        &mut wiki_results,
+    )
+    .await?;
+    let mut wiki_results_emitted = false;
+    for result in wiki_results.into_iter().take(slice_limit) {
+        let verdict = judge.judge(&params.query, &result.content.chars().take(context_chars).collect::<String>()).await;
+        if verdict.is_relevant {
+            send_event(tx, EventType::Result, &result).await?;
+            wiki_results_emitted = true;
+        }
+    }
+
     let _selected = run_advanced_plan_steps(
         &pool,
         &search_engine,
@@ -682,6 +725,7 @@ async fn run_advanced_search_logic(
         Some(tx),
         request_id,
         "advanced_search_logic",
+        wiki_results_emitted,
     )
     .await?;
 
@@ -904,6 +948,65 @@ async fn resolve_scope_for_user(
     Ok((is_admin, user_id, kb_ids))
 }
 
+/// Fuse independently ranked slice and Wiki lists. If Wiki has no hits, existing scores stay intact.
+#[allow(clippy::too_many_arguments)]
+async fn merge_wiki_results(
+    pool: &SqlitePool, engine: &SearchEngine, user: &AuthUser, query: &str, file_ids: Option<&Vec<i64>>,
+    kb_ids: Option<&Vec<i64>>, results: &mut Vec<SearchResultItem>,
+) -> ApiResult<()> {
+    if file_ids.is_some_and(Vec::is_empty) {
+        return Ok(());
+    }
+    let hits = engine
+        .search_wiki_scoped(query, file_ids, kb_ids)
+        .await
+        .map_err(|e| ApiError::internal(format!("Wiki search failed: {e}")))?;
+    let ids: Vec<_> = hits.iter().map(|(p, _)| p.kb_id).collect();
+    let kbs = get_kbs_by_ids(pool, &ids).await?;
+    let mut wiki_results = Vec::new();
+    for (candidate, _) in hits {
+        if super::common::ensure_kb_accessible(pool, candidate.kb_id, &user.user_id, user.is_admin()).await.is_err() {
+            continue;
+        }
+        let Some(page) = crate::wiki::page::get_by_id(pool, candidate.id).await? else {
+            continue;
+        };
+        // Recheck after recall: stale or concurrently changed pages must not leak old content.
+        if page.status != crate::wiki::STATUS_PUBLISHED
+            || page.version != candidate.version
+            || page.kb_id != candidate.kb_id
+        {
+            continue;
+        }
+        let detail = super::wiki::build_detail(pool, page).await?;
+        if file_ids.is_some_and(|ids| !detail.sources.iter().any(|source| ids.contains(&source.file_id))) {
+            continue;
+        }
+        let score = 1.3 / (61.0 + wiki_results.len() as f32);
+        wiki_results.push(SearchResultItem {
+            id: candidate.id,
+            file_id: 0,
+            content: detail.content.clone(),
+            score,
+            file: None,
+            kb: kbs.get(&candidate.kb_id).cloned(),
+            image_filename: None,
+            image_content: None,
+            wiki: Some(detail),
+        });
+    }
+    if wiki_results.is_empty() {
+        return Ok(());
+    }
+    for (rank, item) in results.iter_mut().enumerate() {
+        item.score = 1.0 / (61.0 + rank as f32);
+    }
+    results.extend(wiki_results);
+    results.sort_by(|a, b| b.score.total_cmp(&a.score));
+    results.truncate(crate::config::get().search.limit);
+    Ok(())
+}
+
 async fn build_slice_results_from_raw(
     pool: &SqlitePool, raw_results: Vec<EngineSearchResultItem>, auth_user: &AuthUser, dedupe_by_content: bool,
 ) -> ApiResult<Vec<SearchResultItem>> {
@@ -948,6 +1051,7 @@ async fn build_slice_results_from_raw(
             kb,
             image_filename: None,
             image_content: None,
+            wiki: None,
         });
     }
     Ok(results)
@@ -1100,7 +1204,7 @@ async fn run_advanced_plan_steps(
     pool: &SqlitePool, search_engine: &SearchEngine, params: &AdvancedSearchQuery, kb_ids: Option<&Vec<i64>>,
     planner: &QueryPlanner, judge: &RelevanceJudge, chunk_refiner: &ChunkRefiner, slice_limit: usize,
     context_chars: usize, user_id: &str, is_admin: bool, tx: Option<&mpsc::Sender<Result<Event, Infallible>>>,
-    request_id: &str, log_prefix: &str,
+    request_id: &str, log_prefix: &str, wiki_results_emitted: bool,
 ) -> anyhow::Result<Option<AdvancedSelectedSliceResult>> {
     let planning_started = Instant::now();
     maybe_send_status_event(tx, "初始化", "生成执行计划").await?;
@@ -1238,7 +1342,7 @@ async fn run_advanced_plan_steps(
                         file: Some(finalized.file.clone()),
                         kb: finalized.kb.clone(),
                         slice_ids: slice_ids.clone(),
-                        score: finalized.base_score,
+                        score: if wiki_results_emitted { 1.0 / 61.0 } else { finalized.base_score },
                         judge_score: finalized.judge_score,
                         judge_reason: finalized.judge_reason.clone(),
                         refine_reason: finalized.refine_reason.clone(),
@@ -1340,6 +1444,7 @@ async fn run_advanced_slice_search_non_stream(
         None,
         request_id,
         "advanced_slice_search_non_stream",
+        false,
     )
     .await?;
 
@@ -1356,6 +1461,7 @@ async fn run_advanced_slice_search_non_stream(
         kb: selected.kb,
         image_filename: None,
         image_content: None,
+        wiki: None,
     }])
 }
 
@@ -1912,7 +2018,17 @@ pub async fn search_with_graph(
         .await
         .map_err(|e| crate::api::error::ApiError::internal(format!("Graph search failed: {}", e)))?;
 
-    let results = build_slice_results_from_raw(&pool, raw_results, &auth_user, false).await?;
+    let mut results = build_slice_results_from_raw(&pool, raw_results, &auth_user, false).await?;
+    merge_wiki_results(
+        &pool,
+        &search_engine,
+        &auth_user,
+        &params.query,
+        params.file_id.as_ref(),
+        kb_ids_to_search.as_ref(),
+        &mut results,
+    )
+    .await?;
 
     Ok(Json(SearchResult { results }))
 }

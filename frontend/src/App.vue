@@ -61,6 +61,7 @@ let advancedRequest = 0
 const newId = () =>
   `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
 const sliceKey = (item) => {
+  if (item.wiki?.page) return `wiki-${item.wiki.page.id}`
   const ids = item.slice_ids || item.sliceIds
   if (Array.isArray(ids) && ids.length > 0) {
     const normalized = [...new Set(ids)].sort((a, b) => a - b)

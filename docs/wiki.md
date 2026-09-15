@@ -110,7 +110,7 @@ Wiki 是知识库级别的可选能力（`knowledge_bases.indexing_strategy.wiki
 - **P1 可浏览的 Wiki**（已完成）：数据模型 + 任务队列 + 生成管道（summary/entity/concept/index）+ 只读 API + 前端浏览器
 - **P2 可维护**（已完成）：人工编辑、版本快照/diff/回滚、归档、lint、链接收敛入口；
   `wiki_folders` 目录树、页面去重合并、Agent 工具链仍延后（见「四、实现状态」）
-- **P3 融入检索**：wiki 页进 Tantivy/LanceDB、结果加权、高级搜索引用 wiki 页
+- **P3 融入检索**（已实现）：Wiki 正文进 Tantivy/LanceDB、按排名融合与加权、普通/图谱增强/高级搜索引用 Wiki 页
 
 ### 3.1 数据模型（migration 6，`src/wiki/migration.sql`）
 
@@ -125,8 +125,6 @@ CREATE TABLE wiki_pages (
     summary TEXT NOT NULL DEFAULT '',
     content TEXT NOT NULL DEFAULT '',
     aliases TEXT NOT NULL DEFAULT '[]',         -- JSON array
-    folder_id INTEGER,                          -- P2
-    category_path TEXT NOT NULL DEFAULT '[]',   -- P2，JSON array
     out_links TEXT NOT NULL DEFAULT '[]',
     in_links TEXT NOT NULL DEFAULT '[]',
     version INTEGER NOT NULL DEFAULT 1,
@@ -134,10 +132,10 @@ CREATE TABLE wiki_pages (
     last_editor_id TEXT NOT NULL DEFAULT '',
     content_fingerprint TEXT NOT NULL DEFAULT '',       -- 内容未变则不 +version、不重跑
     created_at INTEGER DEFAULT (strftime('%s','now')),
-    updated_at INTEGER DEFAULT (strftime('%s','now')),
-    deleted_at INTEGER DEFAULT NULL
+    updated_at INTEGER DEFAULT (strftime('%s','now'))
 );
-CREATE UNIQUE INDEX idx_wiki_pages_kb_slug ON wiki_pages(kb_id, slug) WHERE deleted_at IS NULL;
+-- HTKnow 实际使用彻底删除；目录字段仍未实现。
+CREATE UNIQUE INDEX idx_wiki_pages_kb_slug ON wiki_pages(kb_id, slug);
 CREATE INDEX idx_wiki_pages_kb_type ON wiki_pages(kb_id, page_type, status);
 
 -- 文档级来源（对应 WeKnora 的 source_refs）
@@ -295,7 +293,7 @@ P2（已实现，与 P1 一致用查询参数而不是路径参数）：
 
 - 人工编辑过的页面（`last_edit_source` 为 `user`/`revert`）**不会被自动生成的内容覆盖**：
   `page::upsert` 遇到管道草稿时直接跳过内容写入（`UpsertOutcome.skipped_manual = true`），但仍并入来源与切片证据。
-  想要新稿就显式回滚到某个管道版本。
+  回滚到管道历史版本只恢复其内容，新版本仍标记为 `revert`，继续受人工内容保护；目前没有恢复自动生成的入口。
 - 交叉链接维护走 `page::update_content(..., edit_source = None)`：改正文与出链、写版本快照、递增 version，
   但**保留原有作者归属**，所以人工页面既不会链接腐烂，也不会因此变成「管道页」而被覆盖。
 - 状态切换（归档/恢复）不写快照、不递增 version：归档再恢复不该凭空多出一个版本。
@@ -303,12 +301,29 @@ P2（已实现，与 P1 一致用查询参数而不是路径参数）：
   正文与历史都还在，`GET /wiki/pages?status=archived` 可以列出来并恢复。
 - 文档删除触发 retract 时，人工页面失去全部来源只归档不删除（`RetractReport.pages_archived`）。
 
-### 3.5 检索集成（P3）
+### 3.5 检索集成（P3，已实现）
 
-- **Tantivy**：新增第三个索引 `wiki_index`（沿用 default/full 双索引的既有写法），schema 为 `id`(page_id)/`kb_id`/`content`；`SearchEngine` 增加 `write_wiki` / `delete_wiki` / `search_wiki`。
-- **LanceDB**：新增 `wiki_pages` 表，照 `file_summaries` 的建表与损坏恢复路径（`src/search/lancedb.rs:27`），向量取 summary + content。
-- **融合加权**：在 `search_with_graph_expansion`（`src/search/mod.rs:1746`）与 advanced 的融合阶段给 wiki 命中 ×1.3 后稳定重排；先做「结果里没有 wiki 命中就整体跳过」的快路径。
-- **引用跳转**：wiki 命中带 `wiki_page_slice_refs`，前端可直接跳到已有的 `/files/{id}/slices/{slice_id}/highlight`。
+- **Tantivy**：独立索引目录为 `${HTKNOW_TANTIVY_INDEX_PATH}_wiki`。复用现有中文分词和数值过滤 schema，
+  `id` 与内部 `file_id` 过滤槽都存页面 ID（不代表源文件），正文索引包括标题、别名、摘要和完整正文。
+  启动时重建派生的全文缓存；显式重建搜索索引时也会重建 Wiki，以应用词典变化。
+- **LanceDB**：独立 `wiki_pages` 表存页面 ID、KB ID、内容/模型指纹与向量。向量输入是标题、别名、摘要和正文的前 12000 字符，
+  复用 `HTKNOW_EMBEDDING_*` 配置；已有指纹相同则不重复调用模型。表损坏或向量维度变化时可从 SQLite 重建。
+  当前采用精确向量搜索，后续随页面规模增加再补近似索引和专用 compact。
+- **同步与回收**：`SearchEngine::start_wiki_indexer` 每 10 秒对账，单轮最多更新 16 页向量，轮转处理避免失败页阻塞后续页面。
+  查询前同步全文缓存，并在返回前核对发布状态、版本、KB 和向量指纹。
+  编辑、回滚、归档/恢复、页面删除、整库删除以及生成管道更新都由同一条对账路径覆盖，无需 LLM 生成开关。
+  向量写入失败会在后续轮询/重启时重试；向量查询失败仍返回全文结果。
+- **融合加权**：先对 Wiki 的全文/向量结果做 RRF（倒数排名融合），再在 API 层与切片结果按排名融合，Wiki 权重为 1.3。
+  普通搜索、图谱增强搜索、非流式高级搜索都返回混合结果；高级 SSE 会先判断 Wiki 页相关性并携带页面引用，
+  存在 Wiki 结果时切片结果也使用可比较的排名分数。无 Wiki 命中时保留原切片分数。
+- **权限与范围**：只检索 `published` 的非索引页；API 沿用知识库权限，并在召回后复核。
+  文件范围先映射到 `wiki_page_sources` 的页面集合，再进行全文/向量召回，手工无来源页不会混入限定文件的搜索。
+- **引用跳转**：混合结果新增可选 `wiki` 对象（页面元数据、正文、来源与切片证据）；此时 `id` 是页面 ID、`file_id` 为 0、`file` 为空。
+  前端以 `wiki.page.id` 区分页面和切片，显示 Wiki 类型，点击按 KB + slug 打开 `WikiBrowser`，继续使用原文高亮与来源文件预览。
+- **Wiki 内搜索**：`GET /wiki/search` 已从标题/摘要 LIKE 匹配切换为上述正文全文/向量检索。
+
+实现：`src/search/wiki_index.rs`、`src/search/wiki_vector.rs`、`src/api/search.rs`。
+目前对账会扫描全部已发布页面；大规模部署下可进一步改为持久化增量变更队列，避免每次查询扫描全量正文。
 
 ### 3.6 前端
 
@@ -419,21 +434,32 @@ worker 始终运行（空闲轮询代价可忽略），因此关掉全局默认�
 建页 → 局部编辑 → 版本列表/详情 → 体检报出断链 → `rebuild-links` 清掉死链且不改作者归属 → 回滚 →
 归档（退出目录与搜索、按状态仍可列出）→ 恢复 → 删除（历史级联清空），并校验 404/403/400 分支。
 
-### 尚未做（P2 余项 / P3）
+### P3 已实现
+
+- 独立全文与向量索引、指纹复用、自动同步与删除回收。
+- 普通搜索、图谱增强搜索、高级搜索（含 SSE）的 Wiki 引用、加权与权限隔离。
+- Wiki 正文搜索、结果类型筛选、指定页面跳转和来源预览。
+- `tests/wiki_search.rs` 使用本地 mock embedding 服务覆盖正文/纯语义召回、服务失败回退与重试、文件范围、
+  私有/公开知识库权限、编辑后的旧向量排除、归档/草稿/恢复/删除和普通/图谱增强/高级搜索入口。
+
+### 尚未做（P2 余项 / 后续优化）
 
 - `wiki_folders` 目录树与页面移动（改 slug 会牵连全部入链）
 - 页面去重（FTS5 trigram 预筛 + Jaccard）与同义词合并；`lint` 目前只报「标题重复」提示，不做自动合并
 - lint 的 auto-fix（补写摘要之类要过模型，成本高于收益，暂由用户在编辑表单里手工处理）
 - Agent 工具链（把 Wiki 页面作为 Agent 可读写的知识载体）
 - 独立的 Wiki 图视图（后端 `/wiki/graph` 已就绪，前端复用 `GraphVisualization.vue` 即可）
-- 检索集成：wiki 页进 Tantivy/LanceDB、结果加权、高级搜索引用 wiki 页
+- 大规模索引优化：增量变更队列、Wiki 向量近似索引和专用 compact
+- 显式恢复人工页面的自动生成（目前回滚仍保留人工保护）
 
 ### 验证命令
 
 ```sh
+cargo test --test wiki_search                          # P3 检索与同步、权限、来源、mock 向量服务
 cargo test --lib wiki                                  # 迁移、队列、slug、配置合并、模式 A 候选、删除触发器、
                                                        # 版本快照/裁剪、人工编辑保护、回滚、归档、lint
 cargo test --test api_integration wiki                 # 只读接口流程 + 编辑/版本/体检/归档/删除流程
+node --test frontend/src/components/SearchResults.test.mjs # Wiki 类型筛选、来源预览竞态
 node --test frontend/src/components/WikiBrowser.test.mjs   # [[slug|名称]] 改写与代码围栏保护
 node --test frontend/src/wikiDiff.test.mjs                 # 行级 diff：增删改、行号、折叠、超大规模退化
 node --test frontend/src/components/WikiRevisionDrawer.test.mjs  # 版本抽屉里的 diff 与标签逻辑

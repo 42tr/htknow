@@ -43,6 +43,8 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => log::warn!("Failed to load search lexicon at startup: {}", e),
     }
 
+    search_engine.start_wiki_indexer();
+
     let processor =
         processor::FileProcessor::new(pool.clone(), search_engine.clone(), cfg.server.process_interval_secs);
     if cfg.server.parse_enabled {

@@ -23,6 +23,8 @@ mod chinese_tokenizer;
 pub mod embedding;
 mod lancedb;
 pub mod tantivy_engine;
+pub mod wiki_index;
+mod wiki_vector;
 
 pub use lancedb::schedule_startup_index_maintenance;
 pub use tantivy_engine::{FullSearchResultItem, SearchResultItem};
@@ -201,6 +203,7 @@ async fn fetch_rebuild_lancedb_rows(
 
 #[derive(Clone)]
 pub struct SearchEngine {
+    wiki_index: Arc<wiki_index::WikiIndex>,
     schema: Schema,
     index_reader: IndexReader,
     index_write_lock: Arc<Mutex<()>>,
@@ -251,7 +254,13 @@ impl SearchEngine {
                 .expect("open tantivy full index writer failed");
         info!("Search init substep: open full index writer took {}ms", t6.elapsed().as_millis());
 
+        let wiki_index = Arc::new(
+            wiki_index::WikiIndex::open(&format!("{}_wiki", config::get().search.tantivy_index_path))
+                .await
+                .expect("open wiki index"),
+        );
         Self {
+            wiki_index,
             schema,
             index_reader,
             index_write_lock: Arc::new(Mutex::new(())),
@@ -853,7 +862,8 @@ impl SearchEngine {
             // 这些 backup 会在下次成功重建后被覆盖，或通过手动清理。
         }
 
-        rebuild_result
+        rebuild_result?;
+        self.wiki_index.rebuild(pool).await
     }
 
     pub async fn write(

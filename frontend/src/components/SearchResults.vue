@@ -1,7 +1,28 @@
 <script setup>
 import { computed, ref, watch } from 'vue'
 import FileDetail from './FileDetail.vue'
+import WikiBrowser from './WikiBrowser.vue'
+import { api } from '../api.js'
 const selected = ref(null)
+const sourceFile = ref(null)
+const sourceError = ref('')
+let sourceRequest = 0
+const openWikiSource = async ({ id }) => {
+  sourceError.value = ''
+  const request = ++sourceRequest
+  try {
+    const file = await api.getFile(id)
+    if (request === sourceRequest) sourceFile.value = file
+  } catch (error) {
+    if (request === sourceRequest) sourceError.value = error.message
+  }
+}
+const chooseResult = (result) => {
+  sourceFile.value = null
+  sourceError.value = ''
+  sourceRequest++
+  selected.value = result
+}
 const kbFilter = ref('')
 const typeFilter = ref('')
 const sortBy = ref('relevance')
@@ -44,7 +65,8 @@ const filteredResults = computed(() => {
   const items = props.results.filter((item) => {
     if (kbFilter.value && item.kb?.name !== kbFilter.value) return false
     if (typeFilter.value === 'image' && !isImageFile(item.file?.filename)) return false
-    if (typeFilter.value === 'document' && isImageFile(item.file?.filename)) return false
+    if (typeFilter.value === 'wiki' && !item.wiki) return false
+    if (typeFilter.value === 'document' && (item.wiki || isImageFile(item.file?.filename))) return false
     return true
   })
   return [...items].sort((a, b) => sortBy.value === 'newest'
@@ -54,12 +76,15 @@ const filteredResults = computed(() => {
 const selectedIndex = computed(() => filteredResults.value.indexOf(selected.value))
 const selectOffset = (offset) => {
   const next = selectedIndex.value + offset
-  if (next >= 0 && next < filteredResults.value.length) selected.value = filteredResults.value[next]
+  if (next >= 0 && next < filteredResults.value.length) chooseResult(filteredResults.value[next])
 }
 watch(
   () => props.results,
   () => {
     selected.value = null
+    sourceFile.value = null
+    sourceError.value = ''
+    sourceRequest++
   },
 )
 </script>
@@ -67,7 +92,7 @@ watch(
 <template>
   <div
     class="search-results results-workspace"
-    :class="{ 'with-preview': selected }"
+    :class="{ 'with-preview': selected?.file || sourceFile }"
   >
     <div class="min-w-0">
       <!-- Loading State -->
@@ -135,7 +160,7 @@ watch(
         <div class="result-toolbar">
           <p>显示 {{ filteredResults.length }} / {{ results.length }} 个结果</p>
           <select v-model="kbFilter" aria-label="按知识库筛选"><option value="">所有知识库</option><option v-for="name in knowledgeBases" :key="name" :value="name">{{ name }}</option></select>
-          <select v-model="typeFilter" aria-label="按文件类型筛选"><option value="">所有类型</option><option value="document">文档</option><option value="image">图片</option></select>
+          <select v-model="typeFilter" aria-label="按文件类型筛选"><option value="">所有类型</option><option value="document">文档</option><option value="image">图片</option><option value="wiki">Wiki</option></select>
           <select v-model="sortBy" aria-label="结果排序"><option value="relevance">相关度优先</option><option value="newest">最新上传</option></select>
         </div>
 
@@ -143,15 +168,15 @@ watch(
 
         <div
           v-for="result in filteredResults"
-          :key="result.id || `${result.file?.id || 'file'}-${result.slice_id || result.slice_ids?.[0] || result.sliceIds?.[0] || result.receivedAt || result.file?.filename || 'result'}`"
+          :key="result.wiki ? `wiki-${result.wiki.page.id}` : result.id || `${result.file?.id || 'file'}-${result.slice_id || result.slice_ids?.[0] || result.sliceIds?.[0] || result.receivedAt || result.file?.filename || 'result'}`"
           class="result-card group bg-white rounded-xl p-5 border border-slate-200 cursor-pointer"
           :class="{ 'is-selected': selected === result }"
           role="button"
           tabindex="0"
-          :aria-label="`查看 ${result.file?.filename || '未命名文档'} 的详情`"
-          @click="selected = result"
-          @keydown.enter="selected = result"
-          @keydown.space.prevent="selected = result"
+          :aria-label="`查看 ${result.wiki?.page.title || result.file?.filename || '未命名文档'} 的详情`"
+          @click="chooseResult(result)"
+          @keydown.enter="chooseResult(result)"
+          @keydown.space.prevent="chooseResult(result)"
         >
           <div class="flex items-start gap-4">
             <div
@@ -163,12 +188,12 @@ watch(
               <span
                 class="text-[10px] font-semibold tracking-wide"
                 :class="isImageFile(result.file?.filename) ? 'text-purple-700' : 'text-amber-700'"
-              >{{ getFileEmoji(result.file?.filename) }}</span>
+              >{{ result.wiki ? 'WIKI' : getFileEmoji(result.file?.filename) }}</span>
             </div>
             <div class="flex-1 min-w-0">
               <div class="flex items-center justify-between gap-2 mb-1">
                 <h3 class="font-semibold text-slate-800 truncate">
-                  {{ result.file?.filename || '未命名文档' }}
+                  {{ result.wiki?.page.title || result.file?.filename || '未命名文档' }}
                 </h3>
                 <svg
                   class="w-4 h-4 text-slate-300 shrink-0 opacity-0 transition-opacity group-hover:opacity-100"
@@ -235,6 +260,17 @@ watch(
         </div>
       </div>
     </div>
+    <WikiBrowser
+      v-if="selected?.wiki"
+      :key="`wiki-${selected.wiki.page.id}`"
+      :kb-id="selected.wiki.page.kb_id"
+      :initial-slug="selected.wiki.page.slug"
+      :title="selected.kb?.name ? `${selected.kb.name} · Wiki` : '知识库 Wiki'"
+      @locate-file="openWikiSource"
+      @close="selected = null"
+    />
+    <p v-if="sourceError" role="alert" class="text-red-600">{{ sourceError }}</p>
+    <FileDetail v-if="sourceFile" :file="sourceFile" @close="sourceFile = null" />
     <FileDetail
       v-if="selected?.file"
       :file="selected.file"

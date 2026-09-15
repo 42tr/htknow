@@ -9,6 +9,7 @@ import WikiRevisionDrawer from './WikiRevisionDrawer.vue'
 const props = defineProps({
   kbId: { type: [Number, String], required: true },
   title: { type: String, default: '知识库 Wiki' },
+  initialSlug: { type: String, default: '' },
   subtitle: { type: String, default: '' },
   canEdit: { type: Boolean, default: false },
 })
@@ -480,6 +481,10 @@ watch(building, (active) => {
 
 onMounted(async () => {
   await Promise.all([loadIndex(), loadStatus(), loadConfig()])
+  if (props.initialSlug) {
+    await openPage(props.initialSlug)
+    return
+  }
   if (!currentSlug.value) await openPage(INDEX_SLUG)
   if (!detail.value) {
     const first = groups.value.flatMap((group) => group.items || [])[0]

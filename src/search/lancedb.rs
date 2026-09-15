@@ -222,12 +222,12 @@ async fn create_empty_table(schema: &Arc<ArrowSchema>) -> Result<Table> {
         .with_context(|| format!("Failed to create LanceDB table '{}'", TABLE_NAME))
 }
 
-async fn create_empty_named_table(table_name: &str, schema: &Arc<ArrowSchema>) -> Result<Table> {
+pub(super) async fn create_empty_named_table(table_name: &str, schema: &Arc<ArrowSchema>) -> Result<Table> {
     let conn = get_connection()?;
     let empty_batch = if table_name == SUMMARY_TABLE_NAME {
         create_summary_empty_batch(schema)?
     } else {
-        create_empty_batch(schema)?
+        RecordBatch::new_empty(schema.clone())
     };
     conn.create_table(table_name, empty_batch)
         .execute()
@@ -259,7 +259,7 @@ async fn recover_table(storage_path: &str, schema: &Arc<ArrowSchema>) -> Result<
     create_empty_table(schema).await
 }
 
-async fn recover_named_table(storage_path: &str, table_name: &str, schema: &Arc<ArrowSchema>) -> Result<Table> {
+pub(super) async fn recover_named_table(storage_path: &str, table_name: &str, schema: &Arc<ArrowSchema>) -> Result<Table> {
     let conn = get_connection()?;
 
     if let Err(err) = conn.drop_table(table_name, &[]).await {
@@ -699,7 +699,7 @@ pub async fn compact() -> Result<CompactStats> {
     })
 }
 
-fn get_connection() -> Result<Arc<Connection>> {
+pub(super) fn get_connection() -> Result<Arc<Connection>> {
     LANCEDB.get().cloned().ok_or_else(|| anyhow::anyhow!("LanceDB not initialized"))
 }
 

@@ -52,3 +52,30 @@ test('leaves tilde fences alone too', () => {
 test('drops empty link targets instead of emitting broken anchors', () => {
   assert.equal(rewriteWikiLinks('空的 [[ | 名字]]'), '空的 名字')
 })
+
+test('search deep link opens the requested page without falling back to the index', async () => {
+  const source = readFileSync(new URL('./WikiBrowser.vue', import.meta.url), 'utf8')
+    .match(/<script setup>([\s\S]*?)<\/script>/)[1].replace(/^import .*$/gm, '')
+  const opened = []
+  let mounted
+  const sandbox = {
+    ref: (value) => ({ value }),
+    computed: (get) => ({ get value() { return get() } }),
+    defineProps: () => ({ kbId: 7, initialSlug: 'concept/orbit' }),
+    defineEmits: () => () => {},
+    watch() {}, onBeforeUnmount() {}, onMounted: (handler) => { mounted = handler },
+    document: { querySelector: () => null },
+    api: {
+      getWikiIndex: async () => ({ groups: [] }),
+      getWikiStatus: async () => ({}),
+      getWikiConfig: async () => ({}),
+      getWikiPage: async (kbId, slug) => {
+        opened.push([kbId, slug])
+        return { page: { slug } }
+      },
+    },
+  }
+  vm.runInNewContext(source, sandbox)
+  await mounted()
+  assert.deepEqual(opened, [[7, 'concept/orbit']])
+})
