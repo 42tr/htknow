@@ -70,7 +70,6 @@ use crate::search::SearchEngine;
         search::search_with_graph,
         search::search_image,
         search::search_image_by_text,
-        search::advanced_search_stream,
         search::list_lexicons,
         search::create_lexicon,
         search::update_lexicon,
@@ -288,8 +287,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/lexicons/{id}/enabled", put(search::toggle_lexicon_enabled))
         .route("/synonyms", get(search::list_synonyms).post(search::create_synonym))
         .route("/synonyms/{id}", put(search::update_synonym).delete(search::delete_synonym))
-        .route("/synonyms/{id}/enabled", put(search::toggle_synonym_enabled))
-        .route("/advanced/stream", get(search::advanced_search_stream));
+        .route("/synonyms/{id}/enabled", put(search::toggle_synonym_enabled));
     let graph_router = Router::new()
         .route("/entities", get(graph::search_entities))
         .route("/subgraph", get(graph::get_subgraph))

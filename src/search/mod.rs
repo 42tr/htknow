@@ -18,7 +18,6 @@ use tokio::sync::Mutex;
 
 use crate::config;
 
-pub mod advanced;
 mod chinese_tokenizer;
 pub mod embedding;
 mod lancedb;

@@ -91,7 +91,7 @@ Wiki 是知识库级别的可选能力（`knowledge_bases.indexing_strategy.wiki
 | --- | --- | --- |
 | KB / 文件 / 切片模型 | `files`、`slices`，切片正文外置为按文件的 JSON（`src/slice_content.rs:7`） | 可直接作为 chunk 引用源 |
 | 后台异步处理 | `FileProcessor` 轮询 DB + 自适应间隔 + `status`/`parse_run_id` 令牌（`src/processor.rs:568`） | 同一套模式即可，无需 Redis/asynq |
-| LLM 客户端 | `LlmClient.chat` / `chat_json`（`src/search/advanced.rs:20`）、`LLMGraphExtractor`（`src/graph/llm_extractor.rs:85`） | 够用，需补 system+user 双消息与重试退避 |
+| LLM 客户端 | `WikiLlm.chat` / `chat_json`（`src/wiki/llm.rs`）、`LLMGraphExtractor`（`src/graph/llm_extractor.rs`） | Wiki 客户端支持 system+user 双消息与重试退避 |
 | 实体抽取 | 已有图谱：`graph_nodes`/`graph_edges`/`entity_mentions`/`graph_node_sources`/`graph_edge_sources` + `graph_builds` 指纹复用 | **`entity_mentions` 已经把实体映射到 `slice_id`**，等于免费拿到 WeKnora 花一整遍 LLM 调用才产出的 chunk 级引用 |
 | 名称检索 | `graph_node_names` FTS5 trigram 虚表（`src/graph/migration.sql:78`） | 可替代 pg_trgm 做去重预筛 |
 | 检索 | Tantivy 双索引（默认 + full）+ LanceDB `documents`/`file_summaries` + rerank + 图谱扩展（`src/search/mod.rs:1746`） | 加一路 wiki 索引即可 |
@@ -110,7 +110,7 @@ Wiki 是知识库级别的可选能力（`knowledge_bases.indexing_strategy.wiki
 - **P1 可浏览的 Wiki**（已完成）：数据模型 + 任务队列 + 生成管道（summary/entity/concept/index）+ 只读 API + 前端浏览器
 - **P2 可维护**（已完成）：人工编辑、版本快照/diff/回滚、归档、lint、链接收敛入口；
   `wiki_folders` 目录树、页面去重合并、Agent 工具链仍延后（见「四、实现状态」）
-- **P3 融入检索**（已实现）：Wiki 正文进 Tantivy/LanceDB、按排名融合与加权、普通/图谱增强/高级搜索引用 Wiki 页
+- **P3 融入检索**（已实现）：Wiki 正文进 Tantivy/LanceDB、按排名融合与加权、普通/图谱增强搜索引用 Wiki 页
 
 ### 3.1 数据模型（migration 6，`src/wiki/migration.sql`）
 
@@ -314,7 +314,7 @@ P2（已实现，与 P1 一致用查询参数而不是路径参数）：
   编辑、回滚、归档/恢复、页面删除、整库删除以及生成管道更新都由同一条对账路径覆盖，无需 LLM 生成开关。
   向量写入失败会在后续轮询/重启时重试；向量查询失败仍返回全文结果。
 - **融合加权**：先对 Wiki 的全文/向量结果做 RRF（倒数排名融合），再在 API 层与切片结果按排名融合，Wiki 权重为 1.3。
-  普通搜索、图谱增强搜索、非流式高级搜索都返回混合结果；高级 SSE 会先判断 Wiki 页相关性并携带页面引用，
+  普通搜索、图谱增强搜索都返回包含 Wiki 页面引用的混合结果，
   存在 Wiki 结果时切片结果也使用可比较的排名分数。无 Wiki 命中时保留原切片分数。
 - **权限与范围**：只检索 `published` 的非索引页；API 沿用知识库权限，并在召回后复核。
   文件范围先映射到 `wiki_page_sources` 的页面集合，再进行全文/向量召回，手工无来源页不会混入限定文件的搜索。
@@ -447,10 +447,10 @@ worker 始终运行（空闲轮询代价可忽略），因此关掉全局默认�
 「重试失败文件」会对原文解析失败的文件重新解析，对仅 Wiki 失败的文件只重新入队 Wiki。重新解析或移动文件会清除旧 Wiki 构建状态，避免旧结果把新一轮处理误标为完成。关闭知识库 Wiki 后，整体状态重新以原文解析结果为准；启用后尚未构建 Wiki 的历史文件显示等待，可通过 Wiki 重建入口启动生成。
 
 - 独立全文与向量索引、指纹复用、自动同步与删除回收。
-- 普通搜索、图谱增强搜索、高级搜索（含 SSE）的 Wiki 引用、加权与权限隔离。
+- 普通搜索、图谱增强搜索的 Wiki 引用、加权与权限隔离。
 - Wiki 正文搜索、结果类型筛选、指定页面跳转和来源预览。
 - `tests/wiki_search.rs` 使用本地 mock embedding 服务覆盖正文/纯语义召回、服务失败回退与重试、文件范围、
-  私有/公开知识库权限、编辑后的旧向量排除、归档/草稿/恢复/删除和普通/图谱增强/高级搜索入口。
+  私有/公开知识库权限、编辑后的旧向量排除、归档/草稿/恢复/删除和普通/图谱增强搜索入口。
 
 ### 实现问题修复
 

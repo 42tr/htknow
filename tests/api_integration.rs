@@ -654,7 +654,7 @@ async fn graph_endpoints_flow() {
 }
 
 #[tokio::test]
-async fn removed_full_search_and_image_requires_file() {
+async fn removed_search_modes_and_image_requires_file() {
     let app = app().await;
     let user = TestUser::new("search");
 
@@ -664,6 +664,12 @@ async fn removed_full_search_and_image_requires_file() {
     let spec = serde_json::to_value(htknow::api::openapi()).unwrap();
     assert!(spec["paths"].get("/api/v1/knowledge/search/full").is_none());
     assert!(spec["paths"].get("/api/v1/knowledge/search/summary").is_some());
+    let advanced_req = authed_empty_request("GET", "/api/v1/knowledge/search/advanced/stream?query=missing", &user);
+    let advanced_res = app.clone().oneshot(advanced_req).await.unwrap();
+    assert_eq!(advanced_res.status(), StatusCode::NOT_FOUND);
+    assert!(spec["paths"].get("/api/v1/knowledge/search/advanced/stream").is_none());
+    let parameters = spec["paths"]["/api/v1/knowledge/search/"]["get"]["parameters"].as_array().unwrap();
+    assert!(parameters.iter().all(|parameter| parameter["name"] != "advanced"));
 
     let boundary = format!("boundary-{}", next_seq());
     let body = multipart_body(&boundary, &[("text", "sample")]);

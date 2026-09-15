@@ -9,7 +9,14 @@ function subject() {
   const calls = []
   const events = []
   const wiki = { wiki: { page: { id: 1, slug: 'concept/test' } } }
+  const revoked = []
+  let unmount
   const sandbox = {
+    URL: {
+      createObjectURL: (file) => `blob:${file.name}`,
+      revokeObjectURL: (url) => revoked.push(url),
+    },
+    onBeforeUnmount: (callback) => { unmount = callback },
     ref: (value) => ({ value }),
     computed: (value) => typeof value === 'function'
       ? { get value() { return value() } }
@@ -23,8 +30,8 @@ function subject() {
       searchImage: async (...args) => { calls.push(['image', ...args]); return [] },
     },
   }
-  vm.runInNewContext(`${source}\nglobalThis.subject = { query, searchMode, retrievalMode, handleSearch, imageFile };`, sandbox)
-  return { ...sandbox.subject, calls, events, wiki }
+  vm.runInNewContext(`${source}\nglobalThis.subject = { query, handleSearch, imageFile, handlePaste, clearImage, imagePreview, canSubmit };`, sandbox)
+  return { ...sandbox.subject, calls, events, wiki, revoked, unmount }
 }
 
 test('default search uses mixed retrieval and forwards Wiki results', async () => {
@@ -36,23 +43,65 @@ test('default search uses mixed retrieval and forwards Wiki results', async () =
   assert.equal(s.events.find(([event]) => event === 'search')[1][0], s.wiki)
 })
 
-test('returning from advanced mode uses mixed retrieval', async () => {
-  const s = subject()
-  s.query.value = 'question'
-  s.searchMode.value = 'advanced'
-  await s.handleSearch()
-  assert.equal(s.events[0][0], 'advanced-search')
-  assert.equal(s.calls.length, 0)
-  s.retrievalMode.value = 'normal'
-  await s.handleSearch()
-  assert.equal(s.calls[0][0], 'search')
-})
+function paste(s, file) {
+  let prevented = false
+  s.handlePaste({
+    clipboardData: { items: [{ type: file.type, getAsFile: () => file }] },
+    preventDefault: () => { prevented = true },
+  })
+  return prevented
+}
 
-test('image search keeps its own request path', async () => {
+test('pasted image selects image search without requiring text', async () => {
   const s = subject()
-  s.searchMode.value = 'image'
-  s.imageFile.value = { name: 'test.png' }
+  const file = { name: 'test.png', type: 'image/png' }
+  assert.equal(paste(s, file), true)
+  assert.equal(s.canSubmit.value, true)
+  assert.equal(s.imagePreview.value, 'blob:test.png')
   await s.handleSearch()
   assert.equal(s.calls[0][0], 'image')
+  assert.equal(s.calls[0][1], file)
+  assert.equal(s.calls[0][2], '')
   assert.equal(s.calls[0][3], 7)
+})
+
+test('image search includes text and removal restores text search', async () => {
+  const s = subject()
+  s.query.value = '发动机'
+  paste(s, { name: 'test.png', type: 'image/png' })
+  await s.handleSearch()
+  assert.equal(s.calls[0][0], 'image')
+  assert.equal(s.calls[0][2], '发动机')
+  s.clearImage()
+  await s.handleSearch()
+  assert.equal(s.calls[1][0], 'search')
+  assert.equal(s.calls[1][1], '发动机')
+  assert.deepEqual(s.revoked, ['blob:test.png'])
+})
+
+test('text paste keeps browser behavior and does not activate image search', () => {
+  const s = subject()
+  assert.equal(paste(s, { type: 'text/plain' }), false)
+  assert.equal(s.imageFile.value, null)
+  s.handlePaste({})
+  assert.equal(s.canSubmit.value, false)
+})
+
+test('replacing an image and unmounting release preview URLs', () => {
+  const s = subject()
+  paste(s, { name: 'first.png', type: 'image/png' })
+  paste(s, { name: 'second.png', type: 'image/png' })
+  assert.equal(s.imageFile.value.name, 'second.png')
+  assert.deepEqual(s.revoked, ['blob:first.png'])
+  s.unmount()
+  assert.deepEqual(s.revoked, ['blob:first.png', 'blob:second.png'])
+})
+
+test('empty input does not submit after removing the image', async () => {
+  const s = subject()
+  paste(s, { name: 'test.png', type: 'image/png' })
+  s.clearImage()
+  assert.equal(s.canSubmit.value, false)
+  await s.handleSearch()
+  assert.equal(s.calls.length, 0)
 })

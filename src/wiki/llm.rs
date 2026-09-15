@@ -1,6 +1,6 @@
 //! Wiki 生成专用的 LLM 客户端。
 //!
-//! 与 `search::advanced::LlmClient` 的区别：支持 system + user 双消息、独立模型覆盖，
+//! 支持 system + user 双消息、独立模型覆盖，
 //! 以及针对限流/瞬时故障的重试退避——生成管道一次要跑成百上千次调用，
 //! 429 是常态而不是异常。
 
@@ -149,7 +149,7 @@ impl WikiLlm {
         &self, system: &str, user: &str, max_tokens: usize, temperature: f32,
     ) -> Result<T> {
         let content = self.chat(system, user, max_tokens, temperature).await?;
-        let clean = crate::search::advanced::clean_json_like(&content);
+        let clean = clean_json_like(&content);
         serde_json::from_str::<T>(&clean)
             .map_err(|e| anyhow!("Failed to parse wiki LLM JSON: {}. content={}", e, truncate(&clean, 500)))
     }
@@ -165,4 +165,21 @@ fn truncate(value: &str, max_chars: usize) -> String {
     }
     let head: String = value.chars().take(max_chars).collect();
     format!("{}…", head)
+}
+
+/// 去掉模型常见的 JSON 包装（```json 围栏、思考过程尾巴）。
+pub(crate) fn clean_json_like(input: &str) -> String {
+    let mut text = input.trim();
+    if let Some(rest) = text.split_once("</think>") {
+        text = rest.1;
+    }
+    if let Some(stripped) = text.strip_prefix("```json") {
+        text = stripped.trim_start();
+    } else if let Some(stripped) = text.strip_prefix("```") {
+        text = stripped.trim_start();
+    }
+    if let Some(stripped) = text.strip_suffix("```") {
+        text = stripped.trim_end();
+    }
+    text.trim().to_string()
 }

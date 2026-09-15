@@ -993,10 +993,6 @@ p {
 .action-menu-items svg {
   flex-shrink: 0;
 }
-.advanced-search-panel {
-  max-width: none;
-  margin-top: 25px;
-}
 .file-detail .fixed {
   z-index: 80;
 }

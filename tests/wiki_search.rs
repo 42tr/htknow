@@ -129,12 +129,8 @@ async fn wiki_search_lifecycle_permissions_and_vectors() {
         )
         .await
         .unwrap();
-    for path in ["search/", "search/graph", "search/?advanced=true&"] {
-        let uri = if path.ends_with('&') {
-            format!("/api/v1/knowledge/{path}query=orbital")
-        } else {
-            format!("/api/v1/knowledge/{path}?query=orbital")
-        };
+    for path in ["search/", "search/graph"] {
+        let uri = format!("/api/v1/knowledge/{path}?query=orbital");
         let res = app.clone().oneshot(authed_empty_request("GET", &uri, &owner)).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK, "{uri}");
         let body = response_json(res).await;
@@ -172,15 +168,6 @@ async fn wiki_search_lifecycle_permissions_and_vectors() {
     for id in extra_ids {
         htknow::wiki::page::delete_by_id(&pool, id).await.unwrap();
     }
-    let sse = app
-        .clone()
-        .oneshot(authed_empty_request("GET", "/api/v1/knowledge/search/advanced/stream?query=orbital", &owner))
-        .await
-        .unwrap();
-    assert_eq!(sse.status(), StatusCode::OK);
-    let sse = String::from_utf8(sse.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
-    assert!(sse.contains("event: result") && sse.contains("\"wiki\""), "{sse}");
-
     let update = |payload| authed_json_request("PUT", "/api/v1/knowledge/wiki/page", &owner, payload);
     let res = app
         .clone()
