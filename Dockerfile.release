@@ -14,29 +14,23 @@ FROM debian:bookworm-slim
 ARG DEBIAN_FRONTEND=noninteractive
 ARG TARGETARCH
 
-# Install runtime dependencies
+# Keep all runtime setup before COPY so binary updates reuse this layer.
+ENV TZ=Asia/Shanghai
 RUN apt-get update && apt-get install -y --no-install-recommends \
     # Timezone data
     tzdata \
     # sqlite3
     sqlite3 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Configure timezone
-ENV TZ=Asia/Shanghai
-RUN ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime && echo ${TZ} > /etc/timezone
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime \
+    && echo ${TZ} > /etc/timezone \
+    && mkdir -p /app/data/images /app/data/temp /app/data/db
 
 # Create application directory
 WORKDIR /app
 
-# Create data directories
-RUN mkdir -p /app/data/images /app/data/temp /app/data/db
-
 # Copy the pre-compiled binary for the target architecture
-COPY dist/${TARGETARCH}/htknow /app/htknow
-
-# Set permissions
-RUN chmod +x /app/htknow
+COPY --chmod=755 dist/${TARGETARCH}/htknow /app/htknow
 
 # Expose the application port
 EXPOSE 8080

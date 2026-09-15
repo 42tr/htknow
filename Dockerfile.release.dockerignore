@@ -1,0 +1,7 @@
+# Release images only need the pre-built binaries.
+**
+!dist/
+!dist/amd64/
+!dist/amd64/htknow
+!dist/arm64/
+!dist/arm64/htknow

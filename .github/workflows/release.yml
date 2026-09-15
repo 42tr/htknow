@@ -2,10 +2,13 @@
 #   1. 分别构建 x86_64 / arm64 的发布二进制，并打包成 tar.gz
 #   2. 构建 linux/amd64 + linux/arm64 多架构 Docker 镜像并推送到 ghcr.io 和阿里云 ACR
 #   3. 创建 GitHub Release 并上传二进制包
+# master 推送仅构建并预热依赖缓存，供后续 tag 发布复用。
 name: Release
 
 on:
   push:
+    branches:
+      - master
     tags:
       - "v*"
   workflow_dispatch: {}
@@ -69,11 +72,14 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
+          # Tag 缓存相互隔离；发布可读取默认分支预热的缓存。
+          save-if: ${{ github.ref == 'refs/heads/master' }}
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package binary
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME}"
@@ -85,6 +91,7 @@ jobs:
           ls -lh "htknow-${version}-${{ matrix.target }}.tar.gz"
 
       - name: Upload binary artifact
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: htknow-${{ matrix.deb_arch }}
@@ -92,14 +99,17 @@ jobs:
           if-no-files-found: error
 
       - name: Upload package artifact
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: htknow-${{ matrix.target }}-tarball
           path: htknow-*.tar.gz
           if-no-files-found: error
+          compression-level: 0
 
   docker:
     name: Build & push Docker image
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -112,6 +122,7 @@ jobs:
       - name: Download binaries
         uses: actions/download-artifact@v4
         with:
+          pattern: htknow-*64
           path: artifacts
 
       - name: Prepare multi-arch build context
@@ -125,6 +136,8 @@ jobs:
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3
+        with:
+          platforms: arm64
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
@@ -153,6 +166,11 @@ jobs:
           tags: |
             type=ref,event=tag
             type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
+            type=sha,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Set Docker cache reference
+        id: cache
+        run: echo "ref=ghcr.io/${GITHUB_REPOSITORY,,}:buildcache" >> "$GITHUB_OUTPUT"
 
       - name: Build and push multi-arch image
         uses: docker/build-push-action@v6
@@ -165,9 +183,13 @@ jobs:
           provenance: false
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # Registry 缓存可跨 tag 复用；仅存 GHCR，避免 ACR 的 OCI 限制。
+          cache-from: type=registry,ref=${{ steps.cache.outputs.ref }}
+          cache-to: type=registry,ref=${{ steps.cache.outputs.ref }},mode=max,image-manifest=true,oci-mediatypes=true
 
   release:
     name: Create GitHub Release
+    if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
     permissions:
