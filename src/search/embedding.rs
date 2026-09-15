@@ -13,6 +13,9 @@ pub fn image_embedding_enabled() -> bool {
 }
 
 static HTTP_CLIENT: Lazy<Client> = Lazy::new(Client::new);
+// A longer inference timeout must not also turn an unreachable host into a long wait.
+static BATCH_HTTP_CLIENT: Lazy<Client> =
+    Lazy::new(|| Client::builder().connect_timeout(Duration::from_secs(5)).build().expect("embedding HTTP client"));
 
 #[derive(Debug, Serialize)]
 struct EmbeddingRequest {
@@ -27,6 +30,8 @@ struct EmbeddingResponse {
 
 #[derive(Debug, Deserialize)]
 struct EmbeddingData {
+    #[serde(default)]
+    index: Option<usize>,
     embedding: Vec<f32>,
 }
 
@@ -159,58 +164,282 @@ pub async fn get_embedding(text: &str) -> Result<Vec<f32>> {
     Ok(embedding)
 }
 
-/// 批量获取文本的 embedding 向量（自动分批）
+/// 批量获取文本向量；同时限制条数和字符数，保持结果与原文一一对应。
 pub async fn get_embeddings(texts: &[String]) -> Result<Vec<Vec<f32>>> {
     if texts.is_empty() {
         return Ok(Vec::new());
     }
-
-    let batch_size = config::get().ai.embedding_batch_size;
-    let mut all_embeddings = Vec::with_capacity(texts.len());
-    for chunk in texts.chunks(batch_size) {
-        let batch = get_embeddings_single_batch(chunk).await?;
-        all_embeddings.extend(batch);
-    }
-    Ok(all_embeddings)
+    let cfg = config::get();
+    anyhow::ensure!(!cfg.services.embedding_url.trim().is_empty(), "services.embedding_url is not configured");
+    let options = BatchOptions {
+        url: &cfg.services.embedding_url,
+        model: &cfg.ai.embedding_model,
+        max_items: cfg.ai.embedding_batch_size,
+        max_chars: cfg.ai.embedding_batch_max_chars,
+        timeout: Duration::from_secs(cfg.ai.embedding_batch_timeout_secs),
+    };
+    fetch_batches(texts, &options).await
 }
 
-async fn get_embeddings_single_batch(texts: &[String]) -> Result<Vec<Vec<f32>>> {
-    let cfg = config::get();
-    let embedding_url = Some(cfg.services.embedding_url.clone())
-        .filter(|url| !url.trim().is_empty())
-        .ok_or_else(|| anyhow::anyhow!("services.embedding_url is not configured"))?;
-    let request = EmbeddingRequest { model: cfg.ai.embedding_model.clone(), input: texts.to_vec() };
+struct BatchOptions<'a> {
+    url: &'a str,
+    model: &'a str,
+    max_items: usize,
+    max_chars: usize,
+    timeout: Duration,
+}
 
-    let response = HTTP_CLIENT
-        .post(&embedding_url)
-        .timeout(Duration::from_secs(cfg.search.embedding_timeout_secs))
+struct BatchFailure {
+    error: anyhow::Error,
+    split: bool,
+    retry: bool,
+}
+
+impl BatchFailure {
+    fn transport(error: reqwest::Error, context: &str) -> Self {
+        let split = error.is_timeout();
+        let retry = error.is_timeout() || error.is_connect() || error.is_request() || error.is_body();
+        let cause = anyhow::Error::new(error);
+        Self {
+            split,
+            retry,
+            // The file processing log prints Display, so preserve the cause in that message.
+            error: anyhow::anyhow!("{context}: {cause:#}"),
+        }
+    }
+}
+
+fn batches(texts: &[String], max_items: usize, max_chars: usize) -> Vec<&[String]> {
+    let mut result = Vec::new();
+    let mut start = 0;
+    let mut chars = 0usize;
+    for (i, text) in texts.iter().enumerate() {
+        let count = text.chars().count();
+        if i > start && (i - start >= max_items.max(1) || chars.saturating_add(count) > max_chars.max(1)) {
+            result.push(&texts[start..i]);
+            start = i;
+            chars = 0;
+        }
+        chars = chars.saturating_add(count);
+    }
+    if start < texts.len() {
+        result.push(&texts[start..]);
+    }
+    result
+}
+
+async fn fetch_batches(texts: &[String], options: &BatchOptions<'_>) -> Result<Vec<Vec<f32>>> {
+    // Stack pushes right before left, preserving input order even after adaptive splitting.
+    let mut pending = batches(texts, options.max_items, options.max_chars);
+    pending.reverse();
+    let mut all = Vec::with_capacity(texts.len());
+    while let Some(batch) = pending.pop() {
+        for attempt in 0..3 {
+            match request_batch(batch, options).await {
+                Ok(vectors) => {
+                    all.extend(vectors);
+                    break;
+                }
+                Err(failure) if failure.split && batch.len() > 1 => {
+                    log::warn!("{}; splitting batch for retry", failure.error);
+                    let (left, right) = batch.split_at(batch.len() / 2);
+                    pending.push(right);
+                    pending.push(left);
+                    break;
+                }
+                Err(failure) if failure.retry && attempt < 2 => {
+                    log::warn!("{}; retry {}/2", failure.error, attempt + 1);
+                    tokio::time::sleep(Duration::from_millis(500 * (1 << attempt))).await;
+                }
+                Err(failure) => return Err(failure.error),
+            }
+        }
+    }
+    Ok(all)
+}
+
+async fn request_batch(
+    texts: &[String], options: &BatchOptions<'_>,
+) -> std::result::Result<Vec<Vec<f32>>, BatchFailure> {
+    let context = format!(
+        "batch embedding request failed: url={}, batch_size={}, total_chars={}, timeout={}s",
+        options.url,
+        texts.len(),
+        texts.iter().map(|t| t.chars().count()).sum::<usize>(),
+        options.timeout.as_secs_f64()
+    );
+    let request = EmbeddingRequest { model: options.model.to_string(), input: texts.to_vec() };
+    let response = BATCH_HTTP_CLIENT
+        .post(options.url)
+        .timeout(options.timeout)
         .json(&request)
         .send()
         .await
-        .with_context(|| {
-            format!(
-                "batch embedding request failed: url={}, batch_size={}, total_chars={}, timeout={}s",
-                embedding_url,
-                texts.len(),
-                texts.iter().map(|t| t.chars().count()).sum::<usize>(),
-                cfg.search.embedding_timeout_secs
-            )
-        })?;
+        .map_err(|err| BatchFailure::transport(err, &context))?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        return Err(BatchFailure {
+            error: anyhow::anyhow!("{context}: HTTP {status}: {}", body.chars().take(1000).collect::<String>()),
+            split: status == reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+            retry: status == reqwest::StatusCode::REQUEST_TIMEOUT
+                || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+                || status.is_server_error(),
+        });
+    }
+    let response: EmbeddingResponse = response.json().await.map_err(|err| BatchFailure::transport(err, &context))?;
+    ordered_vectors(response, texts.len()).map_err(|err| BatchFailure {
+        error: anyhow::anyhow!("{context}: invalid response: {err:#}"),
+        split: false,
+        retry: false,
+    })
+}
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let error_text = response.text().await.unwrap_or_default();
-        anyhow::bail!(
-            "Embedding API error: {} - {}, batch_size={}, total_chars={}",
-            status,
-            error_text,
-            texts.len(),
-            texts.iter().map(|text| text.chars().count()).sum::<usize>()
-        );
+fn ordered_vectors(response: EmbeddingResponse, count: usize) -> Result<Vec<Vec<f32>>> {
+    anyhow::ensure!(response.data.len() == count, "expected {count} vectors, got {}", response.data.len());
+    let indexed = response.data.iter().any(|item| item.index.is_some());
+    let mut ordered = vec![None; count];
+    for (position, item) in response.data.into_iter().enumerate() {
+        let index = if indexed { item.index.context("mixed indexed and unindexed vectors")? } else { position };
+        anyhow::ensure!(index < count, "vector index {index} is out of range");
+        anyhow::ensure!(ordered[index].is_none(), "duplicate vector index {index}");
+        anyhow::ensure!(!item.embedding.is_empty(), "empty vector at index {index}");
+        ordered[index] = Some(item.embedding);
+    }
+    ordered.into_iter().map(|item| item.context("missing vector")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::{Json, Router, extract::Path, http::StatusCode, routing::post};
+    use serde_json::{Value, json};
+    use std::{
+        collections::HashMap,
+        sync::{Arc, Mutex},
+    };
+
+    #[test]
+    fn embedding_batches_bound_characters_without_losing_text() {
+        let mut texts = vec!["文".repeat(7635); 8];
+        texts[7].push('字');
+        assert_eq!(texts.iter().map(|s| s.chars().count()).sum::<usize>(), 61081);
+        let chunks = batches(&texts, 8, 16000);
+        assert_eq!(chunks.iter().map(|c| c.len()).collect::<Vec<_>>(), vec![2, 2, 2, 2]);
+        assert_eq!(chunks.into_iter().flatten().collect::<Vec<_>>(), texts.iter().collect::<Vec<_>>());
+        let oversized = vec!["x".repeat(20000), "y".into()];
+        assert_eq!(batches(&oversized, 8, 16000)[0][0].len(), 20000);
+        assert_eq!(batches(&texts, 0, 0).len(), 8);
+        assert!(batches(&[], 8, 16000).is_empty());
     }
 
-    let embedding_response: EmbeddingResponse =
-        response.json().await.context("batch embedding response decode failed")?;
+    #[tokio::test]
+    async fn embedding_http_batches_split_retry_and_preserve_alignment() {
+        let calls = Arc::new(Mutex::new(HashMap::<String, usize>::new()));
+        let state = calls.clone();
+        let app = Router::new().route(
+            "/{mode}",
+            post(move |Path(mode): Path<String>, Json(body): Json<Value>| {
+                let calls = state.clone();
+                async move {
+                    let attempt = {
+                        let mut counts = calls.lock().unwrap();
+                        let count = counts.entry(mode.clone()).or_default();
+                        *count += 1;
+                        *count
+                    };
+                    let inputs = body["input"].as_array().unwrap();
+                    if mode == "large" && inputs.len() > 1 {
+                        return (StatusCode::PAYLOAD_TOO_LARGE, Json(json!({"error":"too large"})));
+                    }
+                    if mode == "timeout" && inputs.len() > 1 || mode == "single-timeout" {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    if mode == "unauthorized" {
+                        return (StatusCode::UNAUTHORIZED, Json(json!({"error":"bad credentials"})));
+                    }
+                    if mode == "outage" || mode == "transient" && attempt == 1 {
+                        return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"busy"})));
+                    }
+                    let mut data: Vec<_> = inputs
+                        .iter()
+                        .enumerate()
+                        .map(|(index, input)| {
+                            let value: f32 = input.as_str().unwrap().parse().unwrap();
+                            json!({"index":index,"embedding":[value, 1.0]})
+                        })
+                        .collect();
+                    data.reverse();
+                    if mode == "bad" {
+                        data.pop();
+                    }
+                    (StatusCode::OK, Json(json!({"data":data})))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let root = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let texts: Vec<_> = (0..4).map(|i| i.to_string()).collect();
+        for mode in ["large", "timeout", "transient"] {
+            let url = format!("{root}/{mode}");
+            let options = BatchOptions {
+                url: &url,
+                model: "test",
+                max_items: 8,
+                max_chars: 16000,
+                timeout: Duration::from_millis(100),
+            };
+            let vectors = fetch_batches(&texts, &options).await.unwrap();
+            assert_eq!(vectors, (0..4).map(|i| vec![i as f32, 1.0]).collect::<Vec<_>>(), "{mode}");
+        }
+        assert_eq!(calls.lock().unwrap()["large"], 7);
+        assert_eq!(calls.lock().unwrap()["timeout"], 7);
+        assert_eq!(calls.lock().unwrap()["transient"], 2);
+        for (mode, expected, message) in [
+            ("unauthorized", 1, "401"),
+            ("outage", 3, "503"),
+            ("bad", 1, "expected 4 vectors"),
+            ("single-timeout", 3, "timed out"),
+        ] {
+            let url = format!("{root}/{mode}");
+            let options = BatchOptions {
+                url: &url,
+                model: "test",
+                max_items: 8,
+                max_chars: 16000,
+                timeout: Duration::from_millis(100),
+            };
+            let input = if mode == "single-timeout" { &texts[..1] } else { &texts[..] };
+            let error = fetch_batches(input, &options).await.unwrap_err().to_string();
+            assert!(error.contains(message), "{mode}: {error}");
+            assert!(error.contains("batch_size=") && error.contains("total_chars="), "{error}");
+            assert_eq!(calls.lock().unwrap()[mode], expected, "{mode}");
+        }
+        let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/closed", closed.local_addr().unwrap());
+        drop(closed);
+        let options =
+            BatchOptions { url: &url, model: "test", max_items: 8, max_chars: 16000, timeout: Duration::from_secs(1) };
+        let error = fetch_batches(&texts[..1], &options).await.unwrap_err().to_string();
+        assert!(error.to_lowercase().contains("connect"), "transport cause must be visible: {error}");
+        server.abort();
+    }
 
-    Ok(embedding_response.data.into_iter().map(|data| data.embedding).collect())
+    #[test]
+    fn embedding_response_rejects_ambiguous_indices() {
+        for data in [
+            json!([{"index":0,"embedding":[1.0]}, {"index":0,"embedding":[2.0]}]),
+            json!([{"index":2,"embedding":[1.0]}, {"index":1,"embedding":[2.0]}]),
+            json!([{"index":0,"embedding":[1.0]}, {"embedding":[2.0]}]),
+            json!([{"index":0,"embedding":[]}, {"index":1,"embedding":[2.0]}]),
+        ] {
+            let response = serde_json::from_value(json!({"data":data})).unwrap();
+            assert!(ordered_vectors(response, 2).is_err());
+        }
+        let response = serde_json::from_value(json!({"data":[{"embedding":[1.0]},{"embedding":[2.0]}]})).unwrap();
+        assert_eq!(ordered_vectors(response, 2).unwrap(), vec![vec![1.0], vec![2.0]]);
+    }
 }

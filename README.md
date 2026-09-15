@@ -105,7 +105,9 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | `HTKNOW_EMBEDDING_MODEL` | `bge-m3` | Embedding 模型 |
 | `HTKNOW_EMBEDDING_DIM` | `1024` | Embedding 维度 |
 | `HTKNOW_IMAGE_EMBEDDING_DIM` | `2048` | 图片 Embedding 维度 |
-| `HTKNOW_EMBEDDING_BATCH_SIZE` | `8` | Embedding 批量请求批次大小 |
+| `HTKNOW_EMBEDDING_BATCH_SIZE` | `8` | 文本 embedding 每批最多条数（最小 1） |
+| `HTKNOW_EMBEDDING_BATCH_MAX_CHARS` | `16000` | 每批文本总字符预算；超长单条独立请求，不截断 |
+| `HTKNOW_EMBEDDING_BATCH_TIMEOUT_SECS` | `120` | 文件索引批量 embedding 请求超时（秒），不影响搜索超时 |
 | `HTKNOW_RERANK_MODEL` | `bge-rerank` | Rerank 模型 |
 | `HTKNOW_RERANK_THRESHOLD` | `0.1` | Rerank 阈值 |
 
@@ -139,7 +141,7 @@ docker run -d --name mineru-api --restart unless-stopped --ipc host -p 10001:100
 | `HTKNOW_TANTIVY_MEMORY_MB` | `50` | Tantivy 内存（MB） |
 | `HTKNOW_SEARCH_TANTIVY_REBUILD_BATCH_SIZE` | `100` | Tantivy 索引重建批次大小 |
 | `HTKNOW_SEARCH_LANCEDB_REBUILD_BATCH_SIZE` | `100` | LanceDB 从 SQLite 重建批次大小 |
-| `HTKNOW_SEARCH_EMBEDDING_TIMEOUT_SECS` | `30` | embedding / 图片 embedding 请求超时（秒） |
+| `HTKNOW_SEARCH_EMBEDDING_TIMEOUT_SECS` | `30` | 搜索单条文本 / 图片 embedding 请求超时（秒） |
 | `HTKNOW_SEARCH_RERANK_TIMEOUT_SECS` | `20` | rerank 请求超时（秒） |
 | `HTKNOW_SEARCH_SYNONYM_ENABLED` | `true` | 是否启用同义词查询扩展 |
 | `HTKNOW_SEARCH_SYNONYM_BOOST` | `0.7` | 同义词权重因子（与行权重相乘） |
@@ -218,3 +220,9 @@ mv tantivy_full_index tantivy_full_index_bak0423
 docker start htknow
 ```
 然后在词典可以重建全文检索的索引
+
+### 文件解析时 embedding 请求失败
+
+批量文本向量请求同时受条数和字符预算约束，建立连接最多等待 5 秒，推理超时独立配置。超时或 HTTP 413 会拆小多条批次；单条超时、连接故障、HTTP 408/429/5xx 最多退避重试两次。认证错误及其他不可重试的错误直接报告。响应条数和 `index` 必须与输入对应，避免向量与切片错配。
+
+长文档可使用 `HTKNOW_EMBEDDING_BATCH_TIMEOUT_SECS=120`、`HTKNOW_EMBEDDING_BATCH_MAX_CHARS=16000`（默认值）；旧版本尚未支持这两个变量时，可临时设置 `HTKNOW_EMBEDDING_BATCH_SIZE=2`、`HTKNOW_SEARCH_EMBEDDING_TIMEOUT_SECS=120`，后者也会延长搜索请求超时。环境变量修改后需重启服务，再重试失败文件。单条文本超过模型上下文限制时仍需调整切片大小；字符预算不会截断原文，也不等同于模型 token 上限。

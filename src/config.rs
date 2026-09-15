@@ -121,6 +121,10 @@ pub struct AIConfig {
     pub rerank_threshold: f32,
     /// Embedding 批量请求批次大小
     pub embedding_batch_size: usize,
+    /// 文本批次字符预算；超长单条独立请求，不截断内容
+    pub embedding_batch_max_chars: usize,
+    /// 文件索引批量 embedding 超时，与交互搜索分开
+    pub embedding_batch_timeout_secs: u64,
 }
 
 /// 数据库配置
@@ -287,7 +291,9 @@ impl AIConfig {
             image_embedding_dim: env_or_parse("HTKNOW_IMAGE_EMBEDDING_DIM", 2048),
             rerank_model: env_or("HTKNOW_RERANK_MODEL", "bge-rerank"),
             rerank_threshold: env_or_parse("HTKNOW_RERANK_THRESHOLD", 0.1),
-            embedding_batch_size: env_or_parse("HTKNOW_EMBEDDING_BATCH_SIZE", 8),
+            embedding_batch_size: env_or_parse::<usize>("HTKNOW_EMBEDDING_BATCH_SIZE", 8).max(1),
+            embedding_batch_max_chars: env_or_parse::<usize>("HTKNOW_EMBEDDING_BATCH_MAX_CHARS", 16000).max(1),
+            embedding_batch_timeout_secs: env_or_parse::<u64>("HTKNOW_EMBEDDING_BATCH_TIMEOUT_SECS", 120).max(1),
         }
     }
 }
