@@ -5,6 +5,7 @@ use axum::{
 use sqlx::SqlitePool;
 use utoipa::OpenApi;
 
+mod chat;
 mod common;
 mod error;
 mod file;
@@ -27,6 +28,7 @@ use crate::search::SearchEngine;
 #[derive(OpenApi)]
 #[openapi(
     paths(
+        chat::chat,
         // Knowledge Base
         knowledge_base::list,
         knowledge_base::create,
@@ -116,6 +118,7 @@ use crate::search::SearchEngine;
     ),
     components(
         schemas(
+            chat::ChatRequest, chat::ChatMessage, chat::ChatRole, chat::ChatSource,
             knowledge_base::Knowledge,
             knowledge_base::KnowledgeResponse,
             knowledge_base::KnowledgeDetailResponse,
@@ -317,6 +320,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/rebuild", post(wiki::rebuild));
 
     Router::new()
+        .route("/chat", post(chat::chat))
         .nest("/knowledge_base/", knowledge_router)
         .nest("/files/", file_router)
         .nest("/search/", search_router)

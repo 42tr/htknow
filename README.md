@@ -225,6 +225,19 @@ docker start htknow
 
 长文档可使用 `HTKNOW_EMBEDDING_BATCH_TIMEOUT_SECS=120`、`HTKNOW_EMBEDDING_BATCH_MAX_CHARS=16000`（默认值）；旧版本尚未支持这两个变量时，可临时设置 `HTKNOW_EMBEDDING_BATCH_SIZE=2`、`HTKNOW_SEARCH_EMBEDDING_TIMEOUT_SECS=120`，后者也会延长搜索请求超时。环境变量修改后需重启服务，再重试失败文件。单条文本超过模型上下文限制时仍需调整切片大小；字符预算不会截断原文，也不等同于模型 token 上限。
 
-### 搜索入口
+### 对话与搜索
 
-搜索界面默认使用「段落」，混合检索原文切片与 Wiki；另提供「图片」和「高级」。独立的文档全文搜索入口及 `/search/full` API 已移除，不再创建、写入、重建或导出文档全文索引，原 `HTKNOW_TANTIVY_FULL_INDEX_PATH` 配置不再使用。旧版本留下的索引目录不会自动删除，可在确认升级后自行清理。原文存储、文件预览、切片关键词检索及 `/search/summary` 摘要接口继续使用。
+界面默认使用流式对话：输入问题并回车，系统先混合检索原文切片与 Wiki，再生成带引用的回答。「仅搜索」按钮继续返回原搜索结果；粘贴图片仍使用图片搜索。独立的文档全文搜索入口及 `/search/full` API 已移除，不再创建、写入、重建或导出文档全文索引，原 `HTKNOW_TANTIVY_FULL_INDEX_PATH` 配置不再使用。旧版本留下的索引目录不会自动删除，可在确认升级后自行清理。原文存储、文件预览、切片关键词检索及 `/search/summary` 摘要接口继续使用。
+
+对话使用 `LLM_API_URL`、`LLM_API_KEY`、`LLM_MODEL`，其中 URL 必须是支持 `stream: true` 的完整 OpenAI 兼容 Chat Completions 地址，例如 `https://your-provider.example/v1/chat/completions`。Wiki 专用的 `WIKI_LLM_*` 配置不用于聊天。
+
+- 点击回答中的 `[1]` 等编号可查看本轮证据：原文引用打开对应切片，Wiki 引用打开 Wiki 页面及其来源，不把页面级来源伪装成逐句原文证据。
+- 支持追问、停止生成、重新生成和新对话。历史仅保存在前端内存，刷新即清空；切换知识库后开始新对话，不建立后端会话表。
+- 每轮最多使用最近 6 轮完整历史（共 16000 字符），检索证据最多 8 条、24000 字符。没有可访问的相关资料时明确说明，不调用 LLM 编造回答。
+- 新接口：`POST /api/v1/knowledge/chat`，沿用现有认证头。请求示例：
+
+```json
+{"question":"螺旋桨有哪些类型？","kb_id":1,"messages":[]}
+```
+
+`messages` 为按 `user` / `assistant` 成对排列的历史消息；`kb_id` 可省略或为 `null`，表示当前用户可访问的知识库。返回 `text/event-stream`，事件依次为 `status`（检索/生成阶段）、`sources`（编号和搜索结果）、`delta`（新增文本），最后 `done`；失败时返回 `error`。断开连接会取消本轮处理，流中断不会标记为正常完成。响应禁用代理缓冲，并每 10 秒发送保活注释。

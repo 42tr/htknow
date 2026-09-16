@@ -1,3 +1,4 @@
+import { consumeChatStream } from './chatStream.js'
 const API_BASE = '/api/v1/knowledge'
 
 // 用户认证信息（实际应用中应该从登录获取）
@@ -37,6 +38,13 @@ const buildQuery = (params) => {
 }
 
 export const api = {
+  async chat(request, { signal, onEvent }) {
+    const response = await fetch(`${API_BASE}/chat`, {
+      method: 'POST', headers: getHeaders(), body: JSON.stringify(request), signal,
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '对话请求失败'))
+    return consumeChatStream(response, onEvent)
+  },
   // 搜索
   async search(query, kbId = null, fileId = null) {
     let url = `${API_BASE}/search/?query=${encodeURIComponent(query)}`

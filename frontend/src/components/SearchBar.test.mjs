@@ -24,17 +24,18 @@ function subject() {
     watch: (state, callback) => callback(state.value),
     currentKb: { value: { id: 7 } },
     localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+    defineProps: () => ({ chatBusy: false }),
     defineEmits: () => (...args) => events.push(args),
     api: {
       search: async (...args) => { calls.push(['search', ...args]); return [wiki] },
       searchImage: async (...args) => { calls.push(['image', ...args]); return [] },
     },
   }
-  vm.runInNewContext(`${source}\nglobalThis.subject = { query, handleSearch, imageFile, handlePaste, clearImage, imagePreview, canSubmit };`, sandbox)
+  vm.runInNewContext(`${source}\nglobalThis.subject = { query, handleSearch, handleSubmit, handleKeydown, imageFile, handlePaste, clearImage, imagePreview, canSubmit };`, sandbox)
   return { ...sandbox.subject, calls, events, wiki, revoked, unmount }
 }
 
-test('default search uses mixed retrieval and forwards Wiki results', async () => {
+test('search-only uses mixed retrieval and forwards Wiki results', async () => {
   const s = subject()
   s.query.value = '主要内容'
   await s.handleSearch()
@@ -104,4 +105,25 @@ test('empty input does not submit after removing the image', async () => {
   assert.equal(s.canSubmit.value, false)
   await s.handleSearch()
   assert.equal(s.calls.length, 0)
+})
+
+
+test('default submit starts a conversation with selected scope instead of searching', () => {
+  const s = subject()
+  s.query.value = '螺旋桨的主要类型'
+  s.handleSubmit()
+  assert.equal(s.calls.length, 0)
+  assert.equal(s.events[0][0], 'chat')
+  assert.equal(s.events[0][1].question, '螺旋桨的主要类型')
+  assert.equal(s.events[0][1].kbId, 7)
+  assert.equal(s.query.value, '')
+})
+
+test('enter starts chat but composing input does not submit', () => {
+  const s = subject()
+  s.query.value = '问题'
+  s.handleKeydown({ key: 'Enter', isComposing: true })
+  assert.equal(s.events.length, 0)
+  s.handleKeydown({ key: 'Enter', isComposing: false })
+  assert.equal(s.events[0][0], 'chat')
 })

@@ -4,7 +4,8 @@ import { api } from '../api'
 import { currentKb } from '../store'
 import KnowledgeBaseSelector from './KnowledgeBaseSelector.vue'
 
-const emit = defineEmits(['search', 'search-start', 'search-end', 'search-error'])
+const props = defineProps({ chatBusy: Boolean })
+const emit = defineEmits(['search', 'search-start', 'search-end', 'search-error', 'chat'])
 
 const query = ref('')
 const busy = ref(false)
@@ -19,7 +20,7 @@ try {
 const error = ref('')
 const imageFile = ref(null)
 const imagePreview = ref('')
-const canSubmit = computed(() => !busy.value && Boolean(imageFile.value || query.value.trim()))
+const canSubmit = computed(() => !busy.value && !props.chatBusy && Boolean(imageFile.value || query.value.trim()))
 
 const localSelectedKb = ref({ id: null, name: '所有知识库' })
 const showKbSelector = ref(false)
@@ -88,6 +89,13 @@ const handleSearch = async () => {
   }
 }
 
+const handleSubmit = () => {
+  if (!canSubmit.value) return
+  if (imageFile.value) return handleSearch()
+  emit('chat', { question: query.value.trim(), kbId: localSelectedKb.value?.id ?? null })
+  query.value = ''
+}
+
 const clearImage = () => {
   if (imagePreview.value) URL.revokeObjectURL(imagePreview.value)
   imagePreview.value = ''
@@ -109,7 +117,7 @@ onBeforeUnmount(clearImage)
 
 const handleKeydown = (e) => {
   if (e.key === 'Enter' && !e.isComposing) {
-    handleSearch()
+    handleSubmit()
   }
 }
 </script>
@@ -148,16 +156,17 @@ const handleKeydown = (e) => {
         <input
           v-model="query"
           type="text"
-          :placeholder="imageFile ? '补充图片描述（可选）' : '输入关键词，或粘贴图片搜索知识库'"
+          :placeholder="imageFile ? '补充图片描述（可选）' : '向知识库提问，或点击「仅搜索」查找资料'"
           class="h-12 min-w-0 flex-1 border-0 bg-transparent px-0 text-base text-slate-800 shadow-none outline-none placeholder:text-slate-400 focus:ring-0"
           @keydown="handleKeydown"
         />
+        <button type="button" class="secondary-button shrink-0" :disabled="!canSubmit" @click="handleSearch">仅搜索</button>
         <button
           type="button"
           :disabled="!canSubmit"
           class="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-slate-900 text-white transition hover:bg-slate-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
-          aria-label="搜索"
-          @click="handleSearch"
+          :aria-label="imageFile ? '搜索图片' : '发送问题'"
+          @click="handleSubmit"
         >
           <svg
             class="h-5 w-5"
@@ -176,7 +185,7 @@ const handleKeydown = (e) => {
       </div>
 
       <div class="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 bg-slate-50/60 px-4 py-2 sm:px-5">
-        <span class="text-xs text-slate-400">支持粘贴图片搜索</span>
+        <span class="text-xs text-slate-400">默认对话 · 支持粘贴图片进行搜索</span>
         <!-- Scope chip -->
         <button
           type="button"

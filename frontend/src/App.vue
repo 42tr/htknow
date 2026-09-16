@@ -3,6 +3,7 @@ import { vDialog } from './dialog'
 import { nextTick, reactive, ref, watch } from 'vue'
 import SearchBar from './components/SearchBar.vue'
 import SearchResults from './components/SearchResults.vue'
+import ChatPanel from './components/ChatPanel.vue'
 import KnowledgeBaseList from './components/KnowledgeBaseList.vue'
 import FileUpload from './components/FileUpload.vue'
 import SearchDictionaryManager from './components/SearchDictionaryManager.vue'
@@ -41,6 +42,14 @@ const openUpload = () => {
 const uploaded = () => {
   kbList.value?.refresh()
 }
+const viewMode = ref('chat')
+const chatPanel = ref(null)
+const chatBusy = ref(false)
+const handleChat = (request) => {
+  viewMode.value = 'chat'
+  hasSearched.value = true
+  chatPanel.value?.ask(request)
+}
 const searchResults = ref([])
 const isSearching = ref(false)
 const handleSearchResults = (results) => {
@@ -48,6 +57,7 @@ const handleSearchResults = (results) => {
 }
 
 const handleSearchStart = () => {
+  viewMode.value = 'search'
   hasSearched.value = true
   searchFailed.value = false
   isSearching.value = true
@@ -71,7 +81,7 @@ const handleSearchEnd = () => {
         <nav aria-label="主导航" class="side-nav">
           <button
             v-for="item in [
-              { id: 'search', name: '搜索', icon: '⌕' },
+              { id: 'search', name: '对话与搜索', icon: '⌕' },
               { id: 'knowledge', name: '知识库', icon: '▤' },
             ]"
             :key="item.id"
@@ -109,16 +119,24 @@ const handleSearchEnd = () => {
         >
           <div class="search-intro">
             <span class="eyebrow">YOUR KNOWLEDGE, CONNECTED</span>
-            <h1>从资料中，找到答案的线索</h1>
-            <p>搜索文档、发现关联，让每一条信息都有出处。</p>
+            <h1>向资料提问，让答案有出处</h1>
+            <p>结合知识库回答问题，点击引用查看原文；也可以仅搜索资料。</p>
           </div>
           <SearchBar
+            :chat-busy="chatBusy"
+            @chat="handleChat"
             @search="handleSearchResults"
             @search-start="handleSearchStart"
             @search-end="handleSearchEnd"
             @search-error="searchFailed = true"
           />
+          <div v-if="hasSearched" class="mx-auto max-w-4xl flex gap-3 mt-4 text-sm">
+            <button class="plain-button" :aria-pressed="viewMode === 'chat'" @click="viewMode = 'chat'">对话</button>
+            <button v-if="searchResults.length || viewMode === 'search'" class="plain-button" :aria-pressed="viewMode === 'search'" @click="viewMode = 'search'">搜索结果</button>
+          </div>
+          <ChatPanel ref="chatPanel" v-show="viewMode === 'chat'" @busy="chatBusy = $event" />
           <SearchResults
+            v-show="viewMode === 'search'"
             :results="searchResults"
             :loading="isSearching"
             :searched="hasSearched"
