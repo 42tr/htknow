@@ -2,16 +2,12 @@
 #   1. 分别构建 x86_64 / arm64 的发布二进制，并打包成 tar.gz
 #   2. 构建 linux/amd64 + linux/arm64 多架构 Docker 镜像并推送到 ghcr.io 和阿里云 ACR
 #   3. 创建 GitHub Release 并上传二进制包
-# master 推送仅构建并预热依赖缓存，供后续 tag 发布复用。
 name: Release
 
 on:
   push:
-    branches:
-      - master
     tags:
       - "v*"
-  workflow_dispatch: {}
 
 env:
   RUST_VERSION: "1.97.1"
@@ -107,14 +103,12 @@ jobs:
         uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.target }}
-          # Tag 缓存相互隔离；发布可读取默认分支预热的缓存。
-          save-if: ${{ github.ref == 'refs/heads/master' }}
+          save-if: false
 
       - name: Build release binary
         run: cargo build --release --locked --target ${{ matrix.target }}
 
       - name: Package binary
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         run: |
           set -euo pipefail
           version="${GITHUB_REF_NAME}"
@@ -126,7 +120,6 @@ jobs:
           ls -lh "htknow-${version}-${{ matrix.target }}.tar.gz"
 
       - name: Upload binary artifact
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: htknow-${{ matrix.deb_arch }}
@@ -134,7 +127,6 @@ jobs:
           if-no-files-found: error
 
       - name: Upload package artifact
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
           name: htknow-${{ matrix.target }}-tarball
@@ -144,7 +136,6 @@ jobs:
 
   docker:
     name: Build & push Docker image
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -200,8 +191,7 @@ jobs:
             crpi-gz6f3ok0ezphywc8.cn-shanghai.personal.cr.aliyuncs.com/${{ github.repository }}
           tags: |
             type=ref,event=tag
-            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/') }}
-            type=sha,enable=${{ !startsWith(github.ref, 'refs/tags/') }}
+            type=raw,value=latest
 
       - name: Set Docker cache reference
         id: cache
@@ -224,7 +214,6 @@ jobs:
 
   release:
     name: Create GitHub Release
-    if: startsWith(github.ref, 'refs/tags/')
     needs: build
     runs-on: ubuntu-latest
     permissions:
