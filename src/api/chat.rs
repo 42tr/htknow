@@ -1,5 +1,8 @@
 //! 无会话存储的检索增强对话。客户端逐次提交历史；仅检索结果可作为引用来源。
-use std::{convert::Infallible, time::Duration};
+use async_trait::async_trait;
+use futures::StreamExt;
+use g::{Agent, OpenAIChatModel, RunEvent, Tool, ToolBehavior, ToolContext, ToolError, ToolSpec};
+use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
     Extension, Json,
@@ -141,7 +144,84 @@ fn select_sources(results: Vec<search::SearchResultItem>) -> Vec<ChatSource> {
     sources
 }
 
+struct KnowledgeSearchTool {
+    pool: SqlitePool,
+    engine: SearchEngine,
+    user: AuthUser,
+    kb_id: Option<i64>,
+    tx: mpsc::Sender<Event>,
+}
+
+#[async_trait]
+impl Tool for KnowledgeSearchTool {
+    fn spec(&self) -> ToolSpec {
+        ToolSpec { name: "knowledge_search".into(), description: "Search the user's accessible knowledge base. Always use this before answering factual questions. Returns source IDs that must be cited as [n].".into(), input_schema: json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}), behavior: ToolBehavior { read_only: true, idempotent: true, parallel_safe: false } }
+    }
+    async fn call(&self, _ctx: ToolContext, input: Value) -> Result<Value, ToolError> {
+        let query = input
+            .get("query")
+            .and_then(Value::as_str)
+            .filter(|q| !q.trim().is_empty())
+            .ok_or_else(|| ToolError::new("query is required"))?;
+        let Json(found) = search::search(
+            State(self.pool.clone()),
+            Extension(self.engine.clone()),
+            Query(search::SearchQuery { query: query.to_owned(), kb_id: self.kb_id.map(|id| vec![id]), file_id: None }),
+            Extension(self.user.clone()),
+        )
+        .await
+        .map_err(|_| ToolError::new("knowledge search failed"))?;
+        let sources = select_sources(found.results);
+        send(&self.tx, "sources", json!({"sources": sources})).await.map_err(|e| ToolError::new(e.to_string()))?;
+        Ok(
+            json!({"sources": sources.iter().map(|s| json!({"id":s.id,"content":s.result.content,"title":s.result.wiki.as_ref().map(|w| &w.page.title).or_else(|| s.result.file.as_ref().map(|f| &f.filename))})).collect::<Vec<_>>() }),
+        )
+    }
+}
+
 async fn run_chat(
+    tx: &mpsc::Sender<Event>, pool: SqlitePool, engine: SearchEngine, user: AuthUser, request: ChatRequest, url: &str,
+) -> anyhow::Result<()> {
+    send(tx, "status", json!({"stage":"searching"})).await?;
+    let cfg = config::get();
+    let key = cfg.llm.api_key.clone().unwrap_or_default();
+    let base = url.strip_suffix("/chat/completions").unwrap_or(url);
+    let model = Arc::new(OpenAIChatModel::new(key, cfg.llm.model.clone()).with_base_url(base));
+    let tool = KnowledgeSearchTool { pool, engine, user, kb_id: request.kb_id, tx: tx.clone() };
+    let history = request
+        .messages
+        .iter()
+        .map(|m| {
+            g::Message::text(
+                match m.role {
+                    ChatRole::User => g::Role::User,
+                    ChatRole::Assistant => g::Role::Assistant,
+                },
+                &m.content,
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut agent = Agent::new(model).tool(tool).instruction(SYSTEM);
+    let mut prompt = history;
+    prompt.push(g::Message::user(request.question));
+    let mut events = agent.stream_run(prompt);
+    send(tx, "status", json!({"stage":"generating"})).await?;
+    let mut got = false;
+    while let Some(event) = events.next().await {
+        match event.map_err(|e| anyhow::anyhow!(e.to_string()))? {
+            RunEvent::TextDelta { text, .. } => {
+                got = true;
+                send(tx, "delta", json!({"text":text})).await?;
+            }
+            RunEvent::Completed { .. } => break,
+            _ => {}
+        }
+    }
+    anyhow::ensure!(got, "LLM 未返回回答正文，请检查模型配置");
+    send(tx, "done", json!({"finish_reason":"stop"})).await
+}
+
+async fn run_chat_legacy(
     tx: &mpsc::Sender<Event>, pool: SqlitePool, engine: SearchEngine, user: AuthUser, request: ChatRequest, url: &str,
 ) -> anyhow::Result<()> {
     send(tx, "status", json!({"stage": "searching"})).await?;
