@@ -127,3 +127,28 @@ test('enter starts chat but composing input does not submit', () => {
   s.handleKeydown({ key: 'Enter', isComposing: false })
   assert.equal(s.events[0][0], 'chat')
 })
+
+
+test('Shift+Enter and IME confirmation preserve the draft; Enter prevents a newline', () => {
+  const s = subject()
+  s.query.value = '多行\n问题'
+  s.handleKeydown({ key: 'Enter', shiftKey: true })
+  s.handleKeydown({ key: 'Enter', keyCode: 229 })
+  assert.equal(s.events.length, 0)
+  let prevented = false
+  s.handleKeydown({ key: 'Enter', preventDefault: () => { prevented = true } })
+  assert.equal(prevented, true)
+  assert.equal(s.events[0][1].question, '多行\n问题')
+})
+
+test('overlong questions preserve the draft and Unicode uses the server character limit', () => {
+  const s = subject()
+  s.query.value = '字'.repeat(4001)
+  s.handleSubmit()
+  assert.equal(s.events.length, 0)
+  assert.equal(s.query.value.length, 4001)
+  s.query.value = '😀'.repeat(4000)
+  s.handleSubmit()
+  assert.equal(s.events.length, 1)
+  assert.equal(s.query.value, '')
+})

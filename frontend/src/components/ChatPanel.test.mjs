@@ -24,7 +24,7 @@ function subject(chat) {
       getFile: async (id) => ({ id, filename: '手册.pdf' }),
     },
   }
-  vm.runInNewContext(`${source}\nglobalThis.subject = { ask, stop, clear, turns, busy, openSource, selectedFile, selectedSlice };`, sandbox)
+  vm.runInNewContext(`${source}\nglobalThis.subject = { ask, stop, clear, turns, busy, openSource, selectedFile, selectedSlice, retry, stage };`, sandbox)
   return { ...sandbox.subject, requests, events }
 }
 
@@ -77,4 +77,38 @@ test('clearing a running conversation ignores stale output', async () => {
   await request
   assert.equal(s.turns.value.length, 0)
   assert.equal(s.busy.value, false)
+})
+
+
+test('repeated searches retain citation targets and report the current stage', async () => {
+  const s = subject(async (_, { onEvent }) => {
+    onEvent('status', { stage: 'searching' })
+    assert.equal(s.stage.value, '正在检索知识…')
+    onEvent('sources', { sources: [{ id: 1, result: { file_id: 10, id: 20 } }] })
+    onEvent('delta', { text: '第一条[1]' })
+    assert.equal(s.stage.value, '正在生成回答…')
+    onEvent('status', { stage: 'thinking' })
+    assert.equal(s.stage.value, '正在思考…')
+    onEvent('sources', { sources: [{ id: 1, result: { file_id: 10, id: 20 } }, { id: 2, result: { file_id: 11, id: 21 } }] })
+    onEvent('done', { finish_reason: 'stop' })
+  })
+  await s.ask({ question: 'q', kbId: 1 })
+  await s.openSource(s.turns.value[0].sources[0])
+  assert.equal(s.selectedSlice.value, 20)
+  assert.equal(s.turns.value[0].sources.length, 2)
+})
+
+test('regeneration replaces only the latest turn and excludes its old answer from history', async () => {
+  const s = subject()
+  await s.ask({ question: 'first', kbId: 1 })
+  await s.ask({ question: 'second', kbId: 1 })
+  await s.retry(s.turns.value[0])
+  assert.equal(s.requests.length, 2)
+  const previous = s.turns.value[1]
+  await s.retry(previous)
+  await s.retry(previous)
+  assert.equal(s.requests.length, 3)
+  assert.equal(s.requests[2].question, 'second')
+  assert.equal(s.requests[2].messages.length, 2)
+  assert.equal(s.turns.value.length, 2)
 })

@@ -35,6 +35,9 @@ const clear = () => {
   turns.value = []
   selectedWiki.value = null
   selectedFile.value = null
+  selectedSlice.value = null
+  sourceError.value = ''
+  stage.value = ''
   sourceRequest++
   notice.value = ''
 }
@@ -59,16 +62,16 @@ const ask = async ({ question, kbId }) => {
   const run = ++generation
   controller = new AbortController()
   setBusy(true)
-  stage.value = '正在检索知识…'
+  stage.value = '正在思考…'
   try {
     await api.chat({ question: turn.question, kb_id: scope, messages }, {
       signal: controller.signal,
       onEvent(event, data) {
         if (run !== generation) return
         const current = turns.value[index]
-        if (event === 'status') stage.value = data.stage === 'searching' ? '正在检索知识…' : '正在生成回答…'
+        if (event === 'status') stage.value = ({ searching: '正在检索知识…', thinking: '正在思考…', generating: '正在生成回答…' })[data.stage] || '正在处理…'
         if (event === 'sources') current.sources = data.sources || []
-        if (event === 'delta') { followAnswer(); current.answer += data.text || '' }
+        if (event === 'delta') { stage.value = '正在生成回答…'; followAnswer(); current.answer += data.text || '' }
         if (event === 'done') {
           current.truncated = data.finish_reason === 'length'
           current.complete = !current.truncated && ['stop', 'no_sources'].includes(data.finish_reason)
@@ -115,11 +118,11 @@ const handleAnswerClick = (event, turn) => {
   }
 }
 const retry = async (turn) => {
+  if (busy.value || turns.value.at(-1) !== turn) return
   const question = turn.question
   const kbId = turn.scope
   turns.value.pop()
-  await nextTick()
-  ask({ question, kbId })
+  await ask({ question, kbId })
 }
 onBeforeUnmount(() => { generation++; sourceRequest++; controller?.abort() })
 defineExpose({ ask })
@@ -147,7 +150,7 @@ defineExpose({ ask })
           <small>{{ source.result.content.slice(0, 180) }}</small>
         </button>
       </details>
-      <button v-if="!busy && index === turns.length - 1 && !turn.complete" class="secondary-button mt-3" @click="retry(turn)">重新生成</button>
+      <button v-if="!busy && index === turns.length - 1" class="secondary-button mt-3" @click="retry(turn)">重新生成</button>
     </article>
     </div>
     <button v-if="busy" class="secondary-button mt-3" @click="stop">停止生成</button>

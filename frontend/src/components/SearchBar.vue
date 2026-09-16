@@ -92,6 +92,11 @@ const handleSearch = async () => {
 const handleSubmit = () => {
   if (!canSubmit.value) return
   if (imageFile.value) return handleSearch()
+  if ([...query.value.trim()].length > 4000) {
+    error.value = '问题不能超过 4000 字符，请精简后发送。'
+    return
+  }
+  error.value = ''
   emit('chat', { question: query.value.trim(), kbId: localSelectedKb.value?.id ?? null })
   query.value = ''
 }
@@ -116,7 +121,8 @@ const handlePaste = (event) => {
 onBeforeUnmount(clearImage)
 
 const handleKeydown = (e) => {
-  if (e.key === 'Enter' && !e.isComposing) {
+  if (e.key === 'Enter' && !e.shiftKey && !e.isComposing && e.keyCode !== 229) {
+    e.preventDefault?.()
     handleSubmit()
   }
 }
@@ -153,11 +159,12 @@ const handleKeydown = (e) => {
             />
           </svg>
         </div>
-        <input
+        <textarea
           v-model="query"
-          type="text"
+          rows="2"
+          aria-label="问题或搜索内容"
           :placeholder="imageFile ? '补充图片描述（可选）' : '向知识库提问，或点击「仅搜索」查找资料'"
-          class="h-12 min-w-0 flex-1 border-0 bg-transparent px-0 text-base text-slate-800 shadow-none outline-none placeholder:text-slate-400 focus:ring-0"
+          class="min-w-0 max-h-48 flex-1 resize-y border-0 bg-transparent px-0 text-base text-slate-800 shadow-none outline-none placeholder:text-slate-400 focus:ring-0"
           @keydown="handleKeydown"
         />
         <button type="button" class="secondary-button shrink-0" :disabled="!canSubmit" @click="handleSearch">仅搜索</button>
@@ -185,7 +192,7 @@ const handleKeydown = (e) => {
       </div>
 
       <div class="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 bg-slate-50/60 px-4 py-2 sm:px-5">
-        <span class="text-xs text-slate-400">默认对话 · 支持粘贴图片进行搜索</span>
+        <span class="text-xs text-slate-400">Enter 发送 · Shift+Enter 换行 · 粘贴图片搜索<span v-if="!imageFile && query.length" :class="{ 'text-red-600': [...query.trim()].length > 4000 }"> · {{ [...query.trim()].length }}/4000</span></span>
         <!-- Scope chip -->
         <button
           type="button"

@@ -16,7 +16,7 @@ use futures::stream;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::SqlitePool;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, Mutex};
 use utoipa::ToSchema;
 
 use super::{
@@ -143,12 +143,31 @@ fn select_sources(results: Vec<search::SearchResultItem>) -> Vec<ChatSource> {
     }
     sources
 }
+
+// 编号在本轮回答内保持稳定，后续检索不能覆盖已经展示的引用。
+fn merge_sources(all: &mut Vec<ChatSource>, found: Vec<ChatSource>) -> Vec<usize> {
+    found.into_iter().map(|mut source| {
+        if let Some(existing) = all.iter().find(|existing| {
+            existing.result.wiki.is_some() == source.result.wiki.is_some()
+                && existing.result.file_id == source.result.file_id
+                && existing.result.id == source.result.id
+        }) {
+            return existing.id;
+        }
+        source.id = all.len() + 1;
+        let id = source.id;
+        all.push(source);
+        id
+    }).collect()
+}
+
 struct KnowledgeSearchTool {
     pool: SqlitePool,
     engine: SearchEngine,
     user: AuthUser,
     kb_id: Option<i64>,
     tx: mpsc::Sender<Event>,
+    sources: Mutex<Vec<ChatSource>>,
 }
 
 #[async_trait]
@@ -186,10 +205,11 @@ impl Tool for KnowledgeSearchTool {
         )
         .await
         .map_err(|_| ToolError::new("knowledge search failed"))?;
-        let sources = select_sources(found.results);
-        send(&self.tx, "sources", json!({"sources": sources})).await.map_err(|e| ToolError::new(e.to_string()))?;
+        let mut sources = self.sources.lock().await;
+        let ids = merge_sources(&mut sources, select_sources(found.results));
+        send(&self.tx, "sources", json!({"sources": *sources})).await.map_err(|e| ToolError::new(e.to_string()))?;
         Ok(json!({
-            "sources": sources.iter().map(|s| json!({
+            "sources": ids.iter().map(|id| &sources[id - 1]).map(|s| json!({
                 "id": s.id,
                 "content": s.result.content,
                 "title": s.result.wiki.as_ref().map(|w| &w.page.title).or_else(|| s.result.file.as_ref().map(|f| &f.filename))
@@ -205,7 +225,7 @@ async fn run_chat(
     let key = cfg.llm.api_key.clone().unwrap_or_default();
     let base = url.strip_suffix("/chat/completions").unwrap_or(url);
     let model = Arc::new(OpenAIChatModel::new(key, cfg.llm.model.clone()).with_base_url(base));
-    let tool = KnowledgeSearchTool { pool, engine, user, kb_id: request.kb_id, tx: tx.clone() };
+    let tool = KnowledgeSearchTool { pool, engine, user, kb_id: request.kb_id, tx: tx.clone(), sources: Mutex::new(Vec::new()) };
     let history = request
         .messages
         .iter()
@@ -226,6 +246,10 @@ async fn run_chat(
     let mut got = false;
     while let Some(event) = events.next().await {
         match event.map_err(|e| anyhow::anyhow!(e.to_string()))? {
+            RunEvent::ModelStarted { .. } => send(tx, "status", json!({"stage":"thinking"})).await?,
+            RunEvent::ToolStarted { name, .. } if name == "knowledge_search" => {
+                send(tx, "status", json!({"stage":"searching"})).await?;
+            }
             RunEvent::TextDelta { text, .. } => {
                 got = true;
                 send(tx, "delta", json!({"text":text})).await?;
@@ -240,6 +264,20 @@ async fn run_chat(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn repeated_searches_keep_existing_citations_and_reuse_duplicates() {
+        let source = |id| ChatSource { id: 1, result: search::SearchResultItem {
+            id, file_id: 10, content: format!("source {id}"), score: 1.0,
+            file: None, kb: None, image_filename: None, image_content: None, wiki: None,
+        }};
+        let mut sources = Vec::new();
+        assert_eq!(merge_sources(&mut sources, vec![source(20), source(21)]), vec![1, 2]);
+        assert_eq!(merge_sources(&mut sources, vec![source(21), source(22)]), vec![2, 3]);
+        assert!(merge_sources(&mut sources, vec![]).is_empty());
+        assert_eq!(sources.len(), 3);
+        assert_eq!(sources[0].result.id, 20);
+        assert_eq!(sources[2].id, 3);
+    }
     #[test]
     fn chat_rejects_invalid_history_and_limits() {
         assert!(
