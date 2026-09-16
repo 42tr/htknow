@@ -33,6 +33,16 @@ docker compose up -d
 ```
 脚本会先编译二进制，再构建镜像并给出运行示例。
 
+### GitHub Actions 发布缓存
+
+推送 `v*` tag 会构建两个架构的二进制、发布 Docker 镜像和 GitHub Release。
+`master` 上的 Cargo 依赖、Rust 工具链或发布工作流配置变化时，会用相同环境预热两个架构的 Rust 依赖缓存，但不执行发布。
+tag 构建只读取缓存；缓存写在默认分支，供不同版本 tag 复用，避免每次发布重新编译全部依赖。
+
+首次启用或依赖变化后，先等待 `master` 的 Release 工作流完成，再推送发布 tag。
+缓存被淘汰时，可在 Actions 的 Release 工作流中选择 `master` 手动运行以重新预热。
+无缓存时仍会正常完整编译；应用本身和嵌入的前端会在每次构建时重新编译。
+
 ### 访问入口
 - 前端界面: `http://localhost:3000/`
 - API 文档: `http://localhost:3000/docs`
