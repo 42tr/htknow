@@ -221,7 +221,7 @@ async fn run_chat(
         .collect::<Vec<_>>();
     let agent = Agent::new(model).tool(tool).instruction(SYSTEM);
     let mut prompt = history;
-    prompt.push(g::Message::user(&request.question));
+    prompt.push(g::Message::user(&format!("查询知识库，有需要可以分多次查询，{}", &request.question)));
     let mut events = g::Runtime::new().stream_run(&agent, g::RunRequest::new(prompt));
     let mut got = false;
     while let Some(event) = events.next().await {
