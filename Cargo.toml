@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-g = { path = "../g" }
+g = { git = "https://github.com/42tr/g" }
 anyhow = "1.0.100"
 axum = { version = "0.8.8", features = ["multipart"] }
 chrono = "0.4"
