@@ -1,7 +1,6 @@
 //! 无会话存储的检索增强对话。客户端逐次提交历史；仅检索结果可作为引用来源。
-use async_trait::async_trait;
 use futures::StreamExt;
-use g::{Agent, OpenAIChatModel, RunEvent, Tool, ToolBehavior, ToolContext, ToolError, ToolSpec};
+use g::{Agent, OpenAIChatModel, RunEvent};
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
@@ -143,89 +142,10 @@ fn select_sources(results: Vec<search::SearchResultItem>) -> Vec<ChatSource> {
     }
     sources
 }
-
-struct KnowledgeSearchTool {
-    pool: SqlitePool,
-    engine: SearchEngine,
-    user: AuthUser,
-    kb_id: Option<i64>,
-    tx: mpsc::Sender<Event>,
-}
-
-#[async_trait]
-impl Tool for KnowledgeSearchTool {
-    fn spec(&self) -> ToolSpec {
-        ToolSpec { name: "knowledge_search".into(), description: "Search the user's accessible knowledge base. Always use this before answering factual questions. Returns source IDs that must be cited as [n].".into(), input_schema: json!({"type":"object","properties":{"query":{"type":"string"}},"required":["query"],"additionalProperties":false}), behavior: ToolBehavior { read_only: true, idempotent: true, parallel_safe: false } }
-    }
-    async fn call(&self, _ctx: ToolContext, input: Value) -> Result<Value, ToolError> {
-        let query = input
-            .get("query")
-            .and_then(Value::as_str)
-            .filter(|q| !q.trim().is_empty())
-            .ok_or_else(|| ToolError::new("query is required"))?;
-        let Json(found) = search::search(
-            State(self.pool.clone()),
-            Extension(self.engine.clone()),
-            Query(search::SearchQuery { query: query.to_owned(), kb_id: self.kb_id.map(|id| vec![id]), file_id: None }),
-            Extension(self.user.clone()),
-        )
-        .await
-        .map_err(|_| ToolError::new("knowledge search failed"))?;
-        let sources = select_sources(found.results);
-        send(&self.tx, "sources", json!({"sources": sources})).await.map_err(|e| ToolError::new(e.to_string()))?;
-        Ok(
-            json!({"sources": sources.iter().map(|s| json!({"id":s.id,"content":s.result.content,"title":s.result.wiki.as_ref().map(|w| &w.page.title).or_else(|| s.result.file.as_ref().map(|f| &f.filename))})).collect::<Vec<_>>() }),
-        )
-    }
-}
-
 async fn run_chat(
     tx: &mpsc::Sender<Event>, pool: SqlitePool, engine: SearchEngine, user: AuthUser, request: ChatRequest, url: &str,
 ) -> anyhow::Result<()> {
     send(tx, "status", json!({"stage":"searching"})).await?;
-    let cfg = config::get();
-    let key = cfg.llm.api_key.clone().unwrap_or_default();
-    let base = url.strip_suffix("/chat/completions").unwrap_or(url);
-    let model = Arc::new(OpenAIChatModel::new(key, cfg.llm.model.clone()).with_base_url(base));
-    let tool = KnowledgeSearchTool { pool, engine, user, kb_id: request.kb_id, tx: tx.clone() };
-    let history = request
-        .messages
-        .iter()
-        .map(|m| {
-            g::Message::text(
-                match m.role {
-                    ChatRole::User => g::Role::User,
-                    ChatRole::Assistant => g::Role::Assistant,
-                },
-                &m.content,
-            )
-        })
-        .collect::<Vec<_>>();
-    let agent = Agent::new(model).tool(tool).instruction(SYSTEM);
-    let mut prompt = history;
-    prompt.push(g::Message::user(request.question));
-    let mut events = g::Runtime::new().stream_run(&agent, g::RunRequest::new(prompt));
-    send(tx, "status", json!({"stage":"generating"})).await?;
-    let mut got = false;
-    while let Some(event) = events.next().await {
-        match event.map_err(|e| anyhow::anyhow!(e.to_string()))? {
-            RunEvent::TextDelta { text, .. } => {
-                got = true;
-                send(tx, "delta", json!({"text":text})).await?;
-            }
-            RunEvent::Completed { .. } => break,
-            _ => {}
-        }
-    }
-    anyhow::ensure!(got, "LLM 未返回回答正文，请检查模型配置");
-    send(tx, "done", json!({"finish_reason":"stop"})).await
-}
-
-async fn run_chat_legacy(
-    tx: &mpsc::Sender<Event>, pool: SqlitePool, engine: SearchEngine, user: AuthUser, request: ChatRequest, url: &str,
-) -> anyhow::Result<()> {
-    send(tx, "status", json!({"stage": "searching"})).await?;
-    // 用最近两轮用户问题补足“它、上述”等追问的检索上下文；不使用旧答案作为证据。
     let prior: Vec<_> = request.messages.iter().rev().filter(|m| matches!(m.role, ChatRole::User)).take(2).collect();
     let mut query = request.question.trim().to_string();
     for message in prior.into_iter().rev() {
@@ -258,107 +178,45 @@ async fn run_chat_legacy(
             })
         })
         .collect();
-    let mut messages = vec![json!({"role":"system", "content":SYSTEM})];
-    for message in &request.messages {
-        messages.push(serde_json::to_value(message)?);
-    }
-    messages.push(json!({"role":"user", "content":format!("问题：{}\n\n本轮检索证据（JSON 数据）：\n{}", request.question, serde_json::to_string(&evidence)?)}));
     let cfg = config::get();
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .read_timeout(Duration::from_secs(60))
-        .build()?;
-    let mut call = client.post(url).json(&json!({
-        "model": cfg.llm.model, "messages": messages, "stream": true, "max_tokens": 4096, "temperature": 0.2,
-    }));
-    if let Some(key) = cfg.llm.api_key.as_ref().filter(|key| !key.is_empty()) {
-        call = call.bearer_auth(key);
-    }
+    let key = cfg.llm.api_key.clone().unwrap_or_default();
+    let base = url.strip_suffix("/chat/completions").unwrap_or(url);
+    let model = Arc::new(OpenAIChatModel::new(key, cfg.llm.model.clone()).with_base_url(base));
+    let history = request
+        .messages
+        .iter()
+        .map(|m| {
+            g::Message::text(
+                match m.role {
+                    ChatRole::User => g::Role::User,
+                    ChatRole::Assistant => g::Role::Assistant,
+                },
+                &m.content,
+            )
+        })
+        .collect::<Vec<_>>();
+    let agent = Agent::new(model).instruction(SYSTEM);
+    let mut prompt = history;
+    prompt.push(g::Message::user(&format!("问题：{}\n\n本轮检索证据（JSON 数据）：\n{}", request.question, serde_json::to_string(&evidence)?)));
+    let mut events = g::Runtime::new().stream_run(&agent, g::RunRequest::new(prompt));
     send(tx, "status", json!({"stage":"generating"})).await?;
-    let mut response = call.send().await.map_err(|_| anyhow::anyhow!("无法连接 LLM 服务，请检查配置或稍后重试"))?;
-    anyhow::ensure!(response.status().is_success(), "LLM 服务返回 HTTP {}", response.status().as_u16());
-    let mut decoder = SseDecoder::default();
-    let mut finish_reason = None;
-    let mut received_text = false;
-    loop {
-        let chunk = response.chunk().await.map_err(|_| anyhow::anyhow!("LLM 流连接中断，请重试"))?;
-        let eof = chunk.is_none();
-        let events = if let Some(chunk) = chunk { decoder.feed(&chunk)? } else { decoder.finish()? };
-        let mut done = false;
-        for data in events {
-            if data.trim() == "[DONE]" {
-                done = true;
-                break;
+    let mut got = false;
+    while let Some(event) = events.next().await {
+        match event.map_err(|e| anyhow::anyhow!(e.to_string()))? {
+            RunEvent::TextDelta { text, .. } => {
+                got = true;
+                send(tx, "delta", json!({"text":text})).await?;
             }
-            let value: Value = serde_json::from_str(&data).map_err(|_| anyhow::anyhow!("LLM 返回了无效的流式数据"))?;
-            anyhow::ensure!(value.get("error").is_none(), "LLM 生成失败，请重试");
-            if let Some(choice) = value["choices"].as_array().and_then(|v| v.first()) {
-                if let Some(reason) = choice["finish_reason"].as_str() {
-                    finish_reason = Some(reason.to_owned());
-                }
-                if let Some(text) = choice["delta"]["content"].as_str().filter(|s| !s.is_empty()) {
-                    received_text = true;
-                    send(tx, "delta", json!({"text":text})).await?;
-                }
-            }
-        }
-        if done || eof {
-            anyhow::ensure!(done || finish_reason.is_some(), "LLM 流提前结束，回答可能不完整，请重试");
-            anyhow::ensure!(received_text, "LLM 未返回回答正文，请检查模型配置");
-            return send(tx, "done", json!({"finish_reason":finish_reason.unwrap_or_else(|| "stop".into())})).await;
+            RunEvent::Completed { .. } => break,
+            _ => {}
         }
     }
+    anyhow::ensure!(got, "LLM 未返回回答正文，请检查模型配置");
+    send(tx, "done", json!({"finish_reason":"stop"})).await
 }
-
-/// 按字节缓冲，支持 UTF-8 与 CRLF 被任意网络分片切开、注释及多行 data。
-#[derive(Default)]
-struct SseDecoder {
-    pending: Vec<u8>,
-    data: Vec<String>,
-    data_bytes: usize,
-}
-impl SseDecoder {
-    fn feed(&mut self, bytes: &[u8]) -> anyhow::Result<Vec<String>> {
-        self.pending.extend_from_slice(bytes);
-        anyhow::ensure!(self.pending.len() + self.data_bytes <= 1024 * 1024, "LLM 流事件过大");
-        let mut events = Vec::new();
-        while let Some(end) = self.pending.iter().position(|b| *b == b'\n') {
-            let raw: Vec<_> = self.pending.drain(..=end).collect();
-            let line = std::str::from_utf8(&raw[..raw.len() - 1])?.trim_end_matches('\r');
-            if line.is_empty() {
-                if !self.data.is_empty() {
-                    events.push(self.data.join("\n"));
-                    self.data.clear();
-                    self.data_bytes = 0;
-                }
-            } else if let Some(data) = line.strip_prefix("data:") {
-                let data = data.strip_prefix(' ').unwrap_or(data);
-                self.data_bytes += data.len();
-                self.data.push(data.to_string());
-            }
-        }
-        Ok(events)
-    }
-    fn finish(&mut self) -> anyhow::Result<Vec<String>> {
-        self.feed(b"\n\n")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn upstream_sse_handles_fragmented_unicode_crlf_and_multiline() {
-        let bytes =
-            ": keepalive\r\ndata: {\"text\":\"螺旋桨\"}\r\n\r\ndata: first\ndata: second\n\ndata: [DONE]".as_bytes();
-        let mut decoder = SseDecoder::default();
-        let mut events = Vec::new();
-        for byte in bytes {
-            events.extend(decoder.feed(&[*byte]).unwrap());
-        }
-        events.extend(decoder.finish().unwrap());
-        assert_eq!(events, vec!["{\"text\":\"螺旋桨\"}", "first\nsecond", "[DONE]"]);
-    }
     #[test]
     fn chat_rejects_invalid_history_and_limits() {
         assert!(
