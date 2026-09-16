@@ -515,3 +515,7 @@ curl -H 'x-user-id: user1' -H 'x-role: admin' -X POST -H 'Content-Type: applicat
 curl -H 'x-user-id: user1' -H 'x-role: admin' \
   'http://127.0.0.1:3000/api/v1/knowledge/wiki/status?kb_id=1'
 ```
+
+### 文件生成进度
+
+文件列表与详情在“正在生成 Wiki”后显示实际阶段：提取条目、关联原文切片（已处理/总批数）、生成文档摘要、生成页面（成功完成/总页数，含摘要页）、收尾中。文件列表每 5 秒刷新。同时显示总进度百分比（按阶段工作量估算，不代表耗时百分比）；重试重新计数，对旧版本正在运行但尚未记录进度的任务仍显示原状态。

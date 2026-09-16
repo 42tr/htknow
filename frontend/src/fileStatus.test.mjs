@@ -20,3 +20,16 @@ test('parse failures, pending reparses and storage files take precedence over ol
     assert.equal(wikiStatusInfo({ status, wiki_status: 'failed' }), null)
   }
 })
+
+test('Wiki progress displays real stage counts and hides stale progress outside running', () => {
+  const file = { status: 1, wiki_status: 'running', wiki_stage: 'pages', wiki_completed: 3, wiki_total: 8 }
+  assert.equal(fileStatusText(file), '正在生成 Wiki · 生成页面 · 54%（3/8 页）')
+  assert.equal(fileStatusText({ ...file, wiki_stage: 'citations' }), '正在生成 Wiki · 关联原文切片 · 14%（3/8 批）')
+  assert.equal(fileStatusText({ ...file, wiki_stage: 'extracting' }), '正在生成 Wiki · 提取条目 · 5%')
+  assert.equal(fileStatusText({ ...file, wiki_stage: 'summary', wiki_completed: 0 }), '正在生成 Wiki · 生成文档摘要 · 30%（0/8 页）')
+  assert.equal(fileStatusText({ ...file, wiki_stage: 'finishing' }), '正在生成 Wiki · 收尾中 · 95%')
+  assert.equal(fileStatusText({ ...file, wiki_total: null }), '正在生成 Wiki · 生成页面')
+  assert.equal(fileStatusText({ ...file, wiki_completed: 9 }), '正在生成 Wiki · 生成页面 · 95%')
+  assert.equal(fileStatusText({ ...file, wiki_status: 'retrying' }), 'Wiki 生成重试中')
+  assert.equal(fileStatusText({ ...file, wiki_status: 'completed' }), '已完成')
+})

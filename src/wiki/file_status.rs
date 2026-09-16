@@ -47,6 +47,9 @@ pub(crate) struct FileProgress {
     pub processing_status: i32,
     pub wiki_status: Option<String>,
     pub wiki_error: Option<String>,
+    pub wiki_stage: Option<String>,
+    pub wiki_completed: Option<i64>,
+    pub wiki_total: Option<i64>,
 }
 
 pub(crate) async fn load(
@@ -55,7 +58,12 @@ pub(crate) async fn load(
     let mut result = std::collections::HashMap::new();
     for batch in ids.chunks(500) {
         let mut query = QueryBuilder::<Sqlite>::new(format!(
-            "SELECT id, processing_status, wiki_status, wiki_error FROM {} p WHERE p.id IN (",
+            "SELECT p.id, processing_status, wiki_status, wiki_error,
+               b.progress_stage AS wiki_stage, b.progress_completed AS wiki_completed,
+               b.progress_total AS wiki_total
+             FROM {} p LEFT JOIN wiki_builds b ON b.file_id = p.id
+               AND p.wiki_status = 'running' AND b.status = 'running'
+             WHERE p.id IN (",
             relation()
         ));
         let mut values = query.separated(",");
@@ -82,6 +90,9 @@ pub(crate) async fn populate(pool: &SqlitePool, files: &mut [File]) -> Result<()
             file.processing_status = Some(row.processing_status);
             file.wiki_status = row.wiki_status;
             file.wiki_error = row.wiki_error;
+            file.wiki_stage = row.wiki_stage;
+            file.wiki_completed = row.wiki_completed;
+            file.wiki_total = row.wiki_total;
         }
     }
     Ok(())

@@ -155,6 +155,16 @@ pub struct File {
     #[sqlx(default)]
     #[serde(default)]
     pub wiki_error: Option<String>,
+    /// 当前 Wiki 阶段及该阶段已完成/总工作量。
+    #[sqlx(default)]
+    #[serde(default)]
+    pub wiki_stage: Option<String>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub wiki_completed: Option<i64>,
+    #[sqlx(default)]
+    #[serde(default)]
+    pub wiki_total: Option<i64>,
     pub log: String,
     pub slice_type: String,
     pub kb_id: Option<i64>,

@@ -237,6 +237,7 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
         (7, "wiki_page_revisions", include_str!("migration_v7.sql")),
         (8, "wiki_index_changes", include_str!("migration_v8.sql")),
         (9, "wiki_file_progress", include_str!("migration_v9.sql")),
+        (10, "wiki_generation_progress", include_str!("migration_v10.sql")),
     ] {
         let claimed = sqlx::query("INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (?, ?)")
             .bind(version)

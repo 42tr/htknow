@@ -132,6 +132,32 @@ pub async fn acquire_slug_lock(key: String) -> SlugGuard {
 // 主流程
 // ---------------------------------------------------------------------------
 
+/// Only the active build may publish progress; stale workers cannot overwrite a retry.
+#[derive(Clone)]
+struct BuildProgress {
+    pool: SqlitePool,
+    file_id: i64,
+    run_id: String,
+}
+
+impl BuildProgress {
+    async fn set(&self, stage: &str, completed: usize, total: usize) -> Result<()> {
+        sqlx::query(
+            "UPDATE wiki_builds SET progress_stage = ?, progress_completed = ?, progress_total = ?,
+               updated_at = strftime('%s','now')
+             WHERE file_id = ? AND run_id = ? AND status = 'running'",
+        )
+        .bind(stage)
+        .bind(completed as i64)
+        .bind(total as i64)
+        .bind(self.file_id)
+        .bind(&self.run_id)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+}
+
 /// 为一篇文档生成/更新 Wiki 页面。
 pub async fn ingest_file(pool: &SqlitePool, kb_id: i64, file_id: i64) -> Result<IngestReport> {
     let Some(config) = resolve_config(pool, kb_id).await? else {
@@ -179,7 +205,8 @@ pub async fn ingest_file(pool: &SqlitePool, kb_id: i64, file_id: i64) -> Result<
     }
     let run_id = mark_build_running(pool, file_id, &fingerprint, &llm.model()).await?;
 
-    let result = run_ingest(pool, &llm, &config, kb_id, file_id, &filename, &slices).await;
+    let progress = BuildProgress { pool: pool.clone(), file_id, run_id: run_id.clone() };
+    let result = run_ingest(pool, &llm, &config, kb_id, file_id, &filename, &slices, &progress).await;
     match &result {
         Ok(report) => {
             mark_build_done(pool, file_id, &run_id, report.pages_written, "").await?;
@@ -196,17 +223,18 @@ pub async fn ingest_file(pool: &SqlitePool, kb_id: i64, file_id: i64) -> Result<
 
 async fn run_ingest(
     pool: &SqlitePool, llm: &WikiLlm, config: &ResolvedWikiConfig, kb_id: i64, file_id: i64, filename: &str,
-    slices: &[(i64, String)],
+    slices: &[(i64, String)], progress: &BuildProgress,
 ) -> Result<IngestReport> {
     let content_by_slice: HashMap<i64, String> = slices.iter().cloned().collect();
     let surfaces = page::list_surfaces(pool, kb_id).await?;
     let available = prompts::available_pages(&surfaces, MAX_AVAILABLE_PAGES);
 
     // MAP：候选条目。模式 A 失败（例如图谱未建）时自动回退到模式 B。
+    progress.set("extracting", 0, 0).await?;
     let graph_enabled = crate::config::get().server.build_knowledge_graph;
     let (mode, mut candidates) = match candidates_from_graph(pool, kb_id, file_id, config, graph_enabled).await? {
         Some(found) if !found.is_empty() => ("graph", found),
-        _ => ("llm", candidates_from_llm(pool, llm, config, kb_id, slices).await?),
+        _ => ("llm", candidates_from_llm(pool, llm, config, kb_id, slices, progress).await?),
     };
 
     // 证据多的条目优先，配合 max_pages_per_ingest 保证预算花在最值得写的页面上。
@@ -224,6 +252,8 @@ async fn run_ingest(
     let mut report = IngestReport { mode, candidates: candidates.len(), ..Default::default() };
 
     // 摘要页是文档入库后的头号产物，失败即整体失败并重试；条目页部分失败也标记失败，让队列重试补全。
+    let total_pages = candidates.len() + 1;
+    progress.set("summary", 0, total_pages).await?;
     match write_summary_page(pool, llm, config, kb_id, file_id, filename, slices, &available).await {
         Ok(changed) => {
             report.pages_written += 1;
@@ -234,6 +264,8 @@ async fn run_ingest(
             return Err(error);
         }
     }
+
+    progress.set("pages", 1, total_pages).await?;
 
     // 摘要页写入后，条目页可以链到它；重取一次表面词清单。
     let surfaces = page::list_surfaces(pool, kb_id).await?;
@@ -261,14 +293,15 @@ async fn run_ingest(
             available.clone(),
         ));
     }
-    let outcomes: Vec<Result<bool>> = stream::iter(pending).buffer_unordered(parallel).collect().await;
+    let mut outcomes = stream::iter(pending).buffer_unordered(parallel);
 
     let mut failures = Vec::new();
-    for outcome in outcomes {
+    while let Some(outcome) = outcomes.next().await {
         match outcome {
             Ok(changed) => {
                 report.pages_written += 1;
                 report.pages_changed += changed as usize;
+                progress.set("pages", report.pages_written, total_pages).await?;
             }
             Err(error) => {
                 warn!("wiki ingest: page generation failed for file {}: {}", file_id, error);
@@ -278,6 +311,7 @@ async fn run_ingest(
     }
 
     anyhow::ensure!(failures.is_empty(), "{} Wiki candidate pages failed: {}", failures.len(), failures.join("; "));
+    progress.set("finishing", report.pages_written, total_pages).await?;
     info!(
         "wiki ingest: file {} mode={} candidates={} pages={} changed={}",
         file_id, report.mode, report.candidates, report.pages_written, report.pages_changed
@@ -334,6 +368,7 @@ async fn mark_build_running(pool: &SqlitePool, file_id: i64, fingerprint: &str, 
          VALUES(?, 'running', lower(hex(randomblob(16))), ?, ?)
          ON CONFLICT(file_id) DO UPDATE SET status = 'running', run_id = excluded.run_id,
              fingerprint = excluded.fingerprint, model = excluded.model, error = '',
+             progress_stage = '', progress_completed = 0, progress_total = 0,
              updated_at = strftime('%s','now')
          RETURNING run_id",
     )
@@ -488,6 +523,7 @@ pub(crate) async fn candidates_from_graph(
 /// 模式 B：候选抽取（Pass 0）+ 引用归类（Pass 1..N）。
 async fn candidates_from_llm(
     pool: &SqlitePool, llm: &WikiLlm, config: &ResolvedWikiConfig, kb_id: i64, slices: &[(i64, String)],
+    progress: &BuildProgress,
 ) -> Result<Vec<Candidate>> {
     // 归档页不参与链接：告诉模型它们「已有」只会生成断链。
     let existing_slugs: Vec<(String,)> = sqlx::query_as(
@@ -554,7 +590,7 @@ async fn candidates_from_llm(
     let mut seen: HashSet<String> = HashSet::new();
     candidates.retain(|candidate| seen.insert(candidate.slug.clone()));
 
-    let citations = classify_citations(llm, config, &candidates, slices).await?;
+    let citations = classify_citations(llm, config, &candidates, slices, progress).await?;
     for candidate in &mut candidates {
         candidate.slice_ids = citations.get(&candidate.slug).cloned().unwrap_or_default();
     }
@@ -572,6 +608,7 @@ fn full_document_text(slices: &[(i64, String)]) -> String {
 /// 引用归类：按字符预算切批，批内并发，把模型返回的短句柄映射回真实切片 ID。
 async fn classify_citations(
     llm: &WikiLlm, config: &ResolvedWikiConfig, candidates: &[Candidate], slices: &[(i64, String)],
+    progress: &BuildProgress,
 ) -> Result<HashMap<String, Vec<i64>>> {
     let budget = crate::config::get().wiki.max_source_chars;
     let mut batches: Vec<Vec<(String, i64, String)>> = Vec::new();
@@ -604,15 +641,20 @@ async fn classify_citations(
     );
     let parallel = crate::config::get().wiki.citation_parallel.max(1);
     // 同 REDUCE：拥有所有权的 future，避免借用批次内容跨 await。
+    let total_batches = batches.len();
+    progress.set("citations", 0, total_batches).await?;
     let mut pending = Vec::with_capacity(batches.len());
     for batch in batches {
         pending.push(citation_batch_task(llm.clone(), candidate_xml.clone(), config.language.clone(), batch));
     }
-    let responses: Vec<Result<CitationResponse>> = stream::iter(pending).buffer_unordered(parallel).collect().await;
+    let mut responses = stream::iter(pending).buffer_unordered(parallel);
+    let mut completed_batches = 0;
 
     let known: HashSet<&str> = candidates.iter().map(|c| c.slug.as_str()).collect();
     let mut merged: HashMap<String, Vec<i64>> = HashMap::new();
-    for response in responses {
+    while let Some(response) = responses.next().await {
+        completed_batches += 1;
+        progress.set("citations", completed_batches, total_batches).await?;
         // 单批失败不整体放弃：其余批次的引用仍然有效，条目页会退化为按简介生成。
         let parsed = match response {
             Ok(parsed) => parsed,
@@ -930,4 +972,48 @@ fn strip_code_fence(content: &str) -> String {
         .unwrap_or(trimmed);
     let body = without_language.strip_suffix("```").unwrap_or(without_language);
     body.trim().to_string()
+}
+
+#[cfg(test)]
+mod progress_tests {
+    use super::*;
+    use crate::wiki::{
+        file_status, queue,
+        tests::{database, seed_file, seed_kb_with_wiki_config},
+    };
+
+    #[tokio::test]
+    async fn progress_is_durable_and_scoped_to_the_active_run() {
+        let pool = database().await;
+        seed_kb_with_wiki_config(&pool, 1, r#"{"enabled":true}"#).await;
+        seed_file(&pool, 1, Some(1), "document.txt").await;
+        queue::enqueue_ingest(&pool, 1, 1).await.unwrap();
+        let task = queue::claim_batch(&pool, 1, "test").await.unwrap().remove(0);
+        let run_id = mark_build_running(&pool, 1, "fingerprint", "model").await.unwrap();
+        let progress = BuildProgress { pool: pool.clone(), file_id: 1, run_id };
+        progress.set("pages", 2, 5).await.unwrap();
+        let row = file_status::load(&pool, &[1]).await.unwrap().remove(&1).unwrap();
+        assert_eq!(row.wiki_stage.as_deref(), Some("pages"));
+        assert_eq!(row.wiki_completed, Some(2));
+        assert_eq!(row.wiki_total, Some(5));
+
+        // A retry resets counts; updates from the old worker must be ignored.
+        let run_id = mark_build_running(&pool, 1, "fingerprint", "model").await.unwrap();
+        progress.set("pages", 5, 5).await.unwrap();
+        let row = file_status::load(&pool, &[1]).await.unwrap().remove(&1).unwrap();
+        assert_eq!(row.wiki_completed, Some(0));
+        let next = BuildProgress { pool: pool.clone(), file_id: 1, run_id };
+        next.set("citations", 1, 3).await.unwrap();
+        queue::mark_failed(&pool, &task, "retry").await.unwrap();
+        let row = file_status::load(&pool, &[1]).await.unwrap().remove(&1).unwrap();
+        assert_eq!(row.wiki_status.as_deref(), Some("retrying"));
+        assert_eq!(row.wiki_stage, None);
+        assert_eq!(row.wiki_completed, None);
+
+        // Re-parsing invalidates the old build and its progress.
+        sqlx::query("UPDATE files SET status = 0 WHERE id = 1").execute(&pool).await.unwrap();
+        next.set("pages", 3, 3).await.unwrap();
+        let row = file_status::load(&pool, &[1]).await.unwrap().remove(&1).unwrap();
+        assert_eq!(row.wiki_total, None);
+    }
 }

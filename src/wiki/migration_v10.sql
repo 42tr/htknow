@@ -1,0 +1,3 @@
+ALTER TABLE wiki_builds ADD COLUMN progress_stage TEXT NOT NULL DEFAULT '';
+ALTER TABLE wiki_builds ADD COLUMN progress_completed INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE wiki_builds ADD COLUMN progress_total INTEGER NOT NULL DEFAULT 0;
