@@ -17,6 +17,8 @@ ARG TARGETARCH
 # Keep all runtime setup before COPY so binary updates reuse this layer.
 ENV TZ=Asia/Shanghai
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    # CA certificates (required by reqwest TLS)
+    ca-certificates \
     # Timezone data
     tzdata \
     # sqlite3
