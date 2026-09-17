@@ -32,6 +32,14 @@ const MAX_QUERY_TERMS_FOR_SYNONYM_LOOKUP: usize = 100;
 const DEFAULT_REBUILD_BATCH_SIZE: i64 = 100;
 static RERANK_HTTP_CLIENT: Lazy<Client> = Lazy::new(Client::new);
 
+/// 为外部服务请求附加 `Authorization: Bearer <key>`；未配置或为空时原样返回。
+pub(crate) fn with_api_key(builder: reqwest::RequestBuilder, key: Option<&str>) -> reqwest::RequestBuilder {
+    match key.map(str::trim).filter(|key| !key.is_empty()) {
+        Some(key) => builder.header("Authorization", format!("Bearer {key}")),
+        None => builder,
+    }
+}
+
 /// /v1/rerank 格式的请求体
 #[derive(Debug, Serialize)]
 struct RerankRequest {
@@ -1255,16 +1263,14 @@ impl SearchEngine {
                 query: query.to_string(),
                 documents: documents.clone(),
             };
-            RERANK_HTTP_CLIENT
-                .post(&rerank_url)
+            with_api_key(RERANK_HTTP_CLIENT.post(&rerank_url), cfg.services.rerank_key.as_deref())
                 .timeout(Duration::from_secs(cfg.search.rerank_timeout_secs))
                 .json(&rerank_request)
                 .send()
                 .await?
         } else {
             let rerank_request = SimpleRerankRequest { query: query.to_string(), texts: documents.clone() };
-            RERANK_HTTP_CLIENT
-                .post(&rerank_url)
+            with_api_key(RERANK_HTTP_CLIENT.post(&rerank_url), cfg.services.rerank_key.as_deref())
                 .timeout(Duration::from_secs(cfg.search.rerank_timeout_secs))
                 .json(&rerank_request)
                 .send()

@@ -28,6 +28,10 @@ services:
       - HTKNOW_OFFICE_CONVERT_URL=http://192.168.0.46:8003/convert
       - HTKNOW_EMBEDDING_URL=http://192.168.0.46:9700/v1/embeddings
       - HTKNOW_RERANK_URL=http://192.168.0.46:9600/v1/rerank
+      # 向量/图片向量/Rerank 服务鉴权 Key（可选，配置后以 Authorization: Bearer 发送）
+      # - HTKNOW_EMBEDDING_KEY=your-api-key
+      # - HTKNOW_IMAGE_EMBEDDING_KEY=your-api-key
+      # - HTKNOW_RERANK_KEY=your-api-key
       # AI 模型配置
       - HTKNOW_EMBEDDING_MODEL=bge-m3
       - HTKNOW_EMBEDDING_DIM=1024

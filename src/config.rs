@@ -90,10 +90,16 @@ pub struct ServicesConfig {
     pub audio_transcription_key: Option<String>,
     /// Embedding 服务地址
     pub embedding_url: String,
+    /// Embedding 服务 API Key（可选）
+    pub embedding_key: Option<String>,
     /// 图片 Embedding 服务地址（可选，未配置时不进行图片 embedding）
     pub image_embedding_url: Option<String>,
+    /// 图片 Embedding 服务 API Key（可选）
+    pub image_embedding_key: Option<String>,
     /// Rerank 服务地址
     pub rerank_url: String,
+    /// Rerank 服务 API Key（可选）
+    pub rerank_key: Option<String>,
     /// 图片处理模式：none、ocr 或 custom
     pub image_parse_mode: String,
     /// 图片文本化服务地址（可选）
@@ -269,8 +275,11 @@ impl ServicesConfig {
             ),
             audio_transcription_key: std::env::var("HTKNOW_AUDIO_TRANSCRIPTION_KEY").ok(),
             embedding_url: env_or("HTKNOW_EMBEDDING_URL", "http://222.190.139.186:59700/v1/embeddings"),
+            embedding_key: env_optional("HTKNOW_EMBEDDING_KEY"),
             image_embedding_url: env_optional("HTKNOW_IMAGE_EMBEDDING_URL"),
+            image_embedding_key: env_optional("HTKNOW_IMAGE_EMBEDDING_KEY"),
             rerank_url: env_or("HTKNOW_RERANK_URL", "http://222.190.139.186:59600/v1/rerank"),
+            rerank_key: env_optional("HTKNOW_RERANK_KEY"),
             image_parse_mode: env_or("HTKNOW_IMAGE_PARSE_MODE", default_image_mode),
             image_parse_url,
             image_ocr_url,
@@ -650,6 +659,26 @@ mod tests {
         assert_eq!(config.services.request_timeout_secs, 120);
         unsafe {
             std::env::remove_var("HTKNOW_REQUEST_TIMEOUT_SECS");
+        }
+    }
+
+    #[test]
+    fn test_service_api_keys_from_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        unsafe {
+            std::env::set_var("HTKNOW_EMBEDDING_KEY", "  embed-key  ");
+            std::env::set_var("HTKNOW_IMAGE_EMBEDDING_KEY", "   ");
+            std::env::set_var("HTKNOW_RERANK_KEY", "rerank-key");
+        }
+        let services = ServicesConfig::from_env();
+        // 空值与纯空白视为未配置，非空值去除首尾空白
+        assert_eq!(services.embedding_key.as_deref(), Some("embed-key"));
+        assert_eq!(services.image_embedding_key, None);
+        assert_eq!(services.rerank_key.as_deref(), Some("rerank-key"));
+        unsafe {
+            std::env::remove_var("HTKNOW_EMBEDDING_KEY");
+            std::env::remove_var("HTKNOW_IMAGE_EMBEDDING_KEY");
+            std::env::remove_var("HTKNOW_RERANK_KEY");
         }
     }
 }

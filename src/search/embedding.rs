@@ -5,6 +5,7 @@ use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 
+use super::with_api_key;
 use crate::config;
 
 /// 判断图片 embedding 服务是否已配置。
@@ -53,8 +54,7 @@ pub async fn get_image_embedding_from_path(path: &str, text: Option<&str>) -> Re
         .mime_str(mime.essence_str())?;
     let form = reqwest::multipart::Form::new().part("file", part).text("text", text.unwrap_or(file_name).to_string());
 
-    let response = HTTP_CLIENT
-        .post(&url)
+    let response = with_api_key(HTTP_CLIENT.post(&url), cfg.services.image_embedding_key.as_deref())
         .timeout(Duration::from_secs(cfg.search.embedding_timeout_secs))
         .multipart(form)
         .send()
@@ -85,8 +85,7 @@ pub async fn get_image_embedding_from_bytes(
     }
     let form = reqwest::multipart::Form::new().part("file", part).text("text", text.unwrap_or(file_name).to_string());
 
-    let response = HTTP_CLIENT
-        .post(&url)
+    let response = with_api_key(HTTP_CLIENT.post(&url), cfg.services.image_embedding_key.as_deref())
         .timeout(Duration::from_secs(cfg.search.embedding_timeout_secs))
         .multipart(form)
         .send()
@@ -132,8 +131,7 @@ pub async fn get_embedding(text: &str) -> Result<Vec<f32>> {
     let embedding_url = Some(cfg.services.embedding_url.clone())
         .filter(|url| !url.trim().is_empty())
         .ok_or_else(|| anyhow::anyhow!("services.embedding_url is not configured"))?;
-    let response = HTTP_CLIENT
-        .post(&embedding_url)
+    let response = with_api_key(HTTP_CLIENT.post(&embedding_url), cfg.services.embedding_key.as_deref())
         .timeout(Duration::from_secs(cfg.search.embedding_timeout_secs))
         .json(&request)
         .send()
@@ -174,6 +172,7 @@ pub async fn get_embeddings(texts: &[String]) -> Result<Vec<Vec<f32>>> {
     let options = BatchOptions {
         url: &cfg.services.embedding_url,
         model: &cfg.ai.embedding_model,
+        api_key: cfg.services.embedding_key.as_deref(),
         max_items: cfg.ai.embedding_batch_size,
         max_chars: cfg.ai.embedding_batch_max_chars,
         timeout: Duration::from_secs(cfg.ai.embedding_batch_timeout_secs),
@@ -184,6 +183,8 @@ pub async fn get_embeddings(texts: &[String]) -> Result<Vec<Vec<f32>>> {
 struct BatchOptions<'a> {
     url: &'a str,
     model: &'a str,
+    /// 服务鉴权 Key，未配置时不附加 Authorization 头
+    api_key: Option<&'a str>,
     max_items: usize,
     max_chars: usize,
     timeout: Duration,
@@ -269,8 +270,7 @@ async fn request_batch(
         options.timeout.as_secs_f64()
     );
     let request = EmbeddingRequest { model: options.model.to_string(), input: texts.to_vec() };
-    let response = BATCH_HTTP_CLIENT
-        .post(options.url)
+    let response = with_api_key(BATCH_HTTP_CLIENT.post(options.url), options.api_key)
         .timeout(options.timeout)
         .json(&request)
         .send()
@@ -312,7 +312,7 @@ fn ordered_vectors(response: EmbeddingResponse, count: usize) -> Result<Vec<Vec<
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::{Json, Router, extract::Path, http::StatusCode, routing::post};
+    use axum::{Json, Router, extract::Path, http::{HeaderMap, StatusCode}, routing::post};
     use serde_json::{Value, json};
     use std::{
         collections::HashMap,
@@ -388,6 +388,7 @@ mod tests {
             let options = BatchOptions {
                 url: &url,
                 model: "test",
+                api_key: None,
                 max_items: 8,
                 max_chars: 16000,
                 timeout: Duration::from_millis(100),
@@ -408,6 +409,7 @@ mod tests {
             let options = BatchOptions {
                 url: &url,
                 model: "test",
+                api_key: None,
                 max_items: 8,
                 max_chars: 16000,
                 timeout: Duration::from_millis(100),
@@ -421,11 +423,59 @@ mod tests {
         let closed = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}/closed", closed.local_addr().unwrap());
         drop(closed);
-        let options =
-            BatchOptions { url: &url, model: "test", max_items: 8, max_chars: 16000, timeout: Duration::from_secs(1) };
+        let options = BatchOptions {
+            url: &url,
+            model: "test",
+            api_key: None,
+            max_items: 8,
+            max_chars: 16000,
+            timeout: Duration::from_secs(1),
+        };
         let error = fetch_batches(&texts[..1], &options).await.unwrap_err().to_string();
         assert!(error.to_lowercase().contains("connect"), "transport cause must be visible: {error}");
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn embedding_requests_send_configured_api_key() {
+        let seen = Arc::new(Mutex::new(Vec::<Option<String>>::new()));
+        let state = seen.clone();
+        let app = Router::new().route(
+            "/",
+            post(move |headers: HeaderMap, Json(body): Json<Value>| {
+                let seen = state.clone();
+                async move {
+                    let auth = headers.get("authorization").and_then(|value| value.to_str().ok()).map(String::from);
+                    seen.lock().unwrap().push(auth);
+                    let data: Vec<_> = body["input"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .enumerate()
+                        .map(|(index, _)| json!({"index":index,"embedding":[1.0]}))
+                        .collect();
+                    (StatusCode::OK, Json(json!({"data":data})))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let options = BatchOptions {
+            url: &url,
+            model: "test",
+            api_key: Some("  secret-key  "),
+            max_items: 8,
+            max_chars: 16000,
+            timeout: Duration::from_secs(5),
+        };
+        fetch_batches(&["1".to_string()], &options).await.unwrap();
+        let options = BatchOptions { api_key: None, ..options };
+        fetch_batches(&["1".to_string()], &options).await.unwrap();
+        server.abort();
+        assert_eq!(*seen.lock().unwrap(), vec![Some("Bearer secret-key".to_string()), None]);
     }
 
     #[test]
