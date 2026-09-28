@@ -134,8 +134,11 @@ async fn wiki_search_lifecycle_permissions_and_vectors() {
         let res = app.clone().oneshot(authed_empty_request("GET", &uri, &owner)).await.unwrap();
         assert_eq!(res.status(), StatusCode::OK, "{uri}");
         let body = response_json(res).await;
-        assert_eq!(body["results"][0]["wiki"]["page"]["id"], page_id, "{uri}: {body}");
-        assert!(body["results"][0]["file"].is_null());
+        let wiki = body["results"].as_array().unwrap().iter().find(|item| item["wiki"]["page"]["id"] == page_id).unwrap();
+        assert_eq!(wiki["score"], 1.0, "fallback Wiki score must not be boosted: {body}");
+        assert!(wiki["file"].is_null());
+        assert_eq!(body["results"][0]["file_id"], source_id, "equal scores retain their original order: {body}");
+        assert_eq!(body["results"][0]["score"], wiki["score"]);
         assert!(
             body["results"]
                 .as_array()
@@ -144,8 +147,8 @@ async fn wiki_search_lifecycle_permissions_and_vectors() {
                 .any(|item| item["file_id"] == source_id && item.get("wiki").is_none()),
             "slice results must coexist with Wiki even when IDs overlap: {body}"
         );
-        assert_eq!(body["results"][0]["wiki"]["slices"][0]["slice_id"], slice_id);
-        assert_eq!(body["results"][0]["wiki"]["slices"][0]["file_id"], source_id);
+        assert_eq!(wiki["wiki"]["slices"][0]["slice_id"], slice_id);
+        assert_eq!(wiki["wiki"]["slices"][0]["file_id"], source_id);
         let res = app.clone().oneshot(authed_empty_request("GET", &uri, &outsider)).await.unwrap();
         assert!(response_json(res).await["results"].as_array().unwrap().is_empty());
     }
@@ -163,7 +166,20 @@ async fn wiki_search_lifecycle_permissions_and_vectors() {
     );
     fail_rerank.store(false, Ordering::Relaxed);
     let result = response_json(app.clone().oneshot(authed_empty_request("GET", &uri, &owner)).await.unwrap()).await;
-    assert_eq!(result["results"][0]["file_id"], source_id, "common relevance must outweigh Wiki boost: {result}");
+    assert_eq!(result["results"][0]["file_id"], source_id, "common relevance determines ordering: {result}");
+    let res = app.clone().oneshot(create(kb, "strong-match", "orbital evidence")).await.unwrap();
+    let strong_page_id = response_json(res).await["page"]["id"].as_i64().unwrap();
+    extra_ids.push(strong_page_id);
+    for path in ["search/", "search/graph"] {
+        let uri = format!("/api/v1/knowledge/{path}?query=orbital&kb_id={kb}");
+        let result = response_json(app.clone().oneshot(authed_empty_request("GET", &uri, &owner)).await.unwrap()).await;
+        assert_eq!(result["results"][0]["file_id"], source_id, "Wiki must not get a ranking boost: {result}");
+        let wiki = result["results"].as_array().unwrap().iter()
+            .find(|item| item["wiki"]["page"]["id"] == strong_page_id).unwrap();
+        let slice = result["results"].as_array().unwrap().iter().find(|item| item["file_id"] == source_id).unwrap();
+        assert!((wiki["score"].as_f64().unwrap() - 0.95).abs() < 1e-6, "Wiki retains its rerank score: {result}");
+        assert_eq!(wiki["score"], slice["score"], "same relevance gets the same score regardless of source: {result}");
+    }
     fail_rerank.store(true, Ordering::Relaxed);
     for id in extra_ids {
         htknow::wiki::page::delete_by_id(&pool, id).await.unwrap();

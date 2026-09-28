@@ -491,7 +491,7 @@ async fn merge_wiki_results(
         if file_ids.is_some_and(|ids| !detail.sources.iter().any(|source| ids.contains(&source.file_id))) {
             continue;
         }
-        let score = 1.3 / (1.0 + wiki_results.len() as f32);
+        let score = 1.0 / (1.0 + wiki_results.len() as f32);
         wiki_results.push(SearchResultItem {
             id: candidate.id,
             file_id: 0,
@@ -512,12 +512,12 @@ async fn merge_wiki_results(
     }
     results.extend(wiki_results);
     let texts: Vec<_> = results.iter().map(|item| item.content.clone()).collect();
-    // Score the mixed candidate set together, then apply the modest Wiki preference.
+    // Score the mixed candidate set together without a source-specific boost.
     // If reranking is unavailable, reciprocal ranks interleave the two recall lists.
     if let Ok(scores) = engine.compute_rerank_scores_for_texts(query, &texts).await {
         if scores.len() == results.len() && scores.iter().all(|s| s.is_some_and(f32::is_finite)) {
             for (item, score) in results.iter_mut().zip(scores) {
-                item.score = score.unwrap().max(0.0) * if item.wiki.is_some() { 1.3 } else { 1.0 };
+                item.score = score.unwrap().max(0.0);
             }
         }
     }
