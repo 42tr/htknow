@@ -560,11 +560,34 @@ pub async fn update_config(
     if let Some(max_pages) = req.max_pages_per_ingest {
         config.max_pages_per_ingest = Some(max_pages);
     }
+    let mut tx = pool.begin().await?;
     sqlx::query("UPDATE knowledge_bases SET wiki_config = ?, updated_at = strftime('%s','now') WHERE id = ?")
         .bind(serde_json::to_string(&config)?)
         .bind(req.kb_id)
-        .execute(&pool)
+        .execute(&mut *tx)
         .await?;
+    if config.enabled.unwrap_or(crate::config::get().wiki.enabled) {
+        // 已解析的历史文件不会再次经过解析完成的入队点。保存启用配置时补齐缺失任务，
+        // 也让旧版本已启用但未入队的知识库可通过再次保存恢复。
+        // 保留已有构建（含失败记录）及 pending/claimed 任务，避免重建或重置重试进度。
+        sqlx::query(
+            "INSERT INTO wiki_tasks(kb_id, task_type, op, file_id, not_before)
+             SELECT f.kb_id, 'wiki:ingest', 'add', f.id, strftime('%s','now')
+               FROM files f
+              WHERE f.kb_id = ? AND f.status = 1
+                AND NOT EXISTS (SELECT 1 FROM wiki_builds b WHERE b.file_id = f.id)
+                AND NOT EXISTS (
+                    SELECT 1 FROM wiki_tasks t
+                     WHERE t.kb_id = f.kb_id AND t.file_id = f.id
+                       AND t.task_type = 'wiki:ingest' AND t.status IN ('pending', 'claimed')
+                )",
+        )
+        .bind(req.kb_id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    // 开关与任务同时提交，入队失败时不能留下只显示“等待”而没有任务的配置。
+    tx.commit().await?;
     get_config(Query(WikiKbParams { kb_id: req.kb_id }), State(pool), Extension(user)).await
 }
 

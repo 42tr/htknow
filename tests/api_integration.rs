@@ -1177,6 +1177,123 @@ async fn wiki_endpoints_flow() {
 
 /// P2：人工编辑 → 版本快照 → 回滚 → 体检 → 链接收敛 → 归档 → 删除。
 #[tokio::test]
+async fn wiki_enable_backfills_existing_files_without_restarting_work() {
+    let app = app().await;
+    let pool = get_pool().await;
+    let owner = TestUser::with_role("wiki-enable", "user");
+    let kb_id = insert_kb(&pool, &owner, "wiki-enable", "analysis", None, false).await;
+    let other_kb = insert_kb(&pool, &owner, "wiki-other", "analysis", None, false).await;
+    let path = setup_env().data_dir.join(format!("wiki-enable-{}.txt", next_seq()));
+    let mut expected_tasks = Vec::new();
+    let mut missing_file = 0;
+    for (name, status, kb) in [
+        ("missing", 1, kb_id),
+        ("pending", 1, kb_id),
+        ("claimed", 1, kb_id),
+        ("completed", 1, kb_id),
+        ("skipped", 1, kb_id),
+        ("failed", 1, kb_id),
+        ("unparsed", 0, kb_id),
+        ("parsing", 2, kb_id),
+        ("parse-failed", -1, kb_id),
+        ("no-parse", 3, kb_id),
+        ("other-kb", 1, other_kb),
+    ] {
+        let id = insert_file(&pool, &owner, name, &path, Some(kb), vec![], false).await;
+        sqlx::query("UPDATE files SET status = ? WHERE id = ?").bind(status).bind(id).execute(&pool).await.unwrap();
+        match name {
+            "missing" => {
+                missing_file = id;
+                expected_tasks.push(id);
+            }
+            "pending" | "claimed" => {
+                sqlx::query("INSERT INTO wiki_tasks(kb_id, task_type, file_id, status, fail_count, last_error) VALUES(?, 'wiki:ingest', ?, ?, 2, 'keep retry progress')")
+                    .bind(kb_id).bind(id).bind(name).execute(&pool).await.unwrap();
+                expected_tasks.push(id);
+            }
+            "completed" | "skipped" | "failed" => {
+                sqlx::query("INSERT INTO wiki_builds(file_id, status, page_count, fingerprint) VALUES(?, ?, ?, 'keep fingerprint')")
+                    .bind(id)
+                    .bind(if name == "failed" { "failed" } else { "completed" })
+                    .bind(if name == "skipped" { 0 } else { 1 })
+                    .execute(&pool).await.unwrap();
+            }
+            _ => {}
+        }
+    }
+    let existing_tasks: Vec<(i64, String, i64, String)> =
+        sqlx::query_as("SELECT id, status, fail_count, last_error FROM wiki_tasks WHERE kb_id = ? ORDER BY id")
+            .bind(kb_id)
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+
+    // 关闭时不补任务；首次启用补齐历史文件，再次保存、关闭后重新启用均不重复入队。
+    for (step, enabled) in [false, true, true, false, true].into_iter().enumerate() {
+        let res = app
+            .clone()
+            .oneshot(authed_json_request(
+                "PUT",
+                "/api/v1/knowledge/wiki/config",
+                &owner,
+                serde_json::json!({ "kb_id": kb_id, "enabled": enabled }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::OK);
+        assert_eq!(response_json(res).await["enabled"], enabled);
+        let tasks: Vec<i64> = sqlx::query_scalar(
+            "SELECT file_id FROM wiki_tasks WHERE kb_id = ? AND task_type = 'wiki:ingest' ORDER BY file_id",
+        )
+        .bind(kb_id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        if step == 0 {
+            assert_eq!(tasks, expected_tasks[1..]);
+        } else {
+            assert_eq!(tasks, expected_tasks);
+        }
+    }
+    let unchanged_tasks: Vec<(i64, String, i64, String)> = sqlx::query_as(
+        "SELECT id, status, fail_count, last_error FROM wiki_tasks WHERE kb_id = ? AND file_id != ? ORDER BY id",
+    )
+    .bind(kb_id)
+    .bind(missing_file)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(unchanged_tasks, existing_tasks);
+    let preserved: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM wiki_builds WHERE file_id IN (SELECT id FROM files WHERE kb_id = ?) AND fingerprint = 'keep fingerprint'",
+    ).bind(kb_id).fetch_one(&pool).await.unwrap();
+    assert_eq!(preserved, 3);
+    assert_eq!(htknow::wiki::queue::pending_count(&pool, other_kb).await.unwrap(), 0);
+
+    // 模拟旧版本已启用、状态显示等待但实际没有任务；保持启用并保存即可恢复。
+    sqlx::query("DELETE FROM wiki_tasks WHERE file_id = ?").bind(missing_file).execute(&pool).await.unwrap();
+    let res = app
+        .clone()
+        .oneshot(authed_json_request(
+            "PUT",
+            "/api/v1/knowledge/wiki/config",
+            &owner,
+            serde_json::json!({ "kb_id": kb_id, "language": "中文" }),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(res.status(), StatusCode::OK);
+    let tasks: Vec<i64> = sqlx::query_scalar(
+        "SELECT file_id FROM wiki_tasks WHERE kb_id = ? AND task_type = 'wiki:ingest' ORDER BY file_id",
+    )
+    .bind(kb_id)
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(tasks, expected_tasks);
+}
+
+#[tokio::test]
 async fn wiki_edit_and_revision_flow() {
     let app = app().await;
     let pool = get_pool().await;
