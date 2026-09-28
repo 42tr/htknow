@@ -1301,7 +1301,14 @@ impl FileProcessor {
 
     fn normalize_custom_parse_data(data: CustomParseData) -> anyhow::Result<NormalizedCustomParseData> {
         let mut image_mapping: HashMap<String, String> = HashMap::new();
-        let images = data.images.unwrap_or_default();
+        let mut images = data.images.unwrap_or_default();
+        images.retain(|image_name, _| {
+            let keep = !image_name.trim().is_empty();
+            if !keep {
+                warn!("Custom parse returned an image with an empty name; skipping it");
+            }
+            keep
+        });
 
         for image_name in images.keys() {
             Self::ensure_safe_image_name(image_name)?;
@@ -1311,6 +1318,10 @@ impl FileProcessor {
         if let Some(content_list) = data.content_list.as_ref() {
             for item in content_list {
                 if let Some(img_path) = item.img_path.as_deref() {
+                    if img_path.trim().is_empty() {
+                        warn!("Custom parse returned an empty img_path in content_list; treating it as none");
+                        continue;
+                    }
                     Self::ensure_safe_image_name(img_path)?;
                     let mapped_path = image_mapping.get(img_path).cloned().or_else(|| {
                         Self::basename_for_path(img_path).and_then(|basename| image_mapping.get(&basename).cloned())
@@ -1357,10 +1368,12 @@ impl FileProcessor {
         let mut content_list = data.content_list;
         if let Some(items) = content_list.as_mut() {
             for item in items {
-                if let Some(img_path) = item.img_path.as_deref()
-                    && let Some(new_path) = Self::lookup_image_mapping(&image_mapping, img_path)
-                {
-                    item.img_path = Some(new_path);
+                if let Some(img_path) = item.img_path.as_deref() {
+                    if img_path.trim().is_empty() {
+                        item.img_path = None;
+                    } else if let Some(new_path) = Self::lookup_image_mapping(&image_mapping, img_path) {
+                        item.img_path = Some(new_path);
+                    }
                 }
             }
         }
@@ -1407,7 +1420,7 @@ impl FileProcessor {
     fn ensure_safe_image_name(image_name: &str) -> anyhow::Result<()> {
         anyhow::ensure!(
             resolve_image_storage_path(image_name).is_some(),
-            "Custom parse returned unsafe image path: {}",
+            "Custom parse returned unsafe image path: {:?}",
             image_name
         );
         Ok(())
@@ -1650,7 +1663,7 @@ impl FileProcessor {
                     anyhow::anyhow!(err)
                 })?;
                 let Some(image_path) = resolve_image_storage_path(img_name) else {
-                    anyhow::bail!("Custom parse returned unsafe image path: {}", img_name);
+                    anyhow::bail!("Custom parse returned unsafe image path: {:?}", img_name);
                 };
                 if let Some(parent) = std::path::Path::new(&image_path).parent() {
                     fs::create_dir_all(parent).await?;
@@ -3939,6 +3952,45 @@ mod tests {
         assert!(normalized.slices[0].content.contains("/api/v1/knowledge/files/legacy.png"));
         assert_eq!(normalized.image_paths, vec!["legacy.png".to_string()]);
         Ok(())
+    }
+
+    #[test]
+    fn custom_parse_normalization_skips_blank_image_paths() -> anyhow::Result<()> {
+        let mut images = HashMap::new();
+        images.insert("".to_string(), "raw-base64".to_string());
+        images.insert("img.png".to_string(), "raw-base64".to_string());
+        let mut blank_item = image_content_item("");
+        blank_item.typ = "text".to_string();
+        let data = CustomParseData {
+            slices: vec![CustomSlice { content: "hello".to_string(), positions: Vec::new() }],
+            full_content: None,
+            summary: None,
+            images: Some(images),
+            content_list: Some(vec![blank_item, image_content_item("img.png")]),
+        };
+
+        let normalized = FileProcessor::normalize_custom_parse_data(data)?;
+
+        assert!(!normalized.images.contains_key(""));
+        assert!(normalized.images.contains_key("img.png"));
+        let items = normalized.content_list.as_ref().unwrap();
+        assert_eq!(items[0].img_path, None);
+        assert_eq!(items[1].img_path.as_deref(), Some("img.png"));
+        Ok(())
+    }
+
+    #[test]
+    fn custom_parse_normalization_rejects_unsafe_image_paths() {
+        let data = CustomParseData {
+            slices: vec![CustomSlice { content: "hello".to_string(), positions: Vec::new() }],
+            full_content: None,
+            summary: None,
+            images: None,
+            content_list: Some(vec![image_content_item("../escape.png")]),
+        };
+
+        let err = FileProcessor::normalize_custom_parse_data(data).unwrap_err();
+        assert!(err.to_string().contains("unsafe image path"));
     }
 
     #[test]
