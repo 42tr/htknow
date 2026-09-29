@@ -115,10 +115,20 @@ pub struct StatsParams {
 fn ids_sql(ids: &[i64]) -> String {
     if ids.is_empty() { "NULL".into() } else { ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(",") }
 }
+
+/// SQL 字符串字面量。
+///
+/// 只在「未归属文件」作用域子查询里用于内联当前用户 id：SQLite 的字符串字面量里唯一需要
+/// 转义的就是单引号（写成两个单引号），没有反斜杠转义；HTTP 头也不可能带 NUL/换行，
+/// 因此双写单引号是完备转义。其余用户输入一律走绑定参数。
+fn sql_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
 struct Scope {
     admin: bool,
+    user_id: String,
     kb_ids: Vec<i64>,
-    loose_files: Vec<i64>,
 }
 impl Scope {
     async fn load(
@@ -133,38 +143,69 @@ impl Scope {
         if kb_id.is_some_and(|id| !admin && !kb_ids.contains(&id)) {
             return Err(ApiError::Forbidden("Permission denied".into()));
         }
-        let loose_files = if admin {
-            vec![]
-        } else {
-            sqlx::query_scalar("SELECT id FROM files WHERE kb_id IS NULL AND (user_id=? OR is_public=1)")
-                .bind(&user.user_id)
-                .fetch_all(pool)
-                .await?
-        };
         if let Some(id) = file_id {
             let row: Option<(Option<i64>,)> =
                 sqlx::query_as("SELECT kb_id FROM files WHERE id=?").bind(id).fetch_optional(pool).await?;
             let (file_kb,) = row.ok_or_else(|| ApiError::NotFound("File not found".into()))?;
-            if !admin
-                && !file_kb.is_some_and(|k| kb_ids.contains(&k))
-                && !(file_kb.is_none() && loose_files.contains(&id))
-            {
+            // 单行 EXISTS 判定，取代「先把用户所有未归属文件 id 拉进内存再 contains」。
+            let visible_loose = if admin || file_kb.is_some() {
+                false
+            } else {
+                sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM files WHERE id=? AND kb_id IS NULL AND (user_id=? OR is_public=1))",
+                )
+                .bind(id)
+                .bind(&user.user_id)
+                .fetch_one(pool)
+                .await?
+            };
+            if !admin && !file_kb.is_some_and(|k| kb_ids.contains(&k)) && !visible_loose {
                 return Err(ApiError::Forbidden("Permission denied".into()));
             }
             if kb_id.is_some() && kb_id != file_kb {
                 return Err(ApiError::BadRequest("file_id does not belong to kb_id".into()));
             }
         }
-        Ok(Self { admin, kb_ids, loose_files })
+        Ok(Self { admin, user_id: user.user_id.clone(), kb_ids })
     }
+
+    /// 当前用户可见的「未归属文件」集合。
+    ///
+    /// 用等价子查询而不是内联 id 列表：这些条件会出现在几乎每条图谱 SQL 里
+    /// （`edge_filter` 一次就用到三遍），文件一多就是几十上百 KB 的 SQL 文本，
+    /// 每次请求都要重新拼接并让 SQLite 重新解析。子查询不相关，SQLite 只求值一次。
+    fn loose_file_ids(&self) -> String {
+        format!(
+            "SELECT id FROM files WHERE kb_id IS NULL AND (user_id={} OR is_public=1)",
+            sql_literal(&self.user_id)
+        )
+    }
+
+    /// 当前用户可读取的文件集合，与 `common::push_file_access_filter` 完全同口径。
+    ///
+    /// 图谱的实体名、关系以及 `entity_mentions.context` 都是从文件正文里抽取的，只按知识库放行
+    /// 会把「公开库里的私有文件」的内容泄漏给陌生人——检索与下载侧已经收紧到文件级，图谱必须一致。
+    ///
+    /// 子查询别名固定用 `vf`：`nodes()` 也会被套用到 `files f` 上（实体详情的 mentions 查询），
+    /// 换个别名会与外层 `f` 冲突，或被那里的 `f.file_id -> f.id` 文本替换误伤。
+    fn visible_file_ids(&self) -> String {
+        let user = sql_literal(&self.user_id);
+        format!(
+            "SELECT vf.id FROM files vf WHERE vf.user_id={user}              OR (vf.kb_id IS NULL AND vf.is_public=1)              OR vf.kb_id IN (SELECT id FROM knowledge_bases WHERE user_id={user})              OR vf.kb_id IN (SELECT kb_id FROM kb_permissions WHERE user_id={user})              OR (vf.is_public=1 AND vf.kb_id IN (SELECT id FROM knowledge_bases WHERE is_public=1))"
+        )
+    }
+
     fn nodes(&self, alias: &str) -> String {
         if self.admin {
             return "1=1".into();
         }
+        // 必须是单一括号组：调用方会继续用 `AND` 拼接（edge_filter 后面还接了 `n.kb_id IS t.kb_id`），
+        // 顶层裸 OR 会让后半段逃出作用域条件。
         format!(
-            "({alias}.kb_id IN ({}) OR ({alias}.kb_id IS NULL AND {alias}.file_id IN ({})))",
+            "(({alias}.kb_id IN ({}) AND ({alias}.file_id IS NULL OR {alias}.file_id IN ({})))              OR ({alias}.kb_id IS NULL AND {alias}.file_id IN ({})))",
             ids_sql(&self.kb_ids),
-            ids_sql(&self.loose_files)
+            self.visible_file_ids(),
+            self.loose_file_ids()
         )
     }
 }
@@ -194,7 +235,7 @@ fn edge_filter(scope: &Scope, kb_id: Option<i64>, file_id: Option<i64>) -> Strin
     if !scope.admin {
         filter += &format!(
             " AND (n.kb_id IS NOT NULL OR (n.file_id=t.file_id AND e.file_id IN ({})))",
-            ids_sql(&scope.loose_files)
+            scope.loose_file_ids()
         );
     }
     filter
@@ -407,6 +448,53 @@ mod tests {
         crate::graph::graph_manager::migrate(&pool).await.unwrap();
         (pool, AuthUser { user_id: "owner".into(), user_name: "Owner".into(), role: "user".into() })
     }
+    /// 公开知识库里的**私有文件**不得通过图谱泄漏：实体名与 `entity_mentions.context`
+    /// 都来自文件正文，检索/下载侧已按文件级收紧，图谱必须同口径。
+    #[tokio::test]
+    async fn graph_hides_private_files_inside_a_public_kb() {
+        let (pool, owner) = fixture().await;
+        sqlx::raw_sql(
+            "INSERT INTO knowledge_bases(id,user_id,name,is_public) VALUES(3,'owner','Public KB',1); \
+             INSERT INTO files(id,user_id,hash,filename,path,kb_id,status,is_public) \
+               VALUES(3,'owner','h3','private.txt','p',3,1,0),(4,'owner','h4','public.txt','p',3,1,1); \
+             INSERT INTO slices(id,file_id) VALUES(3,3),(4,4); \
+             INSERT INTO graph_nodes(id,name,entity_type,file_id,kb_id) \
+               VALUES(4,'私有实体','人物',3,3),(5,'公开实体','人物',4,3); \
+             INSERT INTO entity_mentions(node_id,slice_id,context) VALUES(4,3,'PRIVATE_CONTEXT_LEAK')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let stranger = AuthUser { user_id: "stranger".into(), user_name: "Stranger".into(), role: "user".into() };
+
+        let stranger_entities = search_entities(
+            Query(EntitySearchParams { limit: Some(50), ..Default::default() }),
+            State(pool.clone()),
+            Extension(stranger.clone()),
+        )
+        .await
+        .unwrap()
+        .0;
+        let names: Vec<&str> = stranger_entities.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"公开实体"), "{names:?}");
+        assert!(!names.contains(&"私有实体"), "{names:?}");
+
+        // 实体详情整体挡住，避免 mentions 把私有正文带出去。
+        let detail = get_entity(Path(4), State(pool.clone()), Extension(stranger)).await;
+        assert!(matches!(detail, Err(ApiError::NotFound(_))), "{detail:?}");
+
+        // 属主不受影响：公开库内的私有文件实体照常可见。
+        let owner_entities = search_entities(
+            Query(EntitySearchParams { kb_id: Some(3), limit: Some(50), ..Default::default() }),
+            State(pool),
+            Extension(owner),
+        )
+        .await
+        .unwrap()
+        .0;
+        assert!(owner_entities.iter().any(|e| e.name == "私有实体"), "{owner_entities:?}");
+    }
+
     #[tokio::test]
     async fn graph_scope_applies_before_limit_and_to_all_stats() {
         let (pool, user) = fixture().await;

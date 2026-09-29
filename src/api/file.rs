@@ -88,7 +88,7 @@ fn stream_from_std_file(mut file: std::fs::File) -> Result<(u64, Body), ApiError
 ///
 /// 列表类查询不需要全文 content，用此清单避免把可能很大的文本从 SQLite/文件系统读进内存。
 pub(crate) const FILE_COLS_NO_CONTENT: &str = "id, user_id, user_name, hash, filename, path, size, NULL as content, \
-     tags, status, log, slice_type, kb_id, is_public, meta, summary, created_at, updated_at, artifact_id";
+     tags, status, log, slice_type, kb_id, is_public, meta, summary, created_at, updated_at, artifact_id, parse_run_id";
 
 /// Excel 单 sheet 数据
 #[derive(Debug, Serialize, ToSchema)]
@@ -177,6 +177,11 @@ pub struct File {
     #[serde(skip)]
     #[sqlx(default)]
     pub artifact_id: Option<i64>,
+    /// 本轮解析的持有者令牌。写入解析结果与失败状态时都要带上它做 CAS 守卫，
+    /// 避免上一轮运行覆盖已经被重新领取的文件。不作为对外 API 字段返回。
+    #[serde(skip)]
+    #[sqlx(default)]
+    pub parse_run_id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, ToSchema)]
@@ -232,11 +237,39 @@ enum FileStatsScope {
     UnassignedOnly,
 }
 
-fn ensure_file_readable(file: &File, auth_user: &AuthUser) -> ApiResult<()> {
-    if auth_user.is_admin() || file.is_public || file.user_id == auth_user.user_id {
+/// 校验当前用户能否读取该文件。
+///
+/// 规则与检索侧 `search::has_visibility_permission`、列表侧 `common::push_file_access_filter`
+/// 完全一致，避免「搜得到却下载 403」或「搜不到却能直接下载」的权限分裂：
+/// - 全局 admin、文件所有者：始终放行；
+/// - 未归属知识库的散文件：看 `file.is_public`；
+/// - 知识库成员（属主或有 `kb_permissions` 显式授权）：库内全部文件放行；
+/// - 仅因知识库公开而可访问的陌生用户：只放行 `file.is_public = 1` 的文件。
+async fn ensure_file_readable(pool: &SqlitePool, file: &File, auth_user: &AuthUser) -> ApiResult<()> {
+    if auth_user.is_admin() || file.user_id == auth_user.user_id {
+        return Ok(());
+    }
+    let denied = || ApiError::NotFound("File not found or permission denied".to_string());
+    let Some(kb_id) = file.kb_id else {
+        return if file.is_public { Ok(()) } else { Err(denied()) };
+    };
+    let row: Option<(String, bool, Option<String>)> = sqlx::query_as(
+        "SELECT kb.user_id, kb.is_public, \
+                (SELECT permission FROM kb_permissions WHERE kb_id = kb.id AND user_id = ?) \
+         FROM knowledge_bases kb WHERE kb.id = ?",
+    )
+    .bind(&auth_user.user_id)
+    .bind(kb_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some((kb_owner, kb_is_public, explicit_perm)) = row else {
+        return Err(denied());
+    };
+    let is_kb_member = kb_owner == auth_user.user_id || explicit_perm.is_some();
+    if is_kb_member || (kb_is_public && file.is_public) {
         Ok(())
     } else {
-        Err(ApiError::NotFound("File not found or permission denied".to_string()))
+        Err(denied())
     }
 }
 
@@ -271,11 +304,11 @@ async fn query_file_status_breakdown(
         qb.push("WITH RECURSIVE descendants AS (SELECT id FROM knowledge_bases WHERE id = ");
         qb.push_bind(kb_id);
         if !is_admin {
-            qb.push(" AND (user_id = ").push_bind(user_id).push(" OR is_public = 1)");
+            common::push_kb_access_filter(&mut qb, user_id);
         }
-        qb.push(" UNION ALL SELECT kb.id FROM knowledge_bases kb JOIN descendants d ON kb.parent_id = d.id");
+        qb.push(" UNION SELECT kb.id FROM knowledge_bases kb JOIN descendants d ON kb.parent_id = d.id");
         if !is_admin {
-            qb.push(" WHERE kb.user_id = ").push_bind(user_id).push(" OR kb.is_public = 1");
+            common::push_kb_access_filter_where(&mut qb, user_id);
         }
         qb.push(") ");
     }
@@ -304,7 +337,8 @@ async fn query_file_status_breakdown(
     }
 
     if !is_admin {
-        qb.push(" AND (f.user_id = ").push_bind(user_id).push(" OR f.is_public = 1)");
+        qb.push(" AND ");
+        common::push_file_access_filter(&mut qb, user_id, Some("f"));
     }
 
     qb.push(" GROUP BY p.processing_status");
@@ -325,11 +359,12 @@ async fn fetch_status_files_for_scope(
     pool: &SqlitePool, scope: FileStatsScope, user_id: &str, is_admin: bool, status: i32,
 ) -> AnyResult<Vec<FileStatusPreview>> {
     let mut qb = QueryBuilder::<Sqlite>::new(
-        "WITH RECURSIVE kb_paths(id, path) AS ( \
-             SELECT id, name FROM knowledge_bases WHERE parent_id IS NULL \
+        "WITH RECURSIVE kb_paths(id, path, depth) AS ( \
+             SELECT id, name, 0 FROM knowledge_bases WHERE parent_id IS NULL \
              UNION ALL \
-             SELECT kb.id, kb_paths.path || ' / ' || kb.name \
+             SELECT kb.id, kb_paths.path || ' / ' || kb.name, kb_paths.depth + 1 \
              FROM knowledge_bases kb JOIN kb_paths ON kb.parent_id = kb_paths.id \
+             WHERE kb_paths.depth < 64 \
          ) \
          SELECT f.id, f.filename, f.kb_id, kb.name AS kb_name, kb_paths.path AS kb_path, f.updated_at \
          FROM files f \
@@ -351,10 +386,10 @@ async fn fetch_status_files_for_scope(
                 qb.push(" AND f.kb_id IN (WITH RECURSIVE descendants AS (SELECT id FROM knowledge_bases WHERE id = ");
                 qb.push_bind(kb_id);
                 if !is_admin {
-                    qb.push(" AND (user_id = ").push_bind(user_id).push(" OR is_public = 1)");
+                    common::push_kb_access_filter(&mut qb, user_id);
                 }
                 qb.push(
-                    " UNION ALL SELECT kb.id FROM knowledge_bases kb JOIN descendants d ON kb.parent_id = d.id \
+                    " UNION SELECT kb.id FROM knowledge_bases kb JOIN descendants d ON kb.parent_id = d.id \
                      ) SELECT id FROM descendants)",
                 );
             } else {
@@ -367,7 +402,8 @@ async fn fetch_status_files_for_scope(
     }
 
     if !is_admin {
-        qb.push(" AND (f.user_id = ").push_bind(user_id).push(" OR f.is_public = 1)");
+        qb.push(" AND ");
+        common::push_file_access_filter(&mut qb, user_id, Some("f"));
     }
 
     qb.push(" ORDER BY f.updated_at DESC LIMIT 10");
@@ -469,6 +505,38 @@ pub async fn slice_types() -> ApiResult<Json<Vec<SliceTypeOption>>> {
     ]))
 }
 
+/// 上传落盘文件的清理守卫。
+///
+/// multipart 必须边收边写盘，而知识库权限校验只能在收完之后做；校验失败（或写盘/入库中途出错）
+/// 直接返回时，这些已经落盘、却没有任何数据库行引用的文件会永久留在 `files_path` 里。
+/// 守卫在 drop 时清理未入库的文件，入库成功后调用 `release` 把路径交还给数据库。
+#[derive(Default)]
+struct UploadedTempGuard {
+    paths: Vec<String>,
+}
+
+impl UploadedTempGuard {
+    fn track(&mut self, path: String) {
+        self.paths.push(path);
+    }
+
+    fn release(&mut self, path: &str) {
+        self.paths.retain(|tracked| tracked != path);
+    }
+}
+
+impl Drop for UploadedTempGuard {
+    fn drop(&mut self) {
+        for path in self.paths.drain(..) {
+            match std::fs::remove_file(&path) {
+                Ok(()) => debug!("Removed abandoned upload temp file {}", path),
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => warn!("Failed to remove abandoned upload temp file {}: {}", path, err),
+            }
+        }
+    }
+}
+
 /// 上传文件（支持单个或多个文件）
 ///
 /// form-data 参数：
@@ -508,6 +576,7 @@ pub async fn upload(
     let dir = &cfg.storage.files_path;
     tokio::fs::create_dir_all(dir).await?;
     let reuse_duplicates = cfg.server.reuse_duplicate_files;
+    let mut temp_guard = UploadedTempGuard::default();
 
     let mut files_data: Vec<(String, String, String, i64)> = Vec::new();
     let mut slice_type = String::new();
@@ -530,6 +599,8 @@ pub async fn upload(
                         debug!("Uploading file: {}", filename);
                         let tempname = uuid::Uuid::new_v4().to_string();
                         let filepath = format!("{}/{}", dir, tempname);
+                        // 先登记再创建：create/write 中途失败时同样需要清理。
+                        temp_guard.track(filepath.clone());
                         let mut file = tokio::fs::File::create(filepath.clone()).await?;
 
                         // 把 SHA-256 计算卸载到阻塞线程，避免在异步循环里做 CPU 密集哈希。
@@ -658,8 +729,8 @@ pub async fn upload(
             .bind(&auth_user.user_id)
             .bind(&auth_user.user_name)
             .bind(hash)
-            .bind(filename)
-            .bind(filepath)
+            .bind(&filename)
+            .bind(&filepath)
             .bind(size)
             .bind(&slice_type)
             .bind(kb_id)
@@ -671,6 +742,8 @@ pub async fn upload(
             .execute(&pool)
             .await?
             .last_insert_rowid();
+        // 已经有数据库行引用这个路径，后续生命周期由文件记录负责。
+        temp_guard.release(&filepath);
 
         let mut file: File = sqlx::query_as(&format!("SELECT {FILE_COLS_NO_CONTENT} FROM files WHERE id = ?"))
             .bind(id)
@@ -856,7 +929,7 @@ pub async fn get(
         Err(e) => return Err(e.into()),
     };
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
 
     file.content = crate::file_content::read(id).await?;
     crate::wiki::file_status::populate(&pool, std::slice::from_mut(&mut file)).await?;
@@ -1128,13 +1201,13 @@ pub async fn move_to_kb(
 
     let image_paths = collect_image_paths_for_files(&pool, &[id]).await?;
 
-    let _wiki_lock = crate::wiki::ingest::acquire_slug_lock(format!("kb-finalize:{}", file.kb_id.unwrap_or(0))).await;
+    let _wiki_lock = crate::wiki::ingest::acquire_slug_lock(format!("kb-finalize:{}", file.kb_id.unwrap_or(0))).await?;
     let affected: Vec<(i64, String)> = sqlx::query_as(
         "SELECT kb_id, slug FROM wiki_pages WHERE id IN (SELECT page_id FROM wiki_page_sources WHERE file_id = ?) ORDER BY kb_id, slug"
     ).bind(id).fetch_all(&pool).await?;
     let mut _page_locks = Vec::new();
     for (kb_id, slug) in affected {
-        _page_locks.push(crate::wiki::ingest::acquire_slug_lock(format!("{kb_id}:{slug}")).await);
+        _page_locks.push(crate::wiki::ingest::acquire_slug_lock(format!("{kb_id}:{slug}")).await?);
     }
     let mut tx = pool.begin().await?;
     let update_result = sqlx::query(
@@ -1456,7 +1529,7 @@ async fn query_failed_file_ids_for_reparse(
             );
             qb.push_bind(kb_id);
             qb.push(
-                " UNION ALL SELECT kb.id, kb.kb_type FROM knowledge_bases kb JOIN descendants d ON kb.parent_id = d.id)",
+                " UNION SELECT kb.id, kb.kb_type FROM knowledge_bases kb JOIN descendants d ON kb.parent_id = d.id)",
             );
             qb.push(" SELECT id, kb_type FROM descendants WHERE kb_type != ");
             qb.push_bind("storage");
@@ -1823,8 +1896,29 @@ struct FileImagePathState {
 }
 
 pub(crate) async fn collect_image_raw_paths_for_files(pool: &SqlitePool, file_ids: &[i64]) -> AnyResult<Vec<String>> {
+    let by_file = collect_image_raw_paths_by_file(pool, file_ids).await?;
+    let mut raw_paths = Vec::new();
+    let mut seen = HashSet::new();
+    for file_id in file_ids {
+        let Some(paths) = by_file.get(file_id) else { continue };
+        for path in paths {
+            if seen.insert(path.clone()) {
+                raw_paths.push(path.clone());
+            }
+        }
+    }
+    Ok(raw_paths)
+}
+
+/// 按文件收集其引用的图片相对路径（去重、保持发现顺序）。
+///
+/// 依次尝试 `pdf_contents.img_path`、`files.meta` 里的 custom_images、以及切片正文里的
+/// 图片 URL，与 [`collect_image_paths_for_files`] 的口径保持一致。
+pub(crate) async fn collect_image_raw_paths_by_file(
+    pool: &SqlitePool, file_ids: &[i64],
+) -> AnyResult<HashMap<i64, Vec<String>>> {
     if file_ids.is_empty() {
-        return Ok(Vec::new());
+        return Ok(HashMap::new());
     }
 
     let mut states: HashMap<i64, FileImagePathState> =
@@ -1878,18 +1972,63 @@ pub(crate) async fn collect_image_raw_paths_for_files(pool: &SqlitePool, file_id
         }
     }
 
-    let mut raw_paths = Vec::new();
-    let mut seen = HashSet::new();
+    let mut by_file: HashMap<i64, Vec<String>> = HashMap::new();
     for file_id in file_ids {
         let Some(state) = states.get(file_id) else { continue };
+        let mut seen = HashSet::new();
+        let mut paths = Vec::new();
         for path in &state.paths {
             let trimmed = path.trim();
             if !trimmed.is_empty() && seen.insert(trimmed.to_string()) {
-                raw_paths.push(trimmed.to_string());
+                paths.push(trimmed.to_string());
             }
         }
+        if !paths.is_empty() {
+            by_file.insert(*file_id, paths);
+        }
     }
-    Ok(raw_paths)
+    Ok(by_file)
+}
+
+/// 图片文件名（basename）。`/files/images/{filename}` 路由只会给到单段名字，
+/// 而解析服务返回的 `img_path` 可能带 `images/` 前缀，两者都要能对上。
+fn image_basename(raw_path: &str) -> String {
+    let normalized = raw_path.trim().replace('\\', "/");
+    normalized.rsplit('/').next().unwrap_or(normalized.as_str()).to_string()
+}
+
+/// 重建某个文件在 `file_images` 里的图片归属记录。
+///
+/// `/files/images/{filename}` 是全局路由，只能靠这张表判断图片属于哪个文件，
+/// 从而复用文件级 / 知识库级权限。解析失败不应影响主流程，调用方自行决定是否忽略错误。
+pub async fn sync_file_images(pool: &SqlitePool, file_id: i64) -> AnyResult<()> {
+    let by_file = collect_image_raw_paths_by_file(pool, &[file_id]).await?;
+    let paths = by_file.get(&file_id).cloned().unwrap_or_default();
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM file_images WHERE file_id = ?").bind(file_id).execute(&mut *tx).await?;
+    let mut seen = HashSet::new();
+    for path in &paths {
+        let name = image_basename(path);
+        if name.is_empty() || !seen.insert(name.clone()) {
+            continue;
+        }
+        sqlx::query("INSERT OR IGNORE INTO file_images(file_id, image_name, image_path) VALUES (?, ?, ?)")
+            .bind(file_id)
+            .bind(&name)
+            .bind(path)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+/// 查询引用了指定图片名的文件 ID 列表。
+pub(crate) async fn image_owner_ids(pool: &SqlitePool, image_name: &str) -> Result<Vec<i64>, sqlx::Error> {
+    sqlx::query_scalar("SELECT file_id FROM file_images WHERE image_name = ?")
+        .bind(image_name)
+        .fetch_all(pool)
+        .await
 }
 
 pub(crate) async fn collect_image_paths_for_files(pool: &SqlitePool, file_ids: &[i64]) -> AnyResult<Vec<String>> {
@@ -2399,7 +2538,8 @@ pub struct UpdateSlicesReq {
 #[derive(Debug, Clone, Serialize, ToSchema)]
 pub struct SlicePosition {
     pub page_idx: i32,
-    pub bbox: [i32; 4],
+    /// 坐标原样透出（可能是绝对 PDF 点，也可能是解析服务给的归一化小数），由前端按页面尺寸换算。
+    pub bbox: [f32; 4],
     pub sheet_name: Option<String>,
     pub row_num: Option<i32>,
 }
@@ -2416,13 +2556,21 @@ pub struct SliceHighlightPage {
     pub page_idx: i32,
 }
 
+/// `page_idx + bbox` 作为 HashMap 键。f32 没有 Hash/Eq，改用位模式：
+/// 两边都源自同一次解析结果（写库与写 JSON 用的是同一批 f32），位相同即语义相同。
+type BboxKey = (i32, u32, u32, u32, u32);
+
+fn bbox_key(page_idx: i32, bbox: [f32; 4]) -> BboxKey {
+    (page_idx, bbox[0].to_bits(), bbox[1].to_bits(), bbox[2].to_bits(), bbox[3].to_bits())
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct SlicePositionRow {
     page_idx: i32,
-    x1: i32,
-    y1: i32,
-    x2: i32,
-    y2: i32,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
     sheet_name: Option<String>,
     row_num: Option<i32>,
 }
@@ -2438,10 +2586,26 @@ struct SlicePositionRow {
     ),
     responses(
         (status = 200, description = "成功返回切片列表", body = Vec<Slice>),
+        (status = 403, description = "无权限"),
         (status = 404, description = "文件不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
-pub async fn get_slices(State(pool): State<SqlitePool>, Path(id): Path<i64>) -> ApiResult<Json<Vec<Slice>>> {
+pub async fn get_slices(
+    State(pool): State<SqlitePool>, Path(id): Path<i64>, Extension(auth_user): Extension<AuthUser>,
+) -> ApiResult<Json<Vec<Slice>>> {
+    // 切片正文等同于文件全文，必须与 download / get 走同一套权限校验，
+    // 否则任何登录用户都能按 id 遍历读取他人文件内容。
+    let file: File = sqlx::query_as(&format!("SELECT {} FROM files WHERE id = ?", FILE_COLS_NO_CONTENT))
+        .bind(id)
+        .fetch_optional(&pool)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("File not found".to_string()))?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
+
     let source_id = effective_parse_file_id(&pool, id).await?;
     let rows: Vec<(i64, i64, i64)> =
         sqlx::query_as("SELECT id, created_at, updated_at FROM slices WHERE file_id = ? ORDER BY id")
@@ -2589,7 +2753,7 @@ pub async fn update_slices(
     }
 
     // 8. 返回更新后的切片列表
-    get_slices(State(pool), Path(id)).await
+    get_slices(State(pool), Path(id), Extension(auth_user)).await
 }
 
 /// 获取单个切片的高亮位置信息
@@ -2620,7 +2784,7 @@ pub async fn get_slice_highlight(
         .fetch_one(&pool)
         .await?;
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
 
     let parse_file_id = effective_parse_file_id(&pool, id).await?;
     let slice: Option<(i64,)> =
@@ -2633,7 +2797,9 @@ pub async fn get_slice_highlight(
     }
 
     let rows: Vec<SlicePositionRow> = sqlx::query_as(
-        "SELECT page_idx, x1, y1, x2, y2, sheet_name, row_num FROM slice_positions WHERE slice_id = ? ORDER BY page_idx, id",
+        "SELECT page_idx, CAST(x1 AS REAL) AS x1, CAST(y1 AS REAL) AS y1, \
+         CAST(x2 AS REAL) AS x2, CAST(y2 AS REAL) AS y2, sheet_name, row_num \
+         FROM slice_positions WHERE slice_id = ? ORDER BY page_idx, id",
     )
     .bind(slice_id)
     .fetch_all(&pool)
@@ -2685,7 +2851,7 @@ pub async fn get_slice_highlight_page(
         .fetch_one(&pool)
         .await?;
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
 
     let parse_file_id = effective_parse_file_id(&pool, id).await?;
     let slice: Option<(i64,)> =
@@ -2697,11 +2863,13 @@ pub async fn get_slice_highlight_page(
         None => return Err(ApiError::NotFound("Slice not found".to_string())),
     }
 
-    let rows: Vec<(i32, i32, i32, i32, i32)> =
-        sqlx::query_as("SELECT page_idx, x1, y1, x2, y2 FROM slice_positions WHERE slice_id = ? ORDER BY page_idx, id")
-            .bind(slice_id)
-            .fetch_all(&pool)
-            .await?;
+    let rows: Vec<(i32, f32, f32, f32, f32)> = sqlx::query_as(
+        "SELECT page_idx, CAST(x1 AS REAL) AS x1, CAST(y1 AS REAL) AS y1, \
+         CAST(x2 AS REAL) AS x2, CAST(y2 AS REAL) AS y2 FROM slice_positions WHERE slice_id = ? ORDER BY page_idx, id",
+    )
+    .bind(slice_id)
+    .fetch_all(&pool)
+    .await?;
 
     if rows.is_empty() {
         return Err(ApiError::NotFound("Slice has no highlight positions".to_string()));
@@ -2709,10 +2877,12 @@ pub async fn get_slice_highlight_page(
 
     // 按 page_idx + bbox 去 pdf_content 里匹配内容长度；匹配不到时退化为 1（保持原“位置数量”语义）
     let pdf_contents = crate::pdf_content::read(parse_file_id).await.unwrap_or_default();
-    let mut content_len_by_bbox: HashMap<(i32, [i32; 4]), i64> = HashMap::new();
+    let mut content_len_by_bbox: HashMap<BboxKey, i64> = HashMap::new();
     for row in &pdf_contents {
         let Some(raw_bbox) = &row.bbox else { continue };
-        let Ok(bbox) = serde_json::from_str::<Vec<i32>>(raw_bbox) else { continue };
+        // 坐标是浮点：早先这里按 Vec<i32> 解析，遇到小数就整行跳过，
+        // 结果所有位置都退化成 1，推荐页码变成「位置数量最多」而不是「内容最多」。
+        let Ok(bbox) = serde_json::from_str::<Vec<f32>>(raw_bbox) else { continue };
         if bbox.len() != 4 {
             continue;
         }
@@ -2723,14 +2893,13 @@ pub async fn get_slice_highlight_page(
         if let Some(body) = &row.table_body {
             len += body.chars().count() as i64;
         }
-        let key = (row.page_idx, [bbox[0], bbox[1], bbox[2], bbox[3]]);
-        content_len_by_bbox.insert(key, len);
+        content_len_by_bbox.insert(bbox_key(row.page_idx, [bbox[0], bbox[1], bbox[2], bbox[3]]), len);
     }
 
     let mut page_counts: BTreeMap<i32, i64> = BTreeMap::new();
     for (page_idx, x1, y1, x2, y2) in rows {
-        let bbox = [x1, y1, x2, y2];
-        let len = content_len_by_bbox.get(&(page_idx, bbox)).copied().unwrap_or(1);
+        let key = bbox_key(page_idx, [x1, y1, x2, y2]);
+        let len = content_len_by_bbox.get(&key).copied().unwrap_or(1);
         *page_counts.entry(page_idx).or_insert(0) += len;
     }
 
@@ -2755,17 +2924,26 @@ pub async fn get_slice_highlight_page(
     responses(
         (status = 200, description = "成功返回图片文件", content_type = "image/*"),
         (status = 400, description = "请求参数错误"),
+        (status = 403, description = "无权限"),
         (status = 404, description = "图片不存在")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
 pub async fn get_image_by_filename(
-    Path(filename): Path<String>,
+    State(pool): State<SqlitePool>, Path(filename): Path<String>, Extension(auth_user): Extension<AuthUser>,
 ) -> Result<(StatusCode, [(header::HeaderName, String); 2], Body), ApiError> {
     let mut components = std::path::Path::new(&filename).components();
     match components.next() {
         Some(Component::Normal(_)) if components.next().is_none() => {}
         _ => return Err(ApiError::BadRequest("Invalid filename".to_string())),
     }
+
+    // 图片按文件名全局路由，归属关系记录在 file_images 中；只有能读取引用它的文件
+    // （或该文件所属知识库）的用户才能取到图片。
+    ensure_image_readable(&pool, &filename, &auth_user).await?;
 
     let cfg = config::get();
     let image_path = std::path::Path::new(&cfg.storage.images_path).join(&filename);
@@ -2777,6 +2955,29 @@ pub async fn get_image_by_filename(
     let mime_type = mime_guess::from_path(&filename).first_or_octet_stream().to_string();
 
     Ok((StatusCode::OK, [(header::CONTENT_TYPE, mime_type), (header::CONTENT_LENGTH, len.to_string())], body))
+}
+
+/// 校验当前用户能否读取某张图片：至少能读取一个引用它的文件。
+async fn ensure_image_readable(pool: &SqlitePool, filename: &str, auth_user: &AuthUser) -> ApiResult<()> {
+    if auth_user.is_admin() {
+        return Ok(());
+    }
+    let owner_ids = image_owner_ids(pool, filename).await?;
+    if owner_ids.is_empty() {
+        // 归属未知的图片一律拒绝：解析完成后会写入 file_images，历史数据由启动迁移回填。
+        warn!("Rejecting image {filename}: no owning file recorded in file_images");
+        return Err(ApiError::NotFound("Image not found".to_string()));
+    }
+    let mut qb = QueryBuilder::<Sqlite>::new(format!("SELECT {} FROM files WHERE id IN (", FILE_COLS_NO_CONTENT));
+    crate::db::push_i64_list(&mut qb, &owner_ids);
+    qb.push(")");
+    let files: Vec<File> = qb.build_query_as().fetch_all(pool).await?;
+    for file in &files {
+        if ensure_file_readable(pool, file, auth_user).await.is_ok() {
+            return Ok(());
+        }
+    }
+    Err(ApiError::NotFound("Image not found or permission denied".to_string()))
 }
 
 /// 下载文件
@@ -2805,10 +3006,10 @@ pub async fn download(
         .fetch_one(&pool)
         .await?;
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
     let (len, body) = open_file_stream(std::path::Path::new(&file.path)).await?;
     let mime_type = mime_guess::from_path(&file.filename).first_or_octet_stream().to_string();
-    let content_disposition = format!("attachment; filename=\"{}\"", file.filename);
+    let content_disposition = common::content_disposition("attachment", &file.filename);
 
     Ok((
         StatusCode::OK,
@@ -2856,7 +3057,7 @@ pub async fn get_highlighted_pdf(
         .fetch_one(&pool)
         .await?;
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
 
     let parse_file_id = effective_parse_file_id(&pool, id).await?;
 
@@ -2872,7 +3073,9 @@ pub async fn get_highlighted_pdf(
 
         // 从数据库查询 slice 的 positions
         let rows: Vec<SlicePositionRow> = sqlx::query_as(
-            "SELECT page_idx, x1, y1, x2, y2, sheet_name, row_num FROM slice_positions WHERE slice_id = ? ORDER BY page_idx, id",
+            "SELECT page_idx, CAST(x1 AS REAL) AS x1, CAST(y1 AS REAL) AS y1, \
+         CAST(x2 AS REAL) AS x2, CAST(y2 AS REAL) AS y2, sheet_name, row_num \
+         FROM slice_positions WHERE slice_id = ? ORDER BY page_idx, id",
         )
         .bind(slice_id)
         .fetch_all(&pool)
@@ -2953,7 +3156,7 @@ pub async fn get_highlighted_pdf(
         return Err(ApiError::BadRequest("File is not a PDF, Word, PowerPoint, or Excel document".to_string()));
     };
 
-    let content_disposition = format!("inline; filename=\"highlighted_{}.pdf\"", file.id);
+    let content_disposition = common::content_disposition("inline", &format!("highlighted_{}.pdf", file.id));
 
     // 无高亮时直接流式返回原 PDF
     if positions.is_empty() {
@@ -3022,7 +3225,7 @@ pub async fn excel_data(
         .fetch_one(&pool)
         .await?;
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
 
     let filename_lower = file.filename.to_lowercase();
     let is_excel = filename_lower.ends_with(".xls") || filename_lower.ends_with(".xlsx");
@@ -3134,7 +3337,7 @@ pub async fn archive_entries(
         .fetch_one(&pool)
         .await?;
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
 
     if !archive::is_archive_file(&file.filename) {
         return Err(ApiError::BadRequest("File is not an archive".to_string()));
@@ -3179,7 +3382,7 @@ pub async fn archive_extract(
         .fetch_one(&pool)
         .await?;
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
 
     if !archive::is_archive_file(&file.filename) {
         return Err(ApiError::BadRequest("File is not an archive".to_string()));
@@ -3296,7 +3499,7 @@ pub async fn archive_download(
         .fetch_one(&pool)
         .await?;
 
-    ensure_file_readable(&file, &auth_user)?;
+    ensure_file_readable(&pool, &file, &auth_user).await?;
 
     if !archive::is_archive_file(&file.filename) {
         return Err(ApiError::BadRequest("File is not an archive".to_string()));
@@ -3312,7 +3515,7 @@ pub async fn archive_download(
     let cfg = config::get();
     let mime_type = mime_guess::from_path(entry_path).first_or_octet_stream().to_string();
     let filename = std::path::Path::new(entry_path).file_name().and_then(|n| n.to_str()).unwrap_or(entry_path);
-    let content_disposition = format!("attachment; filename=\"{}\"", filename);
+    let content_disposition = common::content_disposition("attachment", filename);
 
     // 尝试从解压目录读取
     if let Some(resolved) = archive::resolve_archive_entry_path(&cfg.storage.archives_path, id, entry_path)

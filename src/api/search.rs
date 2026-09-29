@@ -404,6 +404,16 @@ pub async fn search(
     Ok(Json(SearchResult { results }))
 }
 
+/// 判定用户对某个检索命中是否可见。
+///
+/// 口径与 `api::file::ensure_file_readable`、`common::push_file_access_filter` 一致：
+/// - admin / 文件属主：可见；
+/// - 散文件：看自身 `is_public`；
+/// - 知识库成员（属主或显式授权）：库内全部文件可见；
+/// - 仅因知识库公开而来的陌生用户：只见库内 `is_public = 1` 的文件。
+///
+/// `allowed_kb_ids` 由 `get_user_viewable_kb_ids` 得到（属主 ∪ 公开 ∪ 显式授权），
+/// 因此「在集合内且既非公开也非属主」即等价于存在 `kb_permissions` 显式授权。
 fn has_visibility_permission(
     file: Option<(bool, &str)>, kb: Option<(bool, &str, i64)>, user_id: &str, is_admin: bool,
     allowed_kb_ids: Option<&HashSet<i64>>,
@@ -411,21 +421,21 @@ fn has_visibility_permission(
     if is_admin {
         return true;
     }
-    // If a KB is associated, permission is determined at the KB level.
-    if let Some((kb_is_public, kb_owner_id, kb_id)) = kb {
-        if kb_is_public || kb_owner_id == user_id {
-            return true;
-        }
-        if let Some(allowed) = allowed_kb_ids {
-            return allowed.contains(&kb_id);
-        }
-        return false;
+    let (file_is_public, file_owner_id) = file.unwrap_or((false, ""));
+    if file_owner_id == user_id {
+        return true;
     }
-    // Unassigned file: check file-level ownership/public flag.
-    if let Some((is_public, owner_id)) = file {
-        return is_public || owner_id == user_id;
+    let Some((kb_is_public, kb_owner_id, kb_id)) = kb else {
+        // 散文件：只看自身公开标记。
+        return file_is_public;
+    };
+    let granted = allowed_kb_ids.is_some_and(|allowed| allowed.contains(&kb_id));
+    let kb_member = kb_owner_id == user_id || (!kb_is_public && granted);
+    if kb_member {
+        return true;
     }
-    true
+    // 公开库对陌生人只暴露公开文件；私有库则完全不可见。
+    kb_is_public && file_is_public
 }
 
 fn has_permission(
@@ -466,8 +476,14 @@ async fn merge_wiki_results(
     if file_ids.is_some_and(Vec::is_empty) {
         return Ok(());
     }
+    // Wiki 页面与切片共用 search.limit 个坑位，单独限制 Wiki 数量，
+    // 避免开启 Wiki 后证据切片被大面积挤掉（RAG 场景下切片才是可引用证据）。
+    let wiki_limit = crate::config::get().search.wiki_limit;
+    if wiki_limit == 0 {
+        return Ok(());
+    }
     let hits = engine
-        .search_wiki_scoped(query, file_ids, kb_ids)
+        .search_wiki_scoped(query, file_ids, kb_ids, wiki_limit)
         .await
         .map_err(|e| ApiError::internal(format!("Wiki search failed: {e}")))?;
     let ids: Vec<_> = hits.iter().map(|(p, _)| p.kb_id).collect();
@@ -1732,11 +1748,8 @@ async fn search_file_ids_by_name(
     let mut qb = QueryBuilder::<Sqlite>::new("SELECT id FROM files WHERE filename = ");
     qb.push_bind(filename);
     if !is_admin {
-        qb.push(" AND (user_id = ");
-        qb.push_bind(user_id);
-        qb.push(" OR is_public = 1 OR kb_id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ");
-        qb.push_bind(user_id);
-        qb.push("))");
+        qb.push(" AND ");
+        super::common::push_file_access_filter(&mut qb, user_id, None);
     }
     if let Some(ids) = kb_ids
         && !ids.is_empty()
@@ -1789,17 +1802,15 @@ async fn resolve_kb_ids_to_search(
     }
     qb.push(")");
     if !is_admin {
-        qb.push(" AND (user_id = ");
-        qb.push_bind(user_id);
-        qb.push(" OR is_public = 1)");
+        // 显式授权（kb_permissions）同样构成可检索范围，否则「按 kb_id 精确检索被授权的库」
+        // 会返回空，而不带过滤时又能搜到，行为自相矛盾。
+        super::common::push_kb_access_filter(&mut qb, user_id);
     }
-    qb.push(" UNION ALL ");
+    qb.push(" UNION ");
     qb.push("SELECT kb.id FROM knowledge_bases kb ");
     qb.push("INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id");
     if !is_admin {
-        qb.push(" WHERE kb.user_id = ");
-        qb.push_bind(user_id);
-        qb.push(" OR kb.is_public = 1");
+        super::common::push_kb_access_filter_where(&mut qb, user_id);
     }
     qb.push(") SELECT DISTINCT id FROM kb_hierarchy");
 

@@ -13,34 +13,6 @@ use crate::{
     search::{SearchEngine, tantivy_engine::ForceMergeStats},
 };
 
-/// 进程内存占用
-#[derive(Debug, Serialize, ToSchema)]
-pub struct MemoryUsage {
-    /// 进程 ID
-    pub pid: u32,
-    /// 常驻内存（RSS），单位：字节
-    pub rss_bytes: u64,
-    /// 虚拟内存，单位：字节
-    pub virtual_bytes: u64,
-}
-
-/// 堆分析状态
-#[derive(Debug, Serialize, ToSchema)]
-pub struct HeapProfileStatus {
-    /// jemalloc 版本
-    pub jemalloc_version: Option<String>,
-    /// 是否启用 heap profiling（opt.prof）
-    pub prof_enabled: Option<bool>,
-    /// 是否开启采样（prof.active）
-    pub prof_active: Option<bool>,
-    /// jemalloc 构建时默认配置
-    pub malloc_conf: Option<String>,
-    /// 运行时环境变量 MALLOC_CONF
-    pub env_malloc_conf: Option<String>,
-    /// 状态读取失败的提示
-    pub warnings: Vec<String>,
-}
-
 /// LanceDB compact 统计信息
 #[derive(Debug, Serialize, ToSchema)]
 pub struct LanceDbCompactStats {
@@ -145,11 +117,16 @@ struct IndexRebuildStatusRow {
     tag = "system",
     responses(
         (status = 200, description = "成功返回堆分析快照", body = Vec<u8>, content_type = "application/octet-stream"),
-        (status = 400, description = "未启用堆分析"),
+        (status = 400, description = "未启用堆分析或权限不足"),
         (status = 500, description = "生成堆分析快照失败")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
-pub async fn heap_profile() -> ApiResult<Response> {
+pub async fn heap_profile(Extension(auth_user): Extension<AuthUser>) -> ApiResult<Response> {
+    common::ensure_admin(&auth_user)?;
     heap_profile_impl().await
 }
 
@@ -161,11 +138,16 @@ pub async fn heap_profile() -> ApiResult<Response> {
     tag = "system",
     responses(
         (status = 200, description = "成功返回堆分析 PDF 报告", body = Vec<u8>, content_type = "application/pdf"),
-        (status = 400, description = "未启用堆分析或 jeprof 不可用"),
+        (status = 400, description = "未启用堆分析、jeprof 不可用或权限不足"),
         (status = 500, description = "生成堆分析 PDF 失败")
+    ),
+    security(
+        ("x-user-id" = []),
+        ("x-role" = [])
     )
 )]
-pub async fn heap_profile_pdf() -> ApiResult<Response> {
+pub async fn heap_profile_pdf(Extension(auth_user): Extension<AuthUser>) -> ApiResult<Response> {
+    common::ensure_admin(&auth_user)?;
     heap_profile_pdf_impl().await
 }
 
@@ -177,6 +159,7 @@ pub async fn heap_profile_pdf() -> ApiResult<Response> {
     tag = "system",
     responses(
         (status = 200, description = "LanceDB compact 成功", body = LanceDbCompactStats),
+        (status = 400, description = "权限不足"),
         (status = 500, description = "LanceDB compact 失败")
     ),
     security(
@@ -185,8 +168,10 @@ pub async fn heap_profile_pdf() -> ApiResult<Response> {
     )
 )]
 pub async fn lancedb_compact(
-    Extension(search_engine): Extension<SearchEngine>,
+    Extension(search_engine): Extension<SearchEngine>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<LanceDbCompactStats>> {
+    // compact 会重写向量表并长时间占用 IO，属于运维动作，只允许全局 admin 触发。
+    common::ensure_admin(&auth_user)?;
     let stats = search_engine
         .compact_lancedb()
         .await
@@ -401,7 +386,7 @@ async fn heap_profile_impl() -> ApiResult<Response> {
         HeaderValue::from_str(&len.to_string())
             .map_err(|e| ApiError::internal(format!("Invalid header value: {}", e)))?,
     );
-    let disposition = format!("attachment; filename=\"{}\"", filename);
+    let disposition = common::content_disposition("attachment", &filename);
     headers.insert(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_str(&disposition).map_err(|e| ApiError::internal(format!("Invalid header value: {}", e)))?,
@@ -509,7 +494,7 @@ async fn heap_profile_pdf_impl() -> ApiResult<Response> {
         HeaderValue::from_str(&len.to_string())
             .map_err(|e| ApiError::internal(format!("Invalid header value: {}", e)))?,
     );
-    let disposition = format!("attachment; filename=\"{}\"", pdf_filename);
+    let disposition = common::content_disposition("attachment", &pdf_filename);
     headers.insert(
         header::CONTENT_DISPOSITION,
         HeaderValue::from_str(&disposition).map_err(|e| ApiError::internal(format!("Invalid header value: {}", e)))?,

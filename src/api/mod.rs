@@ -18,8 +18,9 @@ mod wiki;
 pub use file::File;
 pub(crate) use file::{
     FILE_COLS_NO_CONTENT, backfill_missing_image_meta_for_files, collect_image_paths_for_files,
-    collect_image_raw_paths_for_files, effective_parse_file_id, find_reusable_parsed_file, remove_image_files,
-    resolve_image_storage_path, update_file_custom_image_meta,
+    collect_image_raw_paths_by_file, collect_image_raw_paths_for_files, effective_parse_file_id,
+    find_reusable_parsed_file, remove_image_files, resolve_image_storage_path, sync_file_images,
+    update_file_custom_image_meta,
 };
 
 use crate::search::SearchEngine;
@@ -186,8 +187,6 @@ use crate::search::SearchEngine;
             graph::GraphBuildInfo,
             graph::Subgraph,
             graph::GraphEdge,
-            system::MemoryUsage,
-            system::HeapProfileStatus,
             system::LanceDbCompactStats,
             system::TantivyForceMergeIndexStats,
             system::TantivyForceMergeResponse,

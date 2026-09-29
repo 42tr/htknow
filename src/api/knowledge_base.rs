@@ -417,12 +417,23 @@ pub async fn list(
 
         // If `id` provided, try to parse as integer id and filter by id
         if let Some(id_str) = params.id.as_deref() {
-            qb.push(" AND id = ").push_bind(id_str.to_string());
+            // `id` 是 INTEGER 列，必须以整数绑定：SQLite 中 INTEGER 与 TEXT 永不相等，
+            // 用字符串绑定会让「按 ID 精确筛选」静默返回空列表。
+            // 非法输入按「匹配不到任何库」处理，而不是悄悄忽略该条件返回全量数据。
+            match id_str.trim().parse::<i64>() {
+                Ok(id) => {
+                    qb.push(" AND id = ").push_bind(id);
+                }
+                Err(_) => {
+                    qb.push(" AND 1 = 0");
+                }
+            }
         }
 
         // name fuzzy search (only name column)
         if let Some(name) = &params.name {
-            qb.push("AND name LIKE ").push_bind(format!("%{}%", name));
+            // 前导空格不能省：上一个条件不带尾空格，否则拼出 `parent_id IS NULLAND name LIKE ?`。
+            qb.push(" AND name LIKE ").push_bind(format!("%{}%", name));
         }
     };
 
@@ -453,10 +464,11 @@ pub async fn list(
 
     let knowledge_ids: Vec<i64> = knowledges.iter().map(|kb| kb.id).collect();
 
-    // Get file counts and children counts in parallel
-    let (file_counts_res, children_counts_res) = tokio::join!(
+    // Get file counts, children counts and effective permissions in parallel
+    let (file_counts_res, children_counts_res, perms) = tokio::join!(
         get_file_counts(&pool, &knowledge_ids, &auth_user.user_id, is_admin),
-        get_children_kb_counts(&pool, &knowledge_ids, &auth_user.user_id, is_admin)
+        get_children_kb_counts(&pool, &knowledge_ids, &auth_user.user_id, is_admin),
+        async { get_kb_permissions_batch(&pool, &knowledge_ids, &auth_user.user_id, is_admin).await }
     );
     let file_counts = file_counts_res?;
     let children_counts = children_counts_res?;
@@ -475,14 +487,9 @@ pub async fn list(
             parse_priority: kb.parse_priority,
             file_count: *file_counts.get(&kb.id).unwrap_or(&0),
             children_kb_count: *children_counts.get(&kb.id).unwrap_or(&0),
-            current_user_permission: if kb.user_id == auth_user.user_id || is_admin {
-                "admin".to_string()
-            } else if kb.is_public {
-                "viewer".to_string()
-            } else {
-                // fallback - should not happen since query already filters
-                "viewer".to_string()
-            },
+            // 走与详情 / 树接口同一套权限解析（owner > 显式授权 > is_public），
+            // 否则被显式授予 editor/admin 的用户在列表里看不到编辑入口。
+            current_user_permission: perms.get(&kb.id).cloned().unwrap_or_else(|| "viewer".to_string()),
         })
         .collect();
 
@@ -507,7 +514,7 @@ async fn get_children_kb_counts(
     if !is_admin {
         common::push_kb_access_filter(&mut qb, user_id);
     }
-    qb.push(" UNION ALL SELECT d.root_id, kb.id FROM knowledge_bases kb ");
+    qb.push(" UNION SELECT d.root_id, kb.id FROM knowledge_bases kb ");
     qb.push("JOIN descendants d ON kb.parent_id = d.kb_id");
     if !is_admin {
         common::push_kb_access_filter_where(&mut qb, user_id);
@@ -547,7 +554,7 @@ async fn get_file_counts(
     if !is_admin {
         common::push_kb_access_filter(&mut qb, user_id);
     }
-    qb.push(" UNION ALL SELECT d.root_id, kb.id FROM knowledge_bases kb ");
+    qb.push(" UNION SELECT d.root_id, kb.id FROM knowledge_bases kb ");
     qb.push("JOIN descendants d ON kb.parent_id = d.kb_id");
     if !is_admin {
         common::push_kb_access_filter_where(&mut qb, user_id);
@@ -556,9 +563,8 @@ async fn get_file_counts(
     qb.push("SELECT d.root_id, COUNT(f.id) AS cnt FROM descendants d ");
     qb.push("LEFT JOIN files f ON f.kb_id = d.kb_id");
     if !is_admin {
-        qb.push(" AND (f.user_id = ");
-        qb.push_bind(user_id);
-        qb.push(" OR f.is_public = 1)");
+        qb.push(" AND ");
+        common::push_file_access_filter(&mut qb, user_id, Some("f"));
     }
     qb.push(" GROUP BY d.root_id");
 
@@ -586,6 +592,37 @@ pub struct KnowledgeCreateReq {
     pub parse_priority: Option<i64>,
 }
 
+/// 校验「把某个知识库挂到 `parent_id` 下面」是否合法。
+///
+/// 三道关卡：父库必须存在且当前用户对它有 editor 以上权限（否则任何人都能把自己的库
+/// 挂到他人私有库下面，污染对方的树、统计与按子树展开的操作）；挂上去之后的总深度
+/// 不能超过 [`common::MAX_KB_DEPTH`]，避免面包屑等祖先遍历被静默截断。
+///
+/// `subtree_height` 是被移动知识库自身子树的高度，新建时传 0。
+async fn validate_new_parent(
+    pool: &SqlitePool, parent_id: i64, auth_user: &AuthUser, is_admin: bool, subtree_height: usize,
+) -> ApiResult<()> {
+    let parent_perm = get_kb_permission(pool, parent_id, &auth_user.user_id, is_admin).await;
+    if parent_perm.is_none() {
+        return Err(ApiError::NotFound("Parent knowledge base not found or permission denied.".to_string()));
+    }
+    if !meets_requirement(parent_perm.as_deref(), "editor") {
+        return Err(ApiError::Forbidden(
+            "Permission denied. Requires editor or admin on the parent knowledge base.".to_string(),
+        ));
+    }
+    let parent_depth = common::kb_depth(pool, parent_id).await?;
+    // 父库深度(0-based) + 自身这一层 + 自身子树高度
+    let total_depth = parent_depth + 1 + subtree_height;
+    if total_depth >= common::MAX_KB_DEPTH {
+        return Err(ApiError::BadRequest(format!(
+            "Knowledge base hierarchy too deep: {total_depth} levels, max {}.",
+            common::MAX_KB_DEPTH
+        )));
+    }
+    Ok(())
+}
+
 /// 创建知识库
 #[utoipa::path(
     post,
@@ -607,9 +644,13 @@ pub async fn create(
     State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>,
     Json(knowledge): Json<KnowledgeCreateReq>,
 ) -> ApiResult<Json<Knowledge>> {
+    let is_admin = auth_user.is_admin();
     let is_public = if knowledge.is_public.unwrap_or(false) { 1 } else { 0 };
     let kb_type = normalize_kb_type(knowledge.kb_type)?;
     let parse_priority = normalize_parse_priority(knowledge.parse_priority)?;
+    if let Some(parent_id) = knowledge.parent_id {
+        validate_new_parent(&pool, parent_id, &auth_user, is_admin, 0).await?;
+    }
     let query = "INSERT INTO knowledge_bases (user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority) VALUES (?, ?, ?, ?, ?, ?, ?, ?)";
     let id = sqlx::query(query)
         .bind(auth_user.user_id)
@@ -676,15 +717,6 @@ pub async fn update(
         return Err(ApiError::Forbidden("Permission denied. Requires editor or admin.".to_string()));
     }
 
-    // Prevent moving a knowledge base into itself.
-    if let Some(Some(parent_id)) = knowledge.parent_id
-        && parent_id == id
-    {
-        return Err(crate::api::error::ApiError::BadRequest("Cannot move a knowledge base into itself.".to_string()));
-    }
-    // A full descendant check would be needed for production to prevent moving a KB into its own child.
-    // This requires a recursive query and is omitted for this iteration.
-
     // Only admin-level can change sensitive fields: is_public, parent_id, kb_type
     let is_kb_admin = meets_requirement(Some(perm_str), "admin");
     if let Some(ref _kb_type) = knowledge.kb_type
@@ -694,6 +726,18 @@ pub async fn update(
     }
     if knowledge.parent_id.is_some() && !is_kb_admin {
         return Err(ApiError::Forbidden("Only admin can change parent_id.".to_string()));
+    }
+
+    // 移动知识库前必须排除「移到自己或自己的后代下面」：一旦父子成环，所有基于递归 CTE 的
+    // 层级查询（tree / 文件数 / 子库数 / 检索范围 / 导出）都会无限展开。
+    if let Some(Some(parent_id)) = knowledge.parent_id {
+        if common::is_self_or_descendant(&pool, id, parent_id).await? {
+            return Err(ApiError::BadRequest(
+                "Cannot move a knowledge base into itself or one of its descendants.".to_string(),
+            ));
+        }
+        let subtree_height = common::kb_subtree_height(&pool, id).await?;
+        validate_new_parent(&pool, parent_id, &auth_user, is_admin, subtree_height).await?;
     }
     if knowledge.is_public.is_some() && !is_kb_admin {
         return Err(ApiError::Forbidden("Only admin can change visibility.".to_string()));
@@ -812,11 +856,9 @@ pub async fn get(
     let user_id = auth_user.user_id.clone();
 
     // 0. Check permission
-    let user_perm = get_kb_permission(&pool, id, &user_id, is_admin).await;
-    if user_perm.is_none() {
+    let Some(current_user_permission) = get_kb_permission(&pool, id, &user_id, is_admin).await else {
         return Err(ApiError::NotFound("Knowledge base not found or permission denied.".to_string()));
-    }
-    let current_user_permission = user_perm.clone().unwrap();
+    };
 
     // 1. Fetch the main knowledge base (already permission-checked above)
     let main_kb: Knowledge = sqlx::query_as(
@@ -884,20 +926,23 @@ pub async fn get(
 
     // 3. Fetch the breadcrumb path in a single recursive CTE query (root -> parent),
     //    avoiding one round-trip per ancestor level.
-    let path: Vec<Knowledge> = sqlx::query_as(
+    let ancestors_sql = format!(
         "WITH RECURSIVE ancestors(id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority, depth) AS ( \
              SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority, 0 \
              FROM knowledge_bases WHERE id = ? \
              UNION ALL \
              SELECT k.id, k.user_id, k.user_name, k.name, k.description, k.kb_type, k.parent_id, k.is_public, k.parse_priority, a.depth + 1 \
              FROM knowledge_bases k INNER JOIN ancestors a ON k.id = a.parent_id \
+             WHERE a.depth < {max_depth} \
          ) \
          SELECT id, user_id, user_name, name, description, kb_type, parent_id, is_public, parse_priority \
          FROM ancestors ORDER BY depth DESC",
-    )
-    .bind(main_kb.parent_id)
-    .fetch_all(&pool)
-    .await?;
+        max_depth = common::MAX_KB_DEPTH
+    );
+    let path: Vec<Knowledge> = sqlx::query_as(ancestors_sql.as_str())
+        .bind(main_kb.parent_id)
+        .fetch_all(&pool)
+        .await?;
 
     // 4. Construct the response
     let response = KnowledgeDetailResponse {
@@ -960,7 +1005,8 @@ pub async fn get_files(
 
     let push_filters = |qb: &mut QueryBuilder<Sqlite>| {
         if !is_admin {
-            qb.push(" AND (user_id = ").push_bind(user_id.clone()).push(" OR is_public = 1)");
+            qb.push(" AND ");
+            common::push_file_access_filter(qb, &user_id, None);
         }
         if let Some(name) = filename {
             qb.push(" AND filename LIKE ").push_bind(format!("%{}%", name));
@@ -1063,7 +1109,7 @@ pub async fn get_tags(
     if include_descendants {
         qb.push("WITH RECURSIVE descendants AS (SELECT id FROM knowledge_bases WHERE id = ")
             .push_bind(id)
-            .push(" UNION ALL SELECT kb.id FROM knowledge_bases kb JOIN descendants d ON kb.parent_id = d.id");
+            .push(" UNION SELECT kb.id FROM knowledge_bases kb JOIN descendants d ON kb.parent_id = d.id");
         if !is_admin {
             qb.push(" WHERE kb.user_id = ")
                 .push_bind(user_id.clone())
@@ -1130,24 +1176,22 @@ pub async fn delete(
         return Err(ApiError::Forbidden("Permission denied. Admin role required.".to_string()));
     }
 
-    let all_kb_ids: Vec<i64> = sqlx::query_scalar(
-        r#"
-        WITH RECURSIVE kb_hierarchy AS (
-            SELECT id FROM knowledge_bases WHERE id = ?
-            UNION ALL
-            SELECT kb.id FROM knowledge_bases kb
-            INNER JOIN kb_hierarchy kh ON kb.parent_id = kh.id
-        )
-        SELECT id FROM kb_hierarchy;
-        "#,
-    )
-    .bind(id)
-    .fetch_all(&pool)
-    .await?;
+    let all_kb_ids = common::collect_kb_descendant_ids(&pool, id, false).await?;
 
     if all_kb_ids.is_empty() {
         return Err(crate::api::error::ApiError::NotFound(
             "Knowledge base not found or permission denied.".to_string(),
+        ));
+    }
+
+    // 删除会沿外键级联到整棵子树，而知识库权限**不向下继承**：父库的 admin 不等于子库的
+    // admin。因此要求对每一个后代都有 admin 权限，否则拒绝，避免越权删除他人知识库。
+    let authorized_kb_ids = common::filter_kb_ids_by_permission(&pool, &all_kb_ids, &auth_user, "admin").await;
+    if authorized_kb_ids.len() != all_kb_ids.len() {
+        let denied: Vec<i64> = all_kb_ids.iter().copied().filter(|kb| !authorized_kb_ids.contains(kb)).collect();
+        warn!("User {} lacks admin on child knowledge bases {:?} of KB {}", auth_user.user_id, denied, id);
+        return Err(ApiError::Forbidden(
+            "Permission denied on one or more child knowledge bases.".to_string(),
         ));
     }
 
@@ -1224,14 +1268,22 @@ async fn reset_reparse_scope(
     pool: &SqlitePool, search_engine: &SearchEngine, analysis_kb_ids: &[i64], unassigned_file_ids: &[i64],
     file_ids: &[i64], clear_unassigned_graph: bool,
 ) -> ApiResult<()> {
-    // 不能在解析 worker 写入切片/索引时清空同一文件，否则旧批次的失败清理可能误删新数据。
-    // 调用方可在当前解析完成后安全重试。
+    // 所有数据库改动收进一个 IMMEDIATE 事务。
+    //
+    // 解析 worker 领取文件用的是单条 CAS UPDATE（`... WHERE status = 0`），事务的写锁能保证
+    // 「确认没有在解析的文件」和「清空并重置这些文件」之间不会插进新的领取。分步执行则不然：
+    // 检查通过后 worker 领取了文件并开始写切片，这里随后把切片删掉、状态改回 0，
+    // 留下 status = 0 却已有切片/索引的脏状态，旧批次的失败清理还可能误删新数据。
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+
     if !file_ids.is_empty() {
         let mut processing_qb = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM files WHERE status = 2 AND id IN (");
         crate::db::push_i64_list(&mut processing_qb, file_ids);
         processing_qb.push(")");
-        let processing_count: i64 = processing_qb.build_query_scalar().fetch_one(pool).await?;
+        let processing_count: i64 = processing_qb.build_query_scalar().fetch_one(&mut *tx).await?;
         if processing_count > 0 {
+            // 事务随返回被丢弃并回滚：不能在解析 worker 写入切片/索引时清空同一文件。
+            // 调用方可在当前解析完成后安全重试。
             return Err(ApiError::BadRequest(format!(
                 "{} file(s) are currently being parsed; retry reparse after they finish",
                 processing_count
@@ -1246,7 +1298,7 @@ async fn reset_reparse_scope(
         refs_qb.push(") AND ref.id NOT IN (");
         crate::db::push_i64_list(&mut refs_qb, file_ids);
         refs_qb.push(")");
-        let external_refs: i64 = refs_qb.build_query_scalar().fetch_one(pool).await?;
+        let external_refs: i64 = refs_qb.build_query_scalar().fetch_one(&mut *tx).await?;
         if external_refs > 0 {
             return Err(ApiError::BadRequest(
                 "Cannot reparse an artifact source while files outside this scope still reference it".to_string(),
@@ -1254,37 +1306,39 @@ async fn reset_reparse_scope(
         }
     }
 
-    // 清理搜索索引
-    search_engine.delete_batch(None, Some(analysis_kb_ids)).await?;
-    search_engine.delete_batch(Some(unassigned_file_ids), None).await?;
-
     // 清理知识图谱数据（节点会级联删除边和提及）
     if !analysis_kb_ids.is_empty() {
         let mut del_nodes_qb = QueryBuilder::<Sqlite>::new("DELETE FROM graph_nodes WHERE kb_id IN (");
         crate::db::push_i64_list(&mut del_nodes_qb, analysis_kb_ids);
         del_nodes_qb.push(")");
-        del_nodes_qb.build().execute(pool).await?;
+        del_nodes_qb.build().execute(&mut *tx).await?;
 
         let mut del_snapshots_qb = QueryBuilder::<Sqlite>::new("DELETE FROM graph_snapshots WHERE kb_id IN (");
         crate::db::push_i64_list(&mut del_snapshots_qb, analysis_kb_ids);
         del_snapshots_qb.push(")");
-        del_snapshots_qb.build().execute(pool).await?;
+        del_snapshots_qb.build().execute(&mut *tx).await?;
     }
     if clear_unassigned_graph {
-        sqlx::query("DELETE FROM graph_nodes WHERE kb_id IS NULL").execute(pool).await?;
-        sqlx::query("DELETE FROM graph_snapshots WHERE kb_id IS NULL").execute(pool).await?;
+        sqlx::query("DELETE FROM graph_nodes WHERE kb_id IS NULL").execute(&mut *tx).await?;
+        sqlx::query("DELETE FROM graph_snapshots WHERE kb_id IS NULL").execute(&mut *tx).await?;
     }
 
     if !file_ids.is_empty() {
+        // 与 processor 的清理保持一致：先删依赖切片的行，再删切片本身，
+        // 这样无论 `PRAGMA foreign_keys` 是否开启都不会留下孤儿坐标/提及。
+        for table in ["entity_mentions", "slice_positions"] {
+            let mut del_deps_qb = QueryBuilder::<Sqlite>::new(format!(
+                "DELETE FROM {} WHERE slice_id IN (SELECT id FROM slices WHERE file_id IN (",
+                table
+            ));
+            crate::db::push_i64_list(&mut del_deps_qb, file_ids);
+            del_deps_qb.push("))");
+            del_deps_qb.build().execute(&mut *tx).await?;
+        }
         let mut del_slices_qb = QueryBuilder::<Sqlite>::new("DELETE FROM slices WHERE file_id IN (");
         crate::db::push_i64_list(&mut del_slices_qb, file_ids);
         del_slices_qb.push(")");
-        del_slices_qb.build().execute(pool).await?;
-        for file_id in file_ids {
-            if let Err(e) = crate::slice_content::delete(*file_id).await {
-                warn!("Failed to delete slice content file for knowledge base reparse file {}: {}", file_id, e);
-            }
-        }
+        del_slices_qb.build().execute(&mut *tx).await?;
 
         let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as i64;
         let mut update_qb = QueryBuilder::<Sqlite>::new(
@@ -1294,7 +1348,19 @@ async fn reset_reparse_scope(
         update_qb.push(" WHERE id IN (");
         crate::db::push_i64_list(&mut update_qb, file_ids);
         update_qb.push(")");
-        update_qb.build().execute(pool).await?;
+        update_qb.build().execute(&mut *tx).await?;
+    }
+
+    tx.commit().await?;
+
+    // 事务外做非数据库清理：搜索索引与磁盘上的切片正文都是幂等删除，
+    // 放在提交之后可以避免「索引已删、数据库回滚」的半清空状态。
+    search_engine.delete_batch(None, Some(analysis_kb_ids)).await?;
+    search_engine.delete_batch(Some(unassigned_file_ids), None).await?;
+    for file_id in file_ids {
+        if let Err(e) = crate::slice_content::delete(*file_id).await {
+            warn!("Failed to delete slice content file for knowledge base reparse file {}: {}", file_id, e);
+        }
     }
 
     Ok(())
@@ -1395,7 +1461,18 @@ pub async fn reparse_by_id(
         return Err(ApiError::Forbidden("Permission denied. Requires editor or admin.".to_string()));
     }
 
-    let analysis_kb_ids: Vec<i64> = common::collect_kb_descendant_ids(&pool, id, true).await?;
+    // 重解析会重置整棵子树文件的解析状态并重新消耗解析 / 向量化配额，
+    // 因此只对当前用户确实拥有 editor 权限的后代生效（权限不向下继承）。
+    let subtree_kb_ids = common::collect_kb_descendant_ids(&pool, id, true).await?;
+    let analysis_kb_ids = common::filter_kb_ids_by_permission(&pool, &subtree_kb_ids, &auth_user, "editor").await;
+    if analysis_kb_ids.len() != subtree_kb_ids.len() {
+        warn!(
+            "User {} reparse of KB {} skipped {} child knowledge base(s) without editor permission",
+            auth_user.user_id,
+            id,
+            subtree_kb_ids.len() - analysis_kb_ids.len()
+        );
+    }
 
     let file_ids = query_file_ids_for_kbs(&pool, &analysis_kb_ids, None).await?;
     if analysis_kb_ids.is_empty() {
@@ -1421,7 +1498,7 @@ async fn load_tree_knowledges(
                     SELECT id, name, description, kb_type, parent_id, is_public
                     FROM knowledge_bases
                     WHERE id = ?
-                    UNION ALL
+                    UNION
                     SELECT kb.id, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public
                     FROM knowledge_bases kb
                     INNER JOIN tree t ON kb.parent_id = t.id
@@ -1442,7 +1519,7 @@ async fn load_tree_knowledges(
                     SELECT id, name, description, kb_type, parent_id, is_public
                     FROM knowledge_bases
                     WHERE id = ? AND #ACCESS#
-                    UNION ALL
+                    UNION
                     SELECT kb.id, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public
                     FROM knowledge_bases kb
                     INNER JOIN tree t ON kb.parent_id = t.id
@@ -1471,7 +1548,7 @@ async fn load_tree_knowledges(
                     SELECT id, name, description, kb_type, parent_id, is_public
                     FROM knowledge_bases
                     WHERE parent_id IS NULL
-                    UNION ALL
+                    UNION
                     SELECT kb.id, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public
                     FROM knowledge_bases kb
                     INNER JOIN tree t ON kb.parent_id = t.id
@@ -1491,7 +1568,7 @@ async fn load_tree_knowledges(
                     SELECT id, name, description, kb_type, parent_id, is_public
                     FROM knowledge_bases
                     WHERE parent_id IS NULL AND #ACCESS#
-                    UNION ALL
+                    UNION
                     SELECT kb.id, kb.name, kb.description, kb.kb_type, kb.parent_id, kb.is_public
                     FROM knowledge_bases kb
                     INNER JOIN tree t ON kb.parent_id = t.id
@@ -1538,7 +1615,8 @@ async fn load_tree_files_by_kb(
     crate::db::push_i64_list(&mut qb, kb_ids);
     qb.push(")");
     if !is_admin {
-        qb.push(" AND (user_id = ").push_bind(user_id).push(" OR is_public = 1)");
+        qb.push(" AND ");
+        common::push_file_access_filter(&mut qb, user_id, None);
     }
     qb.push(" ORDER BY kb_id, filename");
 
@@ -1701,7 +1779,33 @@ pub async fn batch_export_kb(
         warn!("User {} tried to export inaccessible KBs: {:?}", auth_user.user_id, missing);
     }
 
-    let export_path = crate::export::export_knowledge_bases(&pool, &allowed_ids, req.include_children)
+    // include_children 会把整棵子树的原文、切片、向量与图谱一起导出，而知识库权限
+    // 不向下继承。这里先展开后代再逐个校验权限，只导出确实可访问的部分，
+    // 然后以 include_children=false 调用导出，避免导出层再做一次无过滤的递归。
+    let export_ids = if req.include_children {
+        let mut expanded: Vec<i64> = Vec::new();
+        for kb_id in &allowed_ids {
+            expanded.extend(common::collect_kb_descendant_ids(&pool, *kb_id, false).await?);
+        }
+        expanded.sort_unstable();
+        expanded.dedup();
+        let authorized = common::filter_kb_ids_by_permission(&pool, &expanded, &auth_user, "viewer").await;
+        if authorized.len() != expanded.len() {
+            warn!(
+                "User {} export skipped {} descendant knowledge base(s) without access",
+                auth_user.user_id,
+                expanded.len() - authorized.len()
+            );
+        }
+        authorized
+    } else {
+        allowed_ids.clone()
+    };
+    if export_ids.is_empty() {
+        return Err(ApiError::NotFound("No exportable knowledge bases after permission filtering.".to_string()));
+    }
+
+    let export_path = crate::export::export_knowledge_bases(&pool, &export_ids, false)
         .await
         .map_err(|e| ApiError::Internal(format!("Export failed: {}", e)))?;
 
