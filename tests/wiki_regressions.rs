@@ -19,7 +19,8 @@ async fn wiki_move_edit_and_partial_generation_regressions() {
     let fail = Arc::new(AtomicBool::new(true));
     let failure = fail.clone();
     let mock = Router::new().route(
-        "/chat",
+        // 后端把配置的地址统一规整成完整的 chat/completions 端点后再 POST。
+        "/chat/completions",
         post(move |Json(body): Json<Value>| {
             let fail = failure.clone();
             async move {
@@ -43,7 +44,7 @@ async fn wiki_move_edit_and_partial_generation_regressions() {
     );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     unsafe {
-        std::env::set_var("WIKI_LLM_API_URL", format!("http://{}/chat", listener.local_addr().unwrap()));
+        std::env::set_var("WIKI_LLM_API_URL", format!("http://{}/chat/completions", listener.local_addr().unwrap()));
         std::env::set_var("HTKNOW_EMBEDDING_URL", "http://127.0.0.1:9/embeddings");
     }
     let server = tokio::spawn(async move {

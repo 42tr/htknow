@@ -22,6 +22,17 @@ fn parse_events(body: &str) -> Vec<(String, Value)> {
         .collect()
 }
 
+/// 上游消息正文既可能是纯字符串，也可能是 OpenAI 的 content parts 数组（g SDK 用后者）。
+fn message_text(content: &Value) -> String {
+    if let Some(text) = content.as_str() {
+        return text.to_string();
+    }
+    content
+        .as_array()
+        .map(|parts| parts.iter().filter_map(|part| part["text"].as_str()).collect::<Vec<_>>().join(""))
+        .unwrap_or_default()
+}
+
 #[tokio::test]
 async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
     setup_env();
@@ -38,11 +49,43 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
         .route("/rerank", post(|Json(body): Json<Value>| async move {
             Json(json!(body["texts"].as_array().unwrap().iter().enumerate().map(|(index, _)| json!({"index":index,"score":0.9})).collect::<Vec<_>>()))
         }))
-        .route("/chat", post(move |Json(body): Json<Value>| {
-            captured.lock().unwrap().push(body);
+        .route("/chat/completions", post(move |Json(body): Json<Value>| {
+            captured.lock().unwrap().push(body.clone());
             let mode = mock_mode.load(Ordering::SeqCst);
             let disconnected = disconnected_mock.clone();
+            // chat 是 agent 架构：模型必须先回 OpenAI 风格的 tool_calls，knowledge_search
+            // 才会执行并发出 sources 事件；看到工具结果（role = tool）后再回正文。
+            let wants_tool = mode == 0
+                && !body["messages"].as_array().is_some_and(|messages| messages.iter().any(|m| m["role"] == "tool"));
             async move {
+                if wants_tool {
+                    let payload = json!({
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "role": "assistant",
+                                "tool_calls": [{
+                                    "index": 0,
+                                    "id": "call_1",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "knowledge_search",
+                                        "arguments": json!({"query": "propeller types"}).to_string()
+                                    }
+                                }]
+                            },
+                            "finish_reason": "tool_calls"
+                        }]
+                    });
+                    // 同样按任意字节边界分片，覆盖 SSE 跨包解析。
+                    let data = format!(": comment\r\ndata: {payload}\r\n\r\ndata: [DONE]\n\n");
+                    let chunks: Vec<_> =
+                        data.as_bytes().chunks(9).map(|v| Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(v))).collect();
+                    return Response::builder()
+                        .header("content-type", "text/event-stream")
+                        .body(Body::from_stream(futures::stream::iter(chunks)))
+                        .unwrap();
+                }
                 if mode == 1 {
                     return Response::builder().status(503).body(Body::from("private upstream error")).unwrap();
                 }
@@ -58,7 +101,13 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                 let mut data = ": comment\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"螺旋桨\"}}]}\r\n\r\ndata: {\"choices\":[{\"delta\":{\"content\":\"有两类。[1]\"}}]}\n\n".as_bytes().to_vec();
                 if mode == 0 { data.extend_from_slice(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"); }
                 // 任意字节边界分片，包括中文 UTF-8 和 SSE CRLF。
-                let chunks: Vec<_> = data.chunks(7).map(|v| Ok::<_, std::io::Error>(bytes::Bytes::copy_from_slice(v))).collect();
+                let mut chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
+                    data.chunks(7).map(|v| Ok(bytes::Bytes::copy_from_slice(v))).collect();
+                if mode == 2 {
+                    // 模拟连接中断：body 直接出错，SSE 既没有 finish_reason 也没有 [DONE]。
+                    // 单纯「干净 EOF 但缺 [DONE]」会被 SDK 当作正常收尾，测不出上游流未结束。
+                    chunks.push(Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "connection reset")));
+                }
                 Response::builder().header("content-type", "text/event-stream")
                     .body(Body::from_stream(futures::stream::iter(chunks))).unwrap()
             }
@@ -66,7 +115,8 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     unsafe {
-        std::env::set_var("LLM_API_URL", format!("http://{address}/chat"));
+        // 用文档口径的完整端点：聊天走 SDK（base + /chat/completions），图谱/Wiki 直接 POST。
+        std::env::set_var("LLM_API_URL", format!("http://{address}/chat/completions"));
         std::env::set_var("LLM_MODEL", "test-chat");
         std::env::set_var("HTKNOW_EMBEDDING_URL", format!("http://{address}/embeddings"));
         std::env::set_var("HTKNOW_EMBEDDING_DIM", "2");
@@ -152,7 +202,8 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
     let upstream = received.lock().unwrap()[0].clone();
     assert_eq!(upstream["stream"], true);
     assert_eq!(upstream["model"], "test-chat");
-    assert_eq!(upstream["messages"][1]["content"], "Tell me about propeller");
+    assert_eq!(upstream["messages"][1]["role"], "user");
+    assert_eq!(message_text(&upstream["messages"][1]["content"]), "Tell me about propeller");
     assert!(!upstream.to_string().contains("TOP_SECRET_EVIDENCE"));
 
     let before = received.lock().unwrap().len();
@@ -170,8 +221,14 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
         let text = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
         assert!(!text.contains("FPP"));
         assert!(!text.contains("TOP_SECRET_EVIDENCE"));
+        // agent 架构下工具仍会执行，但无可见来源时 sources 必须为空，不得回灌其他库的证据。
+        for (event, payload) in parse_events(&text) {
+            if event == "sources" {
+                assert!(payload["sources"].as_array().unwrap().is_empty(), "{payload}");
+            }
+        }
     }
-    assert_eq!(received.lock().unwrap().len(), before, "no accessible sources must not invoke LLM");
+    assert!(received.lock().unwrap().len() > before, "每次对话都应调用上游 LLM");
     mode.store(3, Ordering::SeqCst);
     let response = app
         .clone()

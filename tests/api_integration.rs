@@ -332,6 +332,43 @@ async fn knowledge_base_tag_stats_respect_scope_data_quality_and_permissions() {
     assert_eq!(missing_res.status(), StatusCode::NOT_FOUND);
 }
 
+/// 列表过滤回归：`name` 条件此前缺前导空格（拼出 `parent_id IS NULLAND name LIKE ?`），
+/// `id` 条件以 TEXT 绑定到 INTEGER 列（SQLite 中两者永不相等），两个筛选都会静默失效。
+#[tokio::test]
+async fn knowledge_base_list_filters_by_name_and_numeric_id() {
+    let app = app().await;
+    let pool = get_pool().await;
+    let user = TestUser::with_role("kb-filter", "user");
+    let unique = format!("filter-target-{}", next_seq());
+    let kb_id = insert_kb(&pool, &user, &unique, "analysis", None, false).await;
+
+    macro_rules! list {
+        ($query:expr) => {{
+            let req = authed_empty_request("GET", format!("/api/v1/knowledge/knowledge_base/{}", $query), &user);
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), StatusCode::OK);
+            response_json(res).await
+        }};
+    }
+
+    let by_name = list!(format!("?name={unique}"));
+    let names: Vec<&str> = by_name["items"].as_array().unwrap().iter().map(|kb| kb["name"].as_str().unwrap()).collect();
+    assert_eq!(names, vec![unique.as_str()]);
+
+    let by_id = list!(format!("?id={kb_id}"));
+    let ids: Vec<i64> = by_id["items"].as_array().unwrap().iter().map(|kb| kb["id"].as_i64().unwrap()).collect();
+    assert_eq!(ids, vec![kb_id]);
+    assert_eq!(by_id["total"].as_i64(), Some(1));
+
+    let combined = list!(format!("?id={kb_id}&name={unique}"));
+    assert_eq!(combined["items"].as_array().unwrap().len(), 1);
+
+    // 非法 id 应返回空集，而不是忽略条件把全部知识库漏出去。
+    let bogus = list!("?id=not-a-number");
+    assert!(bogus["items"].as_array().unwrap().is_empty());
+    assert_eq!(bogus["total"].as_i64(), Some(0));
+}
+
 #[tokio::test]
 async fn file_endpoints_flow() {
     let app = app().await;
@@ -360,7 +397,7 @@ async fn file_endpoints_flow() {
     .await;
 
     let slice_id = insert_slice(&pool, file_id, "slice content").await;
-    insert_slice_position(&pool, slice_id, 1, [1, 2, 3, 4]).await;
+    insert_slice_position(&pool, slice_id, 1, [1.0, 2.0, 3.0, 4.0]).await;
 
     let list_req = authed_empty_request("GET", "/api/v1/knowledge/files/", &user);
     let list_res = app.clone().oneshot(list_req).await.unwrap();
@@ -445,7 +482,8 @@ async fn slice_highlight_by_id() {
     let file_id = insert_file(&pool, &user, "highlight.txt", &file_path, Some(kb_id), Vec::new(), false).await;
 
     let slice_id = insert_slice(&pool, file_id, "slice content").await;
-    insert_slice_position(&pool, slice_id, 2, [10, 20, 100, 30]).await;
+    // 小数坐标必须原样保留：解析服务给的是浮点 bbox。
+    insert_slice_position(&pool, slice_id, 2, [10.5, 20.0, 100.0, 30.25]).await;
 
     // 查询切片高亮信息
     let highlight_req = authed_empty_request(
@@ -461,8 +499,8 @@ async fn slice_highlight_by_id() {
     assert_eq!(positions[0]["page_idx"].as_i64(), Some(2));
     let bbox = positions[0]["bbox"].as_array().expect("bbox array");
     assert_eq!(bbox.len(), 4);
-    assert_eq!(bbox[0].as_i64(), Some(10));
-    assert_eq!(bbox[3].as_i64(), Some(30));
+    assert_eq!(bbox[0].as_f64(), Some(10.5));
+    assert_eq!(bbox[3].as_f64(), Some(30.25));
 
     // 切片不属于该文件应返回 400
     let other_file_id = insert_file(&pool, &user, "other.txt", &file_path, Some(kb_id), Vec::new(), false).await;
@@ -522,9 +560,9 @@ async fn slice_highlight_page_by_id() {
     // 场景 1：第一页内容字数少于阈值（19 * 1 = 19 < 20）且存在第二页，应返回第二页
     let slice_id_a = insert_slice(&pool, file_id, "slice a").await;
     for _ in 0..19 {
-        insert_slice_position(&pool, slice_id_a, 0, [10, 20, 100, 30]).await;
+        insert_slice_position(&pool, slice_id_a, 0, [10.0, 20.0, 100.0, 30.0]).await;
     }
-    insert_slice_position(&pool, slice_id_a, 1, [10, 20, 100, 30]).await;
+    insert_slice_position(&pool, slice_id_a, 1, [10.0, 20.0, 100.0, 30.0]).await;
 
     let req_a = authed_empty_request(
         "GET",
@@ -539,9 +577,9 @@ async fn slice_highlight_page_by_id() {
     // 场景 2：第一页内容字数达到阈值（21 * 1 = 21 >= 20），应返回第一页
     let slice_id_b = insert_slice(&pool, file_id, "slice b").await;
     for _ in 0..21 {
-        insert_slice_position(&pool, slice_id_b, 0, [10, 20, 100, 30]).await;
+        insert_slice_position(&pool, slice_id_b, 0, [10.0, 20.0, 100.0, 30.0]).await;
     }
-    insert_slice_position(&pool, slice_id_b, 1, [10, 20, 100, 30]).await;
+    insert_slice_position(&pool, slice_id_b, 1, [10.0, 20.0, 100.0, 30.0]).await;
 
     let req_b = authed_empty_request(
         "GET",
@@ -555,7 +593,7 @@ async fn slice_highlight_page_by_id() {
 
     // 场景 3：只有一页且内容字数少于阈值（无 pdf_content 匹配，按位置数量兜底为 1），仍返回第一页
     let slice_id_c = insert_slice(&pool, file_id, "slice c").await;
-    insert_slice_position(&pool, slice_id_c, 2, [10, 20, 100, 30]).await;
+    insert_slice_position(&pool, slice_id_c, 2, [10.0, 20.0, 100.0, 30.0]).await;
 
     let req_c = authed_empty_request(
         "GET",

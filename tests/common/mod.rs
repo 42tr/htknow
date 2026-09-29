@@ -195,12 +195,12 @@ pub async fn insert_slice(pool: &SqlitePool, file_id: i64, content: &str) -> i64
     id
 }
 
-pub async fn insert_slice_position(pool: &SqlitePool, slice_id: i64, page_idx: i32, bbox: [i32; 4]) {
+pub async fn insert_slice_position(pool: &SqlitePool, slice_id: i64, page_idx: i32, bbox: [f32; 4]) {
     insert_slice_position_full(pool, slice_id, page_idx, bbox, None, None).await;
 }
 
 pub async fn insert_slice_position_full(
-    pool: &SqlitePool, slice_id: i64, page_idx: i32, bbox: [i32; 4], sheet_name: Option<&str>, row_num: Option<i32>,
+    pool: &SqlitePool, slice_id: i64, page_idx: i32, bbox: [f32; 4], sheet_name: Option<&str>, row_num: Option<i32>,
 ) {
     sqlx::query(
         "INSERT INTO slice_positions (slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"

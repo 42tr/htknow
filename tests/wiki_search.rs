@@ -106,13 +106,13 @@ async fn wiki_search_lifecycle_permissions_and_vectors() {
     htknow::wiki::page::add_sources(&pool, page_id, &[source_id]).await.unwrap();
     htknow::wiki::page::add_slice_refs(&pool, page_id, &[slice_id]).await.unwrap();
     assert_eq!(
-        engine.search_wiki_scoped("orbital", Some(&vec![source_id]), Some(&vec![kb])).await.unwrap()[0].0.id,
+        engine.search_wiki_scoped("orbital", Some(&vec![source_id]), Some(&vec![kb]), 10).await.unwrap()[0].0.id,
         page_id
     );
     assert!(
-        engine.search_wiki_scoped("orbital", Some(&vec![source_id + 100]), Some(&vec![kb])).await.unwrap().is_empty()
+        engine.search_wiki_scoped("orbital", Some(&vec![source_id + 100]), Some(&vec![kb]), 10).await.unwrap().is_empty()
     );
-    assert!(engine.search_wiki_scoped("orbital", Some(&vec![]), Some(&vec![kb])).await.unwrap().is_empty());
+    assert!(engine.search_wiki_scoped("orbital", Some(&vec![]), Some(&vec![kb]), 10).await.unwrap().is_empty());
 
     engine.sync_wiki_indexes().await.unwrap();
     let before = requests.load(Ordering::Relaxed);
