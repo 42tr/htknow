@@ -97,7 +97,8 @@ impl LLMGraphExtractor {
         let llm_config = &cfg.llm;
 
         let enabled = llm_config.is_enabled();
-        let api_url = llm_config.api_url.clone().unwrap_or_default();
+        // 直接 POST，因此需要完整端点；`LLM_API_URL` 填 base 时由配置层补全。
+        let api_url = llm_config.completions_url().unwrap_or_default();
         let api_key = llm_config.api_key.clone();
         let model = llm_config.model.clone();
 

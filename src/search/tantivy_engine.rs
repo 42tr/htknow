@@ -24,9 +24,36 @@ use tantivy::{
 use super::chinese_tokenizer;
 use crate::config;
 
-const ALL_TOKENIZER: &str = "all";
+/// content 字段使用的分词器名。
+///
+/// 注意：这个名字会被写进磁盘上的 schema，**不能改字符串值**，否则旧索引打开后找不到
+/// 分词器。历史上它注册的是全模式（`FastChineseTokenizer::all()`，实际走 jieba 精确切分），
+/// 与查询侧的搜索模式（`cut_for_search`，会额外产出二字/三字子词）不一致，导致
+/// 「文档里是『中华人民共和国』、查询『共和国』」这类子词完全召回不到。现在两侧统一为
+/// 搜索模式，旧索引由 [`INDEX_FORMAT_VERSION`] 触发重建。
+const CONTENT_TOKENIZER: &str = "all";
 const INDEX_WRITER_LOCK_RETRY_MAX_ATTEMPTS: usize = 8;
 const INDEX_WRITER_LOCK_RETRY_BASE_MS: u64 = 40;
+
+/// 索引格式版本。分词模式、字段或打分口径发生**不兼容**变化时递增，
+/// 启动时会把旧索引备份掉并重建（重建由 DB -> 索引的一致性检查完成）。
+///
+/// - v2：content 字段改用搜索模式分词，与查询侧对齐。
+const INDEX_FORMAT_VERSION: &str = "2";
+const INDEX_FORMAT_FILE: &str = "htknow_index_format";
+
+/// 召回过采样倍数与上限。
+///
+/// 召回深度如果等于最终返回条数，rerank / 融合阶段就只能在「已经按粗排分数选出的
+/// top-N」里重排，粗排漏掉的文档永远补不回来。因此两路召回都先多取一些。
+pub const RECALL_MULTIPLIER: usize = 5;
+pub const RECALL_MAX: usize = 200;
+
+/// 由最终条数推导召回深度。
+pub fn recall_limit(final_limit: usize) -> usize {
+    let final_limit = final_limit.max(1);
+    final_limit.saturating_mul(RECALL_MULTIPLIER).min(RECALL_MAX.max(final_limit))
+}
 
 #[derive(Debug, Clone)]
 pub struct SynonymTerm {
@@ -107,6 +134,17 @@ pub fn init_with_path(path: &str) -> Result<(Schema, Index)> {
                     backup_index_dir(path)?;
                     std::fs::create_dir_all(path)?;
                     Index::create_in_dir(path, schema.clone())?
+                } else if !index_format_is_current(path) {
+                    // 分词 / 打分口径变了，旧 segment 里的 term 与新查询对不上，只能重建。
+                    warn!(
+                        "Tantivy index at '{}' was built with an older format (expected v{}); backing up and rebuilding.",
+                        path.display(),
+                        INDEX_FORMAT_VERSION
+                    );
+                    drop(idx);
+                    backup_index_dir(path)?;
+                    std::fs::create_dir_all(path)?;
+                    Index::create_in_dir(path, schema.clone())?
                 } else {
                     idx
                 }
@@ -132,11 +170,23 @@ pub fn init_with_path(path: &str) -> Result<(Schema, Index)> {
     register_tokenizers(&index);
     info!("Tantivy init substep: register_tokenizers() took {}ms", t2.elapsed().as_millis());
 
+    if let Err(err) = write_index_format_marker(path) {
+        warn!("Failed to write Tantivy index format marker at '{}': {}", path.display(), err);
+    }
+
     Ok((schema, index))
 }
 
 fn schema_has_is_image(schema: Schema) -> bool {
     schema.get_field("is_image").is_ok()
+}
+
+fn index_format_is_current(path: &Path) -> bool {
+    std::fs::read_to_string(path.join(INDEX_FORMAT_FILE)).is_ok_and(|version| version.trim() == INDEX_FORMAT_VERSION)
+}
+
+fn write_index_format_marker(path: &Path) -> std::io::Result<()> {
+    std::fs::write(path.join(INDEX_FORMAT_FILE), INDEX_FORMAT_VERSION)
 }
 
 fn backup_index_dir(path: &Path) -> std::io::Result<()> {
@@ -476,7 +526,8 @@ pub fn search_sync(
         kb_ids,
         filter_is_image,
         synonym_map,
-        config::get().search.limit,
+        // 召回深度 > 最终条数，给融合与 rerank 留出重排空间；调用方负责截断到 search.limit。
+        recall_limit(config::get().search.limit),
     )
 }
 
@@ -569,9 +620,12 @@ fn build_query(
     // content 至少命中一个
     let mut content_queries = Vec::new();
     for query_term in query_terms {
+        // 必须用 WithFreqs：tantivy 在 Basic 下会把词频钉成 1，BM25 退化为纯 IDF，
+        // 词在切片里出现多次也不再加分。索引本身按 WithFreqsAndPositions 建，读取词频无额外成本。
+        // 过滤字段（file_id / kb_id / is_image）不参与打分，继续用 Basic。
         let tq = TermQuery::new(
             Term::from_field_text(get_field(schema, "content"), query_term.term.as_str()),
-            IndexRecordOption::Basic,
+            IndexRecordOption::WithFreqs,
         );
         if (query_term.boost - 1.0).abs() > f32::EPSILON {
             content_queries
@@ -644,8 +698,9 @@ fn perform_segmentation(text: &str, mode: chinese_tokenizer::SegmentationMode) -
 }
 
 fn register_tokenizers(index: &Index) {
-    let all_tokenizer = chinese_tokenizer::FastChineseTokenizer::all();
-    index.tokenizers().register(ALL_TOKENIZER, all_tokenizer);
+    // 索引侧必须与查询侧（`build_query_terms` 用 Search 模式）保持一致，否则子词召回不到。
+    let content_tokenizer = chinese_tokenizer::FastChineseTokenizer::new(chinese_tokenizer::SegmentationMode::Search);
+    index.tokenizers().register(CONTENT_TOKENIZER, content_tokenizer);
 }
 
 fn build_schema() -> Schema {
@@ -658,7 +713,7 @@ fn build_schema() -> Schema {
     let text_options = TextOptions::default()
         .set_indexing_options(
             TextFieldIndexing::default()
-                .set_tokenizer(ALL_TOKENIZER)
+                .set_tokenizer(CONTENT_TOKENIZER)
                 .set_index_option(IndexRecordOption::WithFreqsAndPositions),
         )
         .set_stored();

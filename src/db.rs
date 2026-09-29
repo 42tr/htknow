@@ -6,7 +6,7 @@ use std::{
 };
 
 use anyhow::Context;
-use log::info;
+use log::{info, warn};
 use sqlx::{
     QueryBuilder, Row, Sqlite, SqlitePool,
     sqlite::{SqliteConnectOptions, SqlitePoolOptions, SqliteSynchronous},
@@ -102,6 +102,21 @@ pub async fn init() -> anyhow::Result<SqlitePool> {
     Ok(pool)
 }
 
+/// `schema_migrations` 版本号分段。
+///
+/// 各子系统历史上都在自己的最大版本号上 +1，很容易撞号（撞号会让迁移被静默跳过）。
+/// 已用：核心 1-4、图谱 5、Wiki 6-10。新增迁移请按下面的区间取号：
+/// - `11..=49`   核心库（本文件）
+/// - `50..=79`   知识图谱（`graph::graph_manager`）
+/// - `80..=99`   Wiki（`wiki::migrate`）
+/// - `100..`     新子系统
+pub mod migration_version {
+    pub const CORE_RANGE: std::ops::RangeInclusive<i64> = 11..=49;
+    pub const GRAPH_RANGE: std::ops::RangeInclusive<i64> = 50..=79;
+    pub const WIKI_RANGE: std::ops::RangeInclusive<i64> = 80..=99;
+    pub const FILE_IMAGES_BACKFILL: i64 = 11;
+}
+
 /// 对已有数据库执行只增不减的版本化迁移。
 ///
 /// `init.sql` 只负责全新数据库；已有表不会因为 `CREATE TABLE IF NOT EXISTS`
@@ -132,6 +147,7 @@ async fn run_schema_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
         run_parse_artifact_migration(pool).await?;
         run_image_description_migration(pool).await?;
         run_file_summary_migration(pool).await?;
+        run_file_images_migration(pool).await?;
         return Ok(());
     }
 
@@ -161,6 +177,7 @@ async fn run_schema_migrations(pool: &SqlitePool) -> anyhow::Result<()> {
     run_parse_artifact_migration(pool).await?;
     run_image_description_migration(pool).await?;
     run_file_summary_migration(pool).await?;
+    run_file_images_migration(pool).await?;
     Ok(())
 }
 
@@ -246,6 +263,62 @@ async fn run_image_description_migration(pool: &SqlitePool) -> anyhow::Result<()
     .await?;
     tx.commit().await?;
     info!("Applied schema migration {}: image_descriptions_and_slice_is_image", VERSION);
+    Ok(())
+}
+
+/// 回填 `file_images`（图片 -> 归属文件）索引。
+///
+/// `/api/v1/knowledge/files/images/{filename}` 是全局路由，只能靠这张表判断图片属于哪个
+/// 文件，从而复用文件级 / 知识库级权限。表结构由 `init.sql` 建好，这里只负责一次性回填
+/// 历史数据；解析流程会在每次解析成功后调用 `api::file::sync_file_images` 增量维护。
+async fn run_file_images_migration(pool: &SqlitePool) -> anyhow::Result<()> {
+    const VERSION: i64 = migration_version::FILE_IMAGES_BACKFILL;
+    const CHUNK: i64 = 50;
+
+    let mut tx = pool.begin().await?;
+    let claimed = sqlx::query("INSERT OR IGNORE INTO schema_migrations(version, name) VALUES (?, ?)")
+        .bind(VERSION)
+        .bind("file_images_backfill")
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+    if claimed == 0 {
+        tx.rollback().await?;
+        return Ok(());
+    }
+    tx.commit().await?;
+
+    let file_ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM files WHERE status = 1 ORDER BY id")
+        .fetch_all(pool)
+        .await?;
+    let mut indexed = 0usize;
+    for chunk in file_ids.chunks(CHUNK as usize) {
+        let by_file = match crate::api::collect_image_raw_paths_by_file(pool, chunk).await {
+            Ok(by_file) => by_file,
+            Err(err) => {
+                warn!("file_images backfill: failed to collect image paths, skipping chunk: {}", err);
+                continue;
+            }
+        };
+        for (file_id, paths) in by_file {
+            let mut seen = std::collections::HashSet::new();
+            for path in paths {
+                let name = path.trim().replace('\\', "/");
+                let Some(name) = name.rsplit('/').next().filter(|n| !n.is_empty()) else { continue };
+                if !seen.insert(name.to_string()) {
+                    continue;
+                }
+                sqlx::query("INSERT OR IGNORE INTO file_images(file_id, image_name, image_path) VALUES (?, ?, ?)")
+                    .bind(file_id)
+                    .bind(name)
+                    .bind(path.trim())
+                    .execute(pool)
+                    .await?;
+                indexed += 1;
+            }
+        }
+    }
+    info!("Applied schema migration {VERSION}: file_images_backfill, {indexed} image(s) indexed");
     Ok(())
 }
 

@@ -283,8 +283,9 @@ struct CustomSlice {
 struct ContentItem {
     #[serde(default, rename = "type")]
     typ: String,
+    /// 解析服务给的是浮点坐标（PDF 点或归一化值），用整型接会让整份响应反序列化失败。
     #[serde(default)]
-    bbox: Vec<i32>,
+    bbox: Vec<f32>,
     #[serde(default)]
     page_idx: i32,
     #[serde(default)]
@@ -303,21 +304,46 @@ struct ContentItem {
     table_caption: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct SlicePosition {
     page_idx: i32,
-    bbox: [i32; 4],
+    /// 浮点坐标：既支持绝对 PDF 点，也支持解析服务给出的归一化小数。
+    bbox: [f32; 4],
     #[serde(default)]
     sheet_name: Option<String>,
     #[serde(default)]
     row_num: Option<i32>,
 }
 
+// f32 没有 Eq/Hash，但 `positions_for_range` 要用 HashSet 去重同一批位置。
+// 按位模式比较：这些值都来自同一次解析结果，位相同即语义相同。
+impl PartialEq for SlicePosition {
+    fn eq(&self, other: &Self) -> bool {
+        self.page_idx == other.page_idx
+            && self.sheet_name == other.sheet_name
+            && self.row_num == other.row_num
+            && self.bbox.iter().zip(other.bbox.iter()).all(|(a, b)| a.to_bits() == b.to_bits())
+    }
+}
+
+impl Eq for SlicePosition {}
+
+impl std::hash::Hash for SlicePosition {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        self.page_idx.hash(state);
+        for value in &self.bbox {
+            value.to_bits().hash(state);
+        }
+        self.sheet_name.hash(state);
+        self.row_num.hash(state);
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct RawSlicePosition {
     page_idx: i32,
     #[serde(default)]
-    bbox: Vec<i32>,
+    bbox: Vec<f32>,
     #[serde(default)]
     sheet_name: Option<String>,
     #[serde(default)]
@@ -373,10 +399,10 @@ struct SliceRow {
 struct SlicePositionRecord {
     slice_id: i64,
     page_idx: i32,
-    x1: i32,
-    y1: i32,
-    x2: i32,
-    y2: i32,
+    x1: f32,
+    y1: f32,
+    x2: f32,
+    y2: f32,
     sheet_name: Option<String>,
     row_num: Option<i32>,
 }
@@ -901,10 +927,17 @@ impl FileProcessor {
         }
 
         let mut claimed_total = 0usize;
+        let mut failures: Vec<String> = Vec::new();
         for handle in handles {
-            let worker_claimed = handle.await.map_err(|e| anyhow::anyhow!("pending worker join failed: {}", e))??;
-            claimed_total += worker_claimed;
+            // 必须把每个 worker 都 join 完：中途 `?` 返回会丢下仍在运行的 handle，
+            // 它们继续领取文件却再也没人等待/汇报，下一轮又 spawn 一批，worker 数量无界增长。
+            match handle.await {
+                Ok(Ok(worker_claimed)) => claimed_total += worker_claimed,
+                Ok(Err(error)) => failures.push(error.to_string()),
+                Err(error) => failures.push(format!("pending worker join failed: {}", error)),
+            }
         }
+        anyhow::ensure!(failures.is_empty(), "{} pending worker(s) failed: {}", failures.len(), failures.join("; "));
 
         Ok(claimed_total > 0)
     }
@@ -926,10 +959,14 @@ impl FileProcessor {
 
             if let Err(e) = self.process_file_claimed(&file).await {
                 error!("Failed to process file {}: {}", file.id, e);
-                if let Err(cleanup_err) = self.cleanup_processing_file_data_with_retry(file.id, 3).await {
-                    error!("Failed to cleanup processing data for file {}: {}", file.id, cleanup_err);
+                if self.owns_parse_run(&file).await? {
+                    if let Err(cleanup_err) = self.cleanup_processing_file_data_with_retry(file.id, 3).await {
+                        error!("Failed to cleanup processing data for file {}: {}", file.id, cleanup_err);
+                    }
+                    self.mark_file_failed(&file, &e.to_string()).await?;
+                } else {
+                    warn!("File {} was re-claimed or reset mid-parse; skipping stale failure cleanup", file.id);
                 }
-                self.mark_file_failed(file.id, &e.to_string()).await?;
             } else {
                 info!("Successfully processed file {}", file.id);
             }
@@ -1872,7 +1909,7 @@ impl FileProcessor {
 
                     let positions = vec![SlicePosition {
                         page_idx: sheet_idx as i32,
-                        bbox: [0, 0, 0, 0],
+                        bbox: [0.0; 4],
                         sheet_name: Some(sheet_name.clone()),
                         row_num: Some((row_idx + 1) as i32),
                     }];
@@ -1979,7 +2016,7 @@ impl FileProcessor {
                         let bbox = row
                             .bbox
                             .as_ref()
-                            .and_then(|bbox| serde_json::from_str::<Vec<i32>>(bbox).ok())
+                            .and_then(|bbox| serde_json::from_str::<Vec<f32>>(bbox).ok())
                             .unwrap_or_default();
 
                         ContentItem {
@@ -2229,6 +2266,14 @@ impl FileProcessor {
 
         let content_list = serde_json::to_string(&merged_items)?;
         Ok(Result { content_list, images: merged_images })
+    }
+
+    /// 维护「图片 -> 归属文件」索引，供 `/files/images/{filename}` 做权限判定。
+    /// 失败只告警：索引缺失最多导致该图片暂时不可访问，不应该让整个解析失败。
+    async fn sync_file_images(&self, file_id: i64) {
+        if let Err(err) = crate::api::sync_file_images(&self.pool, file_id).await {
+            warn!("Failed to sync file_images for file {}: {}", file_id, err);
+        }
     }
 
     fn prefix_image_path(img_path: &str, prefix: &str) -> String {
@@ -2596,10 +2641,36 @@ impl FileProcessor {
         self.finish_file_processing(file, wrapped, embeddings, &content, log_message, None, timing).await
     }
 
-    /// 标记文件处理失败
-    async fn mark_file_failed(&self, file_id: i64, error_msg: &str) -> anyhow::Result<()> {
-        let sql = "UPDATE files SET status = -1, parse_run_id = NULL, log = ?, updated_at = strftime('%s','now') WHERE id = ?";
-        sqlx::query(sql).bind(error_msg).bind(file_id).execute(&self.pool).await?;
+    /// 本轮解析是否仍然持有该文件。
+    ///
+    /// 失败清理发生在解析之后，期间用户可能已经重新解析、后台 worker 可能已经重新领取，
+    /// 此时文件属于新一轮运行，旧运行不该再动它的数据。
+    async fn owns_parse_run(&self, file: &File) -> anyhow::Result<bool> {
+        let Some(parse_run_id) = file.parse_run_id.as_deref() else { return Ok(false) };
+        let owned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM files WHERE id = ? AND status = 2 AND parse_run_id = ?)",
+        )
+        .bind(file.id)
+        .bind(parse_run_id)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(owned)
+    }
+
+    /// 标记文件处理失败。带 `parse_run_id` 守卫：只有本轮仍然是持有者时才写回失败状态，
+    /// 否则会把新一轮运行刚写入的状态覆盖成失败（配合前面的清理还会删掉新数据）。
+    async fn mark_file_failed(&self, file: &File, error_msg: &str) -> anyhow::Result<()> {
+        let Some(parse_run_id) = file.parse_run_id.as_deref() else {
+            warn!("File {} carries no parse_run_id; refusing to mark it failed", file.id);
+            return Ok(());
+        };
+        let sql = "UPDATE files SET status = -1, parse_run_id = NULL, log = ?, updated_at = strftime('%s','now') \
+                   WHERE id = ? AND status = 2 AND parse_run_id = ?";
+        let updated =
+            sqlx::query(sql).bind(error_msg).bind(file.id).bind(parse_run_id).execute(&self.pool).await?.rows_affected();
+        if updated == 0 {
+            warn!("File {} is no longer owned by parse run {}; skipping failure mark", file.id, parse_run_id);
+        }
         Ok(())
     }
 
@@ -2689,6 +2760,7 @@ impl FileProcessor {
 
         info!("File {} processed successfully with {} slices", file.id, slice_count);
 
+        self.sync_file_images(file.id).await;
         self.search_engine.reload_readers()?;
 
         timed_step_opt(timing.as_deref_mut(), "build_knowledge_graph", async {
@@ -3308,6 +3380,7 @@ impl FileProcessor {
             .execute(&self.pool)
             .await?;
             crate::file_content::write(target.id, &indexed_content).await?;
+            self.sync_file_images(target.id).await;
             let mut updated_file = target.clone();
             updated_file.artifact_id = Some(artifact_id);
             updated_file.content = Some(indexed_content);
@@ -3383,6 +3456,7 @@ impl FileProcessor {
         .execute(&self.pool)
         .await?;
         crate::file_content::write(target.id, &full_content).await?;
+        self.sync_file_images(target.id).await;
 
         let mut updated_file = target.clone();
         updated_file.content = Some(full_content.clone());
@@ -3414,7 +3488,9 @@ impl FileProcessor {
         let chunk_size = 400;
         for chunk in slice_ids.chunks(chunk_size) {
             let mut qb = QueryBuilder::<Sqlite>::new(
-                "SELECT slice_id, page_idx, x1, y1, x2, y2, sheet_name, row_num FROM slice_positions WHERE slice_id IN (",
+                "SELECT slice_id, page_idx, CAST(x1 AS REAL) AS x1, CAST(y1 AS REAL) AS y1, \
+                 CAST(x2 AS REAL) AS x2, CAST(y2 AS REAL) AS y2, sheet_name, row_num \
+                 FROM slice_positions WHERE slice_id IN (",
             );
             let mut separated = qb.separated(", ");
             for slice_id in chunk {
@@ -3788,10 +3864,14 @@ pub async fn process_file_immediate(pool: SqlitePool, search_engine: SearchEngin
     };
     let result = processor.process_file_claimed(&file).await;
     if let Err(err) = &result {
-        if let Err(cleanup_err) = processor.cleanup_processing_file_data_with_retry(file_id, 3).await {
-            error!("Failed to cleanup immediate parse data for file {}: {}", file_id, cleanup_err);
+        if processor.owns_parse_run(&file).await? {
+            if let Err(cleanup_err) = processor.cleanup_processing_file_data_with_retry(file_id, 3).await {
+                error!("Failed to cleanup immediate parse data for file {}: {}", file_id, cleanup_err);
+            }
+            processor.mark_file_failed(&file, &err.to_string()).await?;
+        } else {
+            warn!("File {} was re-claimed or reset mid-parse; skipping stale failure cleanup", file_id);
         }
-        processor.mark_file_failed(file_id, &err.to_string()).await?;
     }
     result
 }
@@ -3809,10 +3889,14 @@ pub async fn process_file_immediate_skip_reuse(
     };
     let result = processor.process_file_claimed_skip_reuse(&file).await;
     if let Err(err) = &result {
-        if let Err(cleanup_err) = processor.cleanup_processing_file_data_with_retry(file_id, 3).await {
-            error!("Failed to cleanup immediate parse data for file {}: {}", file_id, cleanup_err);
+        if processor.owns_parse_run(&file).await? {
+            if let Err(cleanup_err) = processor.cleanup_processing_file_data_with_retry(file_id, 3).await {
+                error!("Failed to cleanup immediate parse data for file {}: {}", file_id, cleanup_err);
+            }
+            processor.mark_file_failed(&file, &err.to_string()).await?;
+        } else {
+            warn!("File {} was re-claimed or reset mid-parse; skipping stale failure cleanup", file_id);
         }
-        processor.mark_file_failed(file_id, &err.to_string()).await?;
     }
     result
 }
@@ -3896,7 +3980,7 @@ mod tests {
     fn image_content_item(img_path: &str) -> ContentItem {
         ContentItem {
             typ: "image".to_string(),
-            bbox: vec![1, 2, 3, 4],
+            bbox: vec![1.0, 2.0, 3.0, 4.0],
             page_idx: 0,
             text: None,
             text_level: None,

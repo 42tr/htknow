@@ -99,6 +99,9 @@ async fn run_cycle(pool: SqlitePool) -> Result<usize> {
         return Ok(0);
     }
 
+    // 认领即开始计时，批次跑完前必须周期性续约，否则长任务会被当成残留抢走。
+    let heartbeat = spawn_claim_heartbeat(pool.clone(), run_id.clone());
+
     let permits = KbPermits::new(cfg.wiki.max_inflight_per_kb);
     let concurrency = cfg.wiki.batch_size.max(1);
     // 逐个构造拥有所有权的 future：闭包 + 借用捕获会让 spawn 链路的 Send 证明
@@ -108,6 +111,7 @@ async fn run_cycle(pool: SqlitePool) -> Result<usize> {
         pending.push(run_one(pool.clone(), permits.clone(), task));
     }
     let outcomes: Vec<(WikiTask, Result<()>)> = stream::iter(pending).buffer_unordered(concurrency).collect().await;
+    heartbeat.abort();
 
     let mut processed = 0usize;
     for (task, result) in outcomes {
@@ -135,6 +139,24 @@ async fn run_one(pool: SqlitePool, permits: KbPermits, task: WikiTask) -> (WikiT
         return (task, Err(anyhow!("wiki kb permit semaphore closed")));
     };
     dispatch(pool, task).await
+}
+
+/// 批次执行期间周期性续约 `claimed_at`，返回的 handle 由调用方在批次结束时 abort。
+///
+/// 间隔取 `claim_stale_secs / 3`：一次续约失败（例如数据库忙）也还有两次机会补上。
+/// 本批全部落地后 `renew_claims` 返回 0，任务自行退出，不会留下常驻协程。
+fn spawn_claim_heartbeat(pool: SqlitePool, run_id: String) -> tokio::task::JoinHandle<()> {
+    let interval = Duration::from_secs((crate::config::get().wiki.claim_stale_secs / 3).clamp(10, 600));
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(interval).await;
+            match queue::renew_claims(&pool, &run_id).await {
+                Ok(0) => break,
+                Ok(renewed) => debug!("wiki queue: renewed {} claimed tasks for run {}", renewed, run_id),
+                Err(error) => warn!("wiki queue: failed to renew claims for run {}: {}", run_id, error),
+            }
+        }
+    })
 }
 
 /// 只有在确实存在 claimed 行时才发起复位写入，避免每轮空转都产生一次写事务。

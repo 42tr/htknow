@@ -309,7 +309,7 @@ async fn collect_kb_ids(pool: &SqlitePool, root_kb_ids: &[i64], include_children
                 r#"
                 WITH RECURSIVE descendants AS (
                     SELECT id FROM knowledge_bases WHERE id = ?
-                    UNION ALL
+                    UNION
                     SELECT kb.id FROM knowledge_bases kb
                     INNER JOIN descendants d ON kb.parent_id = d.id
                 )
@@ -828,8 +828,10 @@ async fn export_slice_positions(src_pool: &SqlitePool, dst_pool: &SqlitePool) ->
     let mappings: Vec<(i64, i64)> =
         sqlx::query_as("SELECT source_slice_id, export_slice_id FROM export_slice_id_map").fetch_all(dst_pool).await?;
     for (source_slice_id, export_slice_id) in mappings {
+        // 坐标列在新库为 REAL、老库为 INTEGER，统一 CAST 成 REAL 读取以兼容两种声明。
         let rows = sqlx::query(
-            "SELECT page_idx, x1, y1, x2, y2, sheet_name, row_num, created_at \
+            "SELECT page_idx, CAST(x1 AS REAL) AS x1, CAST(y1 AS REAL) AS y1, \
+             CAST(x2 AS REAL) AS x2, CAST(y2 AS REAL) AS y2, sheet_name, row_num, created_at \
              FROM slice_positions WHERE slice_id = ? ORDER BY id",
         )
         .bind(source_slice_id)
@@ -842,10 +844,10 @@ async fn export_slice_positions(src_pool: &SqlitePool, dst_pool: &SqlitePool) ->
             )
             .bind(export_slice_id)
             .bind(row.get::<i32, _>("page_idx"))
-            .bind(row.get::<i32, _>("x1"))
-            .bind(row.get::<i32, _>("y1"))
-            .bind(row.get::<i32, _>("x2"))
-            .bind(row.get::<i32, _>("y2"))
+            .bind(row.get::<f32, _>("x1"))
+            .bind(row.get::<f32, _>("y1"))
+            .bind(row.get::<f32, _>("x2"))
+            .bind(row.get::<f32, _>("y2"))
             .bind(row.get::<Option<String>, _>("sheet_name"))
             .bind(row.get::<Option<i32>, _>("row_num"))
             .bind(row.get::<i64, _>("created_at"))

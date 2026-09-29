@@ -214,6 +214,31 @@ pub struct SearchEngine {
     lancedb_recreated: bool,
 }
 
+/// RRF（Reciprocal Rank Fusion）的平滑常数，取业界常用的 60。
+const RRF_K: f32 = 60.0;
+
+/// 用 RRF 融合多路召回结果。
+///
+/// BM25 与余弦相似度的分数量纲不可比：BM25 常见 5~40，而 `distance_to_score` 归一化后
+/// 落在 (0, 1]。逐条取 max 会让**纯向量召回**的结果永远沉底，rerank 服务不可用时
+/// 语义检索等于失效。RRF 只用名次不用分值，天然无量纲，也与 `merge_wiki_results`
+/// 的 1/(1+rank) 口径一致；同时出现在多路里的文档会累加得分，得到应有的提升。
+fn fuse_by_rrf(lists: Vec<Vec<SearchResultItem>>) -> Vec<SearchResultItem> {
+    let mut fused: HashMap<i64, (SearchResultItem, f32)> = HashMap::new();
+    for list in lists {
+        // 先过滤空内容再编号，保证名次是连续的。
+        let candidates = list.into_iter().filter(|item| !item.content.trim().is_empty());
+        for (rank, result) in candidates.enumerate() {
+            let contribution = 1.0 / (RRF_K + rank as f32 + 1.0);
+            fused.entry(result.id).and_modify(|(_, score)| *score += contribution).or_insert((result, contribution));
+        }
+    }
+    let mut merged: Vec<SearchResultItem> =
+        fused.into_values().map(|(mut item, score)| { item.score = score; item }).collect();
+    merged.sort_by(|a, b| b.score.total_cmp(&a.score));
+    merged
+}
+
 impl SearchEngine {
     pub async fn init() -> Self {
         let t0 = Instant::now();
@@ -1045,37 +1070,8 @@ impl SearchEngine {
             }
         };
 
-        // 合并结果：使用 HashMap 按 id 去重，保留最高分数，同时去除内容为空的结果
-        let mut merged_map: HashMap<i64, SearchResultItem> = HashMap::new();
-
-        for result in tantivy_results {
-            // 跳过空内容（包括仅有空白的情况）
-            if result.content.trim().is_empty() {
-                continue;
-            }
-            merged_map.insert(result.id, result);
-        }
-
-        for result in lancedb_results {
-            // 跳过空内容（包括仅有空白的情况）
-            if result.content.trim().is_empty() {
-                continue;
-            }
-
-            merged_map
-                .entry(result.id)
-                .and_modify(|e| {
-                    // 如果已存在，取两者中分数较高的
-                    if result.score > e.score {
-                        *e = result.clone();
-                    }
-                })
-                .or_insert(result);
-        }
-
-        // 转换为 Vec 并按分数降序排序
-        let mut merged_results: Vec<SearchResultItem> = merged_map.into_values().collect();
-        merged_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        // 融合两路召回（去掉空内容），分数统一为 RRF 名次分。
+        let merged_results = fuse_by_rrf(vec![tantivy_results, lancedb_results]);
 
         info!("Merged results count: {}", merged_results.len());
 
@@ -1173,29 +1169,7 @@ impl SearchEngine {
             }
         };
 
-        let mut merged_map: HashMap<i64, SearchResultItem> = HashMap::new();
-        for result in tantivy_results {
-            if result.content.trim().is_empty() {
-                continue;
-            }
-            merged_map.insert(result.id, result);
-        }
-        for result in lancedb_results {
-            if result.content.trim().is_empty() {
-                continue;
-            }
-            merged_map
-                .entry(result.id)
-                .and_modify(|e| {
-                    if result.score > e.score {
-                        *e = result.clone();
-                    }
-                })
-                .or_insert(result);
-        }
-
-        let mut merged_results: Vec<SearchResultItem> = merged_map.into_values().collect();
-        merged_results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        let merged_results = fuse_by_rrf(vec![tantivy_results, lancedb_results]);
         info!("Image-by-text merged results count: {}", merged_results.len());
 
         if merged_results.is_empty() {

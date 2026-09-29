@@ -391,10 +391,12 @@ pub async fn search(
     }
 
     let execute_start = std::time::Instant::now();
-    let mut result_stream = query_builder.limit(cfg.search.limit).execute().await?;
+    // 召回深度 > 最终条数：与关键词分支保持一致，给融合 / rerank 留出重排空间。
+    let recall = crate::search::tantivy_engine::recall_limit(cfg.search.limit);
+    let mut result_stream = query_builder.limit(recall).execute().await?;
     debug!("LanceDB execute {}ms fast_search={}", execute_start.elapsed().as_millis(), fast_search);
 
-    let mut search_results = Vec::with_capacity(cfg.search.limit);
+    let mut search_results = Vec::with_capacity(recall);
 
     // 从 stream 中读取数据
     let stream_start = std::time::Instant::now();
@@ -451,8 +453,10 @@ pub async fn search_image_by_text(
         query_builder = query_builder.only_if(filter_conditions.join(" AND "));
     }
 
-    let mut result_stream = query_builder.limit(cfg.search.limit).execute().await?;
-    let mut search_results = Vec::with_capacity(cfg.search.limit);
+    // 召回深度 > 最终条数：与关键词分支保持一致，给融合 / rerank 留出重排空间。
+    let recall = crate::search::tantivy_engine::recall_limit(cfg.search.limit);
+    let mut result_stream = query_builder.limit(recall).execute().await?;
+    let mut search_results = Vec::with_capacity(recall);
     while let Some(batch_result) = result_stream.next().await {
         let batch = batch_result?;
         decode_search_batch(&batch, &mut search_results)?;
@@ -490,9 +494,11 @@ pub async fn search_image(
         query_builder = query_builder.only_if(filter_conditions.join(" AND "));
     }
 
-    let mut result_stream = query_builder.limit(cfg.search.limit).execute().await?;
+    // 召回深度 > 最终条数：与关键词分支保持一致，给融合 / rerank 留出重排空间。
+    let recall = crate::search::tantivy_engine::recall_limit(cfg.search.limit);
+    let mut result_stream = query_builder.limit(recall).execute().await?;
 
-    let mut search_results = Vec::with_capacity(cfg.search.limit);
+    let mut search_results = Vec::with_capacity(recall);
     while let Some(batch_result) = result_stream.next().await {
         let batch = batch_result?;
         decode_search_batch(&batch, &mut search_results)?;

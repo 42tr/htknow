@@ -65,7 +65,18 @@ CREATE TABLE IF NOT EXISTS image_descriptions (
     UNIQUE(file_id, image_filename)
 );
 CREATE INDEX IF NOT EXISTS idx_image_descriptions_file_id ON image_descriptions(file_id);
+
 CREATE INDEX IF NOT EXISTS idx_image_descriptions_file_filename ON image_descriptions(file_id, image_filename);
+
+-- 图片归属索引：/files/images/{filename} 是全局路由，需要据此复用文件/知识库级权限
+CREATE TABLE IF NOT EXISTS file_images (
+    file_id INTEGER NOT NULL,
+    image_name TEXT NOT NULL,
+    image_path TEXT NOT NULL DEFAULT '',
+    created_at INTEGER DEFAULT (strftime('%s','now')),
+    PRIMARY KEY (file_id, image_name)
+);
+CREATE INDEX IF NOT EXISTS idx_file_images_image_name ON file_images(image_name);
 
 CREATE TABLE IF NOT EXISTS parse_artifacts (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -86,10 +97,12 @@ CREATE TABLE IF NOT EXISTS slice_positions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     slice_id INTEGER NOT NULL, -- 切片ID
     page_idx INTEGER NOT NULL, -- 所在页码（Excel 中表示 sheet 索引）
-    x1 INTEGER NOT NULL,
-    y1 INTEGER NOT NULL,
-    x2 INTEGER NOT NULL,
-    y2 INTEGER NOT NULL,
+    -- 坐标可能是绝对 PDF 点、千分比归一化值或 0..1 归一化值，必须保留小数。
+    -- 老库里这四列仍是 INTEGER（SQLite 不做类型迁移），读取端统一用 CAST(col AS REAL) 兼容两种声明。
+    x1 REAL NOT NULL,
+    y1 REAL NOT NULL,
+    x2 REAL NOT NULL,
+    y2 REAL NOT NULL,
     sheet_name TEXT DEFAULT NULL, -- Excel 中所在 sheet 名称
     row_num INTEGER DEFAULT NULL, -- Excel 中所在行号（1-based）
     created_at INTEGER DEFAULT (strftime('%s','now')),

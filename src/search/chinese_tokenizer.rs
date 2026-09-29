@@ -5,7 +5,7 @@ use std::{collections::HashSet, sync::RwLock};
 use anyhow::anyhow;
 use jieba_rs::{Jieba, TokenizeMode};
 use lazy_static::lazy_static;
-use log::info;
+use log::{debug, info};
 use tantivy::tokenizer::{Token, TokenStream, Tokenizer};
 
 #[derive(Debug, Clone)]
@@ -59,7 +59,11 @@ pub enum SegmentationMode {
     /// 搜索模式：适合搜索引擎（召回率高但较慢）
     #[default]
     Search,
-    /// 全模式：速度较慢，但能识别更多的词汇
+    /// 全模式：速度较慢，但能识别更多的词汇。
+    ///
+    /// 索引与查询现已统一为搜索模式（见 `tantivy_engine::register_tokenizers`），
+    /// 该变体暂时无人构造，保留以便后续做召回口径对比实验。
+    #[allow(dead_code)]
     All,
 }
 
@@ -75,6 +79,7 @@ impl FastChineseTokenizer {
         FastChineseTokenizer { mode }
     }
     /// 创建全模式分词器
+    #[allow(dead_code)]
     pub fn all() -> Self {
         Self::new(SegmentationMode::All)
     }
@@ -82,7 +87,7 @@ impl FastChineseTokenizer {
     /// 执行分词
     pub fn segment(&self, text: &str) -> Vec<String> {
         let jieba = JIEBA.read().unwrap_or_else(|e| e.into_inner());
-        let words = match self.mode {
+        let words: Vec<String> = match self.mode {
             SegmentationMode::Search => {
                 // 搜索模式：使用 cut_for_search，召回率高
                 jieba
@@ -105,7 +110,8 @@ impl FastChineseTokenizer {
                 .map(|s| s.to_string())
                 .collect(),
         };
-        info!("Segmented mode: {:?}, text: {}, words: {:?}", self.mode, text, words);
+        // 每次检索都会走到这里：不要把完整查询文本打进 INFO（既是日志膨胀，也是隐私面）。
+        debug!("Segmented mode: {:?}, terms: {}, text_len: {}", self.mode, words.len(), text.chars().count());
         words
     }
 

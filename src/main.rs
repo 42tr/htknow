@@ -25,6 +25,11 @@ async fn main() -> anyhow::Result<()> {
     // 加载配置
     let cfg = config::get();
     log::info!("Configuration loaded: server={}:{}", cfg.server.host, cfg.server.port);
+    match cfg.llm.completions_url() {
+        // 只打端点，不打 API Key：配置口径（base 还是完整端点）是排查 404 的第一现场。
+        Some(url) => log::info!("LLM chat completions endpoint: {}", url),
+        None => log::warn!("LLM_API_URL 未配置：聊天、图谱抽取与 Wiki 生成都会跳过 LLM 调用"),
+    }
 
     let pool = db::init().await?;
     log::info!("Initializing search engine...");

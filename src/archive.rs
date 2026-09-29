@@ -96,6 +96,76 @@ impl Default for ExtractLimits {
     }
 }
 
+const MIB: u64 = 1_048_576;
+
+/// 解压字节预算：按**实际读到的字节数**计费。
+///
+/// 压缩包条目头部里的 `size()` 只是声明值，可以被伪造——zip bomb 会声明一个很小的体积，
+/// 实际解压却膨胀到数 GB。因此限额必须在拷贝过程中按真实字节数判断；原先的
+/// `std::io::copy` 是无界拷贝，声明值一旦说谎就能把磁盘写满。
+struct ByteBudget {
+    max_file_size: u64,
+    max_total_size: u64,
+    written: u64,
+}
+
+impl ByteBudget {
+    fn new(limits: &ExtractLimits) -> Self {
+        Self { max_file_size: limits.max_file_size, max_total_size: limits.max_total_size, written: 0 }
+    }
+
+    /// 单条目读取（压缩包内下载）：只受单文件上限约束。
+    fn single_entry(limits: &ExtractLimits) -> Self {
+        Self { max_file_size: limits.max_file_size, max_total_size: limits.max_file_size, written: 0 }
+    }
+
+    /// 基于头部声明值的快速预检：能在解压前拒绝就提前拒绝，但不是唯一依据。
+    fn check_declared(&self, declared: u64) -> Result<(), ArchiveError> {
+        if declared > self.max_file_size {
+            return Err(ArchiveError::SizeLimitExceeded {
+                max_mb: self.max_file_size / MIB,
+                actual_mb: declared / MIB,
+            });
+        }
+        if self.written + declared > self.max_total_size {
+            return Err(ArchiveError::SizeLimitExceeded {
+                max_mb: self.max_total_size / MIB,
+                actual_mb: (self.written + declared) / MIB,
+            });
+        }
+        Ok(())
+    }
+
+    /// 限量拷贝，返回实际写入的字节数。任一上限被突破立即报错（已写出的内容由调用方清理）。
+    fn copy_from<R: Read, W: Write>(&mut self, reader: &mut R, writer: &mut W) -> Result<u64, ArchiveError> {
+        let mut buffer = vec![0u8; 64 * 1024];
+        let mut written = 0u64;
+        loop {
+            let read = reader.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            written += read as u64;
+            if written > self.max_file_size {
+                return Err(ArchiveError::SizeLimitExceeded {
+                    max_mb: self.max_file_size / MIB,
+                    actual_mb: written / MIB,
+                });
+            }
+            if self.written + written > self.max_total_size {
+                return Err(ArchiveError::SizeLimitExceeded {
+                    max_mb: self.max_total_size / MIB,
+                    actual_mb: (self.written + written) / MIB,
+                });
+            }
+            writer.write_all(&buffer[..read])?;
+        }
+        writer.flush()?;
+        self.written += written;
+        Ok(written)
+    }
+}
+
 /// 支持的压缩格式
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFormat {
@@ -234,7 +304,7 @@ fn extract_zip(
     };
 
     let mut entries = Vec::new();
-    let mut total_size: u64 = 0;
+    let mut budget = ByteBudget::new(limits);
     let password_bytes = password.map(|p| p.as_bytes());
 
     log::info!("ZIP archive has {} entries, file_id={}", archive.len(), file_id);
@@ -290,21 +360,9 @@ fn extract_zip(
             continue;
         }
 
-        // 大小限制检查
+        // 大小限制检查（声明值预检；真实体积在拷贝时再按字节数校验一次）
         if !is_dir {
-            if size > limits.max_file_size {
-                return Err(ArchiveError::SizeLimitExceeded {
-                    max_mb: limits.max_file_size / 1_048_576,
-                    actual_mb: size / 1_048_576,
-                });
-            }
-            total_size += size;
-            if total_size > limits.max_total_size {
-                return Err(ArchiveError::SizeLimitExceeded {
-                    max_mb: limits.max_total_size / 1_048_576,
-                    actual_mb: total_size / 1_048_576,
-                });
-            }
+            budget.check_declared(size)?;
         }
 
         // 数量限制检查
@@ -314,21 +372,22 @@ fn extract_zip(
 
         let out_path = Path::new(dest_dir).join(&name);
 
-        if is_dir {
+        let actual_size = if is_dir {
             std::fs::create_dir_all(&out_path)?;
+            0
         } else {
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             let mut out_file = std::fs::File::create(&out_path)?;
-            std::io::copy(&mut file_entry, &mut out_file)?;
-        }
+            budget.copy_from(&mut file_entry, &mut out_file)?
+        };
 
         entries.push(ArchiveEntry {
             id: None,
             file_id,
             entry_path: name,
-            size: Some(size as i64),
+            size: Some(actual_size as i64),
             is_directory: is_dir,
         });
     }
@@ -368,7 +427,7 @@ fn read_zip_entry(src_path: &str, entry_path: &str, password: Option<&str>) -> R
             };
 
             let mut temp = NamedTempFile::new()?;
-            std::io::copy(&mut file_entry, &mut temp)?;
+            ByteBudget::single_entry(&ExtractLimits::default()).copy_from(&mut file_entry, &mut temp)?;
             temp.flush()?;
             return Ok(temp);
         }
@@ -405,7 +464,7 @@ fn extract_tar(
     let mut archive = tar::Archive::new(reader);
 
     let mut entries = Vec::new();
-    let mut total_size: u64 = 0;
+    let mut budget = ByteBudget::new(limits);
 
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
@@ -425,21 +484,9 @@ fn extract_tar(
             continue;
         }
 
-        // 大小限制
+        // 大小限制（声明值预检；真实体积在拷贝时再按字节数校验一次）
         if !is_dir {
-            if size > limits.max_file_size {
-                return Err(ArchiveError::SizeLimitExceeded {
-                    max_mb: limits.max_file_size / 1_048_576,
-                    actual_mb: size / 1_048_576,
-                });
-            }
-            total_size += size;
-            if total_size > limits.max_total_size {
-                return Err(ArchiveError::SizeLimitExceeded {
-                    max_mb: limits.max_total_size / 1_048_576,
-                    actual_mb: total_size / 1_048_576,
-                });
-            }
+            budget.check_declared(size)?;
         }
 
         if entries.len() >= limits.max_file_count {
@@ -448,21 +495,22 @@ fn extract_tar(
 
         let out_path = Path::new(dest_dir).join(&name);
 
-        if is_dir {
+        let actual_size = if is_dir {
             std::fs::create_dir_all(&out_path)?;
+            0
         } else {
             if let Some(parent) = out_path.parent() {
                 std::fs::create_dir_all(parent)?;
             }
             let mut out_file = std::fs::File::create(&out_path)?;
-            std::io::copy(&mut entry, &mut out_file)?;
-        }
+            budget.copy_from(&mut entry, &mut out_file)?
+        };
 
         entries.push(ArchiveEntry {
             id: None,
             file_id,
             entry_path: name,
-            size: Some(size as i64),
+            size: Some(actual_size as i64),
             is_directory: is_dir,
         });
     }
@@ -484,7 +532,7 @@ fn read_tar_entry(src_path: &str, entry_path: &str) -> Result<NamedTempFile, Arc
 
         if name == normalized_target {
             let mut temp = NamedTempFile::new()?;
-            std::io::copy(&mut entry, &mut temp)?;
+            ByteBudget::single_entry(&ExtractLimits::default()).copy_from(&mut entry, &mut temp)?;
             temp.flush()?;
             return Ok(temp);
         }

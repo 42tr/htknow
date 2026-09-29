@@ -171,7 +171,7 @@ pub async fn apply_user_edit(pool: &SqlitePool, kb_id: i64, slug: &str, edit: &P
     if edit.is_empty() {
         return Err(EditError::Invalid("nothing to update".to_string()));
     }
-    let _lock = ingest::acquire_slug_lock(format!("{}:{}", kb_id, slug)).await;
+    let _lock = ingest::acquire_slug_lock(format!("{}:{}", kb_id, slug)).await?;
     let existing = load_page(pool, kb_id, slug).await?;
 
     let title = match edit.title.as_deref().map(str::trim) {
@@ -232,7 +232,7 @@ pub async fn create_user_page(pool: &SqlitePool, kb_id: i64, new: &NewPage) -> E
     let status = new.status.as_deref().map(normalize_status).transpose()?;
     let slug = normalize_slug(new.slug.as_deref(), page_type, title)?;
 
-    let _lock = ingest::acquire_slug_lock(format!("{}:{}", kb_id, slug)).await;
+    let _lock = ingest::acquire_slug_lock(format!("{}:{}", kb_id, slug)).await?;
     if page::get_by_slug(pool, kb_id, &slug).await?.is_some() {
         return Err(EditError::Conflict(format!("page '{}' already exists", slug)));
     }
@@ -261,7 +261,7 @@ pub async fn create_user_page(pool: &SqlitePool, kb_id: i64, new: &NewPage) -> E
 
 /// 回滚到某个历史版本：把该版本内容作为**新版本**写入，历史保持只追加。
 pub async fn revert(pool: &SqlitePool, kb_id: i64, slug: &str, version: i64, editor_id: &str) -> EditResult<WikiPage> {
-    let _lock = ingest::acquire_slug_lock(format!("{}:{}", kb_id, slug)).await;
+    let _lock = ingest::acquire_slug_lock(format!("{}:{}", kb_id, slug)).await?;
     let existing = load_page(pool, kb_id, slug).await?;
     let Some(snapshot) = revision::get(pool, existing.id, version).await? else {
         return Err(EditError::NotFound(format!("revision {} of '{}' not found", version, slug)));
@@ -301,7 +301,7 @@ pub async fn set_page_status(
     pool: &SqlitePool, kb_id: i64, slug: &str, status: &str, editor_id: &str,
 ) -> EditResult<WikiPage> {
     let status = normalize_status(status)?;
-    let _lock = ingest::acquire_slug_lock(format!("{}:{}", kb_id, slug)).await;
+    let _lock = ingest::acquire_slug_lock(format!("{}:{}", kb_id, slug)).await?;
     let existing = load_page(pool, kb_id, slug).await?;
     page::set_status(pool, existing.id, &status, EDIT_SOURCE_USER, editor_id).await?;
     queue::enqueue_finalize(pool, kb_id).await?;
@@ -311,7 +311,7 @@ pub async fn set_page_status(
 /// 彻底删除页面。管道仍可能在下次 ingest 时按证据重新生成同名页，
 /// 想长期隐藏请用归档。
 pub async fn delete_page(pool: &SqlitePool, kb_id: i64, slug: &str) -> EditResult<()> {
-    let _lock = ingest::acquire_slug_lock(format!("{}:{}", kb_id, slug)).await;
+    let _lock = ingest::acquire_slug_lock(format!("{}:{}", kb_id, slug)).await?;
     let existing = load_page(pool, kb_id, slug).await?;
     page::delete_by_id(pool, existing.id).await?;
     queue::enqueue_finalize(pool, kb_id).await?;

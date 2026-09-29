@@ -44,6 +44,9 @@ struct ChatResponse {
 #[derive(Debug, Deserialize)]
 struct Choice {
     message: ResponseMessage,
+    /// `length` 表示输出被 max_tokens 截断：JSON 会解析失败，Markdown 正文会缺尾巴。
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -111,16 +114,38 @@ impl WikiLlm {
                 Ok(response) => {
                     let status = response.status();
                     if status.is_success() {
-                        let body = response.text().await?;
-                        let parsed: ChatResponse = serde_json::from_str(&body)
-                            .map_err(|e| anyhow!("Failed to decode wiki LLM response: {} body={}", e, body))?;
-                        let content = parsed
-                            .choices
-                            .first()
-                            .ok_or_else(|| anyhow!("Wiki LLM response missing choices"))?
-                            .message
-                            .content
-                            .clone();
+                        // 成功分支里一律不用 `?`：读响应体、解析 JSON 都可能是连接被中断导致的
+                        // 瞬时故障，直接冒出循环会让上面的重试退避形同虚设。
+                        let body = match response.text().await {
+                            Ok(body) => body,
+                            Err(err) => {
+                                last_error = format!("LLM response read failed: {}", err);
+                                debug!("{}", last_error);
+                                continue;
+                            }
+                        };
+                        let parsed: ChatResponse = match serde_json::from_str(&body) {
+                            Ok(parsed) => parsed,
+                            Err(err) => {
+                                last_error =
+                                    format!("Failed to decode wiki LLM response: {} body={}", err, truncate(&body, 300));
+                                warn!("{}", last_error);
+                                continue;
+                            }
+                        };
+                        let Some(choice) = parsed.choices.first() else {
+                            last_error = "Wiki LLM response missing choices".to_string();
+                            warn!("{}", last_error);
+                            continue;
+                        };
+                        if choice.finish_reason.as_deref() == Some("length") {
+                            // 截断的输出不能当成品用：宁可失败重试并把原因写进构建日志，
+                            // 也不要静默发布缺尾巴的页面（或让 chat_json 拿到半截 JSON）。
+                            last_error = format!("response truncated by max_tokens ({max_tokens})");
+                            warn!("wiki llm {}", last_error);
+                            continue;
+                        }
+                        let content = choice.message.content.clone();
                         if content.trim().is_empty() {
                             last_error = "empty completion".to_string();
                             continue;

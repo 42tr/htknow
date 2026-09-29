@@ -196,6 +196,11 @@ pub struct SearchConfig {
     pub max_total_synonyms: usize,
     /// 高亮页码选择阈值：首选页的内容字数（按 pdf_content 中文本长度计算）少于该值时，优先使用第二页（如果存在）
     pub highlight_page_min_chars: usize,
+    /// 融合进检索结果的 Wiki 页面数量上限
+    ///
+    /// Wiki 页面与切片共用 `limit` 个坑位：不设上限时，开启 Wiki 的知识库里一半以上的
+    /// 证据切片会被 Wiki 页面挤掉（RAG 场景下切片才是可引用的证据）。
+    pub wiki_limit: usize,
 }
 
 /// 切片配置
@@ -339,6 +344,7 @@ impl SearchConfig {
         let data_dir = env_or("HTKNOW_DATA_DIR", "data");
         Self {
             limit: env_or_parse("HTKNOW_SEARCH_LIMIT", 10),
+            wiki_limit: env_or_parse("HTKNOW_SEARCH_WIKI_LIMIT", 3),
             tantivy_index_path: env_or("HTKNOW_TANTIVY_INDEX_PATH", &format!("{}/tantivy_index", data_dir)),
             tantivy_memory_mb: env_or_parse("HTKNOW_TANTIVY_MEMORY_MB", 50),
             tantivy_rebuild_batch_size: env_or_parse("HTKNOW_SEARCH_TANTIVY_REBUILD_BATCH_SIZE", 100),
@@ -367,11 +373,35 @@ impl SliceConfig {
     }
 }
 
+/// OpenAI 兼容的对话补全路径。
+const CHAT_COMPLETIONS_PATH: &str = "/chat/completions";
+
+/// 把配置的 LLM 地址规整成**完整的** chat/completions 端点。
+///
+/// `LLM_API_URL` 在不同部署里既可能填 base（`https://host/v1`）也可能填完整端点
+/// （`https://host/v1/chat/completions`）。图谱抽取与 Wiki 生成是直接 POST 的，
+/// 而聊天走 OpenAI 兼容 SDK（由 SDK 自己拼 `/chat/completions`）；不统一口径就会出现
+/// 「填 base 时图谱/Wiki 404」或「填完整端点时聊天重复拼接」这类只在某条链路上暴露的故障。
+pub fn chat_completions_url(api_url: &str) -> String {
+    let trimmed = api_url.trim().trim_end_matches('/');
+    if trimmed.ends_with(CHAT_COMPLETIONS_PATH) {
+        trimmed.to_string()
+    } else {
+        format!("{trimmed}{CHAT_COMPLETIONS_PATH}")
+    }
+}
+
+/// 把配置的 LLM 地址规整成 OpenAI 兼容 SDK 需要的 **base** URL（不含 `/chat/completions`）。
+pub fn chat_completions_base_url(api_url: &str) -> String {
+    let trimmed = api_url.trim().trim_end_matches('/');
+    trimmed.strip_suffix(CHAT_COMPLETIONS_PATH).unwrap_or(trimmed).to_string()
+}
+
 impl LLMConfig {
     fn from_env() -> Self {
         Self {
-            api_url: std::env::var("LLM_API_URL").ok(),
-            api_key: std::env::var("LLM_API_KEY").ok(),
+            api_url: std::env::var("LLM_API_URL").ok().filter(|value| !value.trim().is_empty()),
+            api_key: std::env::var("LLM_API_KEY").ok().filter(|value| !value.trim().is_empty()),
             model: env_or("LLM_MODEL", "gpt-3.5-turbo"),
         }
     }
@@ -379,6 +409,16 @@ impl LLMConfig {
     /// 检查 LLM 是否已启用
     pub fn is_enabled(&self) -> bool {
         self.api_url.is_some()
+    }
+
+    /// 完整的 chat/completions 端点，供直接 POST 的调用方使用。
+    pub fn completions_url(&self) -> Option<String> {
+        self.api_url.as_deref().map(chat_completions_url)
+    }
+
+    /// base URL，供自己拼接 `/chat/completions` 的 SDK 使用。
+    pub fn completions_base_url(&self) -> Option<String> {
+        self.api_url.as_deref().map(chat_completions_base_url)
     }
 }
 
@@ -403,10 +443,14 @@ pub struct WikiConfig {
     pub finalize_delay_secs: u64,
     /// 单个任务的最大重试次数，超过后丢弃并记录错误
     pub max_fail_retries: u32,
-    /// 认领后多久视为失效可回收（秒）
+    /// 认领后多久视为失效可回收（秒）。worker 会在批次执行期间周期性续约 `claimed_at`，
+    /// 因此该值只需覆盖「续约间隔」而不是「单批最长耗时」。
     pub claim_stale_secs: u64,
-    /// 单文档最多生成/更新的页面数，0 表示不限制
+    /// 单文档最多生成/更新的页面数，0 表示不限制（仍受 `ingest::PAGES_SAFETY_CAP` 兜底）
     pub max_pages_per_ingest: usize,
+    /// 等待同 slug 页面写锁的上限（秒）。超时按失败返回并交给队列退避重试，
+    /// 避免慢 LLM 调用把编辑接口和 finalize 一起挂死。
+    pub lock_wait_secs: u64,
     /// 送入 LLM 的单页来源正文上限（字符）
     pub max_source_chars: usize,
     /// 每页保留的**管道生成**版本上限（软裁剪，0 表示不裁剪）
@@ -440,12 +484,14 @@ impl WikiConfig {
             max_fail_retries: env_or_parse("HTKNOW_WIKI_MAX_FAIL_RETRIES", 5),
             claim_stale_secs: env_or_parse("HTKNOW_WIKI_CLAIM_STALE_SECS", 5400),
             max_pages_per_ingest: env_or_parse("HTKNOW_WIKI_MAX_PAGES_PER_INGEST", 0),
+            lock_wait_secs: env_or_parse("HTKNOW_WIKI_LOCK_WAIT_SECS", 300),
             max_source_chars: env_or_parse("HTKNOW_WIKI_MAX_SOURCE_CHARS", 12000),
             revision_soft_limit: env_or_parse("HTKNOW_WIKI_REVISION_SOFT_LIMIT", 50),
             revision_hard_limit: env_or_parse("HTKNOW_WIKI_REVISION_HARD_LIMIT", 200),
             granularity: env_or("HTKNOW_WIKI_GRANULARITY", "standard"),
             default_language: env_or("HTKNOW_WIKI_LANGUAGE", "中文"),
-            api_url: env_optional("WIKI_LLM_API_URL").or(llm.api_url),
+            // Wiki 客户端是直接 POST 的，这里就规整成完整端点，避免调用方各自拼接。
+            api_url: env_optional("WIKI_LLM_API_URL").or(llm.api_url).map(|url| chat_completions_url(&url)),
             api_key: env_optional("WIKI_LLM_API_KEY").or(llm.api_key),
             model: env_optional("WIKI_LLM_MODEL").or(Some(llm.model)),
         }
@@ -477,7 +523,18 @@ fn env_optional(key: &str) -> Option<String> {
 
 /// 从环境变量读取并解析值，如果不存在或解析失败则返回默认值
 fn env_or_parse<T: std::str::FromStr>(key: &str, default: T) -> T {
-    std::env::var(key).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+    match std::env::var(key) {
+        Ok(raw) => match raw.parse::<T>() {
+            Ok(value) => value,
+            Err(_) => {
+                // 静默回落会让「配了但写错」的环境变量完全看不出来，这里必须留痕。
+                // 不打印取值本身：该 helper 也可能被用于敏感配置。
+                log::warn!("Ignoring invalid value for {key}; using built-in default");
+                default
+            }
+        },
+        Err(_) => default,
+    }
 }
 
 // ============================================================================

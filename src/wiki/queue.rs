@@ -179,6 +179,23 @@ pub async fn mark_failed(pool: &SqlitePool, task: &WikiTask, error: &str) -> Res
     Ok(())
 }
 
+/// 续约本批认领：把 `claimed_at` 推到当前时间。
+///
+/// 一批任务可能跑很久（单文档 Wiki 生成要几十次 LLM 调用），而 `recover_stale` 只看
+/// 认领时刻；不续约的话，长任务会被判定为崩溃残留并重新入队——滚动发布期间新旧进程
+/// 并存时就会出现同一文档被并发生成、重复烧 token。
+pub async fn renew_claims(pool: &SqlitePool, run_id: &str) -> Result<u64> {
+    let result = sqlx::query(
+        "UPDATE wiki_tasks SET claimed_at = ?, updated_at = strftime('%s','now')
+          WHERE status = 'claimed' AND run_id = ?",
+    )
+    .bind(now())
+    .bind(run_id)
+    .execute(pool)
+    .await?;
+    Ok(result.rows_affected())
+}
+
 /// 回收崩溃残留的认领：进程重启或任务超时后把过期 claim 复位，避免队列被卡死。
 pub async fn recover_stale(pool: &SqlitePool) -> Result<u64> {
     let stale_before = now() - crate::config::get().wiki.claim_stale_secs as i64;

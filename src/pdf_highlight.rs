@@ -16,8 +16,11 @@ use serde::{Deserialize, Serialize};
 pub struct HighlightPosition {
     /// 页码（0-based）
     pub page_idx: i32,
-    /// 边界框 [x1, y1, x2, y2]
-    pub bbox: [i32; 4],
+    /// 边界框 [x1, y1, x2, y2]。
+    ///
+    /// 必须是浮点：解析服务可能给出绝对 PDF 点（含小数）、千分比归一化值或 0..1 归一化值，
+    /// 用整型接会在反序列化阶段直接失败，或把 0..1 的归一化坐标全部塌缩成 0。
+    pub bbox: [f32; 4],
 }
 
 /// 页面坐标系边界（用于缩放转换）
@@ -180,16 +183,16 @@ fn estimate_bounds_from_positions(positions: &[&HighlightPosition]) -> Option<Pa
     }
 
     let first = positions[0];
-    let mut min_x = first.bbox[0].min(first.bbox[2]) as f32;
-    let mut min_y = first.bbox[1].min(first.bbox[3]) as f32;
-    let mut max_x = first.bbox[0].max(first.bbox[2]) as f32;
-    let mut max_y = first.bbox[1].max(first.bbox[3]) as f32;
+    let mut min_x = first.bbox[0].min(first.bbox[2]);
+    let mut min_y = first.bbox[1].min(first.bbox[3]);
+    let mut max_x = first.bbox[0].max(first.bbox[2]);
+    let mut max_y = first.bbox[1].max(first.bbox[3]);
 
     for pos in positions.iter().skip(1) {
-        let x1 = pos.bbox[0] as f32;
-        let y1 = pos.bbox[1] as f32;
-        let x2 = pos.bbox[2] as f32;
-        let y2 = pos.bbox[3] as f32;
+        let x1 = pos.bbox[0];
+        let y1 = pos.bbox[1];
+        let x2 = pos.bbox[2];
+        let y2 = pos.bbox[3];
 
         min_x = min_x.min(x1.min(x2));
         min_y = min_y.min(y1.min(y2));
@@ -224,11 +227,17 @@ fn calc_bbox_transform_from_bounds(page_box: &PageBox, bounds: Option<PageCoordB
     let max_x = bounds.max_x.max(bounds.min_x);
     let max_y = bounds.max_y.max(bounds.min_y);
 
+    // 0..1 归一化：坐标全落在 1 以内，不会与绝对坐标混淆。
     if max_x <= 1.5 && max_y <= 1.5 {
         return BboxTransform { scale_x: page_box.width, scale_y: page_box.height, offset_x: 0.0, offset_y: 0.0 };
     }
 
-    if max_x <= 1000.0 && max_y <= 1000.0 {
+    // 千分比归一化还是绝对 PDF 点，只能靠页面尺寸区分：PDF 页面通常是 595×842pt(A4)
+    // 或 612×792pt(Letter)，千分比坐标几乎一定会超出页面范围；落在页面内的就按绝对点处理。
+    // 旧实现无条件把 ≤1000 的坐标当千分比，A4 页面的绝对坐标会被再乘一次 width/1000，
+    // 高亮整体缩到左下角约 60% 的区域。
+    let beyond_page = max_x > page_box.width * 1.02 || max_y > page_box.height * 1.02;
+    if beyond_page && max_x <= 1000.0 && max_y <= 1000.0 {
         return BboxTransform {
             scale_x: page_box.width / 1000.0,
             scale_y: page_box.height / 1000.0,
@@ -268,10 +277,10 @@ fn add_highlight_annotations_to_page(
     // 为每个位置添加 Highlight 注释
     for pos in positions {
         // 先减去偏移量，将坐标归一化到从 0 开始，然后缩放，最后加上页面原点
-        let x1 = (pos.bbox[0] as f32 - bbox_transform.offset_x) * bbox_transform.scale_x + page_box.x0;
-        let y1_mineru = (pos.bbox[1] as f32 - bbox_transform.offset_y) * bbox_transform.scale_y;
-        let x2 = (pos.bbox[2] as f32 - bbox_transform.offset_x) * bbox_transform.scale_x + page_box.x0;
-        let y2_mineru = (pos.bbox[3] as f32 - bbox_transform.offset_y) * bbox_transform.scale_y;
+        let x1 = (pos.bbox[0] - bbox_transform.offset_x) * bbox_transform.scale_x + page_box.x0;
+        let y1_mineru = (pos.bbox[1] - bbox_transform.offset_y) * bbox_transform.scale_y;
+        let x2 = (pos.bbox[2] - bbox_transform.offset_x) * bbox_transform.scale_x + page_box.x0;
+        let y2_mineru = (pos.bbox[3] - bbox_transform.offset_y) * bbox_transform.scale_y;
 
         // 转换 Y 坐标（MinerU 是从顶部向下，PDF 是从底部向上）
         let y1 = page_box.y0 + (page_box.height - y2_mineru);
@@ -405,7 +414,7 @@ mod tests {
 
     #[test]
     fn test_highlight_position_serialization() {
-        let pos = HighlightPosition { page_idx: 0, bbox: [100, 200, 300, 250] };
+        let pos = HighlightPosition { page_idx: 0, bbox: [100.0, 200.5, 300.0, 250.25] };
         let json = serde_json::to_string(&pos).unwrap();
         assert!(json.contains("page_idx"));
         assert!(json.contains("bbox"));

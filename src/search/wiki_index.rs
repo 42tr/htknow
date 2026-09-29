@@ -54,9 +54,9 @@ impl WikiIndex {
     }
 
     pub async fn rebuild(&self, pool: &SqlitePool) -> Result<()> {
-        for cursor in self.cursors.lock().await.values() {
-            *cursor.lock().await = 0;
-        }
+        // 重建等价于把所有游标归零：直接清空 map，顺带回收已删除知识库留下的条目，
+        // 否则游标表只增不减（每个 kb_id 一条，永不回收）。
+        self.cursors.lock().await.clear();
         self.sync_scoped(pool, None).await?;
         Ok(())
     }
@@ -64,14 +64,29 @@ impl WikiIndex {
     // Only dirty pages in the requested KBs are hydrated. Per-KB cursors serialize
     // reconciliation without holding a global mutex across database reads.
     pub async fn sync_scoped(&self, pool: &SqlitePool, kb_ids: Option<&Vec<i64>>) -> Result<usize> {
-        let ids = match kb_ids {
-            Some(ids) => ids.clone(),
-            None => sqlx::query_scalar("SELECT DISTINCT kb_id FROM wiki_index_changes").fetch_all(pool).await?,
+        // 每次检索都会走到这里，因此先用一条聚合查询判断哪些库真的落后了：
+        // 追平后 `wiki_index_changes` 里仍会留着历史行，逐库加锁 + 逐库查询会让
+        // 每次搜索的成本随知识库数量线性增长。
+        let pending: HashMap<i64, i64> =
+            sqlx::query_as("SELECT kb_id, MAX(seq) FROM wiki_index_changes GROUP BY kb_id")
+                .fetch_all(pool)
+                .await?
+                .into_iter()
+                .collect();
+
+        let ids: Vec<i64> = match kb_ids {
+            Some(ids) => ids.iter().copied().filter(|id| pending.contains_key(id)).collect(),
+            None => pending.keys().copied().collect(),
         };
+
         let mut hydrated = 0;
         for kb_id in ids {
+            let Some(max_seq) = pending.get(&kb_id).copied() else { continue };
             let lock = self.cursors.lock().await.entry(kb_id).or_default().clone();
             let mut cursor = lock.lock().await;
+            if *cursor >= max_seq {
+                continue;
+            }
             loop {
                 let changes: Vec<(i64, i64)> = sqlx::query_as(
                     "SELECT seq, page_id FROM wiki_index_changes WHERE kb_id = ? AND seq > ? ORDER BY seq LIMIT 100",
@@ -190,10 +205,10 @@ impl SearchEngine {
     }
 
     pub async fn search_wiki_scoped(
-        &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
+        &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>, limit: usize,
     ) -> Result<Vec<(IndexedPage, f32)>> {
         let pool = self.pool.as_ref().ok_or_else(|| anyhow::anyhow!("search engine db pool not set"))?;
-        self.wiki_index.recall(pool, query, file_ids, kb_ids, crate::config::get().search.limit).await
+        self.wiki_index.recall(pool, query, file_ids, kb_ids, limit).await
     }
 
     pub async fn search_wiki_limited(

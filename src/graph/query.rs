@@ -2,13 +2,31 @@ use std::collections::HashSet;
 
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
+/// 参与子串枚举的查询前缀长度（字符）。
+const MAX_QUERY_CHARS: usize = 32;
+/// 候选子串的最小长度。单字候选几乎只会命中噪声节点，完整查询本身已单独保留。
+const MIN_TERM_CHARS: usize = 2;
+/// 候选子串的最大长度，与实体名的实际长度上限一致。
+const MAX_TERM_CHARS: usize = 32;
+
 /// Generate bounded exact-name candidates from a question, so the name index can be used.
 /// Full query plus Unicode substrings cover embedded Chinese names without scanning every node.
+///
+/// 候选数量必须是常量级：这些字符串会逐个变成 `name IN (...)` 的绑定参数，
+/// 而 `expand` 在每次搜索里都会跑。原先取查询前 128 个字符的所有 1..=32 长子串，
+/// 最坏情况一次生成 4096 个参数，SQLite 光是解析和探测索引就要花掉数毫秒。
+/// 收窄到前 32 字符、2..=32 长度后上界是 496 个（常见短查询只有几十个），召回口径不变：
+/// 实体名超出前 32 字符的查询极少，且完整查询串始终作为候选保留。
 fn candidates(query: &str) -> Vec<String> {
-    let chars: Vec<char> = query.trim().chars().take(128).collect();
-    let mut result = HashSet::from([query.trim().to_owned()]);
-    for start in 0..chars.len() {
-        for end in (start + 1)..=(start + 32).min(chars.len()) {
+    let trimmed = query.trim();
+    let chars: Vec<char> = trimmed.chars().take(MAX_QUERY_CHARS).collect();
+    let mut result = HashSet::from([trimmed.to_owned()]);
+    for len in MIN_TERM_CHARS..=MAX_TERM_CHARS {
+        for start in 0..chars.len().saturating_sub(len - 1) {
+            let end = start + len;
+            if end > chars.len() {
+                break;
+            }
             let term: String = chars[start..end].iter().collect();
             if !term.trim().is_empty() {
                 result.insert(term);

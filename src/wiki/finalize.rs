@@ -42,7 +42,7 @@ pub async fn finalize_kb(pool: &SqlitePool, kb_id: i64) -> Result<FinalizeReport
         debug!("wiki finalize: kb {} not found", kb_id);
         return Ok(FinalizeReport::default());
     };
-    let _kb_lock = super::ingest::acquire_slug_lock(format!("kb-finalize:{kb_id}")).await;
+    let _kb_lock = super::ingest::acquire_slug_lock(format!("kb-finalize:{kb_id}")).await?;
     let mut report = FinalizeReport::default();
 
     let pages = page::list(pool, kb_id, None, Some(STATUS_PUBLISHED), MAX_PAGES_PER_FINALIZE as i64, None).await?;
@@ -51,7 +51,7 @@ pub async fn finalize_kb(pool: &SqlitePool, kb_id: i64) -> Result<FinalizeReport
     let linkifier = Linkifier::new(&surfaces);
 
     for page in pages.iter().filter(|p| !p.is_index()) {
-        let _lock = super::ingest::acquire_slug_lock(format!("{}:{}", kb_id, page.slug)).await;
+        let _lock = super::ingest::acquire_slug_lock(format!("{}:{}", kb_id, page.slug)).await?;
         let Some(page) = page::get_by_id(pool, page.id).await? else {
             continue;
         };
@@ -130,7 +130,7 @@ async fn rebuild_index(
         edit_source: EDIT_SOURCE_PIPELINE.to_string(),
         editor_id: String::new(),
     };
-    let _lock = super::ingest::acquire_slug_lock(format!("{}:{}", kb_id, INDEX_SLUG)).await;
+    let _lock = super::ingest::acquire_slug_lock(format!("{}:{}", kb_id, INDEX_SLUG)).await?;
     let current = page::list(pool, kb_id, None, Some(STATUS_PUBLISHED), MAX_PAGES_PER_FINALIZE as i64, None).await?;
     anyhow::ensure!(
         render_directory(&current.iter().filter(|p| !p.is_index()).collect::<Vec<_>>()) == directory,

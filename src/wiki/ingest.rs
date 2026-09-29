@@ -10,6 +10,7 @@
 use std::{
     collections::{HashMap, HashSet},
     sync::Arc,
+    time::Duration,
 };
 
 use anyhow::{Result, anyhow, bail};
@@ -38,6 +39,12 @@ const MAX_CHARS_PER_EVIDENCE_SLICE: usize = 4000;
 
 /// 送入模型的候选页面清单上限，防止大知识库把 prompt 撑爆。
 const MAX_AVAILABLE_PAGES: usize = 400;
+
+/// 单文档生成页面数的安全上限，仅在 `max_pages_per_ingest = 0`（不限制）时生效。
+const PAGES_SAFETY_CAP: usize = 200;
+
+/// 正文生成期间不持锁，写回前发现页面被别的来源改过就重生成，最多这么多次。
+const SLUG_WRITE_MAX_ATTEMPTS: u32 = 3;
 
 /// 一个候选条目。
 #[derive(Debug, Clone)]
@@ -120,12 +127,22 @@ impl Drop for SlugGuard {
 ///
 /// 单实例部署下进程内锁就足够；不同文档并发贡献同一实体时，若不串行化，
 /// 后写的会用旧内容覆盖前一次的合并结果。
-pub async fn acquire_slug_lock(key: String) -> SlugGuard {
+///
+/// 等待有上限（`wiki.lock_wait_secs`）：持锁者可能正卡在慢 LLM 调用上，无限等待会把
+/// HTTP 编辑接口与 finalize 一起挂死。超时按错误返回，由队列退避重试，而不是无声堆积。
+pub async fn acquire_slug_lock(key: String) -> Result<SlugGuard> {
     let lock = {
         let mut map = SLUG_LOCKS.lock().expect("wiki slug lock map poisoned");
         map.entry(key.clone()).or_insert_with(|| Arc::new(TokioMutex::new(()))).clone()
     };
-    SlugGuard { key, _permit: lock.lock_owned().await }
+    let wait = Duration::from_secs(crate::config::get().wiki.lock_wait_secs.max(1));
+    match tokio::time::timeout(wait, lock.lock_owned()).await {
+        Ok(permit) => Ok(SlugGuard { key, _permit: permit }),
+        Err(_) => {
+            warn!("wiki slug lock '{}' still busy after {}s", key, wait.as_secs());
+            bail!("timed out after {}s waiting for wiki page lock '{}'", wait.as_secs(), key)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -237,16 +254,21 @@ async fn run_ingest(
         _ => ("llm", candidates_from_llm(pool, llm, config, kb_id, slices, progress).await?),
     };
 
-    // 证据多的条目优先，配合 max_pages_per_ingest 保证预算花在最值得写的页面上。
+    // 证据多的条目优先，配合页面数上限保证预算花在最值得写的页面上。
     candidates.sort_by(|a, b| b.slice_ids.len().cmp(&a.slice_ids.len()).then_with(|| a.slug.cmp(&b.slug)));
-    if config.max_pages_per_ingest > 0 && candidates.len() > config.max_pages_per_ingest {
-        debug!(
-            "wiki ingest: file {} has {} candidates, capping to {}",
+    // `max_pages_per_ingest = 0` 表示「由用户显式放开」，但仍受安全上限约束：
+    // 图谱模式下一条长文档能抽出上千个实体，每个实体一次 LLM 调用，
+    // 不设兜底会把 token 预算和队列时延（进而把 claim 续约窗口）一起打穿。
+    let page_cap = if config.max_pages_per_ingest > 0 { config.max_pages_per_ingest } else { PAGES_SAFETY_CAP };
+    if candidates.len() > page_cap {
+        warn!(
+            "wiki ingest: file {} has {} candidates, capping to {} (max_pages_per_ingest={})",
             file_id,
             candidates.len(),
+            page_cap,
             config.max_pages_per_ingest
         );
-        candidates.truncate(config.max_pages_per_ingest);
+        candidates.truncate(page_cap);
     }
 
     let mut report = IngestReport { mode, candidates: candidates.len(), ..Default::default() };
@@ -732,7 +754,8 @@ async fn write_summary_page(
     };
     // 摘要页是整篇文档的产物，把全部切片登记为证据，前端才能从摘要页直接跳到原文高亮。
     let slice_ids: Vec<i64> = slices.iter().map(|(slice_id, _)| *slice_id).collect();
-    let _lock = acquire_slug_lock(format!("{}:{}", kb_id, slug)).await;
+    // LLM 调用已经在锁外完成，这里只锁住「写页面 + 写外链」这一小段。
+    let _lock = acquire_slug_lock(format!("{}:{}", kb_id, slug)).await?;
     let outcome = page::upsert(pool, &draft, &[file_id], &slice_ids).await?;
     if !outcome.skipped_manual {
         page::set_out_links(pool, outcome.page_id, &super::linkify::out_links(&content, &slug)).await?;
@@ -770,63 +793,101 @@ async fn citation_batch_task(
     .await
 }
 
+/// 页面版本标记。「锁外生成 + 锁内复核」用它判断生成期间是否有别的来源改写过同一页。
+fn page_stamp(page: &Option<super::WikiPage>) -> Option<(i64, String)> {
+    page.as_ref().map(|page| (page.version, page.content_fingerprint.clone()))
+}
+
+/// 单页正文的 LLM 生成。不碰数据库，因此可以放在 slug 锁之外执行。
+async fn generate_candidate_body(
+    llm: &WikiLlm, config: &ResolvedWikiConfig, candidate: &Candidate, evidence: &str,
+    existing: Option<&super::WikiPage>, available: &str, slug: &str,
+) -> Result<String> {
+    let existing_section = match existing {
+        Some(existing) if !existing.content.trim().is_empty() => {
+            prompts::render(prompts::PAGE_BODY_EXISTING_SECTION, &[("ExistingContent", &existing.content)])
+        }
+        _ => String::new(),
+    };
+    let user = prompts::render(
+        prompts::PAGE_BODY_USER,
+        &[
+            ("Title", &candidate.name),
+            ("PageType", &candidate.page_type),
+            ("Description", &candidate.description),
+            ("Evidence", evidence),
+            ("ExistingSection", &existing_section),
+            ("AvailablePages", available),
+            ("Language", &config.language),
+        ],
+    );
+    let content = llm.chat(prompts::PAGE_BODY_SYSTEM, &user, crate::config::get().wiki.llm_max_tokens, 0.3).await?;
+    let content = strip_code_fence(content.trim());
+    if content.is_empty() {
+        bail!("generated empty body for {}", slug);
+    }
+    Ok(content)
+}
+
+/// 写单个条目页。
+///
+/// 锁只覆盖毫秒级的数据库读/写，**不覆盖 LLM 调用**：一次生成可能耗时数十秒到数分钟，
+/// 持锁生成会让同一实体的其他文档、人工编辑接口和 finalize 全部排在后面，
+/// 极端情况下（模型端卡住）表现为整个 Wiki 功能「假死」。
+///
+/// 代价是生成期间页面可能被别的来源改写，因此写回前复核版本标记，不一致就基于新现状重生成。
 async fn write_candidate_page(
     pool: &SqlitePool, llm: &WikiLlm, config: &ResolvedWikiConfig, kb_id: i64, file_id: i64, candidate: &Candidate,
     content_by_slice: &HashMap<i64, String>, available: &str,
 ) -> Result<bool> {
     let slug = candidate.slug.clone();
-    let _lock = acquire_slug_lock(format!("{}:{}", kb_id, slug)).await;
-    {
-        let existing = page::get_by_slug(pool, kb_id, &slug).await?;
-        let evidence_slice_ids = if candidate.slice_ids.is_empty() {
-            // 引用归类没给出证据时，退化到该文档的全部切片，仍然只依据原文写作。
-            content_by_slice.keys().copied().collect::<Vec<i64>>()
-        } else {
-            candidate.slice_ids.clone()
-        };
-        let mut ordered: Vec<i64> = evidence_slice_ids.into_iter().collect::<HashSet<_>>().into_iter().collect();
-        ordered.sort_unstable();
-        let chunks = evidence_chunks(&ordered, content_by_slice);
-        let evidence = prompts::render_evidence(&chunks, crate::config::get().wiki.max_source_chars);
+    let lock_key = format!("{}:{}", kb_id, slug);
 
-        let existing_section = match &existing {
-            Some(existing) if !existing.content.trim().is_empty() => {
-                prompts::render(prompts::PAGE_BODY_EXISTING_SECTION, &[("ExistingContent", &existing.content)])
-            }
-            _ => String::new(),
+    // 证据只取决于本文档的切片，与页面现状无关，锁外算一次即可。
+    let evidence_slice_ids = if candidate.slice_ids.is_empty() {
+        // 引用归类没给出证据时，退化到该文档的全部切片，仍然只依据原文写作。
+        content_by_slice.keys().copied().collect::<Vec<i64>>()
+    } else {
+        candidate.slice_ids.clone()
+    };
+    let mut ordered: Vec<i64> = evidence_slice_ids.into_iter().collect::<HashSet<_>>().into_iter().collect();
+    ordered.sort_unstable();
+    let chunks = evidence_chunks(&ordered, content_by_slice);
+    let evidence = prompts::render_evidence(&chunks, crate::config::get().wiki.max_source_chars);
+
+    for attempt in 1..=SLUG_WRITE_MAX_ATTEMPTS {
+        let existing = {
+            let _lock = acquire_slug_lock(lock_key.clone()).await?;
+            page::get_by_slug(pool, kb_id, &slug).await?
         };
-        let user = prompts::render(
-            prompts::PAGE_BODY_USER,
-            &[
-                ("Title", &candidate.name),
-                ("PageType", &candidate.page_type),
-                ("Description", &candidate.description),
-                ("Evidence", &evidence),
-                ("ExistingSection", &existing_section),
-                ("AvailablePages", available),
-                ("Language", &config.language),
-            ],
-        );
-        let content = llm.chat(prompts::PAGE_BODY_SYSTEM, &user, crate::config::get().wiki.llm_max_tokens, 0.3).await?;
-        let content = strip_code_fence(content.trim());
-        if content.is_empty() {
-            bail!("generated empty body for {}", slug);
+        let stamp = page_stamp(&existing);
+        let content =
+            generate_candidate_body(llm, config, candidate, &evidence, existing.as_ref(), available, &slug).await?;
+
+        let _lock = acquire_slug_lock(lock_key.clone()).await?;
+        let current = page::get_by_slug(pool, kb_id, &slug).await?;
+        if page_stamp(&current) != stamp {
+            if attempt == SLUG_WRITE_MAX_ATTEMPTS {
+                bail!("page '{}' was rewritten {} times while generating its body", slug, attempt);
+            }
+            warn!("wiki ingest: page '{}' changed during generation, regenerating (attempt {})", slug, attempt);
+            continue;
         }
 
         let mut aliases = candidate.aliases.clone();
-        if let Some(existing) = &existing {
-            for alias in &existing.aliases {
+        if let Some(current) = &current {
+            for alias in &current.aliases {
                 if !aliases.contains(alias) {
                     aliases.push(alias.clone());
                 }
             }
         }
-        let title = existing
+        let title = current
             .as_ref()
             .map(|p| p.title.clone())
             .filter(|t| !t.is_empty())
             .unwrap_or_else(|| candidate.name.clone());
-        let summary = existing
+        let summary = current
             .as_ref()
             .map(|p| p.summary.clone())
             .filter(|s| !s.is_empty())
@@ -846,8 +907,9 @@ async fn write_candidate_page(
         if !outcome.skipped_manual {
             page::set_out_links(pool, outcome.page_id, &super::linkify::out_links(&content, &slug)).await?;
         }
-        Ok(outcome.changed)
+        return Ok(outcome.changed);
     }
+    bail!("page '{}' kept changing while generating its body", slug)
 }
 
 /// 用剩余来源的切片证据确定性重建页面（回撤后调用）。
@@ -855,32 +917,38 @@ async fn write_candidate_page(
 /// 不让模型「减去某个文档的贡献」——那既难验证也容易把仍然成立的内容删掉。
 /// 直接按剩余证据重写，结果只取决于当前还活着的来源。
 pub async fn refresh_page(pool: &SqlitePool, kb_id: i64, slug: &str) -> Result<bool> {
-    let _lock = acquire_slug_lock(format!("{}:{}", kb_id, slug)).await;
-    let Some(existing) = page::get_by_slug(pool, kb_id, slug).await? else {
-        debug!("wiki refresh: page {} not found in kb {}", slug, kb_id);
-        return Ok(false);
-    };
-    if page::is_manual_edit_source(&existing.last_edit_source) {
-        if page::source_file_ids(pool, existing.id).await?.is_empty() {
-            page::set_status(
-                pool,
-                existing.id,
-                super::STATUS_ARCHIVED,
-                &existing.last_edit_source,
-                &existing.last_editor_id,
-            )
-            .await?;
+    let lock_key = format!("{}:{}", kb_id, slug);
+
+    // 决策阶段（读现状、必要时归档或删除）持锁：全是短 DB 操作。
+    let (existing, source_ids, slice_ids) = {
+        let _lock = acquire_slug_lock(lock_key.clone()).await?;
+        let Some(existing) = page::get_by_slug(pool, kb_id, slug).await? else {
+            debug!("wiki refresh: page {} not found in kb {}", slug, kb_id);
+            return Ok(false);
+        };
+        if page::is_manual_edit_source(&existing.last_edit_source) {
+            if page::source_file_ids(pool, existing.id).await?.is_empty() {
+                page::set_status(
+                    pool,
+                    existing.id,
+                    super::STATUS_ARCHIVED,
+                    &existing.last_edit_source,
+                    &existing.last_editor_id,
+                )
+                .await?;
+                return Ok(true);
+            }
+            return Ok(false);
+        }
+        let source_ids = page::source_file_ids(pool, existing.id).await?;
+        let slice_ids = page::slice_ref_ids(pool, existing.id).await?;
+        if source_ids.is_empty() || slice_ids.is_empty() {
+            info!("wiki refresh: page {} lost all evidence, deleting", slug);
+            page::delete_by_id(pool, existing.id).await?;
             return Ok(true);
         }
-        return Ok(false);
-    }
-    let source_ids = page::source_file_ids(pool, existing.id).await?;
-    let slice_ids = page::slice_ref_ids(pool, existing.id).await?;
-    if source_ids.is_empty() || slice_ids.is_empty() {
-        info!("wiki refresh: page {} lost all evidence, deleting", slug);
-        page::delete_by_id(pool, existing.id).await?;
-        return Ok(true);
-    }
+        (existing, source_ids, slice_ids)
+    };
 
     let config = resolve_config(pool, kb_id).await?.ok_or_else(|| anyhow!("kb {} not found", kb_id))?;
     let llm = WikiLlm::new(config.model.as_deref());
@@ -899,7 +967,9 @@ pub async fn refresh_page(pool: &SqlitePool, kb_id: i64, slug: &str) -> Result<b
     let chunks = evidence_chunks(&slice_ids, &content_by_slice);
     if chunks.is_empty() {
         info!("wiki refresh: page {} has no readable evidence left, deleting", slug);
-        page::delete_by_id(pool, existing.id).await?;
+        let _lock = acquire_slug_lock(lock_key).await?;
+        let Some(current) = page::get_by_slug(pool, kb_id, slug).await? else { return Ok(false) };
+        page::delete_by_id(pool, current.id).await?;
         return Ok(true);
     }
 
@@ -918,6 +988,8 @@ pub async fn refresh_page(pool: &SqlitePool, kb_id: i64, slug: &str) -> Result<b
             ("Language", &config.language),
         ],
     );
+    // 生成期间不持锁：refresh 与 ingest/人工编辑竞争同一个 slug 时，
+    // 持锁生成会把对方挂住几十秒甚至几分钟。
     let content = strip_code_fence(
         llm.chat(prompts::PAGE_BODY_SYSTEM, &user, crate::config::get().wiki.llm_max_tokens, 0.3).await?.trim(),
     );
@@ -925,23 +997,33 @@ pub async fn refresh_page(pool: &SqlitePool, kb_id: i64, slug: &str) -> Result<b
         bail!("wiki refresh: generated empty body for {}", slug);
     }
 
-    {
-        let draft = PageDraft {
-            kb_id,
-            slug: slug.to_string(),
-            title: existing.title.clone(),
-            page_type: existing.page_type.clone(),
-            summary: existing.summary.clone(),
-            content: content.clone(),
-            aliases: existing.aliases.clone(),
-            edit_source: EDIT_SOURCE_PIPELINE.to_string(),
-            editor_id: String::new(),
-        };
-        let outcome = page::upsert(pool, &draft, &source_ids, &slice_ids).await?;
-        page::set_slice_refs(pool, outcome.page_id, &slice_ids).await?;
-        page::set_out_links(pool, outcome.page_id, &super::linkify::out_links(&content, slug)).await?;
-        Ok(outcome.changed)
+    // 写回：重新拿锁并复核页面仍在、且期间没被人工编辑过。
+    let _lock = acquire_slug_lock(lock_key).await?;
+    let Some(current) = page::get_by_slug(pool, kb_id, slug).await? else {
+        debug!("wiki refresh: page {} vanished before write-back", slug);
+        return Ok(false);
+    };
+    if page::is_manual_edit_source(&current.last_edit_source) {
+        debug!("wiki refresh: page {} became manually edited, keeping user content", slug);
+        return Ok(false);
     }
+    let draft = PageDraft {
+        kb_id,
+        slug: slug.to_string(),
+        title: current.title.clone(),
+        page_type: current.page_type.clone(),
+        summary: current.summary.clone(),
+        content: content.clone(),
+        aliases: current.aliases.clone(),
+        edit_source: EDIT_SOURCE_PIPELINE.to_string(),
+        editor_id: String::new(),
+    };
+    let outcome = page::upsert(pool, &draft, &source_ids, &slice_ids).await?;
+    page::set_slice_refs(pool, outcome.page_id, &slice_ids).await?;
+    if !outcome.skipped_manual {
+        page::set_out_links(pool, outcome.page_id, &super::linkify::out_links(&content, slug)).await?;
+    }
+    Ok(outcome.changed)
 }
 
 /// 文件名去掉扩展名作为摘要页标题。
