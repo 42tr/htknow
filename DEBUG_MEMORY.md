@@ -45,18 +45,16 @@ curl -H "x-user-id: 1" \
      -o htknow.heap.$(date +%s).heap \
      http://localhost:8080/api/v1/knowledge/system/heap
 
-# 查看堆分析状态
+# 索引重建进度（唯一保留的 JSON 状态接口）
 curl -H "x-user-id: 1" \
      -H "x-user-name: admin" \
      -H "x-role: admin" \
-     http://localhost:8080/api/v1/knowledge/system/heap/status | jq
-
-# 查看内存占用
-curl -H "x-user-id: 1" \
-     -H "x-user-name: admin" \
-     -H "x-role: admin" \
-     http://localhost:8080/api/v1/knowledge/system/memory | jq
+     http://localhost:8080/api/v1/knowledge/system/index/rebuild/status | jq
 ```
+
+> 早期的 `/system/heap/status` 与 `/system/memory` 已在「清理不用的接口」中下线，
+> 现存的 system 接口只有：`GET /heap`、`GET /heap/pdf`、`POST /lancedb/compact`、
+> `POST /index/force-merge`、`GET /index/rebuild/status`（完整清单见 `/api/v1/knowledge/swagger-ui/`）。
 
 ### 方法 3: 进入容器手动导出
 
@@ -94,7 +92,7 @@ jeprof --show_bytes --text target/debug/htknow htknow.heap.*.heap | head -20
 
 ## 采样率配置
 
-当前配置在 `src/main.rs:6`:
+当前配置在 `src/main.rs:10`（`MALLOC_CONF` 静态量）:
 
 ```rust
 pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:10\0";
@@ -120,7 +118,7 @@ pub static MALLOC_CONF: &[u8] = b"prof:true,prof_active:true,lg_prof_sample:10\0
 ### 2. 减少数据库连接
 
 ```yaml
-- HTKNOW_DB_MAX_CONNECTIONS=5  # 默认 10
+- HTKNOW_DB_MAX_CONNECTIONS=5  # docker-compose 默认 10，代码默认 16
 ```
 
 ### 3. 调整搜索结果数量

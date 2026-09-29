@@ -1,15 +1,45 @@
 import { consumeChatStream } from './chatStream.js'
 const API_BASE = '/api/v1/knowledge'
 
-// 用户认证信息（实际应用中应该从登录获取）
-const USER_ID = 'user1'
-const USER_NAME = '42tr'
-const ROLE = 'admin'
+// 用户认证信息（演示前端没有登录流程，实际应用中应该从登录获取）。
+// 优先级：localStorage > 构建期环境变量 > 默认值。
+// 这样部署到真实环境时不必改代码就能切换身份，也不会所有人都以同一个硬编码 user_id 访问后端：
+//   localStorage.setItem('htknow.userId', 'alice'); localStorage.setItem('htknow.role', 'user')
+// 或者构建时：VITE_HTKNOW_USER_ID=alice VITE_HTKNOW_ROLE=user npm run build
+// 注意：ROLE 的兜底值仍是 admin（后端完全信任 x-role 头，没有登录态），仅为方便本地演示；
+// 真实部署必须通过上面两种方式显式指定角色，否则每个访问者都拥有管理员权限。
+const readIdentity = (storageKey, envValue, fallback) => {
+  try {
+    const stored = window.localStorage?.getItem(storageKey)
+    if (stored) return stored
+  } catch (_) {
+    // 隐私模式下 localStorage 不可用，忽略即可
+  }
+  return envValue || fallback
+}
+
+const USER_ID = readIdentity('htknow.userId', import.meta.env.VITE_HTKNOW_USER_ID, 'user1')
+const USER_NAME = readIdentity('htknow.userName', import.meta.env.VITE_HTKNOW_USER_NAME, '42tr')
+const ROLE = readIdentity('htknow.role', import.meta.env.VITE_HTKNOW_ROLE, 'admin')
+
+// HTTP 头只能放 ASCII，用户名可能是中文，因此统一用 `b64:` 前缀显式编码（后端按此约定解码）。
+const encodeUserName = (name) => {
+  try {
+    const bytes = new TextEncoder().encode(name)
+    let binary = ''
+    bytes.forEach((byte) => {
+      binary += String.fromCharCode(byte)
+    })
+    return `b64:${btoa(binary)}`
+  } catch (_) {
+    return name
+  }
+}
 
 const getHeaders = (contentType = true) => {
   const headers = {
     'x-user-id': USER_ID,
-    'x-user-name': USER_NAME,
+    'x-user-name': encodeUserName(USER_NAME),
     'x-role': ROLE,
   }
   if (contentType) {
