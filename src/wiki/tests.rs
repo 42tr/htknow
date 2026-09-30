@@ -140,6 +140,15 @@ async fn file_delete_trigger_enqueues_retract_with_page_ids() {
 }
 
 #[test]
+fn strip_links_keeps_labels_only() {
+    let content = "[[entity/船舶主发动机|船舶主发动机]]将[[concept/化学能]]转化为动能；[[|坏链]]与未闭合 [[x";
+    assert_eq!(super::linkify::strip_links(content), "船舶主发动机将concept/化学能转化为动能；[[|坏链]]与未闭合 [[x");
+    let live = std::collections::HashSet::from(["entity/a".to_string()]);
+    let (kept, changed) = super::linkify::strip_dead_links("[[entity/a|A]] [[entity/b|B]]", &live);
+    assert_eq!((kept.as_str(), changed), ("[[entity/a|A]] B", true));
+}
+
+#[test]
 fn slugify_keeps_cjk_and_folds_separators() {
     assert_eq!(super::slugify("张三 / Zhang San"), "张三-zhang-san");
     assert_eq!(super::slugify("  Hello,   World! "), "hello-world");

@@ -303,6 +303,19 @@ pub fn out_links(content: &str, self_slug: &str) -> Vec<String> {
 /// 页面被删除或 reduce 失败后，摘要页可能仍指向不存在的 slug；
 /// 留着会渲染成断链，直接抹掉链接比留 404 更好。
 pub fn strip_dead_links(content: &str, live_slugs: &HashSet<String>) -> (String, bool) {
+    replace_links(content, |slug| !live_slugs.contains(slug))
+}
+
+/// 把全部 `[[slug|label]]` 还原成纯文本 label。
+///
+/// 内链语法只有 Wiki 浏览页认识；检索结果会直接交给外部调用方展示、rerank 与 LLM，
+/// 原样透出会变成 `[[entity/xx|xx]]` 这类噪声。
+pub fn strip_links(content: &str) -> String {
+    replace_links(content, |_| true).0
+}
+
+/// 把 `should_strip(slug)` 为真的内链替换成 label，返回 (新正文, 是否有改动)。
+fn replace_links(content: &str, should_strip: impl Fn(&str) -> bool) -> (String, bool) {
     let mut out = String::with_capacity(content.len());
     let mut cursor = 0usize;
     let mut changed = false;
@@ -312,7 +325,7 @@ pub fn strip_dead_links(content: &str, live_slugs: &HashSet<String>) -> (String,
         let inner = &content[start + 2..start + close];
         out.push_str(&content[cursor..start]);
         match parse_wiki_link(inner) {
-            Some((slug, label)) if !live_slugs.contains(&slug) => {
+            Some((slug, label)) if should_strip(&slug) => {
                 out.push_str(&label);
                 changed = true;
             }

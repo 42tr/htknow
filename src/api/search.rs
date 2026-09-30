@@ -511,7 +511,8 @@ async fn merge_wiki_results(
         wiki_results.push(SearchResultItem {
             id: candidate.id,
             file_id: 0,
-            content: detail.content.clone(),
+            // `wiki.content` 保留内链供 Wiki 浏览页跳转；`content` 给展示/rerank/LLM 用纯文本。
+            content: crate::wiki::linkify::strip_links(&detail.content),
             score,
             file: None,
             kb: kbs.get(&candidate.kb_id).cloned(),
