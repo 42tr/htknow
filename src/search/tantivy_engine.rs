@@ -269,6 +269,16 @@ fn create_writer_with_timing_blocking(index: &Index, label: &str) -> tantivy::Re
 pub struct IndexWriterHandle {
     tx: Sender<WriterJob>,
     thread: Option<thread::JoinHandle<()>>,
+    /// 全量重建期间记录的增量写操作，换目录后回放到新索引，避免重建窗口内的写入/删除丢失。
+    journal: std::sync::Mutex<Option<Vec<JournalOp>>>,
+}
+
+/// 重建窗口内记录的写操作。
+#[derive(Clone)]
+pub enum JournalOp {
+    Write(Vec<Document>),
+    Delete { field_name: &'static str, ids: Vec<i64> },
+    DeleteAll,
 }
 
 struct WriterJob {
@@ -278,8 +288,15 @@ struct WriterJob {
 
 enum WriterOp {
     WriteBatch(Vec<Document>),
+    /// 按 (id, file_id) 先删后写，回放时保证幂等：重建快照已包含的文档不会重复。
+    UpsertBatch(Vec<Document>),
     DeleteTerms { field_name: &'static str, ids: Vec<i64> },
+    DeleteAll,
     ForceMerge,
+    /// 等待后台 merge 结束并释放当前 writer（及目录锁），替换索引目录之前使用。
+    Release,
+    /// 在新 Index 上打开 writer（索引目录被整体替换后使用）。
+    Reopen(Index),
     Shutdown,
 }
 
@@ -291,7 +308,7 @@ enum WriterResult {
 }
 
 impl IndexWriterHandle {
-    pub async fn open(index: Index, schema: Schema, label: String) -> anyhow::Result<Arc<Self>> {
+    pub async fn open(mut index: Index, schema: Schema, label: String) -> anyhow::Result<Arc<Self>> {
         let (init_tx, init_rx) = tokio::sync::oneshot::channel::<anyhow::Result<()>>();
         let (tx, rx) = mpsc::channel::<WriterJob>();
         let thread_name = format!("tantivy-writer-{}", label);
@@ -307,19 +324,47 @@ impl IndexWriterHandle {
                 }
             };
 
-            while let Ok(job) = rx.recv() {
+            while let Ok(WriterJob { op, reply }) = rx.recv() {
+                if let WriterOp::Release = op {
+                    let result = match writer.take().map(|w| w.wait_merging_threads()) {
+                        Some(Err(e)) => WriterResult::Err(e.to_string()),
+                        _ => WriterResult::Ok,
+                    };
+                    if let Some(reply) = reply {
+                        let _ = reply.send(result);
+                    }
+                    continue;
+                }
+                if let WriterOp::Reopen(new_index) = op {
+                    // 先释放旧 writer（及其目录锁），再在新目录上打开。失败时线程保持存活，
+                    // 调用方恢复备份目录后可以再次 reopen。
+                    drop(writer.take());
+                    let result = match create_writer_with_timing_blocking(&new_index, &format!("{}_reopen", label)) {
+                        Ok(new_writer) => {
+                            index = new_index;
+                            writer = Some(new_writer);
+                            WriterResult::Ok
+                        }
+                        Err(e) => WriterResult::Err(e.to_string()),
+                    };
+                    if let Some(reply) = reply {
+                        let _ = reply.send(result);
+                    }
+                    continue;
+                }
+
                 let current_writer = match writer.take() {
                     Some(w) => w,
                     None => {
                         let result = WriterResult::Err("tantivy writer is not available".to_string());
-                        if let Some(reply) = job.reply {
+                        if let Some(reply) = reply {
                             let _ = reply.send(result);
                         }
                         continue;
                     }
                 };
 
-                let (result, maybe_writer) = match job.op {
+                let (result, maybe_writer) = match op {
                     WriterOp::Shutdown => {
                         drop(current_writer);
                         break;
@@ -338,6 +383,29 @@ impl IndexWriterHandle {
                             };
                             (result, Some(writer))
                         }
+                    }
+                    WriterOp::UpsertBatch(docs) => {
+                        let mut writer = current_writer;
+                        let result = match upsert_documents(&mut writer, &schema, docs) {
+                            Ok(count) => match commit_writer(&mut writer, &label, count) {
+                                Ok(()) => WriterResult::WriteBatch,
+                                Err(e) => WriterResult::Err(e.to_string()),
+                            },
+                            Err(e) => WriterResult::Err(e.to_string()),
+                        };
+                        (result, Some(writer))
+                    }
+                    WriterOp::Release | WriterOp::Reopen(_) => unreachable!("handled before taking the writer"),
+                    WriterOp::DeleteAll => {
+                        let mut writer = current_writer;
+                        let result = match writer.delete_all_documents() {
+                            Ok(_) => match commit_writer(&mut writer, &label, 0) {
+                                Ok(()) => WriterResult::Ok,
+                                Err(e) => WriterResult::Err(e.to_string()),
+                            },
+                            Err(e) => WriterResult::Err(e.to_string()),
+                        };
+                        (result, Some(writer))
                     }
                     WriterOp::DeleteTerms { field_name, ids } => {
                         if ids.is_empty() {
@@ -370,7 +438,7 @@ impl IndexWriterHandle {
                 };
 
                 writer = maybe_writer;
-                if let Some(reply) = job.reply {
+                if let Some(reply) = reply {
                     let _ = reply.send(result);
                 }
                 // writer 为 None 时说明 force_merge 失败且未能重建，退出循环
@@ -383,15 +451,78 @@ impl IndexWriterHandle {
         })?;
 
         init_rx.await??;
-        Ok(Arc::new(Self { tx, thread: Some(thread) }))
+        Ok(Arc::new(Self { tx, thread: Some(thread), journal: std::sync::Mutex::new(None) }))
+    }
+
+    fn record(&self, op: impl FnOnce() -> JournalOp) {
+        if let Some(journal) = self.journal.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            journal.push(op());
+        }
+    }
+
+    /// 开始记录增量写操作；必须在重建读取数据库快照之前调用。
+    pub fn start_journal(&self) {
+        *self.journal.lock().unwrap_or_else(|e| e.into_inner()) = Some(Vec::new());
+    }
+
+    /// 停止记录并取出已记录的操作。
+    pub fn take_journal(&self) -> Vec<JournalOp> {
+        self.journal.lock().unwrap_or_else(|e| e.into_inner()).take().unwrap_or_default()
+    }
+
+    async fn send(&self, op: WriterOp) -> anyhow::Result<WriterResult> {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+        self.tx
+            .send(WriterJob { op, reply: Some(reply_tx) })
+            .map_err(|e| anyhow::anyhow!("tantivy writer channel closed: {e}"))?;
+        Ok(reply_rx.await?)
+    }
+
+    /// 等待后台 merge 并释放 writer；之后到 [`reopen`] 之前的写操作都会失败。
+    pub async fn release(&self) -> anyhow::Result<()> {
+        match self.send(WriterOp::Release).await? {
+            WriterResult::Ok => Ok(()),
+            WriterResult::Err(e) => Err(anyhow::anyhow!("tantivy writer release failed: {e}")),
+            _ => Err(anyhow::anyhow!("unexpected result from release")),
+        }
+    }
+
+    /// 索引目录被整体替换后，让 writer 线程改为在新 Index 上工作。
+    pub async fn reopen(&self, index: Index) -> anyhow::Result<()> {
+        match self.send(WriterOp::Reopen(index)).await? {
+            WriterResult::Ok => Ok(()),
+            WriterResult::Err(e) => Err(anyhow::anyhow!("tantivy writer reopen failed: {e}")),
+            _ => Err(anyhow::anyhow!("unexpected result from reopen")),
+        }
+    }
+
+    /// 把重建窗口内记录的操作按顺序回放到（已 reopen 的）新索引。
+    pub async fn replay(&self, ops: Vec<JournalOp>) -> anyhow::Result<()> {
+        for op in ops {
+            let result = match op {
+                JournalOp::Write(docs) => self.send(WriterOp::UpsertBatch(docs)).await?,
+                JournalOp::Delete { field_name, ids } => self.send(WriterOp::DeleteTerms { field_name, ids }).await?,
+                JournalOp::DeleteAll => self.send(WriterOp::DeleteAll).await?,
+            };
+            if let WriterResult::Err(e) = result {
+                return Err(anyhow::anyhow!("tantivy journal replay failed: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn delete_all(&self) -> anyhow::Result<()> {
+        self.record(|| JournalOp::DeleteAll);
+        match self.send(WriterOp::DeleteAll).await? {
+            WriterResult::Ok => Ok(()),
+            WriterResult::Err(e) => Err(anyhow::anyhow!("tantivy delete_all failed: {e}")),
+            _ => Err(anyhow::anyhow!("unexpected result from delete_all")),
+        }
     }
 
     pub async fn write_batch(&self, docs: Vec<Document>) -> anyhow::Result<()> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(WriterJob { op: WriterOp::WriteBatch(docs), reply: Some(reply_tx) })
-            .map_err(|e| anyhow::anyhow!("tantivy writer channel closed: {e}"))?;
-        match reply_rx.await? {
+        self.record(|| JournalOp::Write(docs.clone()));
+        match self.send(WriterOp::WriteBatch(docs)).await? {
             WriterResult::Ok | WriterResult::WriteBatch => Ok(()),
             WriterResult::ForceMerge(_) => Err(anyhow::anyhow!("unexpected force_merge result from write_batch")),
             WriterResult::Err(e) => Err(anyhow::anyhow!("tantivy write_batch failed: {e}")),
@@ -403,6 +534,7 @@ impl IndexWriterHandle {
             return Ok(());
         }
         let ids = ids.to_vec();
+        self.record(|| JournalOp::Delete { field_name, ids: ids.clone() });
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.tx
             .send(WriterJob { op: WriterOp::DeleteTerms { field_name, ids }, reply: Some(reply_tx) })
@@ -505,6 +637,35 @@ pub fn add_documents(
         count += 1;
     }
     Ok(count)
+}
+
+/// 按 (id, file_id) 删除已存在的同一投影后再写入。共享解析产物下同一个切片 id 会对应多个
+/// file_id，因此不能只按 id 删除。
+fn upsert_documents(index_writer: &mut tantivy::IndexWriter, schema: &Schema, docs: Vec<Document>) -> Result<usize> {
+    let id_field = get_field(schema, "id");
+    let file_id_field = get_field(schema, "file_id");
+    for doc in &docs {
+        let query = BooleanQuery::new(vec![
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(Term::from_field_i64(id_field, doc.id), IndexRecordOption::Basic))
+                    as Box<dyn Query>,
+            ),
+            (
+                Occur::Must,
+                Box::new(TermQuery::new(Term::from_field_i64(file_id_field, doc.file_id), IndexRecordOption::Basic)),
+            ),
+        ]);
+        index_writer.delete_query(Box::new(query))?;
+    }
+    add_documents(index_writer, schema, docs)
+}
+
+/// 打开一个已存在的索引目录（不做任何备份/重建），用于重建换目录后重新挂载。
+pub fn open_existing(path: &str) -> Result<Index> {
+    let index = Index::open_in_dir(path)?;
+    register_tokenizers(&index);
+    Ok(index)
 }
 
 pub fn commit_writer(index_writer: &mut tantivy::IndexWriter, label: &str, doc_count: usize) -> tantivy::Result<()> {

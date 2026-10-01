@@ -2097,7 +2097,14 @@ impl FileProcessor {
                         );
                         anyhow::anyhow!(err)
                     })?;
-                    fs::write(format!("{}/{}", cfg.storage.images_path, img_name), bytes).await?;
+                    // 图片名来自外部服务响应，必须校验，防止 `../` 之类的路径穿越。
+                    let Some(image_path) = resolve_image_storage_path(img_name) else {
+                        anyhow::bail!("MinerU returned unsafe image path: {:?}", img_name);
+                    };
+                    if let Some(parent) = std::path::Path::new(&image_path).parent() {
+                        fs::create_dir_all(parent).await?;
+                    }
+                    fs::write(image_path, bytes).await?;
                 }
                 Ok(())
             })

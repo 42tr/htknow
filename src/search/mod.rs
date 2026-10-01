@@ -113,23 +113,86 @@ struct LexiconRow {
     tag: Option<String>,
 }
 
+/// 切片在搜索索引中的一条投影。
+///
+/// 共享解析产物时，同一个切片（`id`，归属 `source_file_id`）会以每个引用该产物的文件
+/// （`file_id`，含源文件本身）各写一份索引文档。所有「从 SQLite 重建索引」的路径都必须
+/// 使用这一口径，否则复用文件的切片会从检索中消失。
 #[derive(Debug, sqlx::FromRow)]
-struct RebuildSliceRow {
+struct SliceProjectionRow {
     id: i64,
     source_file_id: i64,
     file_id: i64,
     kb_id: Option<i64>,
-}
-
-#[derive(Debug, sqlx::FromRow)]
-struct RebuildLanceDbSliceRow {
-    id: i64,
-    source_file_id: i64,
-    file_id: i64,
-    kb_id: Option<i64>,
-    content: String,
+    is_image: i64,
     filename: String,
     path: String,
+}
+
+const SLICE_PROJECTION_COLUMNS: &str = "s.id, s.file_id AS source_file_id, COALESCE(ref.id, source.id) AS file_id, \
+     COALESCE(ref.kb_id, source.kb_id) AS kb_id, s.is_image, \
+     COALESCE(ref.filename, source.filename) AS filename, COALESCE(ref.path, source.path) AS path";
+
+const SLICE_PROJECTION_JOINS: &str = "JOIN files source ON source.id = s.file_id \
+     LEFT JOIN parse_artifacts pa ON pa.source_file_id = source.id \
+     LEFT JOIN files ref ON ref.artifact_id = pa.id";
+
+/// 有效投影总数（与索引文档数可直接比较）。
+async fn count_slice_projections(pool: &SqlitePool) -> anyhow::Result<i64> {
+    let sql = format!(
+        "SELECT COUNT(*) FROM (SELECT DISTINCT s.id, COALESCE(ref.id, source.id) FROM slices s {SLICE_PROJECTION_JOINS})"
+    );
+    Ok(sqlx::query_scalar(&sql).fetch_one(pool).await?)
+}
+
+/// 按 (source_file_id, id) 键集分页读取一页切片的全部投影。
+///
+/// 先在子查询里对**切片**分页，再展开投影，保证同一切片的多份投影不会被 LIMIT 截断在两页之间。
+async fn fetch_slice_projection_page(
+    pool: &SqlitePool, after: (i64, i64), limit: i64,
+) -> anyhow::Result<Vec<SliceProjectionRow>> {
+    let sql = format!(
+        "SELECT DISTINCT {SLICE_PROJECTION_COLUMNS} \
+         FROM (SELECT id FROM slices WHERE (file_id, id) > (?, ?) ORDER BY file_id, id LIMIT ?) page \
+         JOIN slices s ON s.id = page.id {SLICE_PROJECTION_JOINS} \
+         ORDER BY s.file_id, s.id"
+    );
+    Ok(sqlx::query_as(&sql).bind(after.0).bind(after.1).bind(limit).fetch_all(pool).await?)
+}
+
+async fn fetch_slice_projections_by_ids(
+    pool: &SqlitePool, slice_ids: &[i64],
+) -> anyhow::Result<Vec<SliceProjectionRow>> {
+    if slice_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut query_builder: QueryBuilder<'_, Sqlite> = QueryBuilder::new(format!(
+        "SELECT DISTINCT {SLICE_PROJECTION_COLUMNS} FROM slices s {SLICE_PROJECTION_JOINS} WHERE s.id IN ("
+    ));
+    let mut separated = query_builder.separated(", ");
+    for slice_id in slice_ids {
+        separated.push_bind(slice_id);
+    }
+    separated.push_unseparated(") ORDER BY s.file_id, s.id");
+    Ok(query_builder.build_query_as().fetch_all(pool).await?)
+}
+
+/// 切片正文按源文件整体存放；按源文件顺序遍历时只缓存当前文件，避免把整个语料库载入内存，
+/// 也避免同一文件在多个批次里被反复读取、反序列化。
+#[derive(Default)]
+struct SliceContentCache {
+    file_id: Option<i64>,
+    contents: HashMap<i64, String>,
+}
+
+impl SliceContentCache {
+    async fn get(&mut self, source_file_id: i64, slice_id: i64) -> anyhow::Result<String> {
+        if self.file_id != Some(source_file_id) {
+            self.contents = crate::slice_content::read_all(source_file_id).await?;
+            self.file_id = Some(source_file_id);
+        }
+        Ok(self.contents.get(&slice_id).cloned().unwrap_or_default())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -169,37 +232,6 @@ pub fn content_looks_like_image_reference(content: &str) -> bool {
     content.contains("![") && content.contains("](/api/v1/knowledge/files/")
 }
 
-async fn fetch_rebuild_lancedb_rows(
-    pool: &SqlitePool, slice_ids: &[i64],
-) -> anyhow::Result<Vec<RebuildLanceDbSliceRow>> {
-    if slice_ids.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let mut query_builder: QueryBuilder<'_, Sqlite> = QueryBuilder::new(
-        "SELECT s.id, s.file_id AS source_file_id, COALESCE(ref.id, source.id) AS file_id, COALESCE(ref.kb_id, source.kb_id) AS kb_id, \
-         COALESCE(ref.filename, source.filename) AS filename, \
-         COALESCE(ref.path, source.path) AS path \
-         FROM slices s JOIN files source ON source.id = s.file_id \
-         LEFT JOIN parse_artifacts pa ON pa.source_file_id = source.id \
-         LEFT JOIN files ref ON ref.artifact_id = pa.id WHERE s.id IN (",
-    );
-    let mut separated = query_builder.separated(", ");
-    for slice_id in slice_ids {
-        separated.push_bind(slice_id);
-    }
-    separated.push_unseparated(") ORDER BY s.id ASC");
-    let mut rows: Vec<RebuildLanceDbSliceRow> = query_builder.build_query_as().fetch_all(pool).await?;
-    let mut contents = HashMap::new();
-    for source_file_id in rows.iter().map(|row| row.source_file_id).collect::<HashSet<_>>() {
-        contents.insert(source_file_id, crate::slice_content::read_all(source_file_id).await?);
-    }
-    for row in &mut rows {
-        row.content = contents.get(&row.source_file_id).and_then(|v| v.get(&row.id)).cloned().unwrap_or_default();
-    }
-    Ok(rows)
-}
-
 #[derive(Clone)]
 pub struct SearchEngine {
     wiki_index: Arc<wiki_index::WikiIndex>,
@@ -224,13 +256,15 @@ const RRF_K: f32 = 60.0;
 /// 语义检索等于失效。RRF 只用名次不用分值，天然无量纲，也与 `merge_wiki_results`
 /// 的 1/(1+rank) 口径一致；同时出现在多路里的文档会累加得分，得到应有的提升。
 fn fuse_by_rrf(lists: Vec<Vec<SearchResultItem>>) -> Vec<SearchResultItem> {
-    let mut fused: HashMap<i64, (SearchResultItem, f32)> = HashMap::new();
+    // 以 (切片 id, file_id) 为键：共享解析产物下同一切片会以多个文件的投影出现，只按 id 去重
+    // 可能留下调用方无权访问的那份，后续权限过滤会把整条结果丢掉。
+    let mut fused: HashMap<(i64, i64), (SearchResultItem, f32)> = HashMap::new();
     for list in lists {
         // 先过滤空内容再编号，保证名次是连续的。
         let candidates = list.into_iter().filter(|item| !item.content.trim().is_empty());
         for (rank, result) in candidates.enumerate() {
             let contribution = 1.0 / (RRF_K + rank as f32 + 1.0);
-            fused.entry(result.id).and_modify(|(_, score)| *score += contribution).or_insert((result, contribution));
+            fused.entry((result.id, result.file_id)).and_modify(|(_, score)| *score += contribution).or_insert((result, contribution));
         }
     }
     let mut merged: Vec<SearchResultItem> =
@@ -315,8 +349,9 @@ impl SearchEngine {
         }
 
         // 加载所有 slice id 并分离出孤儿切片，确保 LanceDB 不保留无效向量。
+        // 按源文件排序，后续回填时同一文件的切片正文只需读取一次。
         let all_slice_rows: Vec<(i64, i64)> =
-            sqlx::query_as("SELECT s.id, s.file_id FROM slices s ORDER BY s.id ASC").fetch_all(pool).await?;
+            sqlx::query_as("SELECT s.id, s.file_id FROM slices s ORDER BY s.file_id, s.id").fetch_all(pool).await?;
         let valid_file_ids: HashSet<i64> =
             sqlx::query_scalar("SELECT id FROM files").fetch_all(pool).await?.into_iter().collect();
         let mut sqlite_ids = Vec::with_capacity(all_slice_rows.len());
@@ -399,21 +434,24 @@ impl SearchEngine {
         let mut image_embeddings: HashMap<i64, Arc<Vec<f32>>> = HashMap::new();
         let mut attempted_image_embeddings = HashSet::new();
         let mut processed = 0usize;
+        let mut content_cache = SliceContentCache::default();
 
         for id_batch in missing_ids.chunks(batch_size) {
             let t_fetch = Instant::now();
-            let rows = fetch_rebuild_lancedb_rows(pool, id_batch).await?;
+            let rows = fetch_slice_projections_by_ids(pool, id_batch).await?;
             info!(
-                "LanceDB rebuild substep: fetch_rebuild_lancedb_rows(ids={}-{}) took {}ms",
+                "LanceDB rebuild substep: fetch_slice_projections_by_ids(ids={}-{}) took {}ms",
                 id_batch.first().copied().unwrap_or_default(),
                 id_batch.last().copied().unwrap_or_default(),
                 t_fetch.elapsed().as_millis()
             );
-            if rows.len() != id_batch.len() {
+            // 一个切片可能对应多份投影（共享解析产物），按切片 id 去重后再核对是否全部读到。
+            let loaded_slices = rows.iter().map(|row| row.id).collect::<HashSet<_>>().len();
+            if loaded_slices != id_batch.len() {
                 return Err(anyhow!(
                     "Failed to load all missing SQLite slices: requested={}, loaded={}, ids={}-{}",
                     id_batch.len(),
-                    rows.len(),
+                    loaded_slices,
                     id_batch.first().copied().unwrap_or_default(),
                     id_batch.last().copied().unwrap_or_default()
                 ));
@@ -441,18 +479,19 @@ impl SearchEngine {
                 }
             }
 
-            let docs: Vec<lancedb::Document> = rows
-                .into_iter()
-                .map(|row| {
-                    let mut doc = lancedb::Document::new(row.id, row.file_id, row.kb_id, row.content);
-                    let is_image = content_looks_like_image_reference(&doc.content) || is_image_file(&row.filename);
-                    doc = doc.with_is_image(is_image);
-                    if let Some(image_embedding) = image_embeddings.get(&row.file_id) {
-                        doc = doc.with_image_embedding(image_embedding.clone());
-                    }
-                    doc
-                })
-                .collect();
+            let mut docs: Vec<lancedb::Document> = Vec::with_capacity(rows.len());
+            for row in rows {
+                let content = content_cache.get(row.source_file_id, row.id).await?;
+                let mut doc = lancedb::Document::new(row.id, row.file_id, row.kb_id, content);
+                let is_image = row.is_image != 0
+                    || content_looks_like_image_reference(&doc.content)
+                    || is_image_file(&row.filename);
+                doc = doc.with_is_image(is_image);
+                if let Some(image_embedding) = image_embeddings.get(&row.file_id) {
+                    doc = doc.with_image_embedding(image_embedding.clone());
+                }
+                docs.push(doc);
+            }
             let restored = docs.len();
             lancedb::write_documents_batch_for_rebuild(docs).await?;
             processed += restored;
@@ -585,73 +624,50 @@ impl SearchEngine {
             return Err(anyhow!("search engine db pool not set"));
         };
 
-        // 只统计仍有对应 file 的有效 slice，避免孤儿切片导致无限重建。
-        let total_slices: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM slices s WHERE EXISTS (SELECT 1 FROM files f WHERE f.id = s.file_id)",
-        )
-        .fetch_one(pool)
-        .await?;
+        // 按投影口径计数：共享解析产物下一个切片对应多份索引文档，只数切片会永远对不上。
+        let total_projections = count_slice_projections(pool).await?;
         let index_docs = self.index_reader.searcher().num_docs() as i64;
-        if total_slices == index_docs {
-            info!("Tantivy default index is consistent with SQLite: {} valid docs", total_slices);
+        if total_projections == index_docs {
+            info!("Tantivy default index is consistent with SQLite: {} valid docs", total_projections);
             return Ok(());
         }
 
         info!(
-            "Tantivy default index mismatch: sqlite_valid_slices={} index_docs={}, rebuilding...",
-            total_slices, index_docs
+            "Tantivy default index mismatch: sqlite_projections={} index_docs={}, rebuilding...",
+            total_projections, index_docs
         );
 
-        #[derive(Debug, sqlx::FromRow)]
-        struct SliceMeta {
-            id: i64,
-            source_file_id: i64,
-            file_id: i64,
-            kb_id: Option<i64>,
-            is_image: i64,
-        }
-
-        let rows: Vec<SliceMeta> = sqlx::query_as(
-            "SELECT s.id, s.file_id AS source_file_id, f.id AS file_id, f.kb_id, s.is_image \
-             FROM slices s JOIN files f ON f.id = s.file_id \
-             ORDER BY s.id ASC",
-        )
-        .fetch_all(pool)
-        .await?;
-
-        let all_ids: Vec<i64> = rows.iter().map(|row| row.id).collect();
-        if all_ids.is_empty() {
-            return Ok(());
-        }
-
         let cfg = config::get();
-        let batch_size = cfg.search.tantivy_rebuild_batch_size.max(1);
+        let batch_size = i64::try_from(cfg.search.tantivy_rebuild_batch_size)
+            .ok()
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_REBUILD_BATCH_SIZE);
 
         let _guard = self.index_write_lock.lock().await;
-        for chunk in all_ids.chunks(batch_size) {
-            self.index_writer.delete_by_field("id", chunk).await?;
-        }
+        // 整体清空再写回，孤儿文档也一并清掉，避免下次启动再次判定不一致。
+        self.index_writer.delete_all().await?;
 
-        let mut contents = HashMap::new();
-        for source_file_id in rows.iter().map(|row| row.source_file_id).collect::<HashSet<_>>() {
-            contents.insert(source_file_id, crate::slice_content::read_all(source_file_id).await?);
-        }
-
-        for chunk in rows.chunks(batch_size) {
-            let docs: Vec<tantivy_engine::Document> = chunk
-                .iter()
-                .map(|row| {
-                    let content =
-                        contents.get(&row.source_file_id).and_then(|m| m.get(&row.id)).cloned().unwrap_or_default();
-                    let is_image = row.is_image != 0 || content_looks_like_image_reference(&content);
-                    tantivy_engine::Document::new(row.id, row.file_id, row.kb_id, content).with_is_image(is_image)
-                })
-                .collect();
+        let mut content_cache = SliceContentCache::default();
+        let mut after = (0_i64, 0_i64);
+        let mut written = 0_usize;
+        loop {
+            let rows = fetch_slice_projection_page(pool, after, batch_size).await?;
+            let Some(last) = rows.last() else {
+                break;
+            };
+            after = (last.source_file_id, last.id);
+            let mut docs = Vec::with_capacity(rows.len());
+            for row in rows {
+                let content = content_cache.get(row.source_file_id, row.id).await?;
+                let is_image = row.is_image != 0 || content_looks_like_image_reference(&content);
+                docs.push(tantivy_engine::Document::new(row.id, row.file_id, row.kb_id, content).with_is_image(is_image));
+            }
+            written += docs.len();
             self.index_writer.write_batch(docs).await?;
         }
         reload_reader(&self.index_reader, "index")?;
 
-        info!("Tantivy default index rebuilt from SQLite: {} docs", all_ids.len());
+        info!("Tantivy default index rebuilt from SQLite: {} docs", written);
         Ok(())
     }
 
@@ -687,12 +703,26 @@ impl SearchEngine {
         };
         let _rebuild_guard = self.rebuild_lock.lock().await;
 
-        let total_slices: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM slices s WHERE EXISTS (SELECT 1 FROM files f WHERE f.id = s.file_id)",
-        )
-        .fetch_one(pool)
-        .await?;
-        let total_docs = total_slices;
+        // 在读取数据库快照之前开始记录增量写操作；换目录后回放，重建窗口内的写入/删除不会丢失。
+        self.index_writer.start_journal();
+        let result = self.rebuild_tantivy_indexes_inner(pool, job_tag, &mut on_progress).await;
+        // 无论成功与否都停止记录；失败时旧索引仍在使用且已收到全部写入，丢弃即可。
+        let journal = self.index_writer.take_journal();
+        if result.is_err() && !journal.is_empty() {
+            debug!("Discarding {} journaled tantivy ops after failed rebuild", journal.len());
+        }
+        result?;
+        self.wiki_index.rebuild(pool).await
+    }
+
+    async fn rebuild_tantivy_indexes_inner<F, Fut>(
+        &self, pool: &SqlitePool, job_tag: &str, on_progress: &mut F,
+    ) -> anyhow::Result<()>
+    where
+        F: FnMut(RebuildProgress) -> Fut + Send,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let total_docs = count_slice_projections(pool).await?;
         let mut processed_docs = 0_i64;
         on_progress(RebuildProgress { phase: "prepare".to_string(), total_docs, processed_docs }).await;
 
@@ -718,40 +748,23 @@ impl SearchEngine {
             let mut total_slice_docs = 0_usize;
 
             on_progress(RebuildProgress { phase: "build_slice".to_string(), total_docs, processed_docs }).await;
-            let mut last_slice_id = 0_i64;
+            let mut content_cache = SliceContentCache::default();
+            let mut after = (0_i64, 0_i64);
             loop {
-                let rows: Vec<RebuildSliceRow> = sqlx::query_as(
-                    "SELECT s.id, s.file_id AS source_file_id, COALESCE(ref.id, source.id) AS file_id, \
-                            COALESCE(ref.kb_id, source.kb_id) AS kb_id \
-                     FROM slices s JOIN files source ON source.id = s.file_id \
-                     LEFT JOIN parse_artifacts pa ON pa.source_file_id = source.id \
-                     LEFT JOIN files ref ON ref.artifact_id = pa.id \
-                     WHERE s.id > ? \
-                     ORDER BY s.id ASC \
-                     LIMIT ?",
-                )
-                .bind(last_slice_id)
-                .bind(rebuild_batch_size)
-                .fetch_all(pool)
-                .await?;
-                if rows.is_empty() {
+                let rows = fetch_slice_projection_page(pool, after, rebuild_batch_size).await?;
+                let Some(last) = rows.last() else {
                     break;
-                }
-                last_slice_id = rows.last().map(|row| row.id).unwrap_or(last_slice_id);
+                };
+                after = (last.source_file_id, last.id);
                 let batch_size = rows.len() as i64;
-                let mut contents = HashMap::new();
-                for source_file_id in rows.iter().map(|row| row.source_file_id).collect::<HashSet<_>>() {
-                    contents.insert(source_file_id, crate::slice_content::read_all(source_file_id).await?);
+                let mut docs = Vec::with_capacity(rows.len());
+                for row in rows {
+                    let content = content_cache.get(row.source_file_id, row.id).await?;
+                    let is_image = row.is_image != 0 || content_looks_like_image_reference(&content);
+                    docs.push(
+                        tantivy_engine::Document::new(row.id, row.file_id, row.kb_id, content).with_is_image(is_image),
+                    );
                 }
-                let docs: Vec<tantivy_engine::Document> = rows
-                    .into_iter()
-                    .map(|row| {
-                        let content =
-                            contents.get(&row.source_file_id).and_then(|v| v.get(&row.id)).cloned().unwrap_or_default();
-                        let is_image = content_looks_like_image_reference(&content);
-                        tantivy_engine::Document::new(row.id, row.file_id, row.kb_id, content).with_is_image(is_image)
-                    })
-                    .collect();
                 total_slice_docs += tantivy_engine::add_documents(&mut slice_writer, &slice_schema, docs)?;
                 processed_docs += batch_size;
                 on_progress(RebuildProgress { phase: "build_slice".to_string(), total_docs, processed_docs }).await;
@@ -766,13 +779,48 @@ impl SearchEngine {
             let _slice_write_guard = self.index_write_lock.lock().await;
             on_progress(RebuildProgress { phase: "swap".to_string(), total_docs, processed_docs }).await;
 
-            if let Err(err) = swap_index_dir(&slice_live_path, &slice_temp_path, &slice_backup_path) {
+            // 先让常驻 writer 等完后台 merge 并释放，防止它在换目录后继续往该路径写 meta.json。
+            let swapped = match self.index_writer.release().await {
+                Ok(()) => swap_index_dir(&slice_live_path, &slice_temp_path, &slice_backup_path),
+                Err(err) => Err(err),
+            };
+            if let Err(err) = swapped {
+                // swap_index_dir 失败时已把旧目录还原，重新挂回旧索引。
+                if let Ok(index) = tantivy_engine::open_existing(&slice_live_path) {
+                    if let Err(reopen_err) = self.index_writer.reopen(index).await {
+                        log::error!("Failed to reopen tantivy writer on original index: {reopen_err:#}");
+                    }
+                }
                 return Err(err.context("swap slice index failed"));
             }
 
-            if let Err(err) = reload_reader(&self.index_reader, "index") {
+            // 常驻 writer 仍持有旧索引的 segment 列表，必须切到新目录，否则下一次 commit 会把
+            // 旧 segment 写进新目录的 meta.json 并损坏索引。随后回放重建窗口内的增量写操作。
+            let switched: anyhow::Result<()> = async {
+                let new_index = tantivy_engine::open_existing(&slice_live_path).context("open rebuilt slice index")?;
+                self.index_writer.reopen(new_index).await?;
+                let journal = self.index_writer.take_journal();
+                if !journal.is_empty() {
+                    info!("Replaying {} tantivy ops journaled during rebuild", journal.len());
+                }
+                self.index_writer.replay(journal).await?;
+                reload_reader(&self.index_reader, "index")?;
+                Ok(())
+            }
+            .await;
+            if let Err(err) = switched {
+                // 回滚到旧索引。旧索引在重建期间一直接收写入，无需回放。
                 let _ = restore_backup_dir(&slice_live_path, &slice_backup_path);
-                return Err(err).context("reload slice reader after swap failed");
+                match tantivy_engine::open_existing(&slice_live_path) {
+                    Ok(index) => {
+                        if let Err(reopen_err) = self.index_writer.reopen(index).await {
+                            log::error!("Failed to reopen tantivy writer on restored index: {reopen_err:#}");
+                        }
+                    }
+                    Err(open_err) => log::error!("Failed to open restored tantivy index: {open_err:#}"),
+                }
+                let _ = reload_reader(&self.index_reader, "index");
+                return Err(err).context("switch to rebuilt slice index failed");
             }
             cleanup_dir_if_exists(&slice_backup_path)?;
             processed_docs = total_docs;
@@ -789,8 +837,7 @@ impl SearchEngine {
             // 这些 backup 会在下次成功重建后被覆盖，或通过手动清理。
         }
 
-        rebuild_result?;
-        self.wiki_index.rebuild(pool).await
+        rebuild_result
     }
 
     pub async fn write(
