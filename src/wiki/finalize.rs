@@ -46,6 +46,14 @@ pub async fn finalize_kb(pool: &SqlitePool, kb_id: i64) -> Result<FinalizeReport
     let mut report = FinalizeReport::default();
 
     let pages = page::list(pool, kb_id, None, Some(STATUS_PUBLISHED), MAX_PAGES_PER_FINALIZE as i64, None).await?;
+    if pages.len() >= MAX_PAGES_PER_FINALIZE {
+        // page::list 按 id 倒序取前 N 条：超限之后最老的页面永远轮不到收敛，
+        // 它们的死链与交叉链接会一直停在旧状态，必须让运维看得见。
+        warn!(
+            "wiki finalize: kb {} reached the {} page cap, oldest published pages are not converging",
+            kb_id, MAX_PAGES_PER_FINALIZE
+        );
+    }
     let surfaces = page::list_surfaces(pool, kb_id).await?;
     let live_slugs: HashSet<String> = surfaces.iter().map(|s| s.slug.clone()).collect();
     let linkifier = Linkifier::new(&surfaces);
@@ -131,7 +139,9 @@ async fn rebuild_index(
         editor_id: String::new(),
     };
     let _lock = super::ingest::acquire_slug_lock(format!("{}:{}", kb_id, INDEX_SLUG)).await?;
-    let current = page::list(pool, kb_id, None, Some(STATUS_PUBLISHED), MAX_PAGES_PER_FINALIZE as i64, None).await?;
+    // 只校验目录是否变化，不需要正文。
+    let current =
+        page::list_meta(pool, kb_id, None, Some(STATUS_PUBLISHED), MAX_PAGES_PER_FINALIZE as i64, None).await?;
     anyhow::ensure!(
         render_directory(&current.iter().filter(|p| !p.is_index()).collect::<Vec<_>>()) == directory,
         "Wiki pages changed during index generation; retry finalize"

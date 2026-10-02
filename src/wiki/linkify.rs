@@ -387,9 +387,12 @@ impl Linkifier {
 
     /// 为单个页面注入交叉链接。每个 slug 只链接**首次**出现，避免满屏重复链接。
     pub fn linkify(&self, content: &str, self_slug: &str) -> LinkifyOutcome {
-        let links = out_links(content, self_slug);
         let Some(automaton) = &self.automaton else {
-            return LinkifyOutcome { content: content.to_string(), out_links: links, changed: false };
+            return LinkifyOutcome {
+                content: content.to_string(),
+                out_links: out_links(content, self_slug),
+                changed: false,
+            };
         };
 
         let forbidden = forbidden_spans(content);
@@ -400,6 +403,9 @@ impl Linkifier {
             linked_slugs.insert(slug);
         }
 
+        // `find_iter` 按起点递增产出且互不重叠，因此只需记住上一处插入的结尾即可判定重叠，
+        // 不必对已接受的插入做 O(n²) 的两两比较。
+        let mut last_end = 0usize;
         for matched in automaton.find_iter(content) {
             let pattern = matched.pattern().as_usize();
             let Some((slug, name)) = self.patterns.get(pattern) else { continue };
@@ -407,18 +413,20 @@ impl Linkifier {
                 continue;
             }
             let (start, end) = (matched.start(), matched.end());
-            if span_contains(&forbidden, start, end) || !has_word_boundary(content, start, end) {
-                continue;
-            }
-            if insertions.iter().any(|item| start < item.end && end > item.start) {
+            if start < last_end || span_contains(&forbidden, start, end) || !has_word_boundary(content, start, end) {
                 continue;
             }
             linked_slugs.insert(slug.clone());
             insertions.push(Insertion { start, end, slug: slug.clone(), label: name.clone() });
+            last_end = end;
         }
 
         if insertions.is_empty() {
-            return LinkifyOutcome { content: content.to_string(), out_links: links, changed: false };
+            return LinkifyOutcome {
+                content: content.to_string(),
+                out_links: out_links(content, self_slug),
+                changed: false,
+            };
         }
         insertions.sort_by_key(|item| item.start);
 

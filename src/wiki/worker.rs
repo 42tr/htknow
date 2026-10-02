@@ -10,7 +10,6 @@
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use anyhow::{Result, anyhow};
-use futures::stream::{self, StreamExt};
 use log::{debug, error, info, warn};
 use sqlx::SqlitePool;
 use tokio::sync::Semaphore;
@@ -78,11 +77,17 @@ async fn worker_loop(pool: SqlitePool) {
             tokio::time::sleep(base_interval).await;
             continue;
         }
-        match run_cycle(pool.clone()).await {
-            Ok(0) => idle_interval = (idle_interval * 2).min(max_idle_interval),
-            Ok(_) => idle_interval = base_interval,
-            Err(e) => {
+        // worker_loop 只 spawn 一次：cycle 里的 panic 必须挡在这一层，
+        // 否则整个 Wiki 队列会静默停摆到进程重启。
+        match tokio::spawn(run_cycle(pool.clone())).await {
+            Ok(Ok(0)) => idle_interval = (idle_interval * 2).min(max_idle_interval),
+            Ok(Ok(_)) => idle_interval = base_interval,
+            Ok(Err(e)) => {
                 error!("Wiki worker cycle failed: {}", e);
+                idle_interval = (idle_interval * 2).min(max_idle_interval);
+            }
+            Err(join_error) => {
+                error!("Wiki worker cycle panicked: {}", join_error);
                 idle_interval = (idle_interval * 2).min(max_idle_interval);
             }
         }
@@ -100,18 +105,26 @@ async fn run_cycle(pool: SqlitePool) -> Result<usize> {
     }
 
     // 认领即开始计时，批次跑完前必须周期性续约，否则长任务会被当成残留抢走。
-    let heartbeat = spawn_claim_heartbeat(pool.clone(), run_id.clone());
+    let _heartbeat = HeartbeatGuard(spawn_claim_heartbeat(pool.clone(), run_id.clone()));
 
     let permits = KbPermits::new(cfg.wiki.max_inflight_per_kb);
-    let concurrency = cfg.wiki.batch_size.max(1);
-    // 逐个构造拥有所有权的 future：闭包 + 借用捕获会让 spawn 链路的 Send 证明
+    // 每个任务单独 spawn：任务内部 panic 只作废它自己，按失败记账交给队列退避重试，
+    // 不会连带丢掉整批结果、更不会把 worker_loop 打死。
+    // 逐个搬运拥有所有权的值：闭包 + 借用捕获会让 spawn 链路的 Send 证明
     // 退化成高阶生命周期问题。
-    let mut pending = Vec::with_capacity(tasks.len());
+    let mut spawned = Vec::with_capacity(tasks.len());
     for task in tasks {
-        pending.push(run_one(pool.clone(), permits.clone(), task));
+        spawned.push((task.clone(), tokio::spawn(run_one(pool.clone(), permits.clone(), task))));
     }
-    let outcomes: Vec<(WikiTask, Result<()>)> = stream::iter(pending).buffer_unordered(concurrency).collect().await;
-    heartbeat.abort();
+    // 任务已全部并发跑起来，按序 join 只是收结果，不再限制并发度。
+    let mut outcomes = Vec::with_capacity(spawned.len());
+    for (task, handle) in spawned {
+        let result = match handle.await {
+            Ok(result) => result,
+            Err(join_error) => Err(anyhow!("wiki task panicked: {}", join_error)),
+        };
+        outcomes.push((task, result));
+    }
 
     let mut processed = 0usize;
     for (task, result) in outcomes {
@@ -132,16 +145,27 @@ async fn run_cycle(pool: SqlitePool) -> Result<usize> {
     Ok(processed)
 }
 
-async fn run_one(pool: SqlitePool, permits: KbPermits, task: WikiTask) -> (WikiTask, Result<()>) {
+async fn run_one(pool: SqlitePool, permits: KbPermits, task: WikiTask) -> Result<()> {
     // 每知识库在途上限：ingest/finalize 都受约束，避免单库饿死其他库。
     let semaphore = permits.for_kb(task.kb_id);
-    let Ok(_permit) = semaphore.acquire().await else {
-        return (task, Err(anyhow!("wiki kb permit semaphore closed")));
-    };
-    dispatch(pool, task).await
+    let _permit =
+        semaphore.acquire().await.map_err(|_| anyhow!("wiki kb permit semaphore closed for kb {}", task.kb_id))?;
+    run_task(&pool, &task).await
 }
 
-/// 批次执行期间周期性续约 `claimed_at`，返回的 handle 由调用方在批次结束时 abort。
+/// 心跳守卫：批次结束、出错返回或 panic 展开时都要停掉续约。
+///
+/// 漏掉 abort 的后果不是「多跑一个协程」：心跳会一直刷新 `claimed_at`，
+/// `recover_stale` 永远判定这批任务还活着，队列就此卡死。
+struct HeartbeatGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for HeartbeatGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// 批次执行期间周期性续约 `claimed_at`，handle 交给 [`HeartbeatGuard`] 在作用域结束时 abort。
 ///
 /// 间隔取 `claim_stale_secs / 3`：一次续约失败（例如数据库忙）也还有两次机会补上。
 /// 本批全部落地后 `renew_claims` 返回 0，任务自行退出，不会留下常驻协程。
@@ -167,13 +191,6 @@ async fn recover_stale_if_needed(pool: &SqlitePool) -> Result<()> {
         queue::recover_stale(pool).await?;
     }
     Ok(())
-}
-
-/// 分发单个任务。写成自由函数并只接受拥有所有权的参数，
-/// 避免 `&SqlitePool`/`&WikiTask` 借用在并发 future 里引入生命周期约束。
-async fn dispatch(pool: SqlitePool, task: WikiTask) -> (WikiTask, Result<()>) {
-    let result = run_task(&pool, &task).await;
-    (task, result)
 }
 
 async fn run_task(pool: &SqlitePool, task: &WikiTask) -> Result<()> {

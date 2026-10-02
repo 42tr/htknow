@@ -246,9 +246,11 @@ async fn slice_refs(pool: &SqlitePool, source_ids: &[i64], slice_ids: &[i64]) ->
     if slice_ids.is_empty() {
         return Ok(Vec::new());
     }
+    // 一次查完来源文件的映射：一个页面可能由十几个文档共同贡献，逐个查询是纯 N+1。
+    let owners = crate::api::effective_parse_file_ids(pool, source_ids).await?;
     let mut visible_by_owner: HashMap<i64, i64> = HashMap::new();
     for source_id in source_ids {
-        let owner = crate::api::effective_parse_file_id(pool, *source_id).await?;
+        let owner = owners.get(source_id).copied().unwrap_or(*source_id);
         visible_by_owner.entry(owner).or_insert(*source_id);
     }
     let fallback = source_ids.first().copied();
@@ -328,7 +330,8 @@ pub async fn get_index(
     Query(params): Query<WikiKbParams>, State(pool): State<SqlitePool>, Extension(user): Extension<AuthUser>,
 ) -> ApiResult<Json<WikiIndexResponse>> {
     common::ensure_kb_accessible(&pool, params.kb_id, &user.user_id, user.is_admin()).await?;
-    let pages = page::list(&pool, params.kb_id, None, None, i64::MAX, None).await?;
+    // 目录只要标题/摘要，用不带正文的投影：全库正文可能比整个响应大两个数量级。
+    let pages = page::list_meta(&pool, params.kb_id, None, None, i64::MAX, None).await?;
     let index_page = pages.iter().find(|p| p.is_index());
     let intro = index_page.map(|p| p.summary.clone()).unwrap_or_default();
     let updated_at = index_page.map(|p| p.updated_at).unwrap_or(0);
@@ -379,13 +382,16 @@ pub async fn search_pages(
         .search_wiki_limited(query, Some(&vec![params.kb_id]), limit as usize)
         .await
         .map_err(|e| ApiError::internal(format!("Wiki search failed: {e}")))?;
+    let candidates: Vec<_> = hits.into_iter().take(limit as usize).collect();
+    let ids: Vec<i64> = candidates.iter().map(|(candidate, _)| candidate.id).collect();
+    // 一次取回全部命中页：逐条 get_by_id 是 N+1，而 limit 上限是 100。
+    let mut by_id: HashMap<i64, WikiPage> =
+        page::get_by_ids(&pool, &ids).await?.into_iter().map(|page| (page.id, page)).collect();
     let mut pages = Vec::new();
-    for (candidate, _) in hits.into_iter().take(limit as usize) {
-        if let Some(page) = page::get_by_id(&pool, candidate.id).await? {
-            if page.status == wiki::STATUS_PUBLISHED && page.version == candidate.version && page.kb_id == params.kb_id
-            {
-                pages.push(page);
-            }
+    for (candidate, _) in candidates {
+        let Some(page) = by_id.remove(&candidate.id) else { continue };
+        if page.status == wiki::STATUS_PUBLISHED && page.version == candidate.version && page.kb_id == params.kb_id {
+            pages.push(page);
         }
     }
     Ok(Json(WikiPageListResponse { items: pages.into_iter().map(Into::into).collect(), next_before_id: None }))
@@ -439,7 +445,8 @@ pub async fn get_graph(
     Query(params): Query<WikiGraphParams>, State(pool): State<SqlitePool>, Extension(user): Extension<AuthUser>,
 ) -> ApiResult<Json<WikiGraphResponse>> {
     common::ensure_kb_accessible(&pool, params.kb_id, &user.user_id, user.is_admin()).await?;
-    let pages = page::list(&pool, params.kb_id, None, Some(wiki::STATUS_PUBLISHED), i64::MAX, None).await?;
+    // 图视图只用 slug/标题/摘要与出入链，正文不参与，走轻量投影。
+    let pages = page::list_meta(&pool, params.kb_id, None, Some(wiki::STATUS_PUBLISHED), i64::MAX, None).await?;
     let by_slug: HashMap<String, &WikiPage> = pages.iter().map(|p| (p.slug.clone(), p)).collect();
 
     let selected: HashSet<String> = match params.center.as_deref().map(str::trim).filter(|v| !v.is_empty()) {

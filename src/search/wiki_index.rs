@@ -142,22 +142,36 @@ impl WikiIndex {
         if page_ids.as_ref().is_some_and(Vec::is_empty) {
             return Ok(Vec::new());
         }
-        let lexical = tantivy_engine::search_sync_with_limit(
-            &self.reader,
-            &self.schema,
-            query,
-            page_ids.as_ref(),
-            kb_ids,
-            None,
-            None,
-            limit,
-        )?;
+        // 词法召回是同步阻塞的，交给 blocking 线程，别占着 runtime worker；
+        // 它和向量召回（含一次 embedding HTTP 往返）互不依赖，串行等待等于把两边延迟相加。
+        let reader = self.reader.clone();
+        let schema = self.schema.clone();
+        let lexical_query = query.to_string();
+        let lexical_pages = page_ids.clone();
+        let lexical_kbs = kb_ids.cloned();
+        let lexical_task = tokio::task::spawn_blocking(move || {
+            tantivy_engine::search_sync_with_limit(
+                &reader,
+                &schema,
+                &lexical_query,
+                lexical_pages.as_ref(),
+                lexical_kbs.as_ref(),
+                None,
+                None,
+                limit,
+            )
+        });
+        let vector = super::wiki_vector::search(pool, query, page_ids.as_ref(), kb_ids, limit).await;
+        let lexical = lexical_task
+            .await
+            .map_err(|err| anyhow::anyhow!("Wiki lexical search task failed: {}", err))??;
+
         let mut scores = HashMap::<i64, f32>::new();
         // Reciprocal-rank fusion avoids comparing BM25 with vector distances.
         for (rank, hit) in lexical.iter().enumerate() {
             *scores.entry(hit.id).or_default() += 1.0 / (60.0 + rank as f32 + 1.0);
         }
-        match super::wiki_vector::search(pool, query, page_ids.as_ref(), kb_ids, limit).await {
+        match vector {
             Ok(hits) => {
                 for (rank, (id, _)) in hits.into_iter().enumerate() {
                     *scores.entry(id).or_default() += 1.0 / (60.0 + rank as f32 + 1.0);

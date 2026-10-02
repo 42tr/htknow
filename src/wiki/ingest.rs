@@ -621,10 +621,34 @@ async fn candidates_from_llm(
 }
 
 /// 拼接文档全文（受 `max_source_chars` 约束）。
+///
+/// 只拼到刚好覆盖预算为止：先 join 整篇再截断，会让大文档白白分配并复制一份数 MB 的
+/// 中间字符串，而最终送进模型的只有一万多字符。
 fn full_document_text(slices: &[(i64, String)]) -> String {
     let budget = crate::config::get().wiki.max_source_chars;
-    let joined: String = slices.iter().map(|(_, content)| content.as_str()).collect::<Vec<_>>().join("\n\n");
-    prompts::truncate_chars(&joined, budget)
+    let counts: Vec<usize> = slices.iter().map(|(_, content)| content.chars().count()).collect();
+    // 与「先 join 再截断」保持同一口径：分隔符也计入原文总字数。
+    let total_chars = counts.iter().sum::<usize>() + slices.len().saturating_sub(1) * 2;
+    if budget == 0 || total_chars <= budget {
+        // 不会截断时结果就是完整拼接，没必要绕前缀逻辑。
+        return slices.iter().map(|(_, content)| content.as_str()).collect::<Vec<_>>().join("\n\n");
+    }
+    // 多取一个字符，`truncate_with_total` 才能判定「确实超了预算」。
+    let needed = budget + 1;
+    let mut prefix = String::new();
+    let mut used = 0usize;
+    for (index, ((_, content), count)) in slices.iter().zip(&counts).enumerate() {
+        if index > 0 {
+            prefix.push_str("\n\n");
+            used += 2;
+        }
+        if used >= needed {
+            break;
+        }
+        prefix.push_str(content);
+        used += count;
+    }
+    prompts::truncate_with_total(&prefix, budget, total_chars)
 }
 
 /// 引用归类：按字符预算切批，批内并发，把模型返回的短句柄映射回真实切片 ID。
@@ -957,9 +981,14 @@ pub async fn refresh_page(pool: &SqlitePool, kb_id: i64, slug: &str) -> Result<b
     }
 
     // 切片可能分散在多个源文件（共享解析产物），逐文件读取后合并。
+    // 来源映射一次查完；再去重，多个来源复用同一份解析产物时不要重复读盘。
+    let owners = crate::api::effective_parse_file_ids(pool, &source_ids).await?;
+    let mut effective_ids: Vec<i64> =
+        source_ids.iter().map(|file_id| owners.get(file_id).copied().unwrap_or(*file_id)).collect();
+    effective_ids.sort_unstable();
+    effective_ids.dedup();
     let mut content_by_slice: HashMap<i64, String> = HashMap::new();
-    for file_id in &source_ids {
-        let effective = crate::api::effective_parse_file_id(pool, *file_id).await?;
+    for effective in effective_ids {
         for (slice_id, content) in crate::slice_content::read_all(effective).await? {
             content_by_slice.insert(slice_id, content);
         }

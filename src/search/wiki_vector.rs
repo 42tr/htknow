@@ -27,6 +27,8 @@ static CURSOR: AtomicUsize = AtomicUsize::new(0);
 static KNOWN: Mutex<Option<HashMap<i64, i64>>> = Mutex::const_new(None);
 static WRITE_LOCK: Mutex<()> = Mutex::const_new(());
 const TABLE_NAME: &str = "wiki_pages";
+/// 每轮同步处理的变更条数。读侧已批量化，单轮成本主要落在 embedding 调用上。
+const SYNC_BATCH: usize = 16;
 
 fn schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -121,18 +123,35 @@ pub async fn sync(pool: &sqlx::SqlitePool) -> Result<()> {
     let changes: Vec<(i64, i64)> =
         sqlx::query_as("SELECT seq, page_id FROM wiki_index_changes ORDER BY seq").fetch_all(pool).await?;
     let pending: Vec<_> = changes.into_iter().filter(|(seq, id)| known.get(id) != Some(seq)).collect();
-    let start = CURSOR.fetch_add(16, Ordering::Relaxed) % pending.len().max(1);
+    let start = CURSOR.fetch_add(SYNC_BATCH, Ordering::Relaxed) % pending.len().max(1);
+    // `cycle()` 让轮转起点绕回队首：本轮失败的条目下一轮仍会被挑到。
+    let round: Vec<(i64, i64)> = pending
+        .iter()
+        .cycle()
+        .skip(start)
+        .take(pending.len().min(SYNC_BATCH))
+        .map(|(seq, id)| (*seq, *id))
+        .collect();
+    if round.is_empty() {
+        return Ok(());
+    }
+    let round_ids: Vec<i64> = round.iter().map(|(_, id)| *id).collect();
+
+    // 两次批量读替代 2N 次往返：本轮页面正文 + 磁盘上已存的向量指纹。
+    let pages: HashMap<i64, IndexedPage> =
+        super::wiki_index::load_pages(pool, &round_ids).await?.into_iter().map(|page| (page.id, page)).collect();
+    let stored = stored_fingerprints(table, &round_ids).await?;
+
     let mut first_error = None;
-    for (seq, id) in pending.iter().cycle().skip(start).take(pending.len().min(16)) {
-        let mut pages = super::wiki_index::load_pages(pool, &[*id]).await?;
-        let Some(page) = pages.pop() else {
+    for (seq, id) in &round {
+        let Some(page) = pages.get(id) else {
             table.delete(&format!("id = {id}")).await?;
             known.insert(*id, *seq);
             continue;
         };
         // Persisted matching embeddings survive process restarts without another model call.
-        let matching = format!("id = {} AND fingerprint = '{}'", id, fingerprint(&page).replace('\'', "''"));
-        if table.count_rows(Some(matching)).await? > 0 {
+        let current = fingerprint(page);
+        if stored.get(id).is_some_and(|value| *value == current) {
             known.insert(*id, *seq);
             continue;
         }
@@ -152,7 +171,7 @@ pub async fn sync(pool: &sqlx::SqlitePool) -> Result<()> {
                 vec![
                     Arc::new(Int64Array::from(vec![page.id])) as ArrayRef,
                     Arc::new(Int64Array::from(vec![page.kb_id])),
-                    Arc::new(StringArray::from(vec![fingerprint(&page)])),
+                    Arc::new(StringArray::from(vec![current.clone()])),
                     Arc::new(builder.finish()),
                 ],
             )?;
@@ -176,6 +195,46 @@ pub async fn sync(pool: &sqlx::SqlitePool) -> Result<()> {
         return Err(err);
     }
     Ok(())
+}
+
+/// 一次查回若干页面在磁盘上的向量指纹。
+///
+/// 逐条 `count_rows` 要为每个页面付一次 LanceDB 往返；这里一条投影查询就够，
+/// 判定「重启后能否复用已有向量」的语义完全一致。
+/// `id` 在写入路径上是「先删后加」，因此每个 id 至多一行，`limit` 取 id 数即为精确上界。
+async fn stored_fingerprints(table: &Table, ids: &[i64]) -> Result<HashMap<i64, String>> {
+    if ids.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let filter = format!("id IN ({})", ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(","));
+    let batches: Vec<RecordBatch> = table
+        .query()
+        .select(Select::columns(&["id", "fingerprint"]))
+        .only_if(filter)
+        .limit(ids.len())
+        .execute()
+        .await?
+        .try_collect()
+        .await?;
+    let mut stored = HashMap::new();
+    for batch in batches {
+        let ids = batch
+            .column_by_name("id")
+            .context("missing Wiki id")?
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .context("invalid Wiki id")?;
+        let fingerprints = batch
+            .column_by_name("fingerprint")
+            .context("missing Wiki fingerprint")?
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .context("invalid Wiki fingerprint")?;
+        for index in 0..batch.num_rows() {
+            stored.insert(ids.value(index), fingerprints.value(index).to_string());
+        }
+    }
+    Ok(stored)
 }
 
 pub async fn search(

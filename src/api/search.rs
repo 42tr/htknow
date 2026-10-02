@@ -373,23 +373,18 @@ pub async fn search(
         return Ok(Json(SearchResult { results: vec![] }));
     }
 
-    let raw_results = search_engine
-        .search(&params.query, params.file_id.as_ref(), kb_ids_to_search.as_ref())
-        .await
-        .map_err(|e| crate::api::error::ApiError::internal(format!("Search failed: {}", e)))?;
+    let (searched, wiki_hits) = tokio::join!(
+        search_engine.search(&params.query, params.file_id.as_ref(), kb_ids_to_search.as_ref()),
+        fetch_wiki_hits(&search_engine, &params.query, params.file_id.as_ref(), kb_ids_to_search.as_ref())
+    );
+    let raw_results =
+        searched.map_err(|e| crate::api::error::ApiError::internal(format!("Search failed: {}", e)))?;
+    let wiki_hits = wiki_hits?;
 
     let assemble_started = Instant::now();
     let mut results = build_slice_results_from_raw(&pool, raw_results, &auth_user, true).await?;
-    merge_wiki_results(
-        &pool,
-        &search_engine,
-        &auth_user,
-        &params.query,
-        params.file_id.as_ref(),
-        kb_ids_to_search.as_ref(),
-        &mut results,
-    )
-    .await?;
+    merge_wiki_hits(&pool, &search_engine, &auth_user, &params.query, params.file_id.as_ref(), wiki_hits, &mut results)
+        .await?;
     info!(
         "search request completed: user_id={}, query=\"{}\", file_filter={}, kb_scope={}, final_results={}, assemble_elapsed_ms={}, elapsed_ms={}",
         user_id,
@@ -458,6 +453,9 @@ fn file_matches_kb_scope(file: &File, kb_ids: Option<&[i64]>) -> bool {
     kb_ids.is_none_or(|ids| file.kb_id.is_some_and(|kb_id| ids.contains(&kb_id)))
 }
 
+/// 一条 Wiki 召回结果：页面投影 + 融合用分数。
+type WikiHit = (crate::search::wiki_index::IndexedPage, f32);
+
 async fn resolve_scope_for_user(
     pool: &SqlitePool, auth_user: &AuthUser, kb_filter: Option<&Vec<i64>>,
 ) -> ApiResult<(bool, String, Option<Vec<i64>>)> {
@@ -467,25 +465,35 @@ async fn resolve_scope_for_user(
     Ok((is_admin, user_id, kb_ids))
 }
 
-/// Fuse independently ranked slice and Wiki lists. If Wiki has no hits, existing scores stay intact.
-#[allow(clippy::too_many_arguments)]
-async fn merge_wiki_results(
-    pool: &SqlitePool, engine: &SearchEngine, user: &AuthUser, query: &str, file_ids: Option<&Vec<i64>>,
-    kb_ids: Option<&Vec<i64>>, results: &mut Vec<SearchResultItem>,
-) -> ApiResult<()> {
+/// Wiki 召回，独立成一步好让它与切片检索并行：两路各自要算一次查询向量、
+/// 各自访问一套索引，串行等待等于把两边的延迟直接相加。
+///
+/// Wiki 页面与切片共用 `search.limit` 个坑位，因此单独限制 Wiki 数量，
+/// 避免开启 Wiki 后证据切片被大面积挤掉（RAG 场景下切片才是可引用证据）。
+async fn fetch_wiki_hits(
+    engine: &SearchEngine, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
+) -> ApiResult<Vec<WikiHit>> {
     if file_ids.is_some_and(Vec::is_empty) {
-        return Ok(());
+        return Ok(Vec::new());
     }
-    // Wiki 页面与切片共用 search.limit 个坑位，单独限制 Wiki 数量，
-    // 避免开启 Wiki 后证据切片被大面积挤掉（RAG 场景下切片才是可引用证据）。
     let wiki_limit = crate::config::get().search.wiki_limit;
     if wiki_limit == 0 {
+        return Ok(Vec::new());
+    }
+    engine.search_wiki_scoped(query, file_ids, kb_ids, wiki_limit).await.map_err(|e| {
+        ApiError::internal(format!("Wiki search failed: {e}"))
+    })
+}
+
+/// Fuse independently ranked slice and Wiki lists. If Wiki has no hits, existing scores stay intact.
+#[allow(clippy::too_many_arguments)]
+async fn merge_wiki_hits(
+    pool: &SqlitePool, engine: &SearchEngine, user: &AuthUser, query: &str, file_ids: Option<&Vec<i64>>,
+    hits: Vec<WikiHit>, results: &mut Vec<SearchResultItem>,
+) -> ApiResult<()> {
+    if hits.is_empty() {
         return Ok(());
     }
-    let hits = engine
-        .search_wiki_scoped(query, file_ids, kb_ids, wiki_limit)
-        .await
-        .map_err(|e| ApiError::internal(format!("Wiki search failed: {e}")))?;
     let ids: Vec<_> = hits.iter().map(|(p, _)| p.kb_id).collect();
     let kbs = get_kbs_by_ids(pool, &ids).await?;
     let mut wiki_results = Vec::new();
@@ -830,22 +838,17 @@ pub async fn search_with_graph(
         return Ok(Json(SearchResult { results: vec![] }));
     }
 
-    let raw_results = search_engine
-        .search_with_graph_expansion(&params.query, params.file_id.as_ref(), kb_ids_to_search.as_ref())
-        .await
-        .map_err(|e| crate::api::error::ApiError::internal(format!("Graph search failed: {}", e)))?;
+    let (searched, wiki_hits) = tokio::join!(
+        search_engine.search_with_graph_expansion(&params.query, params.file_id.as_ref(), kb_ids_to_search.as_ref()),
+        fetch_wiki_hits(&search_engine, &params.query, params.file_id.as_ref(), kb_ids_to_search.as_ref())
+    );
+    let raw_results =
+        searched.map_err(|e| crate::api::error::ApiError::internal(format!("Graph search failed: {}", e)))?;
+    let wiki_hits = wiki_hits?;
 
     let mut results = build_slice_results_from_raw(&pool, raw_results, &auth_user, false).await?;
-    merge_wiki_results(
-        &pool,
-        &search_engine,
-        &auth_user,
-        &params.query,
-        params.file_id.as_ref(),
-        kb_ids_to_search.as_ref(),
-        &mut results,
-    )
-    .await?;
+    merge_wiki_hits(&pool, &search_engine, &auth_user, &params.query, params.file_id.as_ref(), wiki_hits, &mut results)
+        .await?;
 
     Ok(Json(SearchResult { results }))
 }

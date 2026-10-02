@@ -12,6 +12,18 @@ const PAGE_COLUMNS: &str = "id, kb_id, slug, title, page_type, status, summary, 
                             out_links, in_links, version, last_edit_source, last_editor_id, \
                             content_fingerprint, created_at, updated_at";
 
+/// `wiki_pages` 查询列清单，其中 `content` 以空串占位。
+///
+/// 目录、关系图、索引校验只读标题/摘要/链接，而 `content` 是整个知识库 Markdown 的总量：
+/// 带上它会把这类接口的开销从「页数」放大到「总字数」。
+const PAGE_COLS_NO_CONTENT: &str = "id, kb_id, slug, title, page_type, status, summary, '' AS content, aliases, \
+                            out_links, in_links, version, last_edit_source, last_editor_id, \
+                            content_fingerprint, created_at, updated_at";
+
+/// 批量写关系行的语句头，配合 [`insert_pairs`] 使用。
+const INSERT_SOURCES: &str = "INSERT OR IGNORE INTO wiki_page_sources(page_id, file_id) ";
+const INSERT_SLICE_REFS: &str = "INSERT OR IGNORE INTO wiki_page_slice_refs(page_id, slice_id) ";
+
 fn json_list(raw: &str) -> Vec<String> {
     serde_json::from_str::<Vec<String>>(raw).unwrap_or_default()
 }
@@ -173,20 +185,8 @@ pub async fn upsert(
         }
     };
 
-    for file_id in source_file_ids {
-        sqlx::query("INSERT OR IGNORE INTO wiki_page_sources(page_id, file_id) VALUES(?, ?)")
-            .bind(page_id)
-            .bind(file_id)
-            .execute(&mut *tx)
-            .await?;
-    }
-    for slice_id in slice_ids {
-        sqlx::query("INSERT OR IGNORE INTO wiki_page_slice_refs(page_id, slice_id) VALUES(?, ?)")
-            .bind(page_id)
-            .bind(slice_id)
-            .execute(&mut *tx)
-            .await?;
-    }
+    insert_pairs(&mut tx, INSERT_SOURCES, page_id, source_file_ids).await?;
+    insert_pairs(&mut tx, INSERT_SLICE_REFS, page_id, slice_ids).await?;
     tx.commit().await?;
     if changed {
         revision::prune_by_config(pool, page_id).await?;
@@ -280,39 +280,40 @@ pub async fn set_status(
     Ok(())
 }
 
-pub async fn add_sources(pool: &SqlitePool, page_id: i64, file_ids: &[i64]) -> Result<()> {
-    for file_id in file_ids {
-        sqlx::query("INSERT OR IGNORE INTO wiki_page_sources(page_id, file_id) VALUES(?, ?)")
-            .bind(page_id)
-            .bind(file_id)
-            .execute(pool)
-            .await?;
+/// 批量写入「页面 → id」关系行。
+///
+/// SQLite 是单写者，逐行 INSERT 会把写事务的时长放大到语句数级别：摘要页要登记整篇
+/// 文档的全部切片，一篇几百切的文档就是几百条独立语句，期间其他写入全部排队。
+async fn insert_pairs(
+    conn: &mut sqlx::SqliteConnection, head: &str, page_id: i64, ids: &[i64],
+) -> Result<()> {
+    // 分块留出余量，避免撞上 SQLITE_MAX_VARIABLE_NUMBER。
+    for chunk in ids.chunks(500) {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(head.to_string());
+        qb.push_values(chunk.iter().copied(), |mut binds, id| {
+            binds.push_bind(page_id);
+            binds.push_bind(id);
+        });
+        qb.build().execute(&mut *conn).await?;
     }
     Ok(())
 }
 
+pub async fn add_sources(pool: &SqlitePool, page_id: i64, file_ids: &[i64]) -> Result<()> {
+    let mut conn = pool.acquire().await?;
+    insert_pairs(&mut conn, INSERT_SOURCES, page_id, file_ids).await
+}
+
 pub async fn add_slice_refs(pool: &SqlitePool, page_id: i64, slice_ids: &[i64]) -> Result<()> {
-    for slice_id in slice_ids {
-        sqlx::query("INSERT OR IGNORE INTO wiki_page_slice_refs(page_id, slice_id) VALUES(?, ?)")
-            .bind(page_id)
-            .bind(slice_id)
-            .execute(pool)
-            .await?;
-    }
-    Ok(())
+    let mut conn = pool.acquire().await?;
+    insert_pairs(&mut conn, INSERT_SLICE_REFS, page_id, slice_ids).await
 }
 
 /// 整体替换切片证据（页面被确定性重建时使用）。
 pub async fn set_slice_refs(pool: &SqlitePool, page_id: i64, slice_ids: &[i64]) -> Result<()> {
     let mut tx = pool.begin().await?;
     sqlx::query("DELETE FROM wiki_page_slice_refs WHERE page_id = ?").bind(page_id).execute(&mut *tx).await?;
-    for slice_id in slice_ids {
-        sqlx::query("INSERT OR IGNORE INTO wiki_page_slice_refs(page_id, slice_id) VALUES(?, ?)")
-            .bind(page_id)
-            .bind(slice_id)
-            .execute(&mut *tx)
-            .await?;
-    }
+    insert_pairs(&mut tx, INSERT_SLICE_REFS, page_id, slice_ids).await?;
     tx.commit().await?;
     Ok(())
 }
@@ -329,14 +330,50 @@ pub async fn get_by_id(pool: &SqlitePool, page_id: i64) -> Result<Option<WikiPag
     Ok(row.as_ref().map(map_row))
 }
 
+/// 批量按 id 取页面（含正文）。命中行按 id 升序返回，缺失的 id 直接跳过。
+pub async fn get_by_ids(pool: &SqlitePool, page_ids: &[i64]) -> Result<Vec<WikiPage>> {
+    if page_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
+        "SELECT {} FROM wiki_pages WHERE status != 'withdrawn' AND id IN (",
+        PAGE_COLUMNS
+    ));
+    let mut separated = qb.separated(", ");
+    for id in page_ids {
+        separated.push_bind(id);
+    }
+    separated.push_unseparated(")");
+    let rows = qb.build().fetch_all(pool).await?;
+    Ok(rows.iter().map(map_row).collect())
+}
+
 /// 游标分页列出页面（按 id 倒序），可选按类型/状态过滤。
 pub async fn list(
     pool: &SqlitePool, kb_id: i64, page_type: Option<&str>, status: Option<&str>, limit: i64, before_id: Option<i64>,
 ) -> Result<Vec<WikiPage>> {
-    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
-        "SELECT {} FROM wiki_pages WHERE status != 'withdrawn' AND kb_id = ",
-        PAGE_COLUMNS
-    ));
+    list_with(PAGE_COLUMNS, pool, kb_id, page_type, status, limit, before_id).await
+}
+
+/// [`list`] 的轻量版：`WikiPage::content` 恒为空，调用方不得依赖正文。
+///
+/// 目录、关系图、索引校验都只需要元数据，走这条可以避免把整个知识库的 Markdown
+/// 读进内存。
+pub async fn list_meta(
+    pool: &SqlitePool, kb_id: i64, page_type: Option<&str>, status: Option<&str>, limit: i64, before_id: Option<i64>,
+) -> Result<Vec<WikiPage>> {
+    list_with(PAGE_COLS_NO_CONTENT, pool, kb_id, page_type, status, limit, before_id).await
+}
+
+async fn list_with(
+    columns: &str, pool: &SqlitePool, kb_id: i64, page_type: Option<&str>, status: Option<&str>, limit: i64,
+    before_id: Option<i64>,
+) -> Result<Vec<WikiPage>> {
+    let mut qb =
+        sqlx::QueryBuilder::<sqlx::Sqlite>::new(format!(
+            "SELECT {} FROM wiki_pages WHERE status != 'withdrawn' AND kb_id = ",
+            columns
+        ));
     qb.push_bind(kb_id);
     if let Some(page_type) = page_type {
         qb.push(" AND page_type = ");

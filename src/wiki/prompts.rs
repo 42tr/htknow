@@ -9,11 +9,27 @@
 use super::page::PageSurface;
 
 /// 替换 `{{Key}}` 占位符。未提供的键保留原样，便于测试时观察缺失项。
+///
+/// 单趟扫描模板：逐键 `replace` 会对整段 prompt（含上万字的证据与可链接清单）反复
+/// 扫描并重新分配。顺带也堵住了「替换值里再出现 `{{Key}}` 被后续键二次替换」——
+/// 文档正文与既有页面内容都属于不可信输入，不该能往 prompt 里注入占位符。
 pub fn render(template: &str, values: &[(&str, &str)]) -> String {
-    let mut out = template.to_string();
-    for (key, value) in values {
-        out = out.replace(&format!("{{{{{}}}}}", key), value);
+    let mut out = String::with_capacity(template.len() + 256);
+    let mut cursor = 0usize;
+    while let Some(offset) = template[cursor..].find("{{") {
+        let start = cursor + offset;
+        let Some(close) = template[start + 2..].find("}}") else { break };
+        let end = start + 2 + close + 2;
+        let key = &template[start + 2..end - 2];
+        out.push_str(&template[cursor..start]);
+        match values.iter().find(|(name, _)| *name == key) {
+            Some((_, value)) => out.push_str(value),
+            // 未知键原样输出，行为与逐键 replace 一致。
+            None => out.push_str(&template[start..end]),
+        }
+        cursor = end;
     }
+    out.push_str(&template[cursor..]);
     out
 }
 
@@ -225,12 +241,19 @@ pub fn xml_escape(value: &str) -> String {
 
 /// 按字符数截断长文本，用于控制送入模型的文档正文规模。
 pub fn truncate_chars(value: &str, max_chars: usize) -> String {
-    let count = value.chars().count();
-    if max_chars == 0 || count <= max_chars {
+    truncate_with_total(value, max_chars, value.chars().count())
+}
+
+/// [`truncate_chars`] 的分离版本：`total_chars` 是**截断前**原文的字数。
+///
+/// 调用方已知总字数时，可以只拼出覆盖预算的前缀再截断，
+/// 不必为了末尾那句截断提示把整篇文档完整复制一遍。
+pub fn truncate_with_total(value: &str, max_chars: usize, total_chars: usize) -> String {
+    if max_chars == 0 || total_chars <= max_chars {
         return value.to_string();
     }
     let head: String = value.chars().take(max_chars).collect();
-    format!("{}\n<!-- 正文过长，已截断，原文共 {} 字 -->", head, count)
+    format!("{}\n<!-- 正文过长，已截断，原文共 {} 字 -->", head, total_chars)
 }
 
 /// 从摘要页输出中拆出 `SUMMARY:` 首行与正文。
@@ -261,6 +284,15 @@ mod tests {
     fn render_replaces_placeholders_and_keeps_unknown_keys() {
         let out = render("{{A}} 与 {{B}}", &[("A", "甲")]);
         assert_eq!(out, "甲 与 {{B}}");
+    }
+
+    #[test]
+    fn render_does_not_rescan_substituted_values() {
+        // 文档正文里出现占位符字面量时，不能被后续键替换掉。
+        let out = render("{{Content}} 与 {{Language}}", &[("Content", "{{Language}}"), ("Language", "中文")]);
+        assert_eq!(out, "{{Language}} 与 中文");
+        // 没有闭合 `}}` 的残缺占位符按原文输出。
+        assert_eq!(render("前 {{A 后", &[("A", "甲")]), "前 {{A 后");
     }
 
     #[test]

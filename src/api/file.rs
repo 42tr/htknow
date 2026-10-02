@@ -2280,6 +2280,31 @@ pub(crate) async fn effective_parse_file_id(pool: &SqlitePool, file_id: i64) -> 
     .unwrap_or(file_id))
 }
 
+/// [`effective_parse_file_id`] 的批量版本：来源文件多时不必逐个查询。
+///
+/// 语义与单个版本一致：`files` 里查不到的 id 映射回自身。
+pub(crate) async fn effective_parse_file_ids(
+    pool: &SqlitePool, file_ids: &[i64],
+) -> Result<HashMap<i64, i64>, sqlx::Error> {
+    let mut resolved: HashMap<i64, i64> = file_ids.iter().map(|id| (*id, *id)).collect();
+    for chunk in file_ids.chunks(500) {
+        let mut qb = QueryBuilder::<Sqlite>::new(
+            "SELECT f.id, COALESCE(pa.source_file_id, f.id)
+               FROM files f LEFT JOIN parse_artifacts pa ON pa.id = f.artifact_id
+              WHERE f.id IN (",
+        );
+        let mut separated = qb.separated(", ");
+        for id in chunk {
+            separated.push_bind(id);
+        }
+        separated.push_unseparated(")");
+        for (file_id, owner) in qb.build_query_as::<(i64, i64)>().fetch_all(pool).await? {
+            resolved.insert(file_id, owner);
+        }
+    }
+    Ok(resolved)
+}
+
 pub(crate) async fn remove_image_files(image_paths: Vec<String>) {
     info!("Removing image files: {:?}", image_paths);
     if image_paths.is_empty() {

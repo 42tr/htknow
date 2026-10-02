@@ -120,7 +120,9 @@ pub async fn lint_kb(pool: &SqlitePool, kb_id: i64) -> Result<LintReport> {
                 LintIssue::info(ISSUE_MISSING_SUMMARY, current, "", "缺少摘要，目录与搜索结果里会显示为空".to_string()),
             );
         }
-        if current.in_links.is_empty() {
+        // 入链只由已发布页面重算（见 `page::rebuild_in_links`），草稿页恒为空，
+        // 对它们报「孤儿页」是必然的误报。
+        if current.status == STATUS_PUBLISHED && current.in_links.is_empty() {
             collector.push(
                 ISSUE_ORPHAN_PAGE,
                 LintIssue::info(ISSUE_ORPHAN_PAGE, current, "", "没有任何页面链接到本页".to_string()),
