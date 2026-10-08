@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed, watch } from 'vue'
 import { api } from '../api'
+import { archiveFormat } from '../archiveFormat'
 import ArchiveTreeNode from './ArchiveTreeNode.vue'
 
 const props = defineProps({
@@ -27,11 +28,8 @@ const isPasswordError = (msg) => {
   return lower.includes('密码') || lower.includes('password protected') || lower.includes('password required')
 }
 
-const isArchive = computed(() => {
-  if (!props.file?.filename) return false
-  const lower = props.file.filename.toLowerCase()
-  return /\.(zip|7z|tar|tgz|tar\.gz|tar\.bz2|tar\.xz)$/i.test(lower)
-})
+const archiveLabel = computed(() => archiveFormat(props.file?.filename))
+const isArchive = computed(() => !!archiveLabel.value)
 
 // 构建文件树
 const fileTree = computed(() => {
@@ -192,7 +190,7 @@ watch(() => props.file, () => {
         <!-- Header -->
         <div class="flex items-center justify-between p-5 border-b border-slate-100">
           <div class="flex items-center gap-3">
-            <span class="text-xs font-semibold">ZIP</span>
+            <span class="text-xs font-semibold">{{ archiveLabel }}</span>
             <div>
               <h3 class="text-lg font-semibold text-slate-800">压缩文件内容</h3>
               <p class="text-xs text-slate-400">{{ file.filename }}</p>

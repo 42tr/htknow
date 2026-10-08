@@ -1,7 +1,9 @@
 //! 压缩文件解压模块
 //!
-//! 支持 ZIP、TAR（及其 GZ/BZ2/XZ 变体）格式的解压。
-//! 7Z 和 RAR 格式暂不支持。
+//! 支持 ZIP、RAR、7Z、TAR（及其 GZ/BZ2/XZ 变体）格式的解压。
+
+mod rar;
+mod sevenz;
 
 use std::{
     io::{Read, Write},
@@ -170,6 +172,7 @@ impl ByteBudget {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ArchiveFormat {
     Zip,
+    Rar,
     SevenZ,
     Tar,
     TarGz,
@@ -185,6 +188,8 @@ impl ArchiveFormat {
         let lower = filename.to_lowercase();
         if lower.ends_with(".zip") {
             ArchiveFormat::Zip
+        } else if lower.ends_with(".rar") {
+            ArchiveFormat::Rar
         } else if lower.ends_with(".7z") {
             ArchiveFormat::SevenZ
         } else if lower.ends_with(".tar.gz") {
@@ -202,14 +207,14 @@ impl ArchiveFormat {
         }
     }
 
-    /// 是否为已识别的压缩格式（含暂不解压的 7Z）
+    /// 是否为已识别的压缩格式
     pub fn is_archive(self) -> bool {
         !matches!(self, ArchiveFormat::Unknown)
     }
 
     /// 当前是否可直接解压
     pub fn is_supported(self) -> bool {
-        matches!(self, ArchiveFormat::Zip) || self.is_tar_variant()
+        matches!(self, ArchiveFormat::Zip | ArchiveFormat::Rar | ArchiveFormat::SevenZ) || self.is_tar_variant()
     }
 
     /// 是否为 tar 变体
@@ -228,6 +233,7 @@ impl ArchiveFormat {
     pub fn desc(self) -> &'static str {
         match self {
             ArchiveFormat::Zip => "ZIP",
+            ArchiveFormat::Rar => "RAR",
             ArchiveFormat::SevenZ => "7Z",
             ArchiveFormat::Tar => "TAR",
             ArchiveFormat::TarGz | ArchiveFormat::Tgz => "TAR.GZ",
@@ -268,7 +274,8 @@ pub fn extract_archive_with_limits(
 
     match format {
         ArchiveFormat::Zip => extract_zip(src_path, dest_dir, password, file_id, limits),
-        ArchiveFormat::SevenZ => Err(ArchiveError::UnsupportedFormat("7Z 格式暂不支持".to_string())),
+        ArchiveFormat::Rar => rar::extract(src_path, dest_dir, password, file_id, limits),
+        ArchiveFormat::SevenZ => sevenz::extract(src_path, dest_dir, password, file_id, limits),
         _ if format.is_tar_variant() => extract_tar(src_path, dest_dir, file_id, limits),
         _ => Err(ArchiveError::UnsupportedFormat(format.desc().to_string())),
     }
@@ -284,7 +291,8 @@ pub fn read_archive_entry(
     let format = ArchiveFormat::from_filename(filename);
     match format {
         ArchiveFormat::Zip => read_zip_entry(src_path, entry_path, password),
-        ArchiveFormat::SevenZ => Err(ArchiveError::UnsupportedFormat("7Z 格式暂不支持".to_string())),
+        ArchiveFormat::Rar => rar::read_entry(src_path, entry_path, password),
+        ArchiveFormat::SevenZ => sevenz::read_entry(src_path, entry_path, password),
         _ if format.is_tar_variant() => read_tar_entry(src_path, entry_path),
         _ => Err(ArchiveError::UnsupportedFormat(format.desc().to_string())),
     }
@@ -583,11 +591,16 @@ mod tests {
     fn test_is_archive_file() {
         assert!(is_archive_file("test.zip"));
         assert!(is_archive_file("test.ZIP"));
+        assert!(is_archive_file("test.rar"));
+        assert!(is_archive_file("test.RAR"));
+        assert!(ArchiveFormat::Rar.is_supported());
         assert!(is_archive_file("test.tar.gz"));
         assert!(is_archive_file("test.tgz"));
         assert!(is_archive_file("test.tar.bz2"));
         assert!(is_archive_file("test.tar.xz"));
         assert!(is_archive_file("test.7z"));
+        assert!(is_archive_file("test.7Z"));
+        assert!(ArchiveFormat::SevenZ.is_supported());
         assert!(!is_archive_file("test.pdf"));
         assert!(!is_archive_file("test.txt"));
     }

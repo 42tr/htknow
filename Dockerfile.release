@@ -23,6 +23,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tzdata \
     # sqlite3
     sqlite3 \
+    # Bundled UnRAR C++ runtime
+    libstdc++6 \
     && rm -rf /var/lib/apt/lists/* \
     && ln -snf /usr/share/zoneinfo/${TZ} /etc/localtime \
     && echo ${TZ} > /etc/timezone \

@@ -3,6 +3,7 @@ import { vDialog } from '../dialog'
 import { ref, computed } from 'vue'
 import { api } from '../api'
 import { wikiStatusInfo } from '../fileStatus'
+import { archiveFormat } from '../archiveFormat'
 import FileDetail from './FileDetail.vue'
 import FileSlices from './FileSlices.vue'
 import KnowledgeGraph from './KnowledgeGraph.vue'
@@ -51,11 +52,8 @@ const sliceTypesError = ref('')
 
 const isStorageKb = computed(() => props.kbType === 'storage')
 
-const isArchive = computed(() => {
-  if (!props.file?.filename) return false
-  const lower = props.file.filename.toLowerCase()
-  return /\.(zip|7z|tar|tgz|tar\.gz|tar\.bz2|tar\.xz)$/i.test(lower)
-})
+const archiveLabel = computed(() => archiveFormat(props.file?.filename))
+const isArchive = computed(() => !!archiveLabel.value)
 
 const statusInfo = computed(() => {
   const wiki = wikiStatusInfo(props.file)
@@ -86,7 +84,7 @@ const statusInfo = computed(() => {
         ? {
             text: '压缩文件',
             color: 'bg-purple-100 text-purple-700',
-            icon: 'ZIP',
+            icon: archiveLabel.value,
           }
         : { text: '不解析', color: 'bg-amber-100 text-amber-700', icon: '—' }
     case -1:

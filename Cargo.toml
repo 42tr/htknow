@@ -63,6 +63,8 @@ tar = "0.4"
 flate2 = "1"
 bzip2 = "0.4"
 xz2 = "0.1"
+unrar_sys = "0.5.8"
+sevenz-rust2 = { version = "0.23", default-features = false, features = ["aes256", "bzip2", "ppmd", "deflate"] }
 
 # 错误处理
 thiserror = "1"
@@ -86,6 +88,7 @@ etcd = ["etcd-client"]
 profiling = ["tikv-jemalloc-ctl"]
 
 [dev-dependencies]
+sevenz-rust2 = { version = "0.23", default-features = false, features = ["compress"] }
 http-body-util = "0.1"
 tower = "0.5"
 

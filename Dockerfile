@@ -44,6 +44,8 @@ RUN apt-fast update && apt-fast install -y \
     tzdata \
     # sqlite3
     sqlite3 \
+    # Bundled UnRAR C++ runtime
+    libstdc++6 \
     && rm -rf /var/lib/apt/lists/*
 
 # Configure timezone
