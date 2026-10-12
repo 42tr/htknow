@@ -162,19 +162,19 @@ defineExpose({ ask })
 
 <style scoped>
 .chat-messages { max-height: 65vh; overflow-y: auto; scrollbar-gutter: stable; padding-right: .5rem; }
-.chat-turn { padding: 1.25rem 0; border-bottom: 1px solid #e2e8f0; }
-.chat-question { margin: 0 0 1.25rem auto; padding: .8rem 1rem; border-radius: 1rem; background: #f1f5f9; max-width: 85%; width: fit-content; white-space: pre-wrap; overflow-wrap: anywhere; }
+.chat-turn { padding: 1.25rem 0; border-bottom: 1px solid var(--color-border); }
+.chat-question { margin: 0 0 1.25rem auto; padding: .8rem 1rem; border-radius: 1rem; background: var(--color-bg-sidebar); max-width: 85%; width: fit-content; white-space: pre-wrap; overflow-wrap: anywhere; }
 .chat-answer { line-height: 1.85; color: #334155; overflow-wrap: anywhere; }
 .chat-answer :deep(p) { margin: .6rem 0; }
 .chat-answer :deep(h1), .chat-answer :deep(h2), .chat-answer :deep(h3) { font-weight: 650; margin: 1rem 0 .5rem; }
 .chat-answer :deep(ul), .chat-answer :deep(ol) { padding-left: 1.5rem; list-style: revert; }
-.chat-answer :deep(pre) { overflow: auto; background: #f1f5f9; padding: 1rem; border-radius: .5rem; }
+.chat-answer :deep(pre) { overflow: auto; background: var(--color-bg-sidebar); padding: 1rem; border-radius: .5rem; }
 .chat-answer :deep(table) { display: block; overflow-x: auto; border-collapse: collapse; }
-.chat-answer :deep(td), .chat-answer :deep(th) { border: 1px solid #e2e8f0; padding: .4rem .7rem; }
-.chat-answer :deep(.chat-citation) { color: #2563eb; background: #eff6ff; padding: 0 .25rem; border-radius: .25rem; cursor: pointer; font-size: .8rem; vertical-align: super; }
-.chat-sources { margin-top: 1rem; font-size: .8rem; color: #64748b; }
+.chat-answer :deep(td), .chat-answer :deep(th) { border: 1px solid var(--color-border); padding: .4rem .7rem; }
+.chat-answer :deep(.chat-citation) { color: var(--color-primary); background: var(--color-primary-bg); padding: 0 .25rem; border-radius: .25rem; cursor: pointer; font-size: .8rem; vertical-align: super; }
+.chat-sources { margin-top: 1rem; font-size: .8rem; color: var(--color-text-secondary); }
 .chat-sources summary { cursor: pointer; }
-.chat-source { display: block; width: 100%; text-align: left; padding: .7rem; margin-top: .5rem; background: #f8fafc; border: 1px solid #e2e8f0; border-radius: .5rem; }
+.chat-source { display: block; width: 100%; text-align: left; padding: .7rem; margin-top: .5rem; background: var(--color-bg); border: 1px solid var(--color-border); border-radius: .5rem; }
 .chat-source span, .chat-source small { display: block; }
 .chat-source span { color: #334155; font-weight: 600; }
 .chat-source small { margin-top: .3rem; }
