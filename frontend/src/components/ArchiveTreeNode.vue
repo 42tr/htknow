@@ -36,8 +36,8 @@ const formatSize = (bytes) => {
       <!-- 目录 -->
       <div
         v-if="child.isDir"
-        class="flex items-center gap-2 py-1.5 px-2 hover:bg-slate-50 rounded cursor-pointer select-none"
-        :style="{ paddingLeft: (level * 16 + 8) + 'px' }"
+        class="archive-row flex items-center gap-2 py-1.5 px-2 hover:bg-slate-50 rounded cursor-pointer select-none"
+        :style="{ '--depth': level }"
         @click="$emit('toggle', child.path)"
       >
         <span class="text-amber-500 text-sm">{{ isExpanded(child.path) ? '▾' : '▸' }}</span>
@@ -47,8 +47,8 @@ const formatSize = (bytes) => {
       <!-- 文件 -->
       <div
         v-else
-        class="flex items-center gap-2 py-1.5 px-2 hover:bg-slate-50 rounded cursor-pointer group"
-        :style="{ paddingLeft: (level * 16 + 8) + 'px' }"
+        class="archive-row flex items-center gap-2 py-1.5 px-2 hover:bg-slate-50 rounded cursor-pointer group"
+        :style="{ '--depth': level }"
       >
         <span class="text-slate-400 text-sm">FILE</span>
         <span class="text-sm text-slate-700 flex-1 truncate">{{ child.name }}</span>
@@ -76,3 +76,10 @@ const formatSize = (bytes) => {
     </div>
   </div>
 </template>
+
+<style scoped>
+/* 缩进由 --depth 变量注入，等价于原内联 (level * 16 + 8)px */
+.archive-row {
+  padding-left: calc(var(--depth, 0) * 16px + 8px);
+}
+</style>

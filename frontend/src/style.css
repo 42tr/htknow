@@ -1,4 +1,6 @@
 @import 'tailwindcss';
+
+/* htknow 全局样式分区：Design Tokens -> Base reset -> App shell -> 各页面/组件区块 -> 响应式覆盖（区块顺序与界面自上而下一致） */
 :root {
 
   /* === Design Tokens === */
@@ -22,6 +24,37 @@
   --shadow-elevated: 0 4px 16px rgba(0,0,0,.06), 0 1px 4px rgba(0,0,0,.04);
   --shadow-modal: 0 24px 80px rgba(22,40,68,.12);
 
+  /* === Spacing scale === */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* === Font size scale === */
+  --fs-2xs: 10px;
+  --fs-xs: 11px;
+  --fs-sm: 12px;
+  --fs-md: 13px;
+  --fs-base: 14px;
+  --fs-lg: 16px;
+  --fs-xl: 18px;
+  --fs-2xl: 21px;
+  --fs-3xl: 23px;
+  --fs-4xl: 27px;
+  --fs-5xl: 32px;
+
+  /* === Z-index scale === */
+  --z-sticky: 5;
+  --z-menu: 25;
+  --z-sidebar: 30;
+  --z-dropdown: 40;
+  --z-overlay: 45;
+  --z-modal: 60;
+  --z-top: 80;
+
   font-family:
     Inter,
     ui-sans-serif,
@@ -35,14 +68,17 @@
   background: var(--color-bg);
   font-synthesis: none;
   text-rendering: optimizeLegibility;
-  font-size: 14px;
+  font-size: var(--fs-base);
 }
+/* === Base reset === */
 * {
   box-sizing: border-box;
 }
 body {
   margin: 0;
   min-width: 360px;
+  background: var(--color-bg);
+  color: var(--color-text);
 }
 button,
 input,
@@ -58,18 +94,9 @@ button:disabled {
   cursor: not-allowed;
   opacity: 0.55;
 }
-button,
-a,
-input,
-select,
-summary,
-textarea {
-  outline-offset: 3px;
-}
-button:focus-visible,
-a:focus-visible,
-summary:focus-visible {
+:focus-visible {
   outline: 2px solid var(--color-primary);
+  outline-offset: 3px;
 }
 input,
 select,
@@ -92,6 +119,7 @@ h3,
 p {
   overflow-wrap: anywhere;
 }
+/* === App shell === */
 .app-shell {
   min-height: 100vh;
 }
@@ -104,14 +132,14 @@ p {
   padding: 30px 18px;
   display: flex;
   flex-direction: column;
-  z-index: 30;
+  z-index: var(--z-sidebar);
 }
 .brand {
   display: flex;
   gap: 11px;
   align-items: center;
   text-decoration: none;
-  font-size: 21px;
+  font-size: var(--fs-2xl);
   font-weight: 700;
   letter-spacing: -0.5px;
   padding: 0 9px;
@@ -124,22 +152,23 @@ p {
   display: grid;
   place-items: center;
   border-radius: var(--radius-md);
-  font-size: 23px;
+  font-size: var(--fs-3xl);
 }
 .brand small {
   display: block;
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   font-weight: 400;
   letter-spacing: 2px;
   color: #8190a6;
   margin-top: 3px;
 }
+/* === Buttons === */
 .primary-button,
 .secondary-button {
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  gap: 8px;
+  gap: var(--space-2);
   min-height: 38px;
   padding: 8px 15px;
   border-radius: var(--radius-sm);
@@ -155,7 +184,7 @@ p {
   background: var(--color-primary-hover);
 }
 .secondary-button {
-  background: #fff;
+  background: var(--color-surface);
   border: 1px solid var(--color-border);
   color: #4d5c71;
 }
@@ -172,8 +201,9 @@ p {
 .plain-button:hover {
   background: #edf1f7;
 }
+/* === Sidebar navigation === */
 .nav-caption {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   letter-spacing: 1.5px;
   color: #718096;
   margin: 24px 14px 10px;
@@ -195,7 +225,7 @@ p {
   color: var(--color-text-secondary);
 }
 .side-nav button > span {
-  font-size: 21px;
+  font-size: var(--fs-2xl);
   line-height: 20px;
   width: 21px;
 }
@@ -211,37 +241,13 @@ p {
   margin-top: auto;
 }
 .sidebar-bottom > p {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: #9ba6b6;
   padding: 18px 14px 0;
 }
+/* === Main region & page heading === */
 .app-body {
   margin-left: 216px;
-}
-.app-topbar {
-  height: 66px;
-  padding: 0 36px;
-  background: #fff;
-  border-bottom: 1px solid #e7eaf0;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  font-size: 13px;
-  color: #647187;
-}
-.scope-caption {
-  font-size: 11px;
-  color: #94a0b2;
-  display: flex;
-  gap: 12px;
-  align-items: center;
-}
-.status-dot {
-  width: 5px;
-  height: 5px;
-  background: #98a7bf;
-  border-radius: 50%;
-  margin-left: 10px;
 }
 .app-main {
   padding: 34px 36px 60px;
@@ -252,11 +258,11 @@ p {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 20px;
+  gap: var(--space-5);
   margin-bottom: 25px;
 }
 .page-title h1 {
-  font-size: 27px;
+  font-size: var(--fs-4xl);
   font-weight: 650;
   letter-spacing: -0.8px;
   margin: 7px 0;
@@ -264,20 +270,21 @@ p {
 .page-title p,
 .search-intro p {
   color: #8390a2;
-  font-size: 13px;
+  font-size: var(--fs-md);
   margin: 7px 0;
 }
 .eyebrow {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
   color: #718096;
   letter-spacing: 2px;
   font-weight: 600;
 }
+/* === Search intro, tabs & composer === */
 .view-tabs {
   display: flex;
   align-items: center;
   gap: 22px;
-  border-bottom: 1px solid #dfe5ed;
+  border-bottom: 1px solid var(--color-border);
   margin-bottom: 24px;
   overflow-x: auto;
 }
@@ -292,15 +299,12 @@ p {
   border-color: var(--color-primary);
   font-weight: 600;
 }
-.view-tabs > .scope-caption {
-  margin-left: auto;
-}
 .search-intro {
   text-align: center;
   margin: 72px 0 32px;
 }
 .search-intro h1 {
-  font-size: 32px;
+  font-size: var(--fs-5xl);
   font-weight: 600;
   letter-spacing: -1px;
   margin: 15px 0;
@@ -310,7 +314,7 @@ p {
   text-align: left;
 }
 .has-searched .search-intro h1 {
-  font-size: 23px;
+  font-size: var(--fs-3xl);
   margin: 7px 0;
 }
 .has-searched .search-intro .eyebrow,
@@ -323,56 +327,14 @@ p {
 .has-searched .search-layout {
   max-width: none;
 }
+/* No important flag needed: the competing Tailwind utilities on this element live
+   inside @layer utilities, while this rule is unlayered - unlayered wins. */
 .search-composer {
-  border-radius: var(--radius-lg) !important;
-  border: 1px solid var(--color-border) !important;
-  box-shadow: var(--shadow-elevated) !important;
+  border-radius: var(--radius-lg);
+  border: 1px solid var(--color-border);
+  box-shadow: var(--shadow-elevated);
 }
-.search-controls {
-  display: flex;
-  gap: 8px;
-  align-items: center;
-}
-.search-controls select {
-  padding: 6px;
-  background: #f3f6fc;
-  border-radius: 5px;
-  border: 0;
-  font-size: 12px;
-  color: #536982;
-}
-.search-help {
-  color: #8b98aa;
-  font-size: 12px;
-  margin: 14px 0;
-}
-.search-layout > .search-help {
-  text-align: center;
-}
-.search-history {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-  font-size: 11px;
-  color: #96a0af;
-  margin: 18px 0 28px;
-}
-.search-history button {
-  padding: 5px 10px;
-  border: 1px solid #e2e7ef;
-  border-radius: 5px;
-  color: #718097;
-  background: #fff;
-  max-width: 200px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-.search-history button:hover {
-  border-color: #9cb6ee;
-  color: #3264cf;
-}
+/* === Search results & workspace === */
 .search-results {
   margin: 30px auto 0;
   max-width: 1400px;
@@ -381,28 +343,24 @@ p {
   display: flex;
   align-items: center;
   flex-wrap: wrap;
-  gap: 8px;
+  gap: var(--space-2);
   margin-bottom: 14px;
   color: var(--color-text-secondary);
-  font-size: 13px;
+  font-size: var(--fs-md);
 }
 .result-toolbar p { margin: 0 auto 0 0; }
 .result-toolbar select {
   border: 1px solid var(--color-border);
   border-radius: 6px;
-  background: #fff;
+  background: var(--color-surface);
   color: var(--color-text-secondary);
   padding: 6px 9px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
-.detail-navigation { display: flex; align-items: center; gap: 2px; color: var(--color-text-muted); font-size: 11px; }
+.detail-navigation { display: flex; align-items: center; gap: 2px; color: var(--color-text-muted); font-size: var(--fs-xs); }
 .search-results .bg-linear-to-br {
   background: #edf2fc;
   color: #567bbd;
-}
-.search-results .search-snippet b {
-  background: #fff0b3;
-  color: #79551d;
 }
 .search-results .line-clamp-2 {
   line-height: 1.8;
@@ -419,9 +377,10 @@ p {
 .search-results [role='button'] {
   cursor: pointer;
 }
+/* === File detail panel === */
 .file-detail {
-  background: #fff;
-  border: 1px solid #dfe5ed;
+  background: var(--color-surface);
+  border: 1px solid var(--color-border);
   border-radius: 10px;
   overflow: hidden;
   position: sticky;
@@ -431,18 +390,18 @@ p {
   overflow-y: auto;
 }
 .panel-heading {
-  padding: 20px;
+  padding: var(--space-5);
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 16px;
+  gap: var(--space-4);
   border-bottom: 1px solid #e9edf3;
 }
 .panel-heading > div {
   min-width: 0;
 }
 .panel-heading h2 {
-  font-size: 16px;
+  font-size: var(--fs-lg);
   font-weight: 600;
   margin: 4px 0;
   overflow: hidden;
@@ -450,7 +409,7 @@ p {
   white-space: nowrap;
 }
 .panel-heading p {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: #92a0b3;
   margin: 4px 0;
 }
@@ -458,14 +417,19 @@ p {
   padding: 0 18px;
   margin: 0;
   gap: 17px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .preview-toolbar {
-  padding: 12px 18px;
+  /* 原 FileDetail.vue 内联样式(position/top/z-index/background/padding)合并至此 */
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  background: var(--color-surface);
+  padding: 8px 0;
   display: flex;
   gap: 14px;
   align-items: center;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: #426bc5;
 }
 .preview-toolbar select {
@@ -496,21 +460,21 @@ p {
   border-bottom: 1px solid #e8edf3;
 }
 .slice-entry button {
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: #4774ca;
 }
 .slice-entry p {
-  font-size: 13px;
+  font-size: var(--fs-md);
   line-height: 1.8;
   white-space: pre-wrap;
   margin-top: 12px;
 }
 .file-metadata {
-  padding: 24px;
+  padding: var(--space-6);
   display: grid;
   grid-template-columns: 85px 1fr;
   gap: 18px;
-  font-size: 13px;
+  font-size: var(--fs-md);
 }
 .file-metadata dt {
   color: #8d9aae;
@@ -523,27 +487,28 @@ p {
   padding: 45px 20px;
   text-align: center;
   color: #8b98a9;
-  font-size: 13px;
+  font-size: var(--fs-md);
 }
 .empty-state h3 {
   color: #60738c;
-  font-size: 16px;
+  font-size: var(--fs-lg);
   margin-bottom: 10px;
 }
 .empty-state p {
   margin: 12px 0 20px;
 }
+/* === Overlays & dialogs === */
 .upload-overlay,
 .detail-overlay {
   position: fixed;
   inset: 0;
   background: #172a4740;
   backdrop-filter: blur(3px);
-  z-index: 45;
+  z-index: var(--z-overlay);
   display: flex;
   align-items: center;
   justify-content: center;
-  padding: 24px;
+  padding: var(--space-6);
 }
 .upload-dialog {
   width: 760px;
@@ -557,14 +522,11 @@ p {
 .upload-dialog > .panel-heading {
   position: sticky;
   top: 0;
-  background: #fff;
-  z-index: 5;
-}
-.upload-dialog > .space-y-6 {
-  padding: 24px;
+  background: var(--color-surface);
+  z-index: var(--z-sticky);
 }
 .upload-next {
-  padding: 16px;
+  padding: var(--space-4);
   background: #eff7f3;
   border: 1px solid #d8eadf;
   border-radius: 8px;
@@ -583,30 +545,17 @@ p {
   position: relative;
   top: 0;
 }
+/* === Inline feedback, confirm & batch actions === */
 .inline-error {
   color: #b44444;
   background: #fff2f2;
   border-radius: 6px;
-  padding: 12px;
-  font-size: 12px;
+  padding: var(--space-3);
+  font-size: var(--fs-sm);
   margin: 12px 0;
 }
-.success-message {
-  background: #eef8f1;
-  color: #3c7d55;
-  padding: 12px;
-  border-radius: 6px;
-  margin-bottom: 15px;
-}
-.state-badge {
-  border: 1px solid #e0e7f1;
-  border-radius: 5px;
-  padding: 4px 9px;
-  color: #70829a;
-  font-size: 11px;
-}
 .confirm-dialog {
-  background: #fff;
+  background: var(--color-surface);
   border-radius: 12px;
   padding: 28px;
   max-width: 460px;
@@ -625,11 +574,13 @@ p {
   justify-content: flex-end;
   gap: 10px;
 }
-.danger-button { background: #b83b45 !important; border-color: #b83b45 !important; }
-.batch-toolbar { display:flex; align-items:center; flex-wrap:wrap; gap:8px; padding:8px 10px; border:1px solid #dbe5f5; border-radius:7px; background:#f5f8fd; color:#5e718d; font-size:12px; }
-.batch-toolbar button { border:1px solid #d5deeb; background:#fff; border-radius:5px; padding:4px 9px; color:#4e6480; }
+/* Same specificity as .primary-button, declared later: cascade order is enough. */
+.danger-button { background: #b83b45; border-color: #b83b45; }
+.batch-toolbar { display:flex; align-items:center; flex-wrap:wrap; gap:8px; padding:8px 10px; border:1px solid #dbe5f5; border-radius:7px; background:#f5f8fd; color:#5e718d; font-size: var(--fs-sm); }
+.batch-toolbar button { border:1px solid #d5deeb; background:var(--color-surface); border-radius:5px; padding:4px 9px; color:#4e6480; }
 .batch-toolbar button:hover { background:#edf3fb; }
-.pending-changes { margin-top:8px; display:inline-flex; padding:4px 8px; border-radius:5px; background:#fff6df; border:1px solid #f2dfab; color:#8a651d; font-size:12px; }
+.pending-changes { margin-top:8px; display:inline-flex; padding:4px 8px; border-radius:5px; background:#fff6df; border:1px solid #f2dfab; color:#8a651d; font-size: var(--fs-sm); }
+/* === Library layout & directory tree === */
 .library-layout {
   display: grid;
   grid-template-columns: 200px minmax(0, 1fr);
@@ -647,7 +598,7 @@ p {
   overflow: auto;
 }
 .directory-heading {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: #94a0b1;
   letter-spacing: 1px;
   padding: 0 12px 15px;
@@ -658,6 +609,8 @@ p {
   position: relative;
   border-radius: 5px;
   color: #758399;
+  /* 层级缩进由组件注入的 --depth 变量决定（原为内联 paddingLeft: depth * 12 + 4） */
+  padding-left: calc(var(--depth, 0) * 12px + 4px);
 }
 .directory-row:hover .directory-actions,
 .directory-actions[open],
@@ -667,7 +620,7 @@ p {
 }
 .directory-row.active,
 .directory-root.active {
-  background: #e2eafa;
+  background: var(--color-primary-light);
   color: #3568d9;
 }
 .directory-row:hover,
@@ -703,7 +656,7 @@ p {
   display: flex;
   align-items: center;
   gap: 7px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   padding: 9px 0;
 }
 .directory-resource-icon,
@@ -735,7 +688,8 @@ p {
   line-height: 1;
   cursor: pointer;
 }
-.directory-actions summary::-webkit-details-marker {
+.directory-actions summary::-webkit-details-marker,
+.action-menu summary::-webkit-details-marker {
   display: none;
 }
 .directory-actions summary:hover {
@@ -750,16 +704,16 @@ p {
   padding: 5px;
   border: 1px solid #dfe5ef;
   border-radius: 6px;
-  background: #fff;
+  background: var(--color-surface);
   box-shadow: 0 8px 24px #172b4620;
-  z-index: 40;
+  z-index: var(--z-dropdown);
 }
 .directory-action-menu button {
   width: 100%;
   padding: 7px 9px;
   border-radius: 4px;
   text-align: left;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: #52647c;
 }
 .directory-action-menu button:hover:not(:disabled) {
@@ -777,7 +731,7 @@ p {
   text-align: left;
   width: 100%;
   padding: 10px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: #647893;
   border-radius: 5px;
 }
@@ -787,7 +741,7 @@ p {
   border-radius: 5px;
 }
 .directory-root-row.active {
-  background: #e2eafa;
+  background: var(--color-primary-light);
   color: #3568d9;
 }
 .directory-root-row:hover {
@@ -816,11 +770,7 @@ p {
   width: 16px;
   height: 16px;
 }
-.directory-empty {
-  font-size: 11px;
-  color: #a0aabd;
-  padding: 5px 14px;
-}
+/* === Knowledge base workspace === */
 .knowledge-workspace {
   min-width: 0;
 }
@@ -828,11 +778,11 @@ p {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--space-3);
   padding: 13px 15px;
   border: 1px solid #e0e6ef;
   border-radius: 8px;
-  background: #fff;
+  background: var(--color-surface);
 }
 .workspace-toolbar-summary {
   min-width: 0;
@@ -844,20 +794,20 @@ p {
 }
 .workspace-toolbar-summary p {
   margin-top: 3px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: #92a0b4;
 }
 .workspace-toolbar-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   flex: none;
 }
 .workspace-toolbar-actions > .primary-button,
 .workspace-toolbar-actions > .secondary-button {
   min-height: 32px;
   padding: 5px 12px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .status-strip {
   display: flex;
@@ -865,48 +815,33 @@ p {
   gap: 18px;
   width: 100%;
   text-align: left;
-  font-size: 11px;
-  color: #8492a7;
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
   padding: 12px 15px;
   border: 1px solid #e0e6ef;
   border-radius: 7px;
-  background: #fff;
+  background: var(--color-surface);
 }
 .status-strip > span:last-child {
   margin-left: auto;
   color: #5680cf;
 }
-.workspace-more {
-  position: relative;
-}
-.workspace-more-items {
-  position: absolute;
-  right: 0;
-  top: 45px;
-  width: 230px;
-  padding: 10px;
-  background: #fff;
-  border: 1px solid #e0e6ef;
-  border-radius: 8px;
-  box-shadow: 0 8px 24px #172b4620;
-  z-index: 20;
-  display: flex;
-  flex-direction: column;
-  gap: 8px;
-}
+/* Unlayered rule, so it beats the overflow-hidden utility from @layer utilities. */
 .resource-stream {
   border: 1px solid #e3e8ef;
   border-radius: 9px;
-  overflow: visible !important;
+  overflow: visible;
 }
+/* === Resource streams & file lists === */
 .kb-list {
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
 }
+/* grid-* and gap-* utilities on the element are layered, so plain declarations win. */
 .kb-row {
   border-bottom: 1px solid #edf0f5;
-  grid-template-columns: 1fr !important;
-  gap: 9px !important;
+  grid-template-columns: 1fr;
+  gap: 9px;
 }
 .kb-resource-icon {
   width: 19px;
@@ -923,13 +858,13 @@ p {
   height: 21px;
 }
 .kb-row .text-xs {
-  font-size: 10px;
+  font-size: var(--fs-2xs);
 }
 .file-list > div {
-  border-bottom: 1px solid #edf0f5 !important;
+  border-bottom: 1px solid #edf0f5;
 }
 .file-list > div:last-child {
-  border-bottom: 0 !important;
+  border-bottom: 0;
 }
 .file-name-button {
   font-weight: 500;
@@ -941,15 +876,15 @@ p {
   max-width: 100%;
 }
 .file-name-button:hover {
-  color: #3567dd;
+  color: var(--color-primary);
 }
 .file-row-actions {
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
   align-items: center;
 }
 .file-row-actions > .secondary-button {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   min-height: 30px;
   padding: 4px 10px;
 }
@@ -967,13 +902,13 @@ p {
   position: absolute;
   right: 0;
   top: 35px;
-  background: #fff;
+  background: var(--color-surface);
   border: 1px solid #dfe5ef;
   border-radius: 8px;
   box-shadow: 0 8px 24px #172b4620;
   width: 210px;
   padding: 7px;
-  z-index: 25;
+  z-index: var(--z-menu);
   display: flex;
   flex-direction: column;
 }
@@ -983,7 +918,7 @@ p {
   gap: 9px;
   text-align: left;
   width: 100%;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: #62728a;
 }
 .action-menu-items > button:after {
@@ -994,8 +929,9 @@ p {
   flex-shrink: 0;
 }
 .file-detail .fixed {
-  z-index: 80;
+  z-index: var(--z-top);
 }
+/* === Responsive: wide (>=1600px) & desktop (<=1100px) === */
 @media (min-width: 1600px) {
   .app-main {
     padding-left: 50px;
@@ -1016,9 +952,6 @@ p {
   .app-main {
     padding: 25px 22px;
   }
-  .app-topbar {
-    padding: 0 22px;
-  }
   .library-layout {
     grid-template-columns: 165px minmax(0, 1fr);
     gap: 14px;
@@ -1030,7 +963,7 @@ p {
     position: fixed;
     inset: 25px 25px 25px auto;
     width: 70vw;
-    z-index: 45;
+    z-index: var(--z-overlay);
     box-shadow: 0 0 0 100vw #172a4740;
   }
   .workspace-toolbar {
@@ -1048,174 +981,22 @@ p {
     margin-left: auto;
   }
 }
-@media (max-width: 700px) {
-  .app-sidebar {
-    position: relative;
-    width: 100%;
-    padding: 15px 16px;
-    display: flex;
-    flex-direction: row;
-    align-items: center;
-    gap: 16px;
-    flex-wrap: wrap;
-    border-right: 0;
-    border-bottom: 1px solid #e0e6ef;
-  }
-  /* Flatten sidebar sections so both navigation groups can share a compact row. */
-  .app-sidebar .sidebar-section {
-    display: contents;
-  }
-  .brand {
-    padding: 0;
-    font-size: 18px;
-  }
-  .brand small,
-  .nav-caption,
-  .sidebar-bottom > p {
-    display: none;
-  }
-  .brand-mark {
-    width: 28px;
-    height: 30px;
-    font-size: 18px;
-  }
-  .app-sidebar .side-nav {
-    flex-direction: row;
-    order: 3;
-    flex: 1;
-    gap: 4px;
-    min-width: 0;
-  }
-  .app-sidebar .sidebar-section + .sidebar-section {
-    border-left: 1px solid #dfe5ed;
-    padding-left: 8px;
-  }
-  .side-nav button {
-    padding: 8px 10px;
-    font-size: 12px;
-    gap: 5px;
-  }
-  .side-nav button > span {
-    font-size: 17px;
-  }
-  .sidebar-bottom {
-    margin: 0;
-    order: 4;
-  }
-  /* Action controls must remain discoverable on touch devices (no hover state). */
-  .directory-actions {
-    opacity: 1;
-    pointer-events: auto;
-  }
-  .app-body {
-    margin-left: 0;
-  }
-  .app-topbar {
-    height: 45px;
-    padding: 0 17px;
-  }
-  .app-topbar .scope-caption {
-    font-size: 10px;
-  }
-  .scope-caption .status-dot,
-  .scope-caption .status-dot ~ * {
-    display: none;
-  }
-  .app-main {
-    padding: 24px 16px;
-  }
-  .page-title h1 {
-    font-size: 23px;
-  }
-  .page-title p {
-    font-size: 12px;
-  }
-  .eyebrow {
-    font-size: 9px;
-  }
-  .search-intro {
-    margin: 35px 0 24px;
-  }
-  .search-intro h1 {
-    font-size: 24px;
-  }
-  .library-layout {
-    grid-template-columns: 1fr;
-  }
-  .directory-panel {
-    position: static;
-    max-height: 190px;
-  }
-  .view-tabs {
-    gap: 18px;
-  }
-  .view-tabs > .scope-caption {
-    display: none;
-  }
-  .file-detail {
-    border-radius: 8px;
-  }
-  .results-workspace.with-preview > .file-detail {
-    inset: 8px;
-    width: calc(100vw - 16px);
-    max-height: calc(100vh - 16px);
-  }
-  .upload-overlay,
-  .detail-overlay {
-    padding: 8px;
-  }
-  .upload-dialog {
-    max-height: 95vh;
-  }
-  .detail-overlay > .file-detail {
-    width: 100%;
-    height: calc(100vh - 16px);
-  }
-  .upload-dialog > .space-y-6 {
-    padding: 16px;
-  }
-  .upload-next {
-    align-items: flex-start;
-    flex-direction: column;
-  }
-  .search-controls {
-    flex-wrap: wrap;
-  }
-  .page-title > .primary-button {
-    font-size: 12px;
-    padding: 6px 10px;
-  }
-  .file-list .flex.items-center.gap-2.mb-1 {
-    flex-wrap: wrap;
-  }
-  .file-name-button {
-    white-space: normal;
-  }
-  .file-metadata {
-    grid-template-columns: 70px 1fr;
-  }
-  .status-strip {
-    gap: 12px;
-  }
-}
 
+/* === Upload dialog === */
 .upload-dialog > .max-w-2xl {
-  padding: 24px;
+  padding: var(--space-6);
 }
 .upload-dialog .upload-next {
   margin: 0 24px 24px;
-}
-.action-menu summary::-webkit-details-marker {
-  display: none;
 }
 
 .upload-options {
   margin: 0 0 20px;
 }
 .upload-options > summary {
-  padding: 12px;
+  padding: var(--space-3);
   color: #7588a2;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   border: 1px solid #e3e8f0;
   border-radius: 7px;
   margin-bottom: 14px;
@@ -1238,37 +1019,7 @@ p {
   background: var(--color-primary-bg);
   color: #5d7eae;
 }
-@media (max-width: 700px) {
-  .side-nav button {
-    white-space: nowrap;
-    padding: 9px 7px;
-  }
-  .side-nav button > span {
-    display: none;
-  }
-  .app-sidebar > .side-nav {
-    gap: 5px;
-  }
-  .sidebar-bottom .side-nav button {
-    padding: 9px 5px;
-  }
-  .file-list .text-xs.text-slate-400 {
-    flex-wrap: wrap;
-    gap: 6px;
-  }
-  .file-row-actions {
-    width: 100%;
-    justify-content: flex-end;
-  }
-  .app-topbar .scope-caption {
-    max-width: 60%;
-    overflow: hidden;
-    white-space: nowrap;
-  }
-  .section-heading {
-    align-items: flex-start;
-  }
-}
+/* === Knowledge graph dialog === */
 .graph-dialog {
   width: 1180px;
   max-width: 100%;
@@ -1277,10 +1028,11 @@ p {
   flex-direction: column;
   overflow: hidden;
   border-radius: 14px;
-  background: #fff;
+  background: var(--color-surface);
   box-shadow: 0 24px 90px #16284426;
 }
-.graph-dialog > .panel-heading {
+.graph-dialog > .panel-heading,
+.wiki-dialog > .panel-heading {
   flex: none;
 }
 .graph-dialog-body {
@@ -1293,14 +1045,14 @@ p {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 16px;
+  gap: var(--space-4);
   margin-bottom: 16px;
-  font-size: 11px;
-  color: #8492a7;
+  font-size: var(--fs-xs);
+  color: var(--color-text-muted);
 }
 .graph-summary b {
   color: #33465f;
-  font-size: 13px;
+  font-size: var(--fs-md);
 }
 .graph-build-status {
   color: #5680cf;
@@ -1316,25 +1068,25 @@ p {
 .graph-view-toggle button {
   padding: 5px 11px;
   border-radius: 5px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: #7b889c;
 }
 .graph-view-toggle button.active {
-  background: #fff;
+  background: var(--color-surface);
   color: var(--color-primary);
   font-weight: 600;
 }
 .graph-list-controls {
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
   margin-bottom: 14px;
 }
 .graph-list-controls input {
   flex: 1;
   min-width: 0;
   padding: 8px 12px;
-  font-size: 12px;
-  border: 1px solid #dfe5ed;
+  font-size: var(--fs-sm);
+  border: 1px solid var(--color-border);
   border-radius: 7px;
 }
 .graph-entity-types {
@@ -1351,7 +1103,7 @@ p {
   border: 1px solid #e2e7ef;
   border-radius: 999px;
   background: #f7f9fc;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: #62728a;
 }
 .graph-chip b {
@@ -1370,7 +1122,7 @@ p {
 .graph-empty {
   padding: 40px 0;
   text-align: center;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   color: #97a4b6;
 }
 .graph-entity-list {
@@ -1379,7 +1131,7 @@ p {
   overflow: hidden;
 }
 .graph-entity-list li + li {
-  border-top: 1px solid #eef1f6;
+  border-top: 1px solid var(--color-border-light);
 }
 .graph-entity-row {
   display: flex;
@@ -1395,7 +1147,7 @@ p {
 .graph-entity-name {
   flex: 1;
   min-width: 0;
-  font-size: 13px;
+  font-size: var(--fs-md);
   font-weight: 500;
   color: #374b67;
 }
@@ -1404,19 +1156,174 @@ p {
   padding: 2px 9px;
   border-radius: 999px;
   background: #eef3fa;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: #56739c;
 }
 .graph-entity-date {
   flex: none;
-  font-size: 11px;
+  font-size: var(--fs-xs);
   color: #9aa6b8;
 }
 .graph-entity-arrow {
   flex: none;
   color: #b3bdc9;
 }
+
+/* === Responsive: compact (<=700px) === */
 @media (max-width: 700px) {
+  .app-sidebar {
+    position: relative;
+    width: 100%;
+    padding: 15px 16px;
+    display: flex;
+    flex-direction: row;
+    align-items: center;
+    gap: var(--space-4);
+    flex-wrap: wrap;
+    border-right: 0;
+    border-bottom: 1px solid #e0e6ef;
+  }
+  /* Flatten sidebar sections so both navigation groups can share a compact row. */
+  .app-sidebar .sidebar-section {
+    display: contents;
+  }
+  .brand {
+    padding: 0;
+    font-size: var(--fs-xl);
+  }
+  .brand small {
+    display: none;
+  }
+  .nav-caption {
+    display: none;
+  }
+  .sidebar-bottom > p {
+    display: none;
+  }
+  .brand-mark {
+    width: 28px;
+    height: 30px;
+    font-size: var(--fs-xl);
+  }
+  .app-sidebar .side-nav {
+    flex-direction: row;
+    order: 3;
+    flex: 1;
+    gap: var(--space-1);
+    min-width: 0;
+  }
+  .app-sidebar .sidebar-section + .sidebar-section {
+    border-left: 1px solid var(--color-border);
+    padding-left: 8px;
+  }
+  .side-nav button {
+    padding: 9px 7px;
+    font-size: var(--fs-sm);
+    gap: 5px;
+    white-space: nowrap;
+  }
+  .side-nav button > span {
+    font-size: 17px;
+    display: none;
+  }
+  .sidebar-bottom {
+    margin: 0;
+    order: 4;
+  }
+  /* Action controls must remain discoverable on touch devices (no hover state). */
+  .directory-actions {
+    opacity: 1;
+    pointer-events: auto;
+  }
+  .app-body {
+    margin-left: 0;
+  }
+  .app-main {
+    padding: 24px 16px;
+  }
+  .page-title h1 {
+    font-size: var(--fs-3xl);
+  }
+  .page-title p {
+    font-size: var(--fs-sm);
+  }
+  .eyebrow {
+    font-size: 9px;
+  }
+  .search-intro {
+    margin: 35px 0 24px;
+  }
+  .search-intro h1 {
+    font-size: 24px;
+  }
+  .library-layout {
+    grid-template-columns: 1fr;
+  }
+  .directory-panel {
+    position: static;
+    max-height: 190px;
+  }
+  .view-tabs {
+    gap: 18px;
+  }
+  .file-detail {
+    border-radius: 8px;
+  }
+  .results-workspace.with-preview > .file-detail {
+    inset: 8px;
+    width: calc(100vw - 16px);
+    max-height: calc(100vh - 16px);
+  }
+  .upload-overlay {
+    padding: var(--space-2);
+  }
+  .detail-overlay {
+    padding: var(--space-2);
+  }
+  .upload-dialog {
+    max-height: 95vh;
+  }
+  .detail-overlay > .file-detail {
+    width: 100%;
+    height: calc(100vh - 16px);
+  }
+  .upload-next {
+    align-items: flex-start;
+    flex-direction: column;
+  }
+  .page-title > .primary-button {
+    font-size: var(--fs-sm);
+    padding: 6px 10px;
+  }
+  .file-list .flex.items-center.gap-2.mb-1 {
+    flex-wrap: wrap;
+  }
+  .file-name-button {
+    white-space: normal;
+  }
+  .file-metadata {
+    grid-template-columns: 70px 1fr;
+  }
+  .status-strip {
+    gap: var(--space-3);
+  }
+  .app-sidebar > .side-nav {
+    gap: 5px;
+  }
+  .sidebar-bottom .side-nav button {
+    padding: 9px 5px;
+  }
+  .file-list .text-xs.text-slate-400 {
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+  .file-row-actions {
+    width: 100%;
+    justify-content: flex-end;
+  }
+  .section-heading {
+    align-items: flex-start;
+  }
   .graph-dialog-body {
     padding: 14px 15px 18px;
   }
@@ -1439,12 +1346,12 @@ p {
 .search-scope-chip {
   display: inline-flex;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-1);
   padding: 3px 10px;
   border-radius: 999px;
   background: var(--color-primary-bg);
   color: var(--color-primary);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   font-weight: 500;
   cursor: pointer;
   border: 1px solid transparent;
@@ -1468,6 +1375,7 @@ p {
   box-shadow: 0 0 0 3px rgba(53, 103, 221, 0.12);
 }
 .result-card:focus-visible {
+  outline: none;
   border-color: var(--color-primary);
   box-shadow: 0 0 0 3px rgba(53, 103, 221, 0.2);
 }
@@ -1479,43 +1387,6 @@ p {
   transform: translateY(-2px);
   box-shadow: var(--shadow-elevated);
 }
-.kb-card-actions {
-  display: flex;
-  gap: 4px;
-  opacity: 1;
-}
-/* === Sticky bottom bar === */
-.sticky-bottom-bar {
-  position: sticky;
-  bottom: 0;
-  background: #fff;
-  border-top: 1px solid var(--color-border);
-  padding: 12px 24px;
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  z-index: 10;
-  margin: 24px -24px -24px;
-  border-radius: 0 0 var(--radius-lg) var(--radius-lg);
-}
-/* === Fade transition for tabs === */
-.tab-fade-enter-active,
-.tab-fade-leave-active {
-  transition: opacity .15s ease;
-}
-.tab-fade-enter-from,
-.tab-fade-leave-to {
-  opacity: 0;
-}
-/* === Search highlight in results === */
-.search-snippet :deep(b) {
-  font-weight: 600;
-  color: var(--color-primary);
-  background-color: rgba(53, 103, 221, 0.12);
-  padding: 0 2px;
-  border-radius: 2px;
-}
 
 /* === Wiki browser === */
 .wiki-dialog {
@@ -1526,11 +1397,8 @@ p {
   flex-direction: column;
   overflow: hidden;
   border-radius: 14px;
-  background: #fff;
+  background: var(--color-surface);
   box-shadow: 0 24px 90px #16284426;
-}
-.wiki-dialog > .panel-heading {
-  flex: none;
 }
 .wiki-heading-actions {
   display: flex;
@@ -1542,7 +1410,7 @@ p {
   border-radius: 999px;
   background: var(--color-primary-bg);
   color: var(--color-primary);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   white-space: nowrap;
 }
 .wiki-badge.busy {
@@ -1558,7 +1426,7 @@ p {
   padding: 12px 24px;
   border-bottom: 1px solid var(--color-border-light);
   background: #fbfcfe;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .wiki-setting {
   display: flex;
@@ -1571,7 +1439,7 @@ p {
   padding: 4px 8px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
-  background: #fff;
+  background: var(--color-surface);
 }
 .wiki-setting input[type='number'] {
   width: 84px;
@@ -1579,7 +1447,7 @@ p {
 .wiki-setting-actions {
   display: flex;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   margin-left: auto;
 }
 .wiki-warn {
@@ -1590,7 +1458,7 @@ p {
   flex: none;
   margin: 0;
   padding: 8px 24px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .wiki-error {
   background: #fdecec;
@@ -1639,12 +1507,12 @@ p {
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--color-text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
 .wiki-group-head:hover {
-  background: #eef1f6;
+  background: var(--color-border-light);
 }
 .wiki-tree {
   list-style: none;
@@ -1655,14 +1523,14 @@ p {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 8px;
+  gap: var(--space-2);
   width: 100%;
   padding: 6px 8px;
   border: none;
   border-radius: var(--radius-sm);
   background: transparent;
   color: var(--color-text);
-  font-size: 13px;
+  font-size: var(--fs-md);
   text-align: left;
 }
 .wiki-tree-item:hover {
@@ -1681,23 +1549,23 @@ p {
 .wiki-tree-type {
   flex: none;
   color: var(--color-text-muted);
-  font-size: 10px;
+  font-size: var(--fs-2xs);
 }
 .wiki-tree-summary {
   margin: 0 8px 6px;
   color: var(--color-text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   line-height: 1.5;
 }
 .wiki-index-entry {
   margin-bottom: 8px;
   border: 1px solid var(--color-border-light);
-  background: #fff;
+  background: var(--color-surface);
 }
 .wiki-empty-line {
-  margin: 8px;
+  margin: var(--space-2);
   color: var(--color-text-muted);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   line-height: 1.6;
 }
 .wiki-page-body {
@@ -1718,21 +1586,21 @@ p {
 .wiki-page-meta {
   display: flex;
   flex-wrap: wrap;
-  gap: 12px;
+  gap: var(--space-3);
   margin: 6px 0 0;
   color: var(--color-text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .wiki-page-summary {
   margin: 10px 0 0;
   color: var(--color-text-secondary);
-  font-size: 13px;
+  font-size: var(--fs-md);
   line-height: 1.7;
 }
 .wiki-markdown {
   margin-top: 16px;
   color: var(--color-text);
-  font-size: 14px;
+  font-size: var(--fs-base);
   line-height: 1.8;
 }
 .wiki-markdown h1,
@@ -1743,14 +1611,14 @@ p {
   line-height: 1.4;
 }
 .wiki-markdown h1 {
-  font-size: 18px;
+  font-size: var(--fs-xl);
 }
 .wiki-markdown h2 {
-  font-size: 16px;
+  font-size: var(--fs-lg);
 }
 .wiki-markdown h3,
 .wiki-markdown h4 {
-  font-size: 14px;
+  font-size: var(--fs-base);
 }
 .wiki-markdown p {
   margin: 10px 0;
@@ -1774,7 +1642,7 @@ p {
 .wiki-markdown code {
   padding: 1px 5px;
   border-radius: 4px;
-  background: #f1f3f7;
+  background: var(--color-bg-sidebar);
   font-size: 12.5px;
 }
 .wiki-markdown pre {
@@ -1800,7 +1668,7 @@ p {
   width: 100%;
   margin: 12px 0;
   border-collapse: collapse;
-  font-size: 13px;
+  font-size: var(--fs-md);
 }
 .wiki-markdown th,
 .wiki-markdown td {
@@ -1821,7 +1689,7 @@ p {
 .wiki-sources h4 {
   margin: 0 0 10px;
   color: var(--color-text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   letter-spacing: 0.04em;
   text-transform: uppercase;
 }
@@ -1837,9 +1705,9 @@ p {
   padding: 4px 10px;
   border: 1px solid var(--color-border);
   border-radius: 999px;
-  background: #fff;
+  background: var(--color-surface);
   color: var(--color-text-secondary);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .wiki-chips button:hover {
   border-color: var(--color-primary);
@@ -1854,7 +1722,7 @@ p {
   border: none;
   background: transparent;
   color: var(--color-primary);
-  font-size: 13px;
+  font-size: var(--fs-md);
   text-align: left;
 }
 .wiki-source-name:hover {
@@ -1871,21 +1739,7 @@ p {
 .wiki-empty h3 {
   margin: 0 0 8px;
   color: var(--color-text-secondary);
-  font-size: 16px;
-}
-@media (max-width: 900px) {
-  .wiki-body {
-    flex-direction: column;
-  }
-  .wiki-sidebar {
-    width: 100%;
-    max-height: 220px;
-    border-right: none;
-    border-bottom: 1px solid var(--color-border-light);
-  }
-  .wiki-page-body {
-    padding: 16px 16px 24px;
-  }
+  font-size: var(--fs-lg);
 }
 
 /* ===== Wiki P2：编辑、历史版本、体检 ===== */
@@ -1895,7 +1749,7 @@ p {
   margin: 0 4px 6px;
 }
 .wiki-sidebar-tools .plain-button {
-  font-size: 11px;
+  font-size: var(--fs-xs);
   padding: 3px 8px;
 }
 .plain-button.active {
@@ -1910,13 +1764,13 @@ p {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 4px;
+  gap: var(--space-1);
   margin-top: 10px;
 }
 .wiki-page-actions .plain-button {
   border: 1px solid var(--color-border-light);
-  background: #fff;
-  font-size: 12px;
+  background: var(--color-surface);
+  font-size: var(--fs-sm);
 }
 .wiki-panel {
   padding-bottom: 24px;
@@ -1925,7 +1779,7 @@ p {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--space-3);
   padding-bottom: 12px;
   border-bottom: 1px solid var(--color-border-light);
 }
@@ -1935,24 +1789,24 @@ p {
 }
 .wiki-panel-actions {
   display: flex;
-  gap: 8px;
+  gap: var(--space-2);
 }
 .wiki-lint-summary {
   display: flex;
   flex-wrap: wrap;
   align-items: center;
-  gap: 8px;
+  gap: var(--space-2);
   margin: 12px 0 0;
   color: var(--color-text-secondary);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .wiki-chip {
   padding: 2px 9px;
   border: 1px solid var(--color-border);
   border-radius: 999px;
-  background: #fff;
+  background: var(--color-surface);
   color: var(--color-text-secondary);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   white-space: nowrap;
 }
 .wiki-lint-list {
@@ -1966,7 +1820,7 @@ p {
   gap: 10px;
   padding: 8px 10px;
   border-left: 3px solid transparent;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .wiki-lint-list li + li {
   border-top: 1px solid var(--color-border-light);
@@ -1985,7 +1839,7 @@ p {
   border: 0;
   background: transparent;
   color: var(--color-primary);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   text-align: left;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -1999,7 +1853,7 @@ p {
   border-radius: 999px;
   background: #f1f5fb;
   color: var(--color-text-secondary);
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .wiki-lint-message {
   color: var(--color-text-muted);
@@ -2007,13 +1861,13 @@ p {
 .wiki-lint-hint {
   margin: 14px 0 0;
   color: var(--color-text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
   line-height: 1.6;
 }
 .wiki-edit {
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: var(--space-3);
   margin-top: 16px;
 }
 .wiki-field {
@@ -2021,7 +1875,7 @@ p {
   flex-direction: column;
   gap: 5px;
   color: var(--color-text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .wiki-field input,
 .wiki-field select,
@@ -2029,9 +1883,9 @@ p {
   padding: 8px 10px;
   border: 1px solid var(--color-border);
   border-radius: var(--radius-sm);
-  background: #fff;
+  background: var(--color-surface);
   color: var(--color-text);
-  font-size: 13px;
+  font-size: var(--fs-md);
 }
 .wiki-field textarea {
   resize: vertical;
@@ -2044,7 +1898,7 @@ p {
   align-items: center;
   justify-content: flex-end;
   gap: 10px;
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .wiki-edit-actions .wiki-warn {
   margin-right: auto;
@@ -2052,7 +1906,7 @@ p {
 .wiki-drawer-backdrop {
   position: fixed;
   inset: 0;
-  z-index: 60;
+  z-index: var(--z-modal);
   display: flex;
   justify-content: flex-end;
   background: #16284426;
@@ -2064,7 +1918,7 @@ p {
   max-width: 100%;
   height: 100%;
   overflow: hidden;
-  background: #fff;
+  background: var(--color-surface);
   box-shadow: -18px 0 60px #1628441f;
 }
 .wiki-drawer-head {
@@ -2072,7 +1926,7 @@ p {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 12px;
+  gap: var(--space-3);
   padding: 16px 20px;
   border-bottom: 1px solid var(--color-border-light);
 }
@@ -2083,7 +1937,7 @@ p {
 .wiki-drawer-sub {
   margin: 4px 0 0;
   color: var(--color-text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .wiki-drawer-list {
   flex: none;
@@ -2119,12 +1973,12 @@ p {
 .wiki-revision-version {
   flex: none;
   color: var(--color-primary);
-  font-size: 12px;
+  font-size: var(--fs-sm);
   font-weight: 600;
 }
 .wiki-revision-meta {
   color: var(--color-text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .wiki-diff {
   flex: 1;
@@ -2136,16 +1990,16 @@ p {
   flex: none;
   display: flex;
   align-items: center;
-  gap: 12px;
+  gap: var(--space-3);
   padding: 10px 20px;
   border-bottom: 1px solid var(--color-border-light);
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .wiki-diff-head .secondary-button {
   margin-left: auto;
   min-height: 30px;
   padding: 4px 12px;
-  font-size: 12px;
+  font-size: var(--fs-sm);
 }
 .wiki-diff-stat {
   color: var(--color-text-muted);
@@ -2157,9 +2011,9 @@ p {
   margin: 0;
   overflow: auto;
   padding: 10px 0 24px;
-  background: #fff;
+  background: var(--color-surface);
   font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 12px;
+  font-size: var(--fs-sm);
   line-height: 1.7;
 }
 .wiki-diff-line {
@@ -2180,7 +2034,7 @@ p {
   padding: 3px 16px 3px 6px;
   background: #f7f9fc;
   color: var(--color-text-muted);
-  font-size: 11px;
+  font-size: var(--fs-xs);
 }
 .wiki-diff-no {
   display: inline-block;
@@ -2194,7 +2048,20 @@ p {
 .wiki-diff-no + .wiki-diff-no {
   margin: 0 10px 0 6px;
 }
+
 @media (max-width: 900px) {
+  .wiki-body {
+    flex-direction: column;
+  }
+  .wiki-sidebar {
+    width: 100%;
+    max-height: 220px;
+    border-right: none;
+    border-bottom: 1px solid var(--color-border-light);
+  }
+  .wiki-page-body {
+    padding: 16px 16px 24px;
+  }
   .wiki-drawer {
     width: 100%;
   }

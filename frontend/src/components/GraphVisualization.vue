@@ -898,7 +898,7 @@ const getEntityTypeInfo = (type) => {
     <p v-if="loadError" class="px-4 py-2 text-sm text-red-600">{{ loadError }}</p>
     <p v-if="truncated" class="px-4 py-2 text-sm text-slate-500">当前展示部分图谱，最多 200 个节点、400 条关系。可缩小搜索范围后继续浏览。</p>
     <!-- 画布容器 -->
-    <div ref="container" class="relative" style="height: 600px;">
+    <div ref="container" class="relative h-[600px]">
       <canvas
         ref="canvas"
         @mousemove="handleMouseMove"

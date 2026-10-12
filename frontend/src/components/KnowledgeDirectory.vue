@@ -44,7 +44,7 @@ onMounted(load)
       <div
         class="directory-row"
         :class="{ active: selectedId === kb.id }"
-        :style="{ paddingLeft: `${depth * 12 + 4}px` }"
+        :style="{ '--depth': depth }"
       >
         <button
           v-if="kb.children_kb_count > 0"
