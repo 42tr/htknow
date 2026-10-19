@@ -251,15 +251,17 @@ docker start htknow
 
 界面默认使用流式对话：输入问题并回车，系统先混合检索原文切片与 Wiki，再生成带引用的回答。「仅搜索」按钮继续返回原搜索结果；粘贴图片仍使用图片搜索。独立的文档全文搜索入口及 `/search/full` API 已移除，不再创建、写入、重建或导出文档全文索引，原 `HTKNOW_TANTIVY_FULL_INDEX_PATH` 配置不再使用。旧版本留下的索引目录不会自动删除，可在确认升级后自行清理。原文存储、文件预览、切片关键词检索及 `/search/summary` 摘要接口继续使用。
 
-对话使用 `LLM_API_URL`、`LLM_API_KEY`、`LLM_MODEL`，其中 URL 必须是支持 `stream: true` 的完整 OpenAI 兼容 Chat Completions 地址，例如 `https://your-provider.example/v1/chat/completions`。Wiki 专用的 `WIKI_LLM_*` 配置不用于聊天。
+对话使用 `LLM_API_URL`、`LLM_API_KEY`、`LLM_MODEL`，其中 URL 可以是 OpenAI 兼容 Chat Completions 完整地址或其 base。接口需同时支持流式生成和非流式 JSON 核验。Wiki 专用的 `WIKI_LLM_*` 配置不用于聊天。
+
+回答按事实条目绑定本轮来源和逐字引句，经过结构与语义核验后，由后端渲染引用。失败时最多修正一次；仍未通过则明确报错。详见[对话来源核验](docs/chat-grounding.md)。
 
 - 点击回答中的 `[1]` 等编号可查看本轮证据：原文引用打开对应切片，Wiki 引用打开 Wiki 页面及其来源，不把页面级来源伪装成逐句原文证据。
 - 支持追问、停止生成、重新生成和新对话。历史仅保存在前端内存，刷新即清空；切换知识库后开始新对话，不建立后端会话表。
-- 每轮最多使用最近 6 轮完整历史（共 16000 字符），检索证据最多 8 条、24000 字符。没有可访问的相关资料时明确说明，不调用 LLM 编造回答。
+- 每轮最多使用最近 6 轮完整历史（共 16000 字符），每次检索返回最多 8 条、24000 字符；追加检索会保留本轮已有编号。没有可访问的相关资料时明确说明，不编造答案或引用。
 - 新接口：`POST /api/v1/knowledge/chat`，沿用现有认证头。请求示例：
 
 ```json
 {"question":"螺旋桨有哪些类型？","kb_id":1,"messages":[]}
 ```
 
-`messages` 为按 `user` / `assistant` 成对排列的历史消息；`kb_id` 可省略或为 `null`，表示当前用户可访问的知识库。返回 `text/event-stream`，事件依次为 `status`（检索/生成阶段）、`sources`（编号和搜索结果）、`delta`（新增文本），最后 `done`；失败时返回 `error`。断开连接会取消本轮处理，流中断不会标记为正常完成。响应禁用代理缓冲，并每 10 秒发送保活注释。
+`messages` 为按 `user` / `assistant` 成对排列的历史消息；`kb_id` 可省略或为 `null`，表示当前用户可访问的知识库。返回 `text/event-stream`，事件包括 `status`（检索/生成/核验/修正阶段）、`sources`（编号和搜索结果）、核验通过后的 `delta`（回答文本），最后 `done`；失败时返回 `error`。断开连接会取消本轮处理，流中断不会标记为正常完成。响应禁用代理缓冲，并每 10 秒发送保活注释。

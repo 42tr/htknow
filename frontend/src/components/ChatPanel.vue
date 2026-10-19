@@ -69,7 +69,7 @@ const ask = async ({ question, kbId }) => {
       onEvent(event, data) {
         if (run !== generation) return
         const current = turns.value[index]
-        if (event === 'status') stage.value = ({ searching: '正在检索知识…', thinking: '正在思考…', generating: '正在生成回答…' })[data.stage] || '正在处理…'
+        if (event === 'status') stage.value = ({ searching: '正在检索知识…', thinking: '正在思考…', generating: '正在生成回答…', verifying: '正在核验答案来源…', correcting: '正在修正证据不足的内容…' })[data.stage] || '正在处理…'
         if (event === 'sources') current.sources = data.sources || []
         if (event === 'delta') { stage.value = '正在生成回答…'; followAnswer(); current.answer += data.text || '' }
         if (event === 'done') {
