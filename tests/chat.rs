@@ -314,6 +314,8 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             serde_json::from_str(&message_text(&support["messages"].as_array().unwrap().last().unwrap()["content"]))
                 .unwrap();
         assert_eq!(input["answer"]["claims"].as_array().unwrap().len(), 1);
+        assert!(input.get("question").is_none() && input.get("question_context").is_none());
+        assert!(input["evidence_scope"].is_object());
         assert_eq!(input["sources"].as_array().unwrap().len(), 1);
         let original = &sources.as_array().unwrap().iter().find(|s| s["id"] == input["sources"][0]["id"]).unwrap()["result"]
             ["content"];
@@ -412,10 +414,9 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             })
             .unwrap();
         let claims = &correction["response_format"]["json_schema"]["schema"]["properties"]["claims"];
-        assert_eq!(claims["prefixItems"].as_array().unwrap().len(), 32);
-        assert_eq!(claims["prefixItems"][0]["properties"]["depends_on"]["maxItems"], 0);
-        assert_eq!(claims["prefixItems"][0]["properties"]["depends_on"]["const"], json!([]));
-        assert_eq!(claims["prefixItems"][3]["properties"]["depends_on"]["items"]["maximum"], 2);
+        assert_eq!(claims["maxItems"], 32);
+        assert!(claims.get("prefixItems").is_none());
+        assert!(claims["items"]["properties"].get("depends_on").is_none());
     }
     // A malformed verifier response gets a bounded schema repair, without rewriting the answer.
     mode.store(8, Ordering::SeqCst);
