@@ -304,8 +304,6 @@ fn has_independent_clauses(claim: &Claim) -> bool {
             > 1
 }
 
-const ATOMIC_TEXT_PATTERN: &str = r#"^(?:[^，,；;"]|"[^"]*"|“[^”]*”)+$"#;
-
 fn inherit_evidence(current: &mut Vec<Evidence>, dependencies: &[Evidence]) {
     for dependency in dependencies {
         if let Some(existing) = current.iter_mut().find(|e| e.source_id == dependency.source_id) {
@@ -465,8 +463,7 @@ pub(super) async fn complete_answer(messages: Value, sources: &[ChatSource]) -> 
         tuple(vec![])
     } else {
         let base = object(json!({
-            "text":{"type":"string","minLength":1,"maxLength":2000,
-                "pattern":ATOMIC_TEXT_PATTERN},
+            "text":{"type":"string","minLength":1,"maxLength":2000},
             "calculation":{"anyOf":[{"type":"null"},object(json!({
                 "expression":{"type":"string","pattern":"^[0-9 $.+*/()×÷-]{1,256}$"},
                 "unit":{"type":"string","minLength":1,"maxLength":16}

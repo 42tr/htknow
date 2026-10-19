@@ -421,6 +421,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
         assert_eq!(claims["maxItems"], 32);
         assert!(claims.get("prefixItems").is_none());
         assert!(claims["items"]["properties"].get("depends_on").is_none());
+        assert!(claims["items"]["properties"]["text"].get("pattern").is_none());
     }
     // A malformed verifier response gets a bounded schema repair, without rewriting the answer.
     mode.store(8, Ordering::SeqCst);
@@ -522,7 +523,11 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             .filter(|r| message_text(&r["messages"][0]["content"]).starts_with("你是事实拆分器"))
             .collect::<Vec<_>>();
         assert_eq!(splits.len(), 3);
-        assert!(splits.iter().all(|r| r["response_format"]["json_schema"]["schema"]["properties"]["claims"]["items"]["properties"]["text"]["pattern"].is_string()));
+        assert!(splits.iter().all(|r| {
+            r["response_format"]["json_schema"]["schema"]["properties"]["claims"]["items"]["properties"]["text"]
+                .get("pattern")
+                .is_none()
+        }));
         assert_eq!(new.iter().filter(|r| message_text(&r["messages"][0]["content"]).contains("证据核验器")).count(), 6);
     }
     // Explicit Wiki scope applies to tool calls, generation, correction and

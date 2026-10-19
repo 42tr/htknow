@@ -16,7 +16,9 @@ pub(in crate::api::chat) async fn split_answer(draft: &str, index: usize, source
     // Repair all already-detectable compound sentences in one correction round.
     // Bound concurrency and keep original indices until every replacement is ready.
     let splits = futures::stream::iter(
-        candidates.into_iter().map(|(i, c)| async move { Ok::<_, anyhow::Error>((i, split_claim(&c, sources).await?)) }),
+        candidates
+            .into_iter()
+            .map(|(i, c)| async move { Ok::<_, anyhow::Error>((i, split_claim(&c, sources).await?)) }),
     )
     .buffered(3)
     .try_collect::<Vec<_>>()
@@ -43,7 +45,7 @@ async fn split_claim(claim: &Claim, sources: &[ChatSource]) -> Result<Vec<Claim>
     }
     ensure!(!choices.is_empty(), "待拆分事实没有可用证据");
     let schema = object(json!({"claims":{"type":"array","minItems":2,"maxItems":8,"items":object(json!({
-        "text":{"type":"string","minLength":1,"maxLength":2000,"pattern":ATOMIC_TEXT_PATTERN},
+        "text":{"type":"string","minLength":1,"maxLength":2000},
         "evidence":{"type":"array","minItems":1,"maxItems":6,"items":{"anyOf":choices}}
     }))},"insufficient":{"type":"boolean","const":false}}));
     let result = complete_with_schema(json!([
