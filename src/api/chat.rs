@@ -26,6 +26,8 @@ use super::{
 };
 use crate::{AuthUser, config, search::SearchEngine};
 
+mod calculation;
+mod context;
 mod grounding;
 
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
@@ -153,18 +155,23 @@ fn select_sources(results: Vec<search::SearchResultItem>) -> Vec<ChatSource> {
 fn merge_sources(all: &mut Vec<ChatSource>, found: Vec<ChatSource>) -> Vec<usize> {
     found
         .into_iter()
-        .map(|mut source| {
+        .filter_map(|mut source| {
             if let Some(existing) = all.iter().find(|existing| {
                 existing.result.wiki.is_some() == source.result.wiki.is_some()
                     && existing.result.file_id == source.result.file_id
                     && existing.result.id == source.result.id
             }) {
-                return existing.id;
+                return Some(existing.id);
             }
+            let remaining = 24_000usize.saturating_sub(all.iter().map(|s| s.result.content.chars().count()).sum());
+            if all.len() >= 16 || remaining == 0 {
+                return None;
+            }
+            source.result.content = source.result.content.chars().take(remaining).collect();
             source.id = all.len() + 1;
             let id = source.id;
             all.push(source);
-            id
+            Some(id)
         })
         .collect()
 }
@@ -176,6 +183,7 @@ struct KnowledgeSearchTool {
     kb_id: Option<i64>,
     tx: mpsc::Sender<Event>,
     sources: Arc<Mutex<Vec<ChatSource>>>,
+    context: Arc<context::QuestionContext>,
 }
 
 impl KnowledgeSearchTool {
@@ -189,7 +197,16 @@ impl KnowledgeSearchTool {
         .await
         .map_err(|_| ToolError::new("knowledge search failed"))?;
         let mut sources = self.sources.lock().await;
-        let ids = merge_sources(&mut sources, select_sources(found.results));
+        let found = found
+            .results
+            .into_iter()
+            .filter(|result| match self.context.source_scope {
+                context::SourceScope::Any => true,
+                context::SourceScope::Wiki => result.wiki.is_some(),
+                context::SourceScope::Original => result.wiki.is_none(),
+            })
+            .collect();
+        let ids = merge_sources(&mut sources, select_sources(found));
         send(&self.tx, "sources", json!({"sources": *sources})).await.map_err(|e| ToolError::new(e.to_string()))?;
         let visible = grounding::visible_sources(&sources);
         Ok(json!({"sources":visible.as_array().unwrap().iter()
@@ -235,21 +252,25 @@ async fn run_chat(
     let key = cfg.llm.api_key.clone().unwrap_or_default();
     let model = Arc::new(OpenAIChatModel::new(key, cfg.llm.model.clone()).with_base_url(url));
     let sources = Arc::new(Mutex::new(Vec::new()));
-    let tool =
-        KnowledgeSearchTool { pool, engine, user, kb_id: request.kb_id, tx: tx.clone(), sources: sources.clone() };
+    let context = Arc::new(context::QuestionContext::new(&request));
+    let tool = KnowledgeSearchTool {
+        pool,
+        engine,
+        user,
+        kb_id: request.kb_id,
+        tx: tx.clone(),
+        sources: sources.clone(),
+        context: context.clone(),
+    };
     // A follow-up must retrieve again: prior-turn answers and [n] are never evidence.
-    let query = request
-        .messages
-        .iter()
-        .rev()
-        .find(|m| matches!(m.role, ChatRole::User))
-        .map(|m| format!("{} {}", m.content, request.question))
-        .unwrap_or_else(|| request.question.clone());
     send(tx, "status", json!({"stage":"searching"})).await?;
-    let initial = tool.search(&query).await.map_err(|e| {
-        error!("chat initial search failed: {e}");
-        anyhow::anyhow!(UPSTREAM_FAILURE)
-    })?;
+    for query in context.queries() {
+        tool.search(&query).await.map_err(|e| {
+            error!("chat initial search failed: {e}");
+            anyhow::anyhow!(UPSTREAM_FAILURE)
+        })?;
+    }
+    let initial = json!({"sources":grounding::visible_sources(&sources.lock().await)});
     let history = request
         .messages
         .iter()
@@ -265,7 +286,9 @@ async fn run_chat(
         .collect::<Vec<_>>();
     let agent = Agent::new(model).tool(tool).instruction(format!("{SYSTEM}\n{}", grounding::OUTPUT_RULES));
     let mut prompt = history;
-    prompt.push(g::Message::user(&json!({"question":request.question,"initial_search":initial}).to_string()));
+    prompt.push(g::Message::user(
+        &json!({"question":request.question,"question_context":*context,"initial_search":initial}).to_string(),
+    ));
     let mut events = g::Runtime::new().stream_run(&agent, g::RunRequest::new(prompt));
     let mut draft = String::new();
     let mut completed = false;
@@ -298,12 +321,13 @@ async fn run_chat(
     let sources = sources.lock().await;
     let history = serde_json::to_value(&request.messages)?;
     let mut answer = None;
-    for attempt in 0..2 {
+    // A schema failure can consume the first correction. Keep one more bounded
+    // correction for substantive evidence/computation issues; every draft still
+    // passes the same checks before any text becomes visible.
+    for attempt in 0..3 {
         send(tx, "status", json!({"stage":"verifying"})).await?;
         let result = match grounding::parse_answer(&draft, &sources) {
-            Ok(parsed) => {
-                grounding::verify(&parsed, &sources, &request.question, history.clone()).await.map(|()| parsed)
-            }
+            Ok(parsed) => grounding::verify(&parsed, &sources, &context, history.clone()).await.map(|()| parsed),
             Err(error) => Err(error),
         };
         match result {
@@ -312,18 +336,21 @@ async fn run_chat(
                 break;
             }
             Err(error) => {
-                log::warn!("chat grounding attempt {} rejected: {error}", attempt + 1);
-                if attempt == 1 {
+                log::warn!("chat grounding attempt {} rejected: {error:#}", attempt + 1);
+                if error.downcast_ref::<grounding::VerifierFailure>().is_some() {
+                    return Err(anyhow::anyhow!("来源核验服务暂不可用，请稍后重试"));
+                }
+                if attempt == 2 {
                     break;
                 }
                 send(tx, "status", json!({"stage":"correcting"})).await?;
-                draft = grounding::complete_json(json!([
+                draft = grounding::complete_answer(json!([
                     {"role":"system","content":format!("{SYSTEM}\n{}", grounding::OUTPUT_RULES)},
-                    {"role":"user","content":json!({"question":request.question,"history":history,
+                    {"role":"user","content":json!({"question":request.question,"question_context":*context,"history":history,
                         "sources":grounding::visible_sources(&sources),"rejected_draft":draft,
-                        "validation_error":error.to_string(),
+                        "validation_error":format!("{error:#}"),
                         "instruction":"修正上述核验问题。删除无关事实，补充真正支持陈述的证据，不可盲目添加编号。"}).to_string()},
-                ])).await.map_err(|error| {
+                ]), &sources).await.map_err(|error| {
                     log::error!("chat correction failed: {error}");
                     anyhow::anyhow!(UPSTREAM_FAILURE)
                 })?;
@@ -361,6 +388,14 @@ mod tests {
         assert_eq!(sources.len(), 3);
         assert_eq!(sources[0].result.id, 20);
         assert_eq!(sources[2].id, 3);
+        for i in 0..20 {
+            let mut next = source(100 + i);
+            next.result.content = "字".repeat(4000);
+            merge_sources(&mut sources, vec![next]);
+        }
+        assert_eq!(sources.iter().map(|s| s.result.content.chars().count()).sum::<usize>(), 24_000);
+        assert!(sources.len() <= 16);
+        assert_eq!(merge_sources(&mut sources, vec![source(20)]), vec![1]);
     }
     #[test]
     fn chat_rejects_invalid_history_and_limits() {

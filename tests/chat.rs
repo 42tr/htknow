@@ -42,6 +42,8 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
     let mock_mode = mode.clone();
     let malformed_verdict = Arc::new(AtomicBool::new(false));
     let mock_malformed_verdict = malformed_verdict.clone();
+    let shape_omissions = Arc::new(AtomicUsize::new(0));
+    let mock_shape_omissions = shape_omissions.clone();
     let disconnected = Arc::new(AtomicBool::new(false));
     let disconnected_mock = disconnected.clone();
     let mock = Router::new()
@@ -56,29 +58,48 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             let mode = mock_mode.load(Ordering::SeqCst);
             let malformed_verdict = mock_malformed_verdict.clone();
             let disconnected = disconnected_mock.clone();
+            let shape_omissions = mock_shape_omissions.clone();
             // chat 是 agent 架构：模型必须先回 OpenAI 风格的 tool_calls，knowledge_search
             // 才会执行并发出 sources 事件；看到工具结果（role = tool）后再回正文。
-            let wants_tool = [0, 4, 5, 6, 7, 8, 9, 10, 11].contains(&mode)
+            let wants_tool = (mode == 0 || (4..=16).contains(&mode))
                 && !body["messages"].as_array().is_some_and(|messages| messages.iter().any(|m| m["role"] == "tool"));
             async move {
                 // Non-streaming calls are either the independent verifier or the single correction.
                 let input = body["messages"].as_array().unwrap().iter().rev().find_map(|m| {
-                    serde_json::from_str::<Value>(&message_text(&m["content"])).ok()
+                    serde_json::from_str::<Value>(&message_text(&m["content"])).ok().filter(|v| v.get("answer").is_some() || v.get("sources").is_some() || v.get("initial_search").is_some())
                 }).unwrap_or(json!({}));
                 let visible = input.get("sources").or_else(|| input.pointer("/initial_search/sources"))
                     .and_then(Value::as_array).cloned().unwrap_or_default();
                 let evidence = visible.first().map(|s| json!({"source_id":s["id"],"passage_ids":[1]}));
                 let mut grounded = if let Some(evidence) = evidence {
-                    json!({"claims":[{"text":if mode == 5 { "虚构事实999万元。" } else { "螺旋桨有两类。" },
+                    json!({"claims":[{"text":if mode == 5 { "虚构的桨叶采用金属X。" } else { "螺旋桨有两类。" },
                         "evidence":[evidence]}],"insufficient":false})
                 } else { json!({"claims":[],"insufficient":true}) };
                 if mode == 11 { grounded["insufficient"] = json!(true); }
                 if body["stream"] == false {
                     let verifying = message_text(&body["messages"][0]["content"]).contains("证据核验器");
+                    let covering = message_text(&body["messages"][0]["content"]).starts_with("你是知识库答案完整性核验器");
+                    if covering {
+                        if mode == 16 && body["response_format"]["type"] == "json_schema" {
+                            return Response::builder().status(400).body(Body::from("response_format json_schema is not supported")).unwrap();
+                        }
+                        let coverage = json!({"claim_relevance":input["answer"]["claims"].as_array().unwrap().iter().enumerate().map(|(index,c)|
+                            json!({"index":index,"relevant":!c["text"].as_str().unwrap().contains("资料仅包含"),"reason":"question relevance"})).collect::<Vec<_>>(),
+                            "insufficient_justified":true,
+                            "question_complete":mode != 7 || input["answer"]["claims"].as_array().unwrap().len() == 2,
+                            "missing_aspects":if mode == 7 { json!(["FPP与CPP各自的桨距行为"]) } else { json!([]) }});
+                        return Json(json!({"choices":[{"message":{"role":"assistant","content":coverage.to_string()},"finish_reason":"stop"}]})).into_response();
+                    }
+                    if verifying && mode == 14 {
+                        return Response::builder().status(503).body(Body::from("private verifier failure")).unwrap();
+                    }
+                    if verifying && mode == 16 && body["response_format"]["type"] == "json_schema" {
+                        return Response::builder().status(400).body(Body::from("response_format json_schema is not supported")).unwrap();
+                    }
                     if verifying && mode == 8 && !malformed_verdict.swap(true, Ordering::SeqCst) {
                         return Json(json!({"choices":[{"message":{"role":"assistant","content":"not JSON"},"finish_reason":"stop"}]})).into_response();
                     }
-                    let content = if verifying {
+                    let mut content = if verifying {
                         json!({"claims":input["answer"]["claims"].as_array().unwrap().iter().enumerate().map(|(index,c)| {
                             let supported = !c["text"].as_str().unwrap().contains("虚构");
                             json!({"index":index,"supported":supported,"atomic":true,
@@ -87,7 +108,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                                     json!({"source_id":e["source_id"],"contributes":mode != 9 || i == 0,
                                         "reason":if mode == 9 && i > 0 {"主题相关但不支持这条事实"} else {"supports the requested fact"}})
                                 ).collect::<Vec<_>>(),
-                                "reason":if supported {"supported"} else {"引用有原句，但不支持999万元"}})
+                                "reason":if supported {"supported"} else {"引用有原句，但不支持金属X"}})
                         }).collect::<Vec<_>>(),"insufficient_justified":true,"question_complete":mode != 7 || input["answer"]["claims"].as_array().unwrap().len() == 2,
                             "missing_aspects":if mode == 7 { json!(["FPP与CPP各自的桨距行为"]) } else { json!([]) }})
                     } else if mode == 10 {
@@ -98,6 +119,13 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                         json!({"claims":[{"text":"FPP的桨距固定。","evidence":evidence},
                             {"text":"CPP的桨距可调整。","evidence":evidence}],"insufficient":false})
                     } else { grounded };
+                    if verifying && [12, 13, 15].contains(&mode) {
+                        let first = shape_omissions.fetch_or(1 << mode, Ordering::SeqCst) & (1 << mode) == 0;
+                        if first || mode == 15 {
+                            if mode == 12 { content["claims"] = json!([]); }
+                            else { content["claims"][0]["evidence"] = json!([]); }
+                        }
+                    }
                     return Json(json!({"choices":[{"message":{"role":"assistant","content":content.to_string()},"finish_reason":"stop"}]})).into_response();
                 }
                 if wants_tool {
@@ -156,7 +184,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                 }
                 let payload = json!({"choices":[{"delta":{"content":grounded.to_string()}}]});
                 let mut data = format!(": comment\r\ndata: {payload}\r\n\r\n").into_bytes();
-                if [0, 4, 5, 6, 7, 8, 9, 10, 11].contains(&mode) { data.extend_from_slice(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"); }
+                if mode == 0 || (4..=16).contains(&mode) { data.extend_from_slice(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"); }
                 // 任意字节边界分片，包括中文 UTF-8 和 SSE CRLF。
                 let mut chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
                     data.chunks(7).map(|v| Ok(bytes::Bytes::copy_from_slice(v))).collect();
@@ -263,6 +291,29 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
     assert_eq!(message_text(&upstream["messages"][1]["content"]), "Tell me about propeller");
     assert!(!upstream.to_string().contains("TOP_SECRET_EVIDENCE"));
 
+    // Support checks cannot see uncited sources or another claim. Coverage has
+    // a separate full-evidence request so missing known facts still trigger repair.
+    {
+        let requests = received.lock().unwrap();
+        let support =
+            requests.iter().find(|r| message_text(&r["messages"][0]["content"]).contains("证据核验器")).unwrap();
+        let input: Value =
+            serde_json::from_str(&message_text(&support["messages"].as_array().unwrap().last().unwrap()["content"]))
+                .unwrap();
+        assert_eq!(input["answer"]["claims"].as_array().unwrap().len(), 1);
+        assert_eq!(input["sources"].as_array().unwrap().len(), 1);
+        let original = &sources.as_array().unwrap().iter().find(|s| s["id"] == input["sources"][0]["id"]).unwrap()["result"]
+            ["content"];
+        assert!(original.as_str().unwrap().contains(input["sources"][0]["content"].as_str().unwrap()));
+        let coverage = requests
+            .iter()
+            .find(|r| message_text(&r["messages"][0]["content"]).starts_with("你是知识库答案完整性核验器"))
+            .unwrap();
+        let input: Value =
+            serde_json::from_str(&message_text(&coverage["messages"].as_array().unwrap().last().unwrap()["content"]))
+                .unwrap();
+        assert!(input["sources"].as_array().unwrap().len() >= 2);
+    }
     let before = received.lock().unwrap().len();
     for (user, scope) in [(&owner, empty_kb), (&stranger, kb)] {
         let response = app
@@ -289,6 +340,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
     // Invalid drafts must never become visible, including a real quote attached to a false claim.
     for current_mode in [4, 5, 6] {
         mode.store(current_mode, Ordering::SeqCst);
+        let before = received.lock().unwrap().len();
         let response = app
             .clone()
             .oneshot(authed_json_request("POST", "/api/v1/knowledge/chat", &owner, request.clone()))
@@ -303,6 +355,16 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             assert!(answer.is_empty(), "unverified draft leaked: {text}");
             assert_eq!(events.last().unwrap().0, "error");
             assert!(!events.iter().any(|(e, _)| e == "done"));
+            assert_eq!(
+                received.lock().unwrap()[before..]
+                    .iter()
+                    .filter(
+                        |r| r["stream"] == false && message_text(&r["messages"][0]["content"]).contains("证据核验器")
+                    )
+                    .count(),
+                3,
+                "semantic rejection must stop after two answer corrections"
+            );
         } else {
             assert_eq!(answer, "螺旋桨有两类。[1]");
             assert_eq!(events.last().unwrap().0, "done");
@@ -343,6 +405,66 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
         "answer was needlessly rewritten: {text}"
     );
     assert!(events.iter().any(|(e, v)| e == "delta" && v["text"] == "螺旋桨有两类。[1]"));
+    // Parsed JSON with missing verdict rows/citations is also a verifier format
+    // fault. Repair it without consuming the answer correction budget. Persistent
+    // shape/HTTP errors stop with no unverified text and no answer rewrite.
+    for current_mode in [12, 13, 14, 15, 16] {
+        mode.store(current_mode, Ordering::SeqCst);
+        let before = received.lock().unwrap().len();
+        let response = app
+            .clone()
+            .oneshot(authed_json_request("POST", "/api/v1/knowledge/chat", &owner, request.clone()))
+            .await
+            .unwrap();
+        let text = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        let events = parse_events(&text);
+        let success = ![14, 15].contains(&current_mode);
+        assert_eq!(events.last().unwrap().0, if success { "done" } else { "error" }, "mode={current_mode}: {text}");
+        assert!(!events.iter().any(|(e, v)| e == "status" && v["stage"] == "correcting"), "{text}");
+        assert_eq!(events.iter().filter(|(e, _)| e == "delta").count(), usize::from(success));
+        assert!(!text.contains("private verifier failure"));
+        let requests = received.lock().unwrap();
+        let verification = requests[before..]
+            .iter()
+            .filter(|r| r["stream"] == false && message_text(&r["messages"][0]["content"]).contains("证据核验器"))
+            .collect::<Vec<_>>();
+        assert_eq!(verification.len(), if current_mode == 14 { 1 } else { 2 });
+        assert_eq!(verification[0]["response_format"]["type"], "json_schema");
+        assert_eq!(verification[0]["response_format"]["json_schema"]["schema"]["properties"]["claims"]["minItems"], 1);
+        assert_eq!(
+            verification[0]["response_format"]["json_schema"]["schema"]["properties"]["claims"]["prefixItems"][0]["properties"]
+                ["index"]["const"],
+            0
+        );
+        if current_mode == 16 {
+            assert_eq!(verification[1]["response_format"]["type"], "json_object");
+        }
+    }
+    // Explicit Wiki scope applies to tool calls, generation, correction and
+    // verification, even when retrieval also returns an original with a new value.
+    mode.store(0, Ordering::SeqCst);
+    let before = received.lock().unwrap().len();
+    let response = app
+        .clone()
+        .oneshot(authed_json_request(
+            "POST",
+            "/api/v1/knowledge/chat",
+            &owner,
+            json!({"question":"根据Wiki记录回答propeller types", "kb_id":kb}),
+        ))
+        .await
+        .unwrap();
+    let text = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    assert_eq!(parse_events(&text).last().unwrap().0, "done", "{text}");
+    for (event, payload) in parse_events(&text) {
+        if event == "sources" {
+            assert!(!payload["sources"].as_array().unwrap().is_empty());
+            assert!(payload["sources"].as_array().unwrap().iter().all(|s| s["result"]["wiki"].is_object()));
+        }
+    }
+    for body in &received.lock().unwrap()[before..] {
+        assert!(!body.to_string().contains("fixed pitch"), "out-of-scope original leaked into model input");
+    }
     // Reject a redundant citation even when the overall claim is supported.
     // Refusal explanations are removed without discarding a supported partial answer.
     for (current_mode, question) in
