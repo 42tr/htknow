@@ -422,6 +422,14 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
         assert!(claims.get("prefixItems").is_none());
         assert!(claims["items"]["properties"].get("depends_on").is_none());
         assert!(claims["items"]["properties"]["text"].get("pattern").is_none());
+        let expression = regex::Regex::new(
+            claims["items"]["properties"]["calculation"]["anyOf"][1]["properties"]["expression"]["pattern"]
+                .as_str()
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(expression.is_match("40*3*2-5"));
+        assert!(!expression.is_match("$0*2"));
     }
     // A malformed verifier response gets a bounded schema repair, without rewriting the answer.
     mode.store(8, Ordering::SeqCst);

@@ -39,14 +39,12 @@ text写成不含逗号和分号的独立陈述；名称内部原本有逗号时�
 所有计算结果使用 calculation 字段：{"expression":"40*3*2-5","unit":"元"}，非计算事实用 null。
 expression 只写数字、四则算符和括号，不可写字段名、单位或等号；结果由服务端精确计算并展示完整算式。
 计算条目的 text 只写结果的含义，如“扣减后的总费用”，不要另行重复原始单价、数量和计算结果。
-不同计算步骤分别建条目。使用前序计算结果时在expression中写$0、$1等（claims从0开始的索引），不要把中间金额硬写成常数。
-服务端会自动继承前序计算的全部原始来源和片段，并展开引用，展示从原始数字开始的完整算式。
-例如先写{"text":"所需新增数量","calculation":{"expression":"4-3","unit":"个"},"evidence":[{"source_id":1,"passage_ids":[1]},{"source_id":2,"passage_ids":[1]}]}，
-再写{"text":"每月新增费用","calculation":{"expression":"$0*40","unit":"元"},"evidence":[{"source_id":1,"passage_ids":[1]},{"source_id":2,"passage_ids":[1]},{"source_id":3,"passage_ids":[1]}]}。
-不能把上一轮助手答案的数值直接当成中间结果。
+不同计算步骤分别建条目，每一步都从资料中的原始数字展开完整算式，并选择所有原始数字的来源。
+不要使用$索引，不要把本轮或上轮算出的中间金额硬写成常数；每条核验看不到前序结论。
+例如新增数量写4-3，新增月费写(4-3)*40，两月新增费用写(4-3)*40*2，不能写40*2并仅引合同。
+扣减后的费用写40*3*2-5，不能写240-5；比较额度时继续展开为300-(40*3*2-5)。
 用户给定的假设不单独建claim，也不为假设值编造资料引用；在条件性结论中保留假设前提，并引用判断所需的规则。
 非计算的比较或推论必须直接引用其全部原始证据，不能把前面答案的结论当证据；不要输出depends_on字段。
-不确定前序计算索引时，直接在expression中使用原始数字展开算式，不要猜测索引。
 只回答当前问题，避免补充未被问到的预算、背景、建议等额外事实。一个列表项也必须独立绑定证据。
 仅使用本轮 sources 中的编号和 content。历史回答及其引用只能帮助理解指代，不能作为证据。
 passage_ids 选择该 source 的 passages 中实际支持事实的编号，从 1 开始；编号仅在对应 source 内有效。
@@ -465,7 +463,7 @@ pub(super) async fn complete_answer(messages: Value, sources: &[ChatSource]) -> 
         let base = object(json!({
             "text":{"type":"string","minLength":1,"maxLength":2000},
             "calculation":{"anyOf":[{"type":"null"},object(json!({
-                "expression":{"type":"string","pattern":"^[0-9 $.+*/()×÷-]{1,256}$"},
+                "expression":{"type":"string","pattern":"^[0-9 .+*/()×÷-]{1,256}$"},
                 "unit":{"type":"string","minLength":1,"maxLength":16}
             }))]},
             "evidence":{"type":"array","minItems":1,"maxItems":6,"items":{"anyOf":evidence}}
@@ -478,11 +476,14 @@ pub(super) async fn complete_answer(messages: Value, sources: &[ChatSource]) -> 
 async fn complete_with_schema(messages: Value, schema: Option<Value>) -> Result<String> {
     let cfg = crate::config::get();
     let url = cfg.llm.completions_url().context("LLM URL is missing")?;
-    let client = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(90))
-        .redirect(reqwest::redirect::Policy::none())
-        .build()?;
+    static HTTP: once_cell::sync::OnceCell<reqwest::Client> = once_cell::sync::OnceCell::new();
+    let client = HTTP.get_or_try_init(|| {
+        reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(10))
+            .timeout(Duration::from_secs(90))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+    })?;
     let format = schema
         .map(|schema| {
             json!({"type":"json_schema","json_schema":{
@@ -492,14 +493,7 @@ async fn complete_with_schema(messages: Value, schema: Option<Value>) -> Result<
         .unwrap_or(json!({"type":"json_object"}));
     let body = json!({"model":cfg.llm.model, "messages":messages, "stream":false,
         "temperature":0, "max_tokens":6000, "response_format":format});
-    let post = |body: &Value| {
-        let mut request = client.post(&url).json(body);
-        if let Some(key) = cfg.llm.api_key.as_deref().filter(|k| !k.is_empty()) {
-            request = request.bearer_auth(key);
-        }
-        request
-    };
-    let mut response = post(&body).send().await?;
+    let mut response = post_completion(client, &url, &body, cfg.llm.api_key.as_deref()).await?;
     // Older compatible providers may explicitly reject JSON Schema. Retain all
     // local shape checks and bounded repairs when falling back to JSON mode.
     if body["response_format"]["type"] == "json_schema" && matches!(response.status().as_u16(), 400 | 422) {
@@ -516,7 +510,7 @@ async fn complete_with_schema(messages: Value, schema: Option<Value>) -> Result<
         );
         let mut fallback = body;
         fallback["response_format"] = json!({"type":"json_object"});
-        response = post(&fallback).send().await?;
+        response = post_completion(client, &url, &fallback, cfg.llm.api_key.as_deref()).await?;
     }
     let mut response = response.error_for_status()?;
     let mut bytes = Vec::new();
@@ -527,6 +521,28 @@ async fn complete_with_schema(messages: Value, schema: Option<Value>) -> Result<
     let value: Value = serde_json::from_slice(&bytes)?;
     ensure!(value["choices"][0]["finish_reason"] == "stop", "LLM did not finish normally");
     Ok(value["choices"][0]["message"]["content"].as_str().context("LLM returned no JSON text")?.to_owned())
+}
+
+async fn post_completion(
+    client: &reqwest::Client, url: &str, body: &Value, key: Option<&str>,
+) -> Result<reqwest::Response> {
+    for attempt in 0..2 {
+        let mut request = client.post(url).json(body);
+        if let Some(key) = key.filter(|k| !k.is_empty()) {
+            request = request.bearer_auth(key);
+        }
+        match request.send().await {
+            Ok(response) => return Ok(response),
+            // No request reached the server. Do not retry HTTP failures, body
+            // timeouts, malformed responses or semantic rejection here.
+            Err(error) if attempt == 0 && error.is_connect() => {
+                log::warn!("chat LLM connection failed before sending request; retrying once");
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    unreachable!()
 }
 
 #[derive(Deserialize)]
@@ -894,6 +910,36 @@ fn validate_verdict(verdict: Verification, answer: &GroundedAnswer) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn retries_a_failed_connection_but_returns_http_errors_without_retry() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let reserved = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = reserved.local_addr().unwrap();
+        drop(reserved);
+        let server = tokio::spawn(async move {
+            // The first attempt is refused; only the bounded retry can succeed.
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            let listener = tokio::net::TcpListener::bind(address).await.unwrap();
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = [0; 4096];
+            socket.read(&mut bytes).await.unwrap();
+            socket
+                .write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}")
+                .await
+                .unwrap();
+            // A second accepted request would incorrectly retry an HTTP failure.
+            assert!(tokio::time::timeout(Duration::from_millis(400), listener.accept()).await.is_err());
+        });
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .connect_timeout(Duration::from_secs(2))
+            .timeout(Duration::from_secs(3))
+            .build()
+            .unwrap();
+        let response = post_completion(&client, &format!("http://{address}"), &json!({}), None).await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+        server.await.unwrap();
+    }
     use crate::api::search::SearchResultItem;
     fn sources() -> Vec<ChatSource> {
         vec![ChatSource {
