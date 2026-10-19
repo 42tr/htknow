@@ -12,7 +12,10 @@ pub(in crate::api::chat) async fn split_answer(draft: &str, index: usize, source
         .filter(|(i, c)| c.calculation.is_none() && (*i == index || has_independent_clauses(c)))
         .map(|(i, c)| (i, c.clone()))
         .collect::<Vec<_>>();
-    ensure!(!candidates.is_empty() && candidates.len() <= 8, "单次拆分事实数量无效");
+    ensure!(!candidates.is_empty(), "没有可拆分事实");
+    if candidates.len() > 8 {
+        return Err(SplitCapacity.into());
+    }
     // Repair all already-detectable compound sentences in one correction round.
     // Bound concurrency and keep original indices until every replacement is ready.
     let splits = futures::stream::iter(
@@ -61,7 +64,10 @@ async fn split_claim(claim: &Claim, sources: &[ChatSource]) -> Result<Vec<Claim>
 fn replace_claim(answer: &mut GroundedAnswer, index: usize, mut split: Vec<Claim>) -> Result<()> {
     let original = answer.claims.get(index).context("待拆分事实不存在")?;
     let count = split.len();
-    ensure!(count >= 2 && answer.claims.len() + count - 1 <= 32, "拆分后事实条目过多");
+    ensure!(count >= 2, "拆分结果数量不足");
+    if answer.claims.len() + count - 1 > 32 {
+        return Err(SplitCapacity.into());
+    }
     for claim in &mut split {
         claim.depends_on = original.depends_on.clone();
     }

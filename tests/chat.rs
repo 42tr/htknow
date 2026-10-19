@@ -61,7 +61,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             let shape_omissions = mock_shape_omissions.clone();
             // chat 是 agent 架构：模型必须先回 OpenAI 风格的 tool_calls，knowledge_search
             // 才会执行并发出 sources 事件；看到工具结果（role = tool）后再回正文。
-            let wants_tool = (mode == 0 || (4..=24).contains(&mode))
+            let wants_tool = (mode == 0 || (4..=26).contains(&mode))
                 && ([21,22].contains(&mode) || !body["messages"].as_array().is_some_and(|messages| messages.iter().any(|m| m["role"] == "tool")));
             async move {
                 // Non-streaming calls are either the independent verifier or the single correction.
@@ -81,6 +81,11 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                     let evidence = visible.iter().take(2).map(|s| json!({"source_id":s["id"],"passage_ids":[1]})).collect::<Vec<_>>();
                     grounded["claims"] = json!((0..3).map(|_| json!({"text":"FPP的桨距为固定，CPP的桨距为可调整。","evidence":evidence})).collect::<Vec<_>>());
                 }
+                if mode == 26 && body["stream"] == true && !grounded["claims"].as_array().unwrap().is_empty() {
+                    let c = grounded["claims"][0].clone();
+                    grounded["claims"] = json!(vec![c;32]);
+                    grounded["claims"][0]["text"] = json!("FPP的桨距固定，CPP的桨距可调整。");
+                }
                 if body["stream"] == false {
                     if message_text(&body["messages"][0]["content"]).starts_with("你是事实拆分器") {
                         let evidence = grounded["claims"][0]["evidence"].clone();
@@ -90,7 +95,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                     }
                     if message_text(&body["messages"][0]["content"]).starts_with("你是事实原子性复核器") {
                         let input: Value = serde_json::from_str(&message_text(&body["messages"].as_array().unwrap().last().unwrap()["content"])).unwrap();
-                        let compound = [18,19].contains(&mode) && input["text"].as_str().unwrap().contains('，');
+                        let compound = [18,19,26].contains(&mode) && input["text"].as_str().unwrap().contains('，');
                         let verdict = json!({"atomic":!compound,"reason":if compound {"两个独立属性"} else {"本句只有一个属性，来源的其他属性不属于本句"}});
                         return Json(json!({"choices":[{"message":{"role":"assistant","content":verdict.to_string()},"finish_reason":"stop"}]})).into_response();
                     }
@@ -121,11 +126,11 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                     }
                     let mut content = if verifying {
                         json!({"claims":input["answer"]["claims"].as_array().unwrap().iter().enumerate().map(|(index,c)| {
-                            let supported = !c["text"].as_str().unwrap().contains("虚构");
-                            json!({"index":index,"supported":supported,"atomic":![17,18,19].contains(&mode),
+                            let supported = !c["text"].as_str().unwrap().contains("虚构") && !(mode == 25 && c["evidence"].as_array().unwrap().len() == 1);
+                            json!({"index":index,"supported":supported,"atomic":![17,18,19,26].contains(&mode),
                                 "answers_question":!c["text"].as_str().unwrap().contains("资料仅包含"),
                                 "evidence":c["evidence"].as_array().unwrap().iter().enumerate().map(|(i,e)|
-                                    json!({"source_id":e["source_id"],"contributes":mode != 9 || i == 0,
+                                    json!({"source_id":e["source_id"],"contributes":![9,25].contains(&mode) || i == 0,
                                         "reason":if mode == 9 && i > 0 {"主题相关但不支持这条事实"} else {"supports the requested fact"}})
                                 ).collect::<Vec<_>>(),
                                 "reason":if supported {"supported"} else {"引用有原句，但不支持金属X"}})
@@ -192,7 +197,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                 let mut grounded = grounded;
                 if mode == 4 { grounded["claims"][0]["evidence"] = json!([]); }
                 if mode == 6 { grounded["claims"][0]["evidence"][0]["source_id"] = json!(99); }
-                if mode == 9 {
+                if [9,25].contains(&mode) {
                     let other = visible.get(1).expect("two current-turn sources");
                     grounded["claims"][0]["evidence"].as_array_mut().unwrap().push(json!({"source_id":other["id"],"passage_ids":[1]}));
                 }
@@ -204,7 +209,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                 }
                 let payload = json!({"choices":[{"delta":{"content":grounded.to_string()}}]});
                 let mut data = format!(": comment\r\ndata: {payload}\r\n\r\n").into_bytes();
-                if mode == 0 || (4..=24).contains(&mode) { data.extend_from_slice(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"); }
+                if mode == 0 || (4..=26).contains(&mode) { data.extend_from_slice(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"); }
                 // 任意字节边界分片，包括中文 UTF-8 和 SSE CRLF。
                 let mut chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
                     data.chunks(7).map(|v| Ok(bytes::Bytes::copy_from_slice(v))).collect();
@@ -543,7 +548,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
     }
     // Repeated tool calls fall back to one tool-free draft, which still needs
     // full verification. A fabricated fallback must never become visible.
-    for current_mode in [21, 22, 23, 24] {
+    for current_mode in [21, 22, 23, 24, 25, 26] {
         mode.store(current_mode, Ordering::SeqCst);
         let before = received.lock().unwrap().len();
         let response = app
@@ -555,11 +560,11 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
         let events = parse_events(&text);
         assert_eq!(
             events.last().unwrap().0,
-            if current_mode == 22 { "error" } else { "done" },
+            if [22, 25].contains(&current_mode) { "error" } else { "done" },
             "mode={current_mode}: {text}"
         );
-        assert_eq!(events.iter().filter(|(e, _)| e == "delta").count(), usize::from(current_mode != 22));
-        if current_mode >= 23 {
+        assert_eq!(events.iter().filter(|(e, _)| e == "delta").count(), usize::from(![22, 25].contains(&current_mode)));
+        if [23, 24].contains(&current_mode) {
             assert!(!events.iter().any(|(e, v)| e == "status" && v["stage"] == "correcting"));
         }
         let requests = received.lock().unwrap();
@@ -568,7 +573,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             assert_eq!(new.iter().filter(|r| r["stream"] == true).count(), 4);
             assert!(new.iter().any(|r| r["stream"] == false
                 && message_text(&r["messages"][0]["content"]).starts_with("你是知识库问答助手")));
-        } else {
+        } else if [23, 24].contains(&current_mode) {
             let marker = if current_mode == 23 {
                 "你是知识库答案的证据核验器"
             } else {
@@ -577,6 +582,14 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             assert_eq!(
                 new.iter().filter(|r| message_text(&r["messages"][0]["content"]).starts_with(marker)).count(),
                 2
+            );
+        } else if current_mode == 26 {
+            assert_eq!(
+                new.iter()
+                    .filter(|r| message_text(&r["messages"][0]["content"]).starts_with("你是知识库问答助手")
+                        && r["stream"] == false)
+                    .count(),
+                1
             );
         }
         assert!(!text.contains("虚构") && !text.contains("检索前的未核验草稿"));
@@ -627,7 +640,11 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
         let answer: String =
             events.iter().filter(|(e, _)| e == "delta").map(|(_, v)| v["text"].as_str().unwrap()).collect();
         assert_eq!(events.last().unwrap().0, "done", "{text}");
-        assert!(events.iter().any(|(e, v)| e == "status" && v["stage"] == "correcting"), "{text}");
+        assert_eq!(
+            events.iter().any(|(e, v)| e == "status" && v["stage"] == "correcting"),
+            current_mode != 9,
+            "{text}"
+        );
         assert!(!answer.contains("资料仅包含") && !answer.contains("[2]"), "{text}");
         match current_mode {
             9 => assert_eq!(answer, "螺旋桨有两类。[1]"),

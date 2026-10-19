@@ -355,7 +355,9 @@ async fn run_chat(
     for attempt in 0..3 {
         send(tx, "status", json!({"stage":"verifying"})).await?;
         let result = match grounding::parse_answer(&draft, &sources) {
-            Ok(parsed) => grounding::verify(&parsed, &sources, &context, history.clone()).await.map(|()| parsed),
+            Ok(mut parsed) => {
+                grounding::verify(&mut parsed, &sources, &context, history.clone()).await.map(|()| parsed)
+            }
             Err(error) => Err(error),
         };
         match result {
@@ -372,17 +374,24 @@ async fn run_chat(
                     break;
                 }
                 send(tx, "status", json!({"stage":"correcting"})).await?;
-                let correction = if let Some(compound) =
-                    error.downcast_ref::<grounding::CompoundClaim>().filter(|c| c.can_split)
-                {
-                    grounding::split_answer(&draft, compound.index, &sources).await
+                let split =
+                    if let Some(compound) = error.downcast_ref::<grounding::CompoundClaim>().filter(|c| c.can_split) {
+                        match grounding::split_answer(&draft, compound.index, &sources).await {
+                            Err(error) if error.is::<grounding::SplitCapacity>() => None,
+                            result => Some(result),
+                        }
+                    } else {
+                        None
+                    };
+                let correction = if let Some(result) = split {
+                    result
                 } else {
                     grounding::complete_answer(json!([
                     {"role":"system","content":format!("{SYSTEM}\n{}", grounding::OUTPUT_RULES)},
                     {"role":"user","content":json!({"question":request.question,"question_context":*context,"history":history,
                         "sources":grounding::visible_sources(&sources),"rejected_draft":draft,
                         "validation_error":format!("{error:#}"),
-                        "instruction":"修正上述核验问题。删除无关事实，补充真正支持陈述的证据，不可盲目添加编号。"}).to_string()},
+                        "instruction":"修正上述核验问题。删除无关事实与重复陈述，补充真正支持陈述的证据，不可盲目添加编号。若拆分会超出条目预算，去掉重复的规则、前提和背景，保留所问的各项独立结论。"}).to_string()},
                 ]), &sources).await
                 };
                 draft = correction.map_err(|error| {

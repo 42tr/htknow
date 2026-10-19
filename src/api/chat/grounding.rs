@@ -22,6 +22,15 @@ impl std::fmt::Display for CompoundClaim {
 }
 impl std::error::Error for CompoundClaim {}
 
+#[derive(Debug)]
+pub(super) struct SplitCapacity;
+impl std::fmt::Display for SplitCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("拆分超出事实条目预算，需去重并精简整份草稿")
+    }
+}
+impl std::error::Error for SplitCapacity {}
+
 pub(super) const OUTPUT_RULES: &str = r#"
 最终回答只输出一个 JSON 对象，不要代码围栏：
 {"claims":[{"text":"一个直接回答问题的完整事实句","calculation":null,"evidence":[{"source_id":1,"passage_ids":[2]}]}],"insufficient":false}
@@ -182,6 +191,15 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
             inherit_evidence(&mut claim.evidence, dependencies);
         }
         for evidence in &mut claim.evidence {
+            let source = sources.iter().find(|s| s.id == evidence.source_id).context("证据来源不存在")?;
+            static ENTITY_HEADER: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+                regex::Regex::new(r"[\p{Han}A-Za-z][\p{Han}A-Za-z0-9]{0,32}[-_][A-Za-z0-9]{4,32}").unwrap()
+            });
+            let header = passages(&source.result.content).into_iter().next().unwrap_or_default();
+            if evidence.passage_ids.len() < 12 && !evidence.passage_ids.contains(&1) && ENTITY_HEADER.is_match(&header)
+            {
+                evidence.passage_ids.push(1);
+            }
             evidence.passage_ids.sort_unstable();
         }
         if let Some(calculation) = &mut claim.calculation {
@@ -731,49 +749,73 @@ struct Coverage {
     missing_aspects: Vec<String>,
 }
 
+async fn verify_claim(
+    mut claim: Claim, sources: &[ChatSource], context: &super::context::QuestionContext,
+) -> Result<(Claim, ClaimVerdict)> {
+    for round in 0..2 {
+        let single = GroundedAnswer { claims: vec![claim.clone()], insufficient: false };
+        let mut selected = Vec::new();
+        let mut visible = Vec::new();
+        for evidence in &claim.evidence {
+            let source = sources.iter().find(|s| s.id == evidence.source_id).context("证据来源不存在")?;
+            let excerpts = evidence_text(evidence, source)?;
+            selected.push(json!({"claim_index":0,"source_id":source.id,"excerpts":excerpts}));
+            visible.push(json!({"id":source.id,"kind":if source.result.wiki.is_some() { "wiki" } else { "original" },
+    "content":excerpts.join("\n"),"passages":evidence.passage_ids.iter().zip(&excerpts)
+        .map(|(id,text)| json!({"id":id,"text":text})).collect::<Vec<_>>()}));
+        }
+        let messages = json!([
+            {"role":"system","content":VERIFY},
+            {"role":"user","content":json!({"evidence_scope":context.evidence_scope(),
+                "answer":single,"sources":visible,"selected_evidence":selected}).to_string()},
+        ]);
+        let mut verdict = request_verdict(&single, messages).await?;
+        let mut verdict = verdict.claims.remove(0);
+        if !verdict.atomic {
+            // The source may contain several attributes even though this
+            // sentence asserts only one. Recheck the sentence in isolation.
+            let atomicity = check_atomicity(&claim.text).await?;
+            verdict.atomic = atomicity.atomic;
+            if !atomicity.atomic {
+                verdict.reason = atomicity.reason;
+            }
+        }
+        if round == 0
+            && verdict.supported
+            && verdict.atomic
+            && verdict.evidence.iter().any(|e| e.contributes)
+            && verdict.evidence.iter().any(|e| !e.contributes)
+        {
+            let retained =
+                verdict.evidence.iter().filter(|e| e.contributes).map(|e| e.source_id).collect::<HashSet<_>>();
+            claim.evidence.retain(|e| retained.contains(&e.source_id));
+            continue;
+        }
+        return Ok((claim, verdict));
+    }
+    unreachable!()
+}
+
 pub(super) async fn verify(
-    answer: &GroundedAnswer, sources: &[ChatSource], context: &super::context::QuestionContext, history: Value,
+    answer: &mut GroundedAnswer, sources: &[ChatSource], context: &super::context::QuestionContext, history: Value,
 ) -> Result<()> {
     // Each fact sees only its own selected passages. Completeness sees all visible
     // sources in a separate request, so unrelated evidence cannot leak into a
     // fact's support judgment. Dropping these checks cannot make an answer pass.
     let checks =
         futures::stream::iter(answer.claims.clone().into_iter().enumerate().map(|(index, claim)| async move {
-            let single = GroundedAnswer { claims: vec![claim.clone()], insufficient: false };
-            let mut selected = Vec::new();
-            let mut visible = Vec::new();
-            for evidence in &claim.evidence {
-                let source = sources.iter().find(|s| s.id == evidence.source_id).context("证据来源不存在")?;
-                let excerpts = evidence_text(evidence, source)?;
-                selected.push(json!({"claim_index":0,"source_id":source.id,"excerpts":excerpts}));
-                visible.push(
-                    json!({"id":source.id,"kind":if source.result.wiki.is_some() { "wiki" } else { "original" },
-                "content":excerpts.join("\n"),"passages":evidence.passage_ids.iter().zip(&excerpts)
-                    .map(|(id,text)| json!({"id":id,"text":text})).collect::<Vec<_>>()}),
-                );
-            }
-            let messages = json!([
-                {"role":"system","content":VERIFY},
-                {"role":"user","content":json!({"evidence_scope":context.evidence_scope(),
-                    "answer":single,"sources":visible,"selected_evidence":selected}).to_string()},
-            ]);
-            let mut verdict = request_verdict(&single, messages).await?;
-            let mut verdict = verdict.claims.remove(0);
-            if !verdict.atomic {
-                // The source may contain several attributes even though this
-                // sentence asserts only one. Recheck the sentence in isolation.
-                let atomicity = check_atomicity(&claim.text).await?;
-                verdict.atomic = atomicity.atomic;
-                if !atomicity.atomic {
-                    verdict.reason = atomicity.reason;
-                }
-            }
+            let (claim, mut verdict) = verify_claim(claim, sources, context).await?;
             verdict.index = index;
-            Ok::<_, anyhow::Error>(verdict)
+            Ok::<_, anyhow::Error>((claim, verdict))
         }))
         .buffered(3)
         .try_collect::<Vec<_>>();
-    let (mut claims, coverage) = tokio::try_join!(checks, check_coverage(answer, sources, context, history))?;
+    let (checked, coverage) = tokio::try_join!(checks, check_coverage(answer, sources, context, history))?;
+    let mut claims = Vec::new();
+    for (index, (claim, verdict)) in checked.into_iter().enumerate() {
+        answer.claims[index].evidence = claim.evidence;
+        claims.push(verdict);
+    }
     for relevance in coverage.claim_relevance {
         let claim = &mut claims[relevance.index];
         claim.answers_question = relevance.relevant;
@@ -1022,6 +1064,16 @@ fn validate_verdict(verdict: Verification, answer: &GroundedAnswer) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn entity_headers_are_selected_without_exposing_other_unselected_passages() {
+        let mut source = sources().remove(0);
+        source.result.content = "澄海-A1B2C3 2028年6月20日实测记录\n报表服务实际副本数7个。\n其他服务私有字段。".into();
+        let answer = parse_answer(&json!({"claims":[{"text":"澄海-A1B2C3报表服务实际副本数7个。","evidence":[{"source_id":1,"passage_ids":[2]}]}],"insufficient":false}).to_string(), std::slice::from_ref(&source)).unwrap();
+        assert_eq!(answer.claims[0].evidence[0].passage_ids, vec![1, 2]);
+        let visible = evidence_text(&answer.claims[0].evidence[0], &source).unwrap().join("\n");
+        assert!(visible.contains("2028年6月20日"));
+        assert!(!visible.contains("私有字段"));
+    }
     fn chained_money_fixture() -> (Vec<ChatSource>, Value) {
         let sources = ["每副本每月单价40元。", "计划采购副本数3个。", "周期2个月。额度300元。"]
             .iter()
