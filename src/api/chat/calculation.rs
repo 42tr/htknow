@@ -82,6 +82,32 @@ struct Parser {
     pos: usize,
     money: bool,
 }
+
+struct Parsed {
+    number: Number,
+    text: String,
+    precedence: u8,
+}
+impl Parsed {
+    fn binary(self, op: char, right: Self) -> Result<Self> {
+        let op = match op {
+            '×' => '*',
+            '÷' => '/',
+            other => other,
+        };
+        let precedence = if matches!(op, '+' | '-') { 1 } else { 2 };
+        let left_text = if self.precedence < precedence { format!("({})", self.text) } else { self.text };
+        let right_text = if right.precedence < precedence
+            || (op == '-' && right.precedence == precedence)
+            || (op == '/' && right.precedence <= precedence)
+        {
+            format!("({})", right.text)
+        } else {
+            right.text
+        };
+        Ok(Self { number: self.number.op(op, right.number)?, text: format!("{left_text}{op}{right_text}"), precedence })
+    }
+}
 impl Parser {
     fn peek(&mut self) -> Option<char> {
         while self.chars.get(self.pos).is_some_and(|c| c.is_whitespace()) {
@@ -89,24 +115,24 @@ impl Parser {
         }
         self.chars.get(self.pos).copied()
     }
-    fn expr(&mut self, depth: usize) -> Result<Number> {
+    fn expr(&mut self, depth: usize) -> Result<Parsed> {
         ensure!(depth <= 16, "算式括号过深");
         let mut value = self.term(depth)?;
         while let Some(op @ ('+' | '-')) = self.peek() {
             self.pos += 1;
-            value = value.op(op, self.term(depth)?)?;
+            value = value.binary(op, self.term(depth)?)?;
         }
         Ok(value)
     }
-    fn term(&mut self, depth: usize) -> Result<Number> {
+    fn term(&mut self, depth: usize) -> Result<Parsed> {
         let mut value = self.factor(depth)?;
         while let Some(op @ ('*' | '×' | '/' | '÷')) = self.peek() {
             self.pos += 1;
-            value = value.op(op, self.factor(depth)?)?;
+            value = value.binary(op, self.factor(depth)?)?;
         }
         Ok(value)
     }
-    fn factor(&mut self, depth: usize) -> Result<Number> {
+    fn factor(&mut self, depth: usize) -> Result<Parsed> {
         let mut sign = 1;
         if let Some(c @ ('+' | '-')) = self.peek() {
             if c == '-' {
@@ -127,7 +153,8 @@ impl Parser {
                 self.pos += 1;
             }
             ensure!(start != self.pos, "算式缺少数字");
-            let value = Number::decimal(&self.chars[start..self.pos].iter().collect::<String>())?;
+            let text = self.chars[start..self.pos].iter().collect::<String>();
+            let value = Number::decimal(&text)?;
             self.peek();
             let tail = self.chars[self.pos..].iter().collect::<String>();
             let mut value = value;
@@ -166,13 +193,27 @@ impl Parser {
                     break;
                 }
             }
-            value
+            Parsed { number: value, text, precedence: 3 }
         };
-        value.scale(sign)
+        if sign == -1 {
+            let text = if value.precedence < 3 || value.text.starts_with('-') {
+                format!("-({})", value.text)
+            } else {
+                format!("-{}", value.text)
+            };
+            Ok(Parsed { number: value.number.scale(-1)?, text, precedence: 3 })
+        } else {
+            Ok(value)
+        }
     }
 }
 
 fn evaluate(text: &str) -> Result<(Number, bool)> {
+    let (parsed, money) = parse(text)?;
+    Ok((parsed.number, money))
+}
+
+fn parse(text: &str) -> Result<(Parsed, bool)> {
     ensure!(text.chars().count() <= 512, "算式过长");
     let mut parser = Parser { chars: text.chars().collect(), pos: 0, money: false };
     let value = parser.expr(0)?;
@@ -188,6 +229,11 @@ pub(super) fn result(expression: &str) -> Result<String> {
         "calculation.expression只允许数字、四则算符和括号，不可夹入字段名、单位或等号"
     );
     evaluate(expression)?.0.display()
+}
+
+pub(super) fn canonical(expression: &str) -> Result<String> {
+    result(expression)?;
+    Ok(parse(expression)?.0.text)
 }
 
 pub(super) struct Equation {
@@ -263,5 +309,16 @@ mod tests {
         assert_eq!(result("-0.1+0.3").unwrap(), "0.2");
         assert!(result("1/3").is_err());
         assert!(result("40元*3").is_err());
+        for (expression, expected) in [
+            ("((40*3)*2)-5", "40*3*2-5"),
+            ("40*(3+2)", "40*(3+2)"),
+            ("40/(3+2)", "40/(3+2)"),
+            ("40-(3-2)", "40-(3-2)"),
+            ("24/(3/2)", "24/(3/2)"),
+            ("-(-2)", "-(-2)"),
+        ] {
+            assert_eq!(canonical(expression).unwrap(), expected);
+            assert_eq!(result(expression).unwrap(), result(expected).unwrap());
+        }
     }
 }

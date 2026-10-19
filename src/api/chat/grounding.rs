@@ -22,7 +22,7 @@ pub(super) const OUTPUT_RULES: &str = r#"
 expression 只写数字、四则算符和括号，不可写字段名、单位或等号；结果由服务端精确计算并展示完整算式。
 计算条目的 text 只写结果的含义，如“扣减后的总费用”，不要另行重复原始单价、数量和计算结果。
 不同计算步骤分别建条目。使用前序计算结果时在expression中写$0、$1等（claims从0开始的索引），不要把中间金额硬写成常数。
-后一步必须保留支持该前序计算的全部原始来源和片段。服务端会展开引用，展示从原始数字开始的完整算式。
+服务端会自动继承前序计算的全部原始来源和片段，并展开引用，展示从原始数字开始的完整算式。
 例如先写{"text":"所需新增数量","calculation":{"expression":"4-3","unit":"个"},"evidence":[{"source_id":1,"passage_ids":[1]},{"source_id":2,"passage_ids":[1]}]}，
 再写{"text":"每月新增费用","calculation":{"expression":"$0*40","unit":"元"},"evidence":[{"source_id":1,"passage_ids":[1]},{"source_id":2,"passage_ids":[1]},{"source_id":3,"passage_ids":[1]}]}。
 不能把上一轮助手答案的数值直接当成中间结果。
@@ -150,6 +150,9 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
             }
         }
         claim.evidence = merged;
+        for evidence in &mut claim.evidence {
+            evidence.passage_ids.sort_unstable();
+        }
         if let Some(calculation) = &mut claim.calculation {
             ensure!(
                 !calculation.unit.is_empty()
@@ -171,13 +174,15 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
                     .and_then(Option::as_ref)
                     .with_context(|| format!("计算引用${index}必须指向前序已有的calculation条目"))?;
                 for dependency in dependencies {
-                    ensure!(
-                        claim.evidence.iter().any(|e| e.source_id == dependency.source_id
-                            && dependency.passage_ids.iter().all(|id| e.passage_ids.contains(id))),
-                        "计算引用${index}缺少原始证据：须保留来源{}的片段{:?}",
-                        dependency.source_id,
-                        dependency.passage_ids
-                    );
+                    if let Some(current) = claim.evidence.iter_mut().find(|e| e.source_id == dependency.source_id) {
+                        for id in &dependency.passage_ids {
+                            if !current.passage_ids.contains(id) {
+                                current.passage_ids.push(*id);
+                            }
+                        }
+                    } else {
+                        claim.evidence.push(dependency.clone());
+                    }
                 }
                 let money_scale = |unit: &str| match unit.split('/').next().unwrap_or("") {
                     "元" => Some(1),
@@ -192,7 +197,10 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
                 last = m.end();
             }
             expanded.push_str(&calculation.expression[last..]);
-            calculation.expression = expanded;
+            for evidence in &mut claim.evidence {
+                evidence.passage_ids.sort_unstable();
+            }
+            calculation.expression = calculation::canonical(&expanded)?;
             let result = calculation::result(&calculation.expression)?;
             let expression = calculation.expression.chars().filter(|c| !c.is_whitespace()).collect::<String>();
             claim.text = format!(
@@ -219,6 +227,21 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
         ensure!(!REFERENCE.is_match(&claim.text), "第 {} 条事实不能手写引用或链接", index + 1);
         validate_equalities(&claim.text)?;
         ensure!(!claim.evidence.is_empty() && claim.evidence.len() <= 6, "第 {} 条事实缺少有效证据", index + 1);
+        if claim.evidence.len() > 1 {
+            let assertions = claim
+                .text
+                .split(['，', ',', '；', ';'])
+                .filter(|part| {
+                    ["属于", "是", "为", "要求", " is ", " are "].iter().any(|predicate| part.contains(predicate))
+                })
+                .count();
+            ensure!(
+                assertions <= 1,
+                "第{}条并列了多个独立陈述却共用引用：{}。将每个原始属性拆为独立claim并分别引用；联合推论只写结论，不复述前提属性。",
+                index + 1,
+                claim.text
+            );
+        }
         let mut ids = HashSet::new();
         let mut excerpts = Vec::new();
         for evidence in &claim.evidence {
@@ -496,6 +519,8 @@ const VERIFY: &str = r#"你是知识库答案的证据核验器。本次只核�
 检查 supported：所有实体、数值、条件、时间和因果均有依据。不能凭常识、历史助手回答、标题或其他未引用资料补全。
 用户历史只解释指代，不能证明关系；服务到团队、团队到负责人等跨文档映射须有全部必要前提。
 每个 evidence.source_id 分别给出 contributes，只有它支持本条事实或联合推理的必要前提时才为true；主题相关不足以证明事实。
+来源直接记载本条事实可以为true；间接来源必须是联合推导所必需的数值、关系或条件，不能只是额外印证。
+若一个版本文档已完整证明其适用日期，另一个版本的生效日期不是该版本事实所必需的证据，不能仅因时间相关就判贡献。
 检查 atomic：仅依据当前这条text，不把问题中的其他事项或引句中其他未陈述的属性算进本条事实。
 “负责人是甲”和“容量为20”各自都是单一事实；即使同一引句含两个属性，也不能误判这两条为合并事实。
 同一计算结果及其必要算式、单一比较结论、跨文档映射结论可以atomic=true；并列的独立属性必须拆分。
@@ -1049,11 +1074,12 @@ mod tests {
             {"text":"两期合计","calculation":{"expression":"$0*2","unit":"元"},"evidence":evidence}
         ],"insufficient":false});
         let parsed = parse_answer(&draft.to_string(), &sources()).unwrap();
-        assert!(render(&parsed).contains("((112+36)*10000/1)*2=2960000元"));
+        assert!(render(&parsed).contains("(112+36)*10000/1*2=2960000元"));
         assert!(!render(&parsed).contains('$'));
         let good = draft.clone();
         draft["claims"][1]["evidence"][0]["passage_ids"] = json!([1]);
-        assert!(parse_answer(&draft.to_string(), &sources()).unwrap_err().to_string().contains("缺少原始证据"));
+        let inherited = parse_answer(&draft.to_string(), &sources()).unwrap();
+        assert_eq!(inherited.claims[1].evidence[0].passage_ids, vec![1, 2]);
         draft = good.clone();
         draft["claims"][0]["calculation"]["expression"] = json!("$1*2");
         assert!(parse_answer(&draft.to_string(), &sources()).is_err());
@@ -1072,5 +1098,23 @@ mod tests {
         assert_eq!(render(&parsed).matches("[1]").count(), 1);
         draft["claims"][0]["evidence"][1]["passage_ids"] = json!([99]);
         assert!(parse_answer(&draft.to_string(), &sources()).is_err());
+    }
+
+    #[test]
+    fn independent_clauses_cannot_share_multiple_sources() {
+        let mut sources = sources();
+        sources[0].result.content = "服务A属于团队B。".into();
+        let mut owner = self::sources().remove(0);
+        owner.id = 2;
+        owner.result.content = "团队B负责人是陈宁。".into();
+        sources.push(owner);
+        let evidence = json!([{"source_id":1,"passage_ids":[1]},{"source_id":2,"passage_ids":[1]}]);
+        let mut draft =
+            json!({"claims":[{"text":"服务A属于团队B，其负责人是陈宁。","evidence":evidence}],"insufficient":false});
+        assert!(parse_answer(&draft.to_string(), &sources).is_err());
+        draft["claims"] = json!([
+            {"text":"服务A属于团队B。","evidence":[{"source_id":1,"passage_ids":[1]}]},
+            {"text":"服务A的负责人是陈宁。","evidence":evidence}]);
+        assert!(parse_answer(&draft.to_string(), &sources).is_ok());
     }
 }
