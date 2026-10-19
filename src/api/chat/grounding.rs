@@ -8,8 +8,9 @@ use std::{collections::HashSet, time::Duration};
 
 pub(super) const OUTPUT_RULES: &str = r#"
 最终回答只输出一个 JSON 对象，不要代码围栏：
-{"claims":[{"text":"一个直接回答问题的完整事实句","calculation":null,"evidence":[{"source_id":1,"passage_ids":[2]}]}],"insufficient":false}
+{"claims":[{"text":"一个直接回答问题的完整事实句","calculation":null,"depends_on":[],"evidence":[{"source_id":1,"passage_ids":[2]}]}],"insufficient":false}
 每条 claim 只表达一个可核验事实，必须附支持整句的 evidence；引用由服务端渲染，text 不要写 [n]。
+text写成不含逗号和分号的独立陈述；名称内部原本有逗号时给名称加引号并原样保留，不要给整段复合陈述加引号来规避分条。
 原始属性先分别绑定来源，再写需要联合证据的计算或结论。例如“实际副本数为3”只引实测记录，
 “要求至少4副本”只引规则，“因此副本要求未达标”才同时引这两处。结论中不要重复并列已单列的原始属性。
 不要把多个属性拼句后共享引用。涉及多个条件时，每个条件的比较单独写一条，再给总体结论。
@@ -18,6 +19,7 @@ pub(super) const OUTPUT_RULES: &str = r#"
 完整回答当前问题所问的全部要点。多个属性、比较对象、计算分项和合计必须分别覆盖，不能只回答第一项。
 遵守用户限定的来源和时间范围：询问 Wiki 的记录时如实报告 Wiki 内容，不能擅自换成其他资料的最新数值。
 未被要求比较版本时，不补充其他版本的冲突数值，以免混淆所问的记录。
+用户仅问某日期下的属性时，直接回答该日期的属性并引用当时有效的记录；除非用户要求版本或解释依据，不另建版本选择条目。
 所有计算结果使用 calculation 字段：{"expression":"40*3*2-5","unit":"元"}，非计算事实用 null。
 expression 只写数字、四则算符和括号，不可写字段名、单位或等号；结果由服务端精确计算并展示完整算式。
 计算条目的 text 只写结果的含义，如“扣减后的总费用”，不要另行重复原始单价、数量和计算结果。
@@ -26,6 +28,9 @@ expression 只写数字、四则算符和括号，不可写字段名、单位或
 例如先写{"text":"所需新增数量","calculation":{"expression":"4-3","unit":"个"},"evidence":[{"source_id":1,"passage_ids":[1]},{"source_id":2,"passage_ids":[1]}]}，
 再写{"text":"每月新增费用","calculation":{"expression":"$0*40","unit":"元"},"evidence":[{"source_id":1,"passage_ids":[1]},{"source_id":2,"passage_ids":[1]},{"source_id":3,"passage_ids":[1]}]}。
 不能把上一轮助手答案的数值直接当成中间结果。
+用户给定的假设不单独建claim，也不为假设值编造资料引用；在条件性结论中保留假设前提，并引用判断所需的规则。
+非计算的比较或推论可用depends_on引用本回答前序事实/计算的索引，例如“额度能够覆盖费用”依赖前面已算出的应付金额。
+后端会继承依赖项的原始证据，不能只引额度数值而省略支撑费用的来源。直接提取的事实depends_on为空数组。
 只回答当前问题，避免补充未被问到的预算、背景、建议等额外事实。一个列表项也必须独立绑定证据。
 仅使用本轮 sources 中的编号和 content。历史回答及其引用只能帮助理解指代，不能作为证据。
 passage_ids 选择该 source 的 passages 中实际支持事实的编号，从 1 开始；编号仅在对应 source 内有效。
@@ -58,6 +63,8 @@ pub(super) struct Claim {
     pub evidence: Vec<Evidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub calculation: Option<Calculation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub depends_on: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -132,6 +139,7 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
     let mut answer: GroundedAnswer = serde_json::from_str(text).context("回答必须符合 claims/evidence JSON 结构")?;
     ensure!(answer.claims.len() <= 32, "事实条目过多，请仅回答当前问题");
     let mut calculations: Vec<Option<(String, String, Vec<Evidence>)>> = Vec::new();
+    let mut prior_evidence: Vec<Vec<Evidence>> = Vec::new();
     for claim in &mut answer.claims {
         // Multiple selections from the same source form one citation. Merge
         // them before checking dependency coverage; invalid passages still fail.
@@ -150,6 +158,11 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
             }
         }
         claim.evidence = merged;
+        ensure!(claim.depends_on.len() <= 8, "事实依赖条目过多");
+        for index in std::mem::take(&mut claim.depends_on) {
+            let dependencies = prior_evidence.get(index).with_context(|| format!("事实依赖{index}必须指向前序条目"))?;
+            inherit_evidence(&mut claim.evidence, dependencies);
+        }
         for evidence in &mut claim.evidence {
             evidence.passage_ids.sort_unstable();
         }
@@ -173,17 +186,7 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
                     .get(index)
                     .and_then(Option::as_ref)
                     .with_context(|| format!("计算引用${index}必须指向前序已有的calculation条目"))?;
-                for dependency in dependencies {
-                    if let Some(current) = claim.evidence.iter_mut().find(|e| e.source_id == dependency.source_id) {
-                        for id in &dependency.passage_ids {
-                            if !current.passage_ids.contains(id) {
-                                current.passage_ids.push(*id);
-                            }
-                        }
-                    } else {
-                        claim.evidence.push(dependency.clone());
-                    }
-                }
+                inherit_evidence(&mut claim.evidence, dependencies);
                 let money_scale = |unit: &str| match unit.split('/').next().unwrap_or("") {
                     "元" => Some(1),
                     "万元" => Some(10_000),
@@ -212,6 +215,7 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
         } else {
             calculations.push(None);
         }
+        prior_evidence.push(claim.evidence.clone());
     }
     ensure!(!answer.claims.is_empty() || answer.insufficient, "空回答必须说明资料不足");
     let mut derived: Vec<(calculation::Number, &Vec<Evidence>)> = Vec::new();
@@ -275,6 +279,20 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
         }
     }
     Ok(answer)
+}
+
+fn inherit_evidence(current: &mut Vec<Evidence>, dependencies: &[Evidence]) {
+    for dependency in dependencies {
+        if let Some(existing) = current.iter_mut().find(|e| e.source_id == dependency.source_id) {
+            for id in &dependency.passage_ids {
+                if !existing.passage_ids.contains(id) {
+                    existing.passage_ids.push(*id);
+                }
+            }
+        } else {
+            current.push(dependency.clone());
+        }
+    }
 }
 
 // Preserve text identifiers in structured "label: value" evidence. Whitespace
@@ -422,7 +440,9 @@ pub(super) async fn complete_answer(messages: Value, sources: &[ChatSource]) -> 
         tuple(vec![])
     } else {
         json!({"type":"array","maxItems":32,"items":object(json!({
-            "text":{"type":"string","minLength":1,"maxLength":2000},
+            "text":{"type":"string","minLength":1,"maxLength":2000,
+                "pattern":r#"^(?:[^，,；;"]|"[^"]*"|“[^”]*”)+$"#},
+            "depends_on":{"type":"array","maxItems":8,"items":{"type":"integer","minimum":0,"maximum":31}},
             "calculation":{"anyOf":[{"type":"null"},object(json!({
                 "expression":{"type":"string","pattern":"^[0-9 $.+*/()×÷-]{1,256}$"},
                 "unit":{"type":"string","minLength":1,"maxLength":16}
@@ -594,6 +614,15 @@ pub(super) async fn verify(
             ]);
             let mut verdict = request_verdict(&single, messages).await?;
             let mut verdict = verdict.claims.remove(0);
+            if !verdict.atomic {
+                // The source may contain several attributes even though this
+                // sentence asserts only one. Recheck the sentence in isolation.
+                let atomicity = check_atomicity(&claim.text).await?;
+                verdict.atomic = atomicity.atomic;
+                if !atomicity.atomic {
+                    verdict.reason = atomicity.reason;
+                }
+            }
             verdict.index = index;
             Ok::<_, anyhow::Error>(verdict)
         }))
@@ -616,6 +645,35 @@ pub(super) async fn verify(
         },
         answer,
     )
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Atomicity {
+    atomic: bool,
+    reason: String,
+}
+
+async fn check_atomicity(text: &str) -> Result<Atomicity> {
+    let schema = object(json!({"atomic":{"type":"boolean"},"reason":{"type":"string","maxLength":180}}));
+    let mut messages = json!([
+        {"role":"system","content":"你是事实原子性复核器，只判断给定text本身。一个属性、计算结果及其算式、单一比较结论或跨文档映射结论可为atomic=true。并列陈述两个独立属性（如归属和负责人、实测值和规则值）应为false。不要臆造text未陈述的其他事实；本任务没有来源或用户问题。仅输出JSON：{\"atomic\":true,\"reason\":\"一句理由\"}。"},
+        {"role":"user","content":json!({"text":text}).to_string()},
+    ]);
+    for attempt in 0..2 {
+        let result = complete_with_schema(messages.clone(), Some(schema.clone()))
+            .await
+            .map_err(|e| VerifierFailure(format!("原子性复核请求失败：{e:#}")))?;
+        match serde_json::from_str(&result) {
+            Ok(verdict) => return Ok(verdict),
+            Err(error) if attempt == 0 => messages.as_array_mut().unwrap().extend([
+                json!({"role":"assistant","content":result}),
+                json!({"role":"user","content":format!("复核JSON格式错误：{error}，按schema重试。")}),
+            ]),
+            Err(error) => return Err(VerifierFailure(format!("原子性复核结构无效：{error}")).into()),
+        }
+    }
+    unreachable!()
 }
 
 async fn request_verdict(answer: &GroundedAnswer, mut messages: Value) -> Result<Verification> {
@@ -1116,5 +1174,25 @@ mod tests {
             {"text":"服务A属于团队B。","evidence":[{"source_id":1,"passage_ids":[1]}]},
             {"text":"服务A的负责人是陈宁。","evidence":evidence}]);
         assert!(parse_answer(&draft.to_string(), &sources).is_ok());
+    }
+
+    #[test]
+    fn derived_conclusions_inherit_current_turn_proof_without_forward_or_history_references() {
+        let mut sources = sources();
+        sources[0].result.content = "单价40元。计划数量3个。".into();
+        let mut allowance = self::sources().remove(0);
+        allowance.id = 2;
+        allowance.result.content = "已核准额度150元。".into();
+        sources.push(allowance);
+        let mut draft = json!({"claims":[
+            {"text":"应付总额","calculation":{"expression":"40*3","unit":"元"},"evidence":[{"source_id":1,"passage_ids":[1,2]}]},
+            {"text":"额度可以覆盖应付金额。","depends_on":[0],"evidence":[{"source_id":2,"passage_ids":[1]}]}
+        ],"insufficient":false});
+        let answer = parse_answer(&draft.to_string(), &sources).unwrap();
+        assert!(answer.claims[1].depends_on.is_empty());
+        assert_eq!(answer.claims[1].evidence.len(), 2);
+        assert!(answer.claims[1].evidence.iter().any(|e| e.source_id == 1 && e.passage_ids == vec![1, 2]));
+        draft["claims"][0]["depends_on"] = json!([1]);
+        assert!(parse_answer(&draft.to_string(), &sources).is_err());
     }
 }

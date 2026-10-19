@@ -61,7 +61,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             let shape_omissions = mock_shape_omissions.clone();
             // chat 是 agent 架构：模型必须先回 OpenAI 风格的 tool_calls，knowledge_search
             // 才会执行并发出 sources 事件；看到工具结果（role = tool）后再回正文。
-            let wants_tool = (mode == 0 || (4..=16).contains(&mode))
+            let wants_tool = (mode == 0 || (4..=18).contains(&mode))
                 && !body["messages"].as_array().is_some_and(|messages| messages.iter().any(|m| m["role"] == "tool"));
             async move {
                 // Non-streaming calls are either the independent verifier or the single correction.
@@ -76,7 +76,12 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                         "evidence":[evidence]}],"insufficient":false})
                 } else { json!({"claims":[],"insufficient":true}) };
                 if mode == 11 { grounded["insufficient"] = json!(true); }
+                if mode == 18 && !grounded["claims"].as_array().unwrap().is_empty() { grounded["claims"][0]["text"] = json!("FPP的桨距固定，CPP的桨距可调整。"); }
                 if body["stream"] == false {
+                    if message_text(&body["messages"][0]["content"]).starts_with("你是事实原子性复核器") {
+                        let verdict = json!({"atomic":mode != 18,"reason":if mode == 18 {"两个独立属性"} else {"本句只有一个属性，来源的其他属性不属于本句"}});
+                        return Json(json!({"choices":[{"message":{"role":"assistant","content":verdict.to_string()},"finish_reason":"stop"}]})).into_response();
+                    }
                     let verifying = message_text(&body["messages"][0]["content"]).contains("证据核验器");
                     let covering = message_text(&body["messages"][0]["content"]).starts_with("你是知识库答案完整性核验器");
                     if covering {
@@ -102,7 +107,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                     let mut content = if verifying {
                         json!({"claims":input["answer"]["claims"].as_array().unwrap().iter().enumerate().map(|(index,c)| {
                             let supported = !c["text"].as_str().unwrap().contains("虚构");
-                            json!({"index":index,"supported":supported,"atomic":true,
+                            json!({"index":index,"supported":supported,"atomic":![17,18].contains(&mode),
                                 "answers_question":!c["text"].as_str().unwrap().contains("资料仅包含"),
                                 "evidence":c["evidence"].as_array().unwrap().iter().enumerate().map(|(i,e)|
                                     json!({"source_id":e["source_id"],"contributes":mode != 9 || i == 0,
@@ -184,7 +189,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                 }
                 let payload = json!({"choices":[{"delta":{"content":grounded.to_string()}}]});
                 let mut data = format!(": comment\r\ndata: {payload}\r\n\r\n").into_bytes();
-                if mode == 0 || (4..=16).contains(&mode) { data.extend_from_slice(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"); }
+                if mode == 0 || (4..=18).contains(&mode) { data.extend_from_slice(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"); }
                 // 任意字节边界分片，包括中文 UTF-8 和 SSE CRLF。
                 let mut chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
                     data.chunks(7).map(|v| Ok(bytes::Bytes::copy_from_slice(v))).collect();
@@ -438,6 +443,34 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
         );
         if current_mode == 16 {
             assert_eq!(verification[1]["response_format"]["type"], "json_object");
+        }
+    }
+    // Atomicity rechecks see only the current sentence, never the multi-field
+    // evidence paragraph. They still reject a genuinely compound sentence.
+    for current_mode in [17, 18] {
+        mode.store(current_mode, Ordering::SeqCst);
+        let before = received.lock().unwrap().len();
+        let response = app
+            .clone()
+            .oneshot(authed_json_request("POST", "/api/v1/knowledge/chat", &owner, request.clone()))
+            .await
+            .unwrap();
+        let text = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        let events = parse_events(&text);
+        assert_eq!(events.last().unwrap().0, if current_mode == 17 { "done" } else { "error" }, "{text}");
+        assert_eq!(events.iter().filter(|(e, _)| e == "delta").count(), usize::from(current_mode == 17));
+        let requests = received.lock().unwrap();
+        let rechecks = requests[before..]
+            .iter()
+            .filter(|r| message_text(&r["messages"][0]["content"]).starts_with("你是事实原子性复核器"))
+            .collect::<Vec<_>>();
+        assert_eq!(rechecks.len(), if current_mode == 17 { 1 } else { 3 });
+        for body in rechecks {
+            let input: Value =
+                serde_json::from_str(&message_text(&body["messages"].as_array().unwrap().last().unwrap()["content"]))
+                    .unwrap();
+            assert_eq!(input.as_object().unwrap().keys().cloned().collect::<Vec<_>>(), vec!["text".to_string()]);
+            assert!(!body.to_string().contains("fixed pitch"));
         }
     }
     // Explicit Wiki scope applies to tool calls, generation, correction and
