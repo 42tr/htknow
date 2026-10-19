@@ -61,7 +61,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             let shape_omissions = mock_shape_omissions.clone();
             // chat 是 agent 架构：模型必须先回 OpenAI 风格的 tool_calls，knowledge_search
             // 才会执行并发出 sources 事件；看到工具结果（role = tool）后再回正文。
-            let wants_tool = (mode == 0 || (4..=19).contains(&mode))
+            let wants_tool = (mode == 0 || (4..=20).contains(&mode))
                 && !body["messages"].as_array().is_some_and(|messages| messages.iter().any(|m| m["role"] == "tool"));
             async move {
                 // Non-streaming calls are either the independent verifier or the single correction.
@@ -77,6 +77,10 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                 } else { json!({"claims":[],"insufficient":true}) };
                 if mode == 11 { grounded["insufficient"] = json!(true); }
                 if [18,19].contains(&mode) && !grounded["claims"].as_array().unwrap().is_empty() { grounded["claims"][0]["text"] = json!("FPP的桨距固定，CPP的桨距可调整。"); }
+                if mode == 20 && !grounded["claims"].as_array().unwrap().is_empty() {
+                    let evidence = visible.iter().take(2).map(|s| json!({"source_id":s["id"],"passage_ids":[1]})).collect::<Vec<_>>();
+                    grounded["claims"] = json!((0..3).map(|_| json!({"text":"FPP的桨距为固定，CPP的桨距为可调整。","evidence":evidence})).collect::<Vec<_>>());
+                }
                 if body["stream"] == false {
                     if message_text(&body["messages"][0]["content"]).starts_with("你是事实拆分器") {
                         let evidence = grounded["claims"][0]["evidence"].clone();
@@ -197,7 +201,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                 }
                 let payload = json!({"choices":[{"delta":{"content":grounded.to_string()}}]});
                 let mut data = format!(": comment\r\ndata: {payload}\r\n\r\n").into_bytes();
-                if mode == 0 || (4..=19).contains(&mode) { data.extend_from_slice(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"); }
+                if mode == 0 || (4..=20).contains(&mode) { data.extend_from_slice(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"); }
                 // 任意字节边界分片，包括中文 UTF-8 和 SSE CRLF。
                 let mut chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
                     data.chunks(7).map(|v| Ok(bytes::Bytes::copy_from_slice(v))).collect();
@@ -496,6 +500,30 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             assert_eq!(input.as_object().unwrap().keys().cloned().collect::<Vec<_>>(), vec!["text".to_string()]);
             assert!(!body.to_string().contains("fixed pitch"));
         }
+    }
+    // Several compound sentences are repaired together, without spending one
+    // answer correction on each sentence. Every resulting fact is verified.
+    mode.store(20, Ordering::SeqCst);
+    let before = received.lock().unwrap().len();
+    let response = app
+        .clone()
+        .oneshot(authed_json_request("POST", "/api/v1/knowledge/chat", &owner, request.clone()))
+        .await
+        .unwrap();
+    let text = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+    let events = parse_events(&text);
+    assert_eq!(events.last().unwrap().0, "done", "{text}");
+    assert_eq!(events.iter().filter(|(e, v)| e == "status" && v["stage"] == "correcting").count(), 1);
+    {
+        let requests = received.lock().unwrap();
+        let new = &requests[before..];
+        let splits = new
+            .iter()
+            .filter(|r| message_text(&r["messages"][0]["content"]).starts_with("你是事实拆分器"))
+            .collect::<Vec<_>>();
+        assert_eq!(splits.len(), 3);
+        assert!(splits.iter().all(|r| r["response_format"]["json_schema"]["schema"]["properties"]["claims"]["items"]["properties"]["text"]["pattern"].is_string()));
+        assert_eq!(new.iter().filter(|r| message_text(&r["messages"][0]["content"]).contains("证据核验器")).count(), 6);
     }
     // Explicit Wiki scope applies to tool calls, generation, correction and
     // verification, even when retrieval also returns an original with a new value.

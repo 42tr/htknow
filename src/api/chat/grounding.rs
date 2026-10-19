@@ -277,19 +277,10 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
             .map(|(number, _)| *number)
             .collect::<Vec<_>>();
         validate_money_derivations(&claim.text, &excerpts, &available)?;
-        if claim.evidence.len() > 1 {
-            let assertions = claim
-                .text
-                .split(['，', ',', '；', ';'])
-                .filter(|part| {
-                    ["属于", "是", "为", "要求", " is ", " are "].iter().any(|predicate| part.contains(predicate))
-                })
-                .count();
-            if assertions > 1 {
-                return Err(
-                    CompoundClaim { index, can_split: claim.calculation.is_none(), text: claim.text.clone() }.into()
-                );
-            }
+        if has_independent_clauses(claim) {
+            return Err(
+                CompoundClaim { index, can_split: claim.calculation.is_none(), text: claim.text.clone() }.into()
+            );
         }
 
         for equation in calculation::equations(&claim.text)? {
@@ -300,6 +291,20 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
     }
     Ok(answer)
 }
+
+fn has_independent_clauses(claim: &Claim) -> bool {
+    claim.evidence.len() > 1
+        && claim
+            .text
+            .split(['，', ',', '；', ';'])
+            .filter(|part| {
+                ["属于", "是", "为", "要求", " is ", " are "].iter().any(|predicate| part.contains(predicate))
+            })
+            .count()
+            > 1
+}
+
+const ATOMIC_TEXT_PATTERN: &str = r#"^(?:[^，,；;"]|"[^"]*"|“[^”]*”)+$"#;
 
 fn inherit_evidence(current: &mut Vec<Evidence>, dependencies: &[Evidence]) {
     for dependency in dependencies {
@@ -461,7 +466,7 @@ pub(super) async fn complete_answer(messages: Value, sources: &[ChatSource]) -> 
     } else {
         let base = object(json!({
             "text":{"type":"string","minLength":1,"maxLength":2000,
-                "pattern":r#"^(?:[^，,；;"]|"[^"]*"|“[^”]*”)+$"#},
+                "pattern":ATOMIC_TEXT_PATTERN},
             "calculation":{"anyOf":[{"type":"null"},object(json!({
                 "expression":{"type":"string","pattern":"^[0-9 $.+*/()×÷-]{1,256}$"},
                 "unit":{"type":"string","minLength":1,"maxLength":16}
