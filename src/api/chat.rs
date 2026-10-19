@@ -344,13 +344,20 @@ async fn run_chat(
                     break;
                 }
                 send(tx, "status", json!({"stage":"correcting"})).await?;
-                draft = grounding::complete_answer(json!([
+                let correction = if let Some(compound) =
+                    error.downcast_ref::<grounding::CompoundClaim>().filter(|c| c.can_split)
+                {
+                    grounding::split_answer(&draft, compound.index, &sources).await
+                } else {
+                    grounding::complete_answer(json!([
                     {"role":"system","content":format!("{SYSTEM}\n{}", grounding::OUTPUT_RULES)},
                     {"role":"user","content":json!({"question":request.question,"question_context":*context,"history":history,
                         "sources":grounding::visible_sources(&sources),"rejected_draft":draft,
                         "validation_error":format!("{error:#}"),
                         "instruction":"修正上述核验问题。删除无关事实，补充真正支持陈述的证据，不可盲目添加编号。"}).to_string()},
-                ]), &sources).await.map_err(|error| {
+                ]), &sources).await
+                };
+                draft = correction.map_err(|error| {
                     log::error!("chat correction failed: {error}");
                     anyhow::anyhow!(UPSTREAM_FAILURE)
                 })?;

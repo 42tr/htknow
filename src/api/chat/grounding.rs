@@ -6,6 +6,22 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashSet, time::Duration};
 
+mod normalize;
+pub(super) use normalize::split_answer;
+
+#[derive(Debug)]
+pub(super) struct CompoundClaim {
+    pub index: usize,
+    pub can_split: bool,
+    text: String,
+}
+impl std::fmt::Display for CompoundClaim {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "第{}条合并了多个独立事实，需拆分并分别引用：{}", self.index + 1, self.text)
+    }
+}
+impl std::error::Error for CompoundClaim {}
+
 pub(super) const OUTPUT_RULES: &str = r#"
 最终回答只输出一个 JSON 对象，不要代码围栏：
 {"claims":[{"text":"一个直接回答问题的完整事实句","calculation":null,"depends_on":[],"evidence":[{"source_id":1,"passage_ids":[2]}]}],"insufficient":false}
@@ -126,7 +142,7 @@ pub(super) fn visible_sources(sources: &[ChatSource]) -> Value {
     )
 }
 
-pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<GroundedAnswer> {
+fn decode_answer(text: &str) -> Result<GroundedAnswer> {
     ensure!(text.len() <= 96_000, "回答结构过长");
     let text = text.trim();
     // Some OpenAI-compatible models still surround JSON with a single code fence.
@@ -136,7 +152,11 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
         .and_then(|t| t.trim().strip_suffix("```"))
         .unwrap_or(text)
         .trim();
-    let mut answer: GroundedAnswer = serde_json::from_str(text).context("回答必须符合 claims/evidence JSON 结构")?;
+    serde_json::from_str(text).context("回答必须符合 claims/evidence JSON 结构")
+}
+
+pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<GroundedAnswer> {
+    let mut answer = decode_answer(text)?;
     ensure!(answer.claims.len() <= 32, "事实条目过多，请仅回答当前问题");
     let mut calculations: Vec<Option<(String, String, Vec<Evidence>)>> = Vec::new();
     let mut prior_evidence: Vec<Vec<Evidence>> = Vec::new();
@@ -231,21 +251,6 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
         ensure!(!REFERENCE.is_match(&claim.text), "第 {} 条事实不能手写引用或链接", index + 1);
         validate_equalities(&claim.text)?;
         ensure!(!claim.evidence.is_empty() && claim.evidence.len() <= 6, "第 {} 条事实缺少有效证据", index + 1);
-        if claim.evidence.len() > 1 {
-            let assertions = claim
-                .text
-                .split(['，', ',', '；', ';'])
-                .filter(|part| {
-                    ["属于", "是", "为", "要求", " is ", " are "].iter().any(|predicate| part.contains(predicate))
-                })
-                .count();
-            ensure!(
-                assertions <= 1,
-                "第{}条并列了多个独立陈述却共用引用：{}。将每个原始属性拆为独立claim并分别引用；联合推论只写结论，不复述前提属性。",
-                index + 1,
-                claim.text
-            );
-        }
         let mut ids = HashSet::new();
         let mut excerpts = Vec::new();
         for evidence in &claim.evidence {
@@ -272,6 +277,21 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
             .map(|(number, _)| *number)
             .collect::<Vec<_>>();
         validate_money_derivations(&claim.text, &excerpts, &available)?;
+        if claim.evidence.len() > 1 {
+            let assertions = claim
+                .text
+                .split(['，', ',', '；', ';'])
+                .filter(|part| {
+                    ["属于", "是", "为", "要求", " is ", " are "].iter().any(|predicate| part.contains(predicate))
+                })
+                .count();
+            if assertions > 1 {
+                return Err(
+                    CompoundClaim { index, can_split: claim.calculation.is_none(), text: claim.text.clone() }.into()
+                );
+            }
+        }
+
         for equation in calculation::equations(&claim.text)? {
             if equation.explicit_currency {
                 derived.push((equation.result, &claim.evidence));
@@ -439,7 +459,7 @@ pub(super) async fn complete_answer(messages: Value, sources: &[ChatSource]) -> 
     let claims = if evidence.is_empty() {
         tuple(vec![])
     } else {
-        json!({"type":"array","maxItems":32,"items":object(json!({
+        let base = object(json!({
             "text":{"type":"string","minLength":1,"maxLength":2000,
                 "pattern":r#"^(?:[^，,；;"]|"[^"]*"|“[^”]*”)+$"#},
             "depends_on":{"type":"array","maxItems":8,"items":{"type":"integer","minimum":0,"maximum":31}},
@@ -448,7 +468,19 @@ pub(super) async fn complete_answer(messages: Value, sources: &[ChatSource]) -> 
                 "unit":{"type":"string","minLength":1,"maxLength":16}
             }))]},
             "evidence":{"type":"array","minItems":1,"maxItems":6,"items":{"anyOf":evidence}}
-        }))})
+        }));
+        let positions = (0..32)
+            .map(|index| {
+                let mut item = base.clone();
+                item["properties"]["depends_on"] = if index == 0 {
+                    tuple(vec![])
+                } else {
+                json!({"type":"array","maxItems":8,"items":{"type":"integer","minimum":0,"maximum":index-1,"enum":(0..index).collect::<Vec<_>>()}})
+                };
+                item
+            })
+            .collect::<Vec<_>>();
+        json!({"type":"array","maxItems":32,"prefixItems":positions,"items":false})
     };
     complete_with_schema(messages, Some(object(json!({"claims":claims,"insufficient":{"type":"boolean"}})))).await
 }
@@ -777,7 +809,7 @@ fn verification_schema(answer: &GroundedAnswer) -> Value {
 
 fn tuple(items: Vec<Value>) -> Value {
     if items.is_empty() {
-        json!({"type":"array","maxItems":0,"items":false})
+        json!({"type":"array","maxItems":0,"items":false,"const":[]})
     } else {
         json!({"type":"array","prefixItems":items,"items":false,"minItems":items.len(),"maxItems":items.len()})
     }
@@ -829,12 +861,12 @@ fn validate_verdict(verdict: Verification, answer: &GroundedAnswer) -> Result<()
             ));
         }
         if !claim.atomic {
-            errors.push(format!(
-                "第 {} 条合并了多个独立事实，请拆成多条claim，各自绑定来源。待修正陈述：{}；判定理由：{}",
-                claim.index + 1,
-                answer.claims[claim.index].text,
-                claim.reason
-            ));
+            return Err(CompoundClaim {
+                index: claim.index,
+                can_split: answer.claims[claim.index].calculation.is_none(),
+                text: answer.claims[claim.index].text.clone(),
+            }
+            .into());
         }
         if !claim.supported {
             errors.push(format!(
