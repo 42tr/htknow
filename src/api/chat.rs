@@ -1,7 +1,9 @@
 //! 无会话存储的检索增强对话。客户端逐次提交历史；仅检索结果可作为引用来源。
 use async_trait::async_trait;
 use futures::StreamExt;
-use g::{Agent, OpenAIChatModel, RunEvent, Tool, ToolBehavior, ToolContext, ToolError, ToolSpec};
+use g::{
+    Agent, AgentError, OpenAIChatModel, RunEvent, RunLimits, Tool, ToolBehavior, ToolContext, ToolError, ToolSpec,
+};
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
@@ -284,7 +286,10 @@ async fn run_chat(
             )
         })
         .collect::<Vec<_>>();
-    let agent = Agent::new(model).tool(tool).instruction(format!("{SYSTEM}\n{}", grounding::OUTPUT_RULES));
+    let agent = Agent::new(model)
+        .tool(tool)
+        .instruction(format!("{SYSTEM}\n{}", grounding::OUTPUT_RULES))
+        .with_limits(RunLimits { max_turns: 4, max_tool_calls: 3, ..RunLimits::default() });
     let mut prompt = history;
     prompt.push(g::Message::user(
         &json!({"question":request.question,"question_context":*context,"initial_search":initial}).to_string(),
@@ -292,11 +297,21 @@ async fn run_chat(
     let mut events = g::Runtime::new().stream_run(&agent, g::RunRequest::new(prompt));
     let mut draft = String::new();
     let mut completed = false;
+    let mut search_limit = false;
     while let Some(event) = events.next().await {
-        match event.map_err(|e| {
-            error!("chat run failed: {e}");
-            anyhow::anyhow!(UPSTREAM_FAILURE)
-        })? {
+        let event = match event {
+            Ok(event) => event,
+            Err(AgentError::MaxTurnsExceeded(_) | AgentError::MaxToolCallsExceeded(_)) => {
+                log::warn!("chat additional search budget exhausted; generating from visible evidence");
+                search_limit = true;
+                break;
+            }
+            Err(error) => {
+                error!("chat run failed: {error}");
+                return Err(anyhow::anyhow!(UPSTREAM_FAILURE));
+            }
+        };
+        match event {
             RunEvent::ModelStarted { .. } => {
                 // Discard any planning text from a preceding tool-call model turn.
                 draft.clear();
@@ -316,10 +331,23 @@ async fn run_chat(
             _ => {}
         }
     }
-    anyhow::ensure!(completed && !draft.trim().is_empty(), UPSTREAM_FAILURE);
+    drop(events);
     // Snapshot precisely the excerpts supplied to this turn, never wiki.page.content.
     let sources = sources.lock().await;
     let history = serde_json::to_value(&request.messages)?;
+    if search_limit {
+        draft = grounding::complete_answer(json!([
+            {"role":"system","content":format!("{SYSTEM}\n{}", grounding::OUTPUT_RULES)},
+            {"role":"user","content":json!({"question":request.question,"question_context":*context,
+                "history":history,"sources":grounding::visible_sources(&sources),
+                "instruction":"追加检索预算已耗尽。只依据这些可见资料回答，未知部分说明资料不足，不再调用工具。"}).to_string()}
+        ]), &sources).await.map_err(|error| {
+            error!("chat bounded-search completion failed: {error}");
+            anyhow::anyhow!(UPSTREAM_FAILURE)
+        })?;
+    } else {
+        anyhow::ensure!(completed && !draft.trim().is_empty(), UPSTREAM_FAILURE);
+    }
     let mut answer = None;
     // A schema failure can consume the first correction. Keep one more bounded
     // correction for substantive evidence/computation issues; every draft still

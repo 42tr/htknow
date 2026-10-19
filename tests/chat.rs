@@ -61,8 +61,8 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             let shape_omissions = mock_shape_omissions.clone();
             // chat 是 agent 架构：模型必须先回 OpenAI 风格的 tool_calls，knowledge_search
             // 才会执行并发出 sources 事件；看到工具结果（role = tool）后再回正文。
-            let wants_tool = (mode == 0 || (4..=20).contains(&mode))
-                && !body["messages"].as_array().is_some_and(|messages| messages.iter().any(|m| m["role"] == "tool"));
+            let wants_tool = (mode == 0 || (4..=24).contains(&mode))
+                && ([21,22].contains(&mode) || !body["messages"].as_array().is_some_and(|messages| messages.iter().any(|m| m["role"] == "tool")));
             async move {
                 // Non-streaming calls are either the independent verifier or the single correction.
                 let input = body["messages"].as_array().unwrap().iter().rev().find_map(|m| {
@@ -72,7 +72,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                     .and_then(Value::as_array).cloned().unwrap_or_default();
                 let evidence = visible.first().map(|s| json!({"source_id":s["id"],"passage_ids":[1]}));
                 let mut grounded = if let Some(evidence) = evidence {
-                    json!({"claims":[{"text":if mode == 5 { "虚构的桨叶采用金属X。" } else { "螺旋桨有两类。" },
+                    json!({"claims":[{"text":if [5,22].contains(&mode) { "虚构的桨叶采用金属X。" } else { "螺旋桨有两类。" },
                         "evidence":[evidence]}],"insufficient":false})
                 } else { json!({"claims":[],"insufficient":true}) };
                 if mode == 11 { grounded["insufficient"] = json!(true); }
@@ -96,6 +96,9 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                     }
                     let verifying = message_text(&body["messages"][0]["content"]).contains("证据核验器");
                     let covering = message_text(&body["messages"][0]["content"]).starts_with("你是知识库答案完整性核验器");
+                    if ((verifying && mode == 23) || (covering && mode == 24)) && shape_omissions.fetch_or(1 << mode, Ordering::SeqCst) & (1 << mode) == 0 {
+                        return Json(json!({"choices":[{"message":{"role":"assistant","content":"{\"claims\":["},"finish_reason":"length"}]})).into_response();
+                    }
                     if covering {
                         if mode == 16 && body["response_format"]["type"] == "json_schema" {
                             return Response::builder().status(400).body(Body::from("response_format json_schema is not supported")).unwrap();
@@ -201,7 +204,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                 }
                 let payload = json!({"choices":[{"delta":{"content":grounded.to_string()}}]});
                 let mut data = format!(": comment\r\ndata: {payload}\r\n\r\n").into_bytes();
-                if mode == 0 || (4..=20).contains(&mode) { data.extend_from_slice(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"); }
+                if mode == 0 || (4..=24).contains(&mode) { data.extend_from_slice(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"); }
                 // 任意字节边界分片，包括中文 UTF-8 和 SSE CRLF。
                 let mut chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
                     data.chunks(7).map(|v| Ok(bytes::Bytes::copy_from_slice(v))).collect();
@@ -537,6 +540,46 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                 .is_none()
         }));
         assert_eq!(new.iter().filter(|r| message_text(&r["messages"][0]["content"]).contains("证据核验器")).count(), 6);
+    }
+    // Repeated tool calls fall back to one tool-free draft, which still needs
+    // full verification. A fabricated fallback must never become visible.
+    for current_mode in [21, 22, 23, 24] {
+        mode.store(current_mode, Ordering::SeqCst);
+        let before = received.lock().unwrap().len();
+        let response = app
+            .clone()
+            .oneshot(authed_json_request("POST", "/api/v1/knowledge/chat", &owner, request.clone()))
+            .await
+            .unwrap();
+        let text = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        let events = parse_events(&text);
+        assert_eq!(
+            events.last().unwrap().0,
+            if current_mode == 22 { "error" } else { "done" },
+            "mode={current_mode}: {text}"
+        );
+        assert_eq!(events.iter().filter(|(e, _)| e == "delta").count(), usize::from(current_mode != 22));
+        if current_mode >= 23 {
+            assert!(!events.iter().any(|(e, v)| e == "status" && v["stage"] == "correcting"));
+        }
+        let requests = received.lock().unwrap();
+        let new = &requests[before..];
+        if current_mode <= 22 {
+            assert_eq!(new.iter().filter(|r| r["stream"] == true).count(), 4);
+            assert!(new.iter().any(|r| r["stream"] == false
+                && message_text(&r["messages"][0]["content"]).starts_with("你是知识库问答助手")));
+        } else {
+            let marker = if current_mode == 23 {
+                "你是知识库答案的证据核验器"
+            } else {
+                "你是知识库答案完整性核验器"
+            };
+            assert_eq!(
+                new.iter().filter(|r| message_text(&r["messages"][0]["content"]).starts_with(marker)).count(),
+                2
+            );
+        }
+        assert!(!text.contains("虚构") && !text.contains("检索前的未核验草稿"));
     }
     // Explicit Wiki scope applies to tool calls, generation, correction and
     // verification, even when retrieval also returns an original with a new value.
