@@ -218,6 +218,7 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
                 last = m.end();
             }
             expanded.push_str(&calculation.expression[last..]);
+            expanded = expand_money_inputs(&expanded, &calculation.unit, &mut claim.evidence, &calculations, sources)?;
             for evidence in &mut claim.evidence {
                 evidence.passage_ids.sort_unstable();
             }
@@ -288,6 +289,75 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
         }
     }
     Ok(answer)
+}
+
+// Restore the proof behind an unambiguous current-answer monetary intermediate.
+// Raw source literals take precedence, and equal-valued/ambiguous calculations
+// are never guessed. Every inherited passage is subsequently verified normally.
+fn expand_money_inputs(
+    expression: &str, unit: &str, evidence: &mut Vec<Evidence>, prior: &[Option<(String, String, Vec<Evidence>)>],
+    sources: &[ChatSource],
+) -> Result<String> {
+    let scale = |unit: &str| match unit.split('/').next().unwrap_or("") {
+        "元" => Some(1),
+        "万元" => Some(10_000),
+        "亿元" => Some(100_000_000),
+        _ => None,
+    };
+    let Some(target_scale) = scale(unit) else {
+        return Ok(expression.into());
+    };
+    static NUMBER: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| regex::Regex::new(r"\d+(?:\.\d+)?").unwrap());
+    static MONEY: once_cell::sync::Lazy<regex::Regex> =
+        once_cell::sync::Lazy::new(|| regex::Regex::new(r"(-?\d+(?:\.\d+)?)\s*([万亿]?元)").unwrap());
+    let mut raw = Vec::new();
+    let mut raw_money = Vec::new();
+    for selected in evidence.iter() {
+        let source = sources.iter().find(|s| s.id == selected.source_id).context("计算来源不存在")?;
+        for text in evidence_text(selected, source)? {
+            raw.extend(NUMBER.find_iter(&text).filter_map(|m| calculation::Number::decimal(m.as_str()).ok()));
+            for amount in MONEY.captures_iter(&text) {
+                if let Ok(number) = calculation::Number::decimal(&amount[1]) {
+                    raw_money.push(number.scale(scale(&amount[2]).unwrap())?);
+                }
+            }
+        }
+    }
+    let mut output = String::new();
+    let mut last = 0;
+    for token in NUMBER.find_iter(expression) {
+        output.push_str(&expression[last..token.start()]);
+        let value = calculation::Number::decimal(token.as_str())?;
+        let mut candidates = Vec::new();
+        if !raw.contains(&value) && !raw_money.contains(&value.scale(target_scale)?) {
+            for (formula, source_unit, dependencies) in prior.iter().flatten() {
+                if !formula.chars().skip(1).any(|c| "+-*/×÷".contains(c)) {
+                    continue;
+                }
+                let Some(source_scale) = scale(source_unit) else {
+                    continue;
+                };
+                let result = calculation::Number::decimal(&calculation::result(formula)?)?;
+                if result.scale(source_scale)? == value.scale(target_scale)? {
+                    candidates.push((formula, source_scale, dependencies));
+                }
+            }
+        }
+        if let [(formula, source_scale, dependencies)] = candidates.as_slice() {
+            if *source_scale == target_scale {
+                output.push_str(&format!("({formula})"));
+            } else {
+                output.push_str(&format!("(({formula})*{source_scale}/{target_scale})"));
+            }
+            inherit_evidence(evidence, dependencies);
+        } else {
+            output.push_str(token.as_str());
+        }
+        last = token.end();
+    }
+    output.push_str(&expression[last..]);
+    Ok(output)
 }
 
 fn has_independent_clauses(claim: &Claim) -> bool {
@@ -952,6 +1022,61 @@ fn validate_verdict(verdict: Verification, answer: &GroundedAnswer) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn chained_money_fixture() -> (Vec<ChatSource>, Value) {
+        let sources = ["每副本每月单价40元。", "计划采购副本数3个。", "周期2个月。额度300元。"]
+            .iter()
+            .enumerate()
+            .map(|(i, text)| {
+                let mut source = sources().remove(0);
+                source.id = i + 1;
+                source.result.content = text.to_string();
+                source
+            })
+            .collect();
+        let draft = json!({"claims":[
+            {"text":"每月费用","calculation":{"expression":"40*3","unit":"元"},"evidence":[{"source_id":1,"passage_ids":[1]},{"source_id":2,"passage_ids":[1]}]},
+            {"text":"周期费用","calculation":{"expression":"120*2","unit":"元"},"evidence":[{"source_id":3,"passage_ids":[1]}]}
+        ],"insufficient":false});
+        (sources, draft)
+    }
+    #[test]
+    fn monetary_intermediates_expand_to_original_numbers_and_inherit_their_evidence() {
+        let (sources, draft) = chained_money_fixture();
+        let answer = parse_answer(&draft.to_string(), &sources).unwrap();
+        assert_eq!(answer.claims[1].calculation.as_ref().unwrap().expression, "40*3*2");
+        assert_eq!(
+            answer.claims[1].evidence.iter().map(|e| e.source_id).collect::<HashSet<_>>(),
+            HashSet::from([1, 2, 3])
+        );
+        assert!(render(&answer).contains("40*3*2=240元"));
+    }
+    #[test]
+    fn monetary_literal_evidence_wins_even_after_currency_conversion() {
+        let (mut sources, mut draft) = chained_money_fixture();
+        sources[2].result.content.push_str("另项固定费用120元。");
+        draft["claims"][1]["calculation"] = json!({"expression":"0.012*2","unit":"万元"});
+        draft["claims"][1]["evidence"][0]["passage_ids"] = json!([1, 3]);
+        let answer = parse_answer(&draft.to_string(), &sources).unwrap();
+        assert_eq!(answer.claims[1].calculation.as_ref().unwrap().expression, "0.012*2");
+        assert_eq!(answer.claims[1].evidence.len(), 1);
+    }
+    #[test]
+    fn ambiguous_equal_intermediates_are_not_guessed() {
+        let (sources, mut draft) = chained_money_fixture();
+        let previous = draft["claims"][0].clone();
+        draft["claims"].as_array_mut().unwrap().insert(1, previous);
+        let answer = parse_answer(&draft.to_string(), &sources).unwrap();
+        assert_eq!(answer.claims[2].calculation.as_ref().unwrap().expression, "120*2");
+        assert_eq!(answer.claims[2].evidence.len(), 1);
+    }
+    #[test]
+    fn monetary_intermediate_expansion_preserves_currency_scale() {
+        let (sources, mut draft) = chained_money_fixture();
+        draft["claims"][1]["calculation"] = json!({"expression":"0.012*2","unit":"万元"});
+        let answer = parse_answer(&draft.to_string(), &sources).unwrap();
+        assert_eq!(calculation::result(&answer.claims[1].calculation.as_ref().unwrap().expression).unwrap(), "0.024");
+        assert_eq!(answer.claims[1].evidence.len(), 3);
+    }
     #[tokio::test]
     async fn retries_a_failed_connection_but_returns_http_errors_without_retry() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
