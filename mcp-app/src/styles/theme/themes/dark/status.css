@@ -1,0 +1,9 @@
+@layer base {
+  :root,
+  [data-theme='dark'] {
+    --cm-status-success: #00d492;
+    --cm-status-warning: #fdc700;
+    --cm-status-danger: #ff2056;
+    --cm-status-info: #3ba1ff;
+  }
+}

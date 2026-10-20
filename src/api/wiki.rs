@@ -270,7 +270,7 @@ async fn slice_refs(pool: &SqlitePool, source_ids: &[i64], slice_ids: &[i64]) ->
         .collect())
 }
 
-pub(super) async fn build_detail(pool: &SqlitePool, page: WikiPage) -> ApiResult<WikiPageDetail> {
+pub(crate) async fn build_detail(pool: &SqlitePool, page: WikiPage) -> ApiResult<WikiPageDetail> {
     let source_ids = page::source_file_ids(pool, page.id).await?;
     let mut sources = Vec::with_capacity(source_ids.len());
     if !source_ids.is_empty() {

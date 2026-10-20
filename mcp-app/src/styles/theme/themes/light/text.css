@@ -1,0 +1,12 @@
+@layer base {
+  [data-theme='light'] {
+    --cm-text-heading: #0c2b3a;
+    --cm-text-primary: #102434;
+    --cm-text-secondary: #365068;
+    --cm-text-tertiary: #5b738a;
+    --cm-text-quaternary: #7e95ab;
+    --cm-text-accent: #008fb0;
+    --cm-text-inverse: #ffffff;
+    --cm-text-on-accent: #05101d;
+  }
+}

@@ -1,0 +1,334 @@
+@import "tailwindcss";
+@import "./styles/theme/index.css";
+
+@config "../tailwind.config.js";
+@source "./**/*.{vue,js,ts,jsx,tsx}";
+
+@theme inline {
+  --color-cm-canvas: var(--cm-bg-canvas);
+  --color-cm-panel: var(--cm-bg-panel);
+  --color-cm-sidebar: var(--cm-bg-sidebar);
+  --color-cm-surface: var(--cm-bg-surface);
+  --color-cm-surface-muted: var(--cm-bg-surface-muted);
+  --color-cm-input: var(--cm-bg-input);
+  --color-cm-accent-soft: var(--cm-bg-accent-soft);
+
+  --color-cm-heading: var(--cm-text-heading);
+  --color-cm-primary: var(--cm-text-primary);
+  --color-cm-secondary: var(--cm-text-secondary);
+  --color-cm-tertiary: var(--cm-text-tertiary);
+  --color-cm-quaternary: var(--cm-text-quaternary);
+  --color-cm-accent: var(--cm-text-accent);
+  --color-cm-inverse: var(--cm-text-inverse);
+  --color-cm-on-accent: var(--cm-text-on-accent);
+
+  --color-cm-brand: var(--cm-brand-primary);
+  --color-cm-brand-secondary: var(--cm-brand-secondary);
+  --color-cm-brand-glow: var(--cm-brand-glow);
+  --color-cm-subtle: var(--cm-border-subtle);
+  --color-cm-default: var(--cm-border-default);
+  --color-cm-strong: var(--cm-border-strong);
+  --color-cm-focus: var(--cm-border-focus);
+  --color-cm-divider: var(--cm-border-divider);
+
+  --color-cm-success: var(--cm-status-success);
+  --color-cm-warning: var(--cm-status-warning);
+  --color-cm-danger: var(--cm-status-danger);
+  --color-cm-info: var(--cm-status-info);
+
+  --color-cm-task-news: var(--cm-task-news);
+  --color-cm-task-medical: var(--cm-task-medical);
+  --color-cm-task-fire: var(--cm-task-fire);
+  --color-cm-task-supply: var(--cm-task-supply);
+  --color-cm-task-personnel: var(--cm-task-personnel);
+
+  --radius-cm-xs: var(--cm-radius-xs);
+  --radius-cm-s: var(--cm-radius-s);
+  --radius-cm-m: var(--cm-radius-m);
+  --radius-cm-l: var(--cm-radius-l);
+  --radius-cm-pill: var(--cm-radius-pill);
+
+  --shadow-cm-glow-soft: var(--cm-glow-soft);
+  --shadow-cm-glow-medium: var(--cm-glow-medium);
+  --shadow-cm-glow-strong: var(--cm-glow-strong);
+  --shadow-cm-glow-xstrong: var(--cm-glow-xstrong);
+  --shadow-cm-glow-xxstrong: var(--cm-glow-xxstrong);
+
+  --font-cm-sans: var(--cm-font-sans);
+  --font-cm-mono: var(--cm-font-mono);
+}
+
+@layer components {
+  .assistant-multiselect-dropdown.el-popper {
+    @apply rounded-cm-m border border-cm-default bg-cm-panel text-cm-primary shadow-lg;
+  }
+
+  .assistant-multiselect-dropdown .el-popper__arrow::before {
+    @apply border-cm-default bg-cm-panel;
+  }
+
+  .assistant-multiselect-dropdown .el-select-dropdown {
+    @apply bg-cm-panel text-cm-primary;
+  }
+
+  .assistant-multiselect-dropdown .el-select-dropdown__list {
+    @apply py-1;
+  }
+
+  .assistant-multiselect-dropdown .el-select-dropdown__item {
+    @apply h-auto min-h-10 px-3 py-2 text-cm-primary;
+  }
+
+  .assistant-multiselect-dropdown .el-select-dropdown__item.hover,
+  .assistant-multiselect-dropdown .el-select-dropdown__item:hover,
+  .assistant-multiselect-dropdown .el-select-dropdown__item.is-hovering {
+    @apply !bg-[rgba(0,0,0,0.32)] text-cm-primary;
+  }
+
+  .assistant-multiselect-dropdown .el-select-dropdown__item.is-selected {
+    @apply !bg-[color-mix(in_srgb,var(--cm-brand-primary)_4%,transparent)] text-cm-accent;
+  }
+
+  .assistant-multiselect-dropdown .el-select-dropdown__item.is-selected.hover,
+  .assistant-multiselect-dropdown .el-select-dropdown__item.is-selected:hover,
+  .assistant-multiselect-dropdown .el-select-dropdown__item.is-selected.is-hovering {
+    @apply !bg-[rgba(0,0,0,0.32)] text-cm-accent;
+  }
+
+  .assistant-multiselect-dropdown .el-select-dropdown__item.is-disabled {
+    @apply cursor-not-allowed text-cm-quaternary;
+  }
+
+  .feedback-select-popper.el-popper,
+  .feedback-date-picker-popper.el-popper,
+  .system-log-date-picker.el-popper {
+    --el-bg-color: var(--cm-bg-surface);
+    --el-bg-color-overlay: var(--cm-bg-panel);
+    --el-border-color-light: var(--cm-border-default);
+    --el-border-color-lighter: var(--cm-border-subtle);
+    --el-border-color: var(--cm-border-default);
+    --el-fill-color-blank: var(--cm-bg-surface);
+    --el-fill-color-extra-light: var(--cm-bg-surface-muted);
+    --el-fill-color-light: var(--cm-bg-panel);
+    --el-fill-color-lighter: var(--cm-bg-surface-muted);
+    --el-text-color-placeholder: var(--cm-text-tertiary);
+    --el-text-color-primary: var(--cm-text-heading);
+    --el-text-color-regular: var(--cm-text-primary);
+    --el-text-color-secondary: var(--cm-text-secondary);
+    @apply rounded-cm-m border border-cm-default bg-cm-panel text-cm-primary shadow-lg;
+  }
+
+  .feedback-select-popper .el-select-dropdown,
+  .feedback-date-picker-popper .el-picker-panel,
+  .system-log-date-picker .el-picker-panel {
+    @apply bg-cm-panel text-cm-primary;
+  }
+
+  .feedback-select-popper .el-select-dropdown__item {
+    @apply text-cm-primary;
+  }
+
+  .feedback-select-popper .el-select-dropdown__item.hover,
+  .feedback-select-popper .el-select-dropdown__item:hover,
+  .feedback-select-popper .el-select-dropdown__item.is-hovering,
+  .feedback-select-popper .el-select-dropdown__item.is-selected {
+    @apply !bg-cm-accent-soft text-cm-accent;
+  }
+
+  .feedback-date-picker-popper .el-date-table td.available,
+  .system-log-date-picker .el-date-table td.available,
+  .feedback-date-picker-popper .el-month-table td .cell,
+  .system-log-date-picker .el-month-table td .cell,
+  .feedback-date-picker-popper .el-year-table td .cell,
+  .system-log-date-picker .el-year-table td .cell {
+    @apply text-cm-primary;
+  }
+
+  .feedback-date-picker-popper .el-date-table td.current:not(.disabled) .el-date-table-cell__text,
+  .system-log-date-picker .el-date-table td.current:not(.disabled) .el-date-table-cell__text,
+  .feedback-date-picker-popper .el-month-table td.current:not(.disabled) .cell,
+  .system-log-date-picker .el-month-table td.current:not(.disabled) .cell,
+  .feedback-date-picker-popper .el-year-table td.current:not(.disabled) .cell,
+  .system-log-date-picker .el-year-table td.current:not(.disabled) .cell {
+    @apply bg-cm-accent text-cm-inverse;
+  }
+
+  .system-log-date-input .el-input__wrapper {
+    background-color: var(--cm-bg-input) !important;
+    box-shadow: 0 0 0 1px var(--cm-border-default) inset !important;
+  }
+
+  .system-log-date-input.el-date-editor,
+  .system-log-date-input .el-input {
+    width: 100% !important;
+  }
+
+  .system-log-date-input:hover .el-input__wrapper,
+  .system-log-date-input.is-focus .el-input__wrapper {
+    box-shadow: 0 0 0 1px var(--cm-border-focus) inset !important;
+  }
+
+  .system-log-date-input .el-input__inner {
+    color: var(--cm-text-primary) !important;
+  }
+
+  .system-log-date-input .el-input__prefix,
+  .system-log-date-input .el-input__suffix {
+    color: var(--cm-text-secondary) !important;
+  }
+
+  .feedback-process-dialog,
+  .feedback-message-box,
+  .version-dialog {
+    --el-bg-color: var(--cm-bg-surface);
+    --el-bg-color-overlay: var(--cm-bg-panel);
+    --el-border-color: var(--cm-border-default);
+    --el-text-color-primary: var(--cm-text-heading);
+    --el-text-color-regular: var(--cm-text-primary);
+    @apply rounded-cm-l border border-cm-default bg-cm-panel text-cm-primary shadow-2xl;
+  }
+
+  .feedback-process-dialog .el-dialog__header,
+  .feedback-message-box .el-message-box__header,
+  .version-dialog .el-dialog__header {
+    @apply border-b border-cm-default pb-3;
+  }
+
+  .feedback-dialog-overlay {
+    @apply bg-black/50 backdrop-blur-sm;
+  }
+}
+
+/* --- 通用工具类 --- */
+.neon-text {
+  color: var(--cm-brand-primary);
+  text-shadow: 0 0 5px var(--primary-blue-dim), 0 0 10px var(--primary-blue-dim);
+}
+
+.neon-box {
+  box-shadow: 0 0 10px var(--primary-blue-dim), inset 0 0 15px var(--primary-blue-dim);
+  border: 1px solid var(--cm-brand-primary);
+}
+
+/* --- 动画 --- */
+@keyframes pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.6; }
+}
+
+@keyframes shimmer {
+  0% { background-position: -200% center; }
+  100% { background-position: 200% center; }
+}
+
+@keyframes bounce {
+  0%, 100% { transform: translateX(-50%) translateY(0); }
+  50% { transform: translateX(-50%) translateY(-4px); }
+}
+
+@keyframes progressPulse {
+  0%, 100% { opacity: 0.8; }
+  50% { opacity: 1; }
+}
+
+@keyframes alertPulse {
+  0%, 100% { box-shadow: none; }
+  50% { box-shadow: inset 0 0 20px color-mix(in srgb, var(--cm-status-danger) 60%, transparent); }
+}
+
+@keyframes markerPulse {
+  0%, 100% { opacity: 1; transform: scale(1); }
+  50% { opacity: 0.7; transform: scale(1.1); }
+}
+
+@keyframes centerGlow {
+  0%, 100% { filter: drop-shadow(0 0 8px currentColor); }
+  50% { filter: drop-shadow(0 0 16px currentColor); }
+}
+
+/* Vue Transition */
+.fade-enter-active,
+.fade-leave-active {
+  transition: opacity 0.3s ease;
+}
+
+.fade-enter-from,
+.fade-leave-to {
+  opacity: 0;
+}
+
+.gradient-text {
+  background: linear-gradient(90deg, var(--cm-brand-primary), var(--cm-text-inverse), var(--cm-brand-primary));
+  background-clip: text;
+  -webkit-background-clip: text;
+  color: transparent;
+  background-size: 200% auto;
+  animation: shimmer 3s linear infinite;
+}
+
+/* Map popup */
+.leaflet-popup.custom-popup .leaflet-popup-content-wrapper {
+  background: transparent;
+  border: 0;
+  border-radius: 16px;
+  box-shadow: none;
+  padding: 0;
+}
+
+.leaflet-popup.custom-popup .leaflet-popup-content {
+  margin: 0;
+}
+
+.leaflet-popup.custom-popup .leaflet-popup-tip-container {
+  display: none;
+}
+
+.leaflet-popup.custom-popup .leaflet-popup-tip,
+.leaflet-popup.custom-popup .leaflet-popup-tip::before,
+.leaflet-popup.custom-popup .leaflet-popup-tip::after {
+  display: none !important;
+}
+
+.map-line-distance-label {
+  background: transparent !important;
+  border: 0 !important;
+  width: max-content !important;
+  transform: translate(-50%, -50%);
+}
+
+.ai-route-point {
+  filter: drop-shadow(0 2px 4px rgba(15, 23, 42, 0.45));
+}
+
+.ai-route-casing {
+  filter: drop-shadow(0 2px 3px rgba(15, 23, 42, 0.32));
+}
+
+.ai-route-direction-arrow {
+  width: 16px !important;
+  height: 16px !important;
+  border: 0 !important;
+  background: transparent !important;
+}
+
+.ai-route-direction-arrow svg {
+  display: block;
+  width: 16px;
+  height: 16px;
+  overflow: visible;
+  transform: rotate(var(--arrow-angle));
+  transform-origin: center;
+  filter: drop-shadow(0 1px 2px rgba(4, 63, 45, 0.8));
+}
+
+.ai-route-direction-arrow path {
+  fill: none;
+  stroke: #ecfdf5;
+  stroke-width: 3;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+.ai-selected-route {
+  filter: drop-shadow(0 1px 2px rgba(4, 120, 87, 0.42));
+}

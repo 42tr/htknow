@@ -359,44 +359,42 @@ pub async fn search(
     Query(params): Query<SearchQuery>, Extension(auth_user): Extension<AuthUser>,
 ) -> ApiResult<Json<SearchResult>> {
     let total_started = Instant::now();
-    let (_is_admin, user_id, kb_ids_to_search) =
-        resolve_scope_for_user(&pool, &auth_user, params.kb_id.as_ref()).await?;
-    if no_accessible_kb_scope(kb_ids_to_search.as_deref()) {
-        info!(
-            "search request completed: user_id={}, query=\"{}\", file_filter={}, kb_scope={}, raw_results=0, final_results=0, elapsed_ms={}",
-            user_id,
-            preview_for_log(&params.query, 120),
-            format_id_filter(params.file_id.as_deref()),
-            summarize_kb_scope(kb_ids_to_search.as_deref()),
-            total_started.elapsed().as_millis()
-        );
-        return Ok(Json(SearchResult { results: vec![] }));
-    }
-
-    let (searched, wiki_hits) = tokio::join!(
-        search_engine.search(&params.query, params.file_id.as_ref(), kb_ids_to_search.as_ref()),
-        fetch_wiki_hits(&search_engine, &params.query, params.file_id.as_ref(), kb_ids_to_search.as_ref())
-    );
-    let raw_results =
-        searched.map_err(|e| crate::api::error::ApiError::internal(format!("Search failed: {}", e)))?;
-    let wiki_hits = wiki_hits?;
-
-    let assemble_started = Instant::now();
-    let mut results = build_slice_results_from_raw(&pool, raw_results, &auth_user, true).await?;
-    merge_wiki_hits(&pool, &search_engine, &auth_user, &params.query, params.file_id.as_ref(), wiki_hits, &mut results)
-        .await?;
+    let user_id = auth_user.user_id.clone();
+    let results =
+        search_items_for_user(&pool, &search_engine, &auth_user, &params.query, params.file_id.as_ref(), params.kb_id.as_ref())
+            .await?;
     info!(
-        "search request completed: user_id={}, query=\"{}\", file_filter={}, kb_scope={}, final_results={}, assemble_elapsed_ms={}, elapsed_ms={}",
+        "search request completed: user_id={}, query=\"{}\", file_filter={}, final_results={}, elapsed_ms={}",
         user_id,
         preview_for_log(&params.query, 120),
         format_id_filter(params.file_id.as_deref()),
-        summarize_kb_scope(kb_ids_to_search.as_deref()),
         results.len(),
-        assemble_started.elapsed().as_millis(),
         total_started.elapsed().as_millis()
     );
-
     Ok(Json(SearchResult { results }))
+}
+
+/// 检索核心，供 HTTP handler 与 MCP tool 共用：解析权限范围 → 切片/Wiki 双路召回 → 结果组装。
+/// 不做日志与响应包装，由调用方按各自协议（HTTP / MCP）处理。
+pub(crate) async fn search_items_for_user(
+    pool: &SqlitePool, search_engine: &SearchEngine, auth_user: &AuthUser, query: &str, file_id: Option<&Vec<i64>>,
+    kb_filter: Option<&Vec<i64>>,
+) -> ApiResult<Vec<SearchResultItem>> {
+    let (_is_admin, _user_id, kb_ids_to_search) = resolve_scope_for_user(pool, auth_user, kb_filter).await?;
+    if no_accessible_kb_scope(kb_ids_to_search.as_deref()) {
+        return Ok(vec![]);
+    }
+
+    let (searched, wiki_hits) = tokio::join!(
+        search_engine.search(query, file_id, kb_ids_to_search.as_ref()),
+        fetch_wiki_hits(search_engine, query, file_id, kb_ids_to_search.as_ref())
+    );
+    let raw_results = searched.map_err(|e| crate::api::error::ApiError::internal(format!("Search failed: {}", e)))?;
+    let wiki_hits = wiki_hits?;
+
+    let mut results = build_slice_results_from_raw(pool, raw_results, auth_user, true).await?;
+    merge_wiki_hits(pool, search_engine, auth_user, query, file_id, wiki_hits, &mut results).await?;
+    Ok(results)
 }
 
 /// 判定用户对某个检索命中是否可见。
@@ -651,13 +649,6 @@ fn format_id_filter(ids: Option<&[i64]>) -> String {
     }
 }
 
-fn summarize_kb_scope(kb_ids: Option<&[i64]>) -> String {
-    match kb_ids {
-        None => "all_accessible_kbs".to_string(),
-        Some([]) => "no_accessible_kbs".to_string(),
-        Some(ids) => format!("{} kbs {}", ids.len(), format_id_filter(Some(ids))),
-    }
-}
 
 fn preview_for_log(text: &str, max_chars: usize) -> String {
     preview_text(&text.replace('\n', " "), max_chars)

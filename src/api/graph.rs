@@ -125,7 +125,7 @@ fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
-struct Scope {
+pub(crate) struct Scope {
     admin: bool,
     user_id: String,
     kb_ids: Vec<i64>,
@@ -244,7 +244,7 @@ const NODE_COLUMNS: &str = "n.id,n.name,n.entity_type,n.properties,n.file_id,n.k
 const EDGE_FROM: &str =
     "FROM graph_edges e JOIN graph_nodes n ON n.id=e.source_node_id JOIN graph_nodes t ON t.id=e.target_node_id";
 
-async fn find_entities(
+pub(crate) async fn find_entities(
     pool: &SqlitePool, params: &EntitySearchParams, scope: &Scope,
 ) -> Result<Vec<EntityInfo>, ApiError> {
     let limit = params.limit.unwrap_or(100);
@@ -289,8 +289,15 @@ pub async fn search_entities(
 pub async fn get_subgraph(
     Query(params): Query<EntitySearchParams>, State(pool): State<SqlitePool>, Extension(user): Extension<AuthUser>,
 ) -> Result<Json<Subgraph>, ApiError> {
-    let scope = Scope::load(&pool, &user, params.kb_id, params.file_id).await?;
-    let mut nodes = find_entities(&pool, &params, &scope).await?;
+    Ok(Json(subgraph_for_user(&pool, &user, &params).await?))
+}
+
+/// 子图查询核心，供 HTTP handler 与 MCP tool 共用。
+pub(crate) async fn subgraph_for_user(
+    pool: &SqlitePool, user: &AuthUser, params: &EntitySearchParams,
+) -> Result<Subgraph, ApiError> {
+    let scope = Scope::load(pool, user, params.kb_id, params.file_id).await?;
+    let mut nodes = find_entities(pool, params, &scope).await?;
     let matched_ids: Vec<i64> = nodes.iter().map(|n| n.id).collect();
     let ids = ids_sql(&matched_ids);
     let filter = edge_filter(&scope, params.kb_id, params.file_id);
@@ -300,7 +307,7 @@ pub async fn get_subgraph(
         {EDGE_FROM} WHERE {filter} AND e.id IN (SELECT id FROM graph_edges WHERE source_node_id IN ({ids}) \
         UNION SELECT id FROM graph_edges WHERE target_node_id IN ({ids})) ORDER BY e.id LIMIT 401"
     );
-    let mut edges: Vec<GraphEdge> = sqlx::query_as(&sql).fetch_all(&pool).await?;
+    let mut edges: Vec<GraphEdge> = sqlx::query_as(&sql).fetch_all(pool).await?;
     let mut truncated =
         edges.len() > 400 || (params.node_id.is_none() && nodes.len() as i64 == params.limit.unwrap_or(100));
     edges.truncate(400);
@@ -324,10 +331,10 @@ pub async fn get_subgraph(
             scope.nodes("n"),
             ids_sql(&extra)
         );
-        let rows: Vec<EntityRow> = sqlx::query_as(&sql).fetch_all(&pool).await?;
+        let rows: Vec<EntityRow> = sqlx::query_as(&sql).fetch_all(pool).await?;
         nodes.extend(rows.into_iter().map(EntityInfo::from));
     }
-    Ok(Json(Subgraph { nodes, edges, matched_ids, truncated }))
+    Ok(Subgraph { nodes, edges, matched_ids, truncated })
 }
 
 #[utoipa::path(get, path="/api/v1/knowledge/graph/entities/{id}", operation_id="graph_get_entity", tag="graph", params(("id"=i64, Path)), responses((status=200, body=EntityDetail), (status=404)))]

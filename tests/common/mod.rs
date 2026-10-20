@@ -15,7 +15,7 @@ pub use axum::{
     body::Body,
     http::{Request, Response, StatusCode, header},
 };
-use htknow::{api, auth, db, search::SearchEngine, slice_content};
+use htknow::{api, auth, db, mcp, search::SearchEngine, slice_content};
 pub use http_body_util::BodyExt;
 pub use serde_json::Value;
 use sqlx::SqlitePool;
@@ -66,7 +66,8 @@ pub async fn build_app() -> Router {
     let upload_limit = htknow::config::get().server.upload_limit_mb * 1024 * 1024;
 
     Router::new()
-        .nest("/api/v1/knowledge/", api::app(pool, search_engine))
+        .nest("/api/v1/knowledge/", api::app(pool.clone(), search_engine.clone()))
+        .nest_service("/mcp", mcp::service(pool, search_engine))
         .layer(middleware::from_fn(auth))
         .layer(DefaultBodyLimit::max(upload_limit))
 }

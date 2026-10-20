@@ -1,0 +1,16 @@
+@import './foundation.css';
+@import './global.css';
+
+/* Dark Theme - default :root values */
+@import './themes/dark/surface.css';
+@import './themes/dark/text.css';
+@import './themes/dark/brand-border.css';
+@import './themes/dark/status.css';
+@import './themes/dark/task.css';
+
+/* Light Theme - overrides by [data-theme='light'] */
+@import './themes/light/surface.css';
+@import './themes/light/text.css';
+@import './themes/light/brand-border.css';
+@import './themes/light/status.css';
+@import './themes/light/task.css';

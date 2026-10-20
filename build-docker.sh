@@ -17,6 +17,12 @@ npm install
 npm run build
 cd ..
 
+# Build MCP App UI（cm 知识空间前端，内嵌为 /mcp/app/knowledge-space）
+cd mcp-app
+npm install
+npm run build
+cd ..
+
 if [ "$BUILD_MODE" = "debug" ]; then
     echo "Building htknow for debug with profiling..."
     cargo build ${PROFILING_FLAG}

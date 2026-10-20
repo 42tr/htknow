@@ -1,0 +1,31 @@
+@layer base {
+  :root {
+    --cm-radius-xs: 6px;
+    --cm-radius-s: 8px;
+    --cm-radius-m: 10px;
+    --cm-radius-l: 14px;
+    --cm-radius-pill: 999px;
+
+    --cm-space-xxs: 4px;
+    --cm-space-xs: 8px;
+    --cm-space-s: 12px;
+    --cm-space-m: 16px;
+    --cm-space-l: 24px;
+    --cm-space-xl: 32px;
+
+    --cm-stroke-thin: 1px;
+    --cm-stroke-regular: 1.5px;
+
+    --cm-glow-soft: 0 0 12px var(--cm-brand-glow);
+    --cm-glow-medium: 0 0 18px var(--cm-brand-glow);
+    --cm-glow-strong: 0 0 24px var(--cm-brand-glow);
+    --cm-glow-xstrong: 0 0 28px var(--cm-brand-glow);
+    --cm-glow-xxstrong: 0 0 40px var(--cm-brand-glow);
+
+    --cm-brand-gradient: linear-gradient(90deg, var(--cm-brand-primary), var(--cm-brand-secondary));
+    --cm-brand-gradient-diagonal: linear-gradient(135deg, var(--cm-brand-primary), var(--cm-brand-secondary));
+
+    --cm-font-sans: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Noto Sans SC', 'Noto Sans CJK SC', 'Source Han Sans SC', 'Microsoft YaHei', 'WenQuanYi Micro Hei', sans-serif;
+    --cm-font-mono: 'SF Mono', Consolas, 'Liberation Mono', Menlo, monospace;
+  }
+}

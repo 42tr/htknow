@@ -1,0 +1,10 @@
+@layer base {
+  :root,
+  [data-theme='dark'] {
+    --cm-task-news: #ffd230;
+    --cm-task-medical: #5ee9b5;
+    --cm-task-fire: #ffa1ad;
+    --cm-task-supply: #74d4ff;
+    --cm-task-personnel: #c4b4ff;
+  }
+}

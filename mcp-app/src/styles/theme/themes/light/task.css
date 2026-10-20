@@ -1,0 +1,9 @@
+@layer base {
+  [data-theme='light'] {
+    --cm-task-news: #c89000;
+    --cm-task-medical: #0faf7a;
+    --cm-task-fire: #d85b73;
+    --cm-task-supply: #2b90d9;
+    --cm-task-personnel: #7b63e6;
+  }
+}

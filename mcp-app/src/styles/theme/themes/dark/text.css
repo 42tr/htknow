@@ -1,0 +1,13 @@
+@layer base {
+  :root,
+  [data-theme='dark'] {
+    --cm-text-heading: #cefafe;
+    --cm-text-primary: #e2e8f0;
+    --cm-text-secondary: #cad5e2;
+    --cm-text-tertiary: #90a1b9;
+    --cm-text-quaternary: #62748e;
+    --cm-text-accent: #53eafd;
+    --cm-text-inverse: #ffffff;
+    --cm-text-on-accent: #05101d;
+  }
+}

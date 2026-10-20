@@ -18,6 +18,7 @@ pub mod image_description;
 pub mod image_ocr;
 pub mod image_parse;
 pub mod log4rs;
+pub mod mcp;
 pub mod pdf_content;
 pub mod pdf_highlight;
 pub mod processor;
