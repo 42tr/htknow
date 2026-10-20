@@ -86,7 +86,7 @@ pub(super) async fn reselect(
     let dependencies = if calculations.is_empty() {
         tuple(vec![])
     } else {
-        json!({"type":"array","maxItems":8,"uniqueItems":true,
+        json!({"type":"array","maxItems":8,
             "items":{"type":"integer","enum":calculations.iter().map(|c| c["index"].clone()).collect::<Vec<_>>()}})
     };
     let schema = object(json!({"evidence":{"type":"array","minItems":1,"maxItems":6,"items":{"anyOf":options}},
