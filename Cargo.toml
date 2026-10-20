@@ -39,6 +39,9 @@ jieba-rs = "0.6"
 sha2 = "0.10"
 hex = "0.4"
 
+rmcp = { version = "3.5", features = ["server", "macros", "transport-streamable-http-server"] }
+schemars = "1"
+
 rust-embed = "8"
 mime_guess = "2"
 uuid = "1.19.0"

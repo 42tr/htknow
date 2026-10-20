@@ -1,0 +1,13 @@
+@layer base {
+  [data-theme='light'] {
+    --cm-brand-primary: #00b8db;
+    --cm-brand-secondary: #1d78f2;
+    --cm-brand-glow: #00b8db33;
+
+    --cm-border-subtle: #10243414;
+    --cm-border-default: #0092af2e;
+    --cm-border-strong: #0092af61;
+    --cm-border-focus: #00a9cc;
+    --cm-border-divider: #1024341f;
+  }
+}

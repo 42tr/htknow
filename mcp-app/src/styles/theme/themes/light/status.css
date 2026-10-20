@@ -1,0 +1,8 @@
+@layer base {
+  [data-theme='light'] {
+    --cm-status-success: #00b67a;
+    --cm-status-warning: #f3b300;
+    --cm-status-danger: #e84663;
+    --cm-status-info: #268cff;
+  }
+}

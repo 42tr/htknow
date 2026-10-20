@@ -245,7 +245,7 @@ enum FileStatsScope {
 /// - 未归属知识库的散文件：看 `file.is_public`；
 /// - 知识库成员（属主或有 `kb_permissions` 显式授权）：库内全部文件放行；
 /// - 仅因知识库公开而可访问的陌生用户：只放行 `file.is_public = 1` 的文件。
-async fn ensure_file_readable(pool: &SqlitePool, file: &File, auth_user: &AuthUser) -> ApiResult<()> {
+pub(crate) async fn ensure_file_readable(pool: &SqlitePool, file: &File, auth_user: &AuthUser) -> ApiResult<()> {
     if auth_user.is_admin() || file.user_id == auth_user.user_id {
         return Ok(());
     }

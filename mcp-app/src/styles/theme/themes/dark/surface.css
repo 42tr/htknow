@@ -1,0 +1,18 @@
+@layer base {
+  :root,
+  [data-theme='dark'] {
+    --cm-bg-canvas: #05101d;
+    --cm-bg-body: linear-gradient(135deg, #050b14, #0a1428);
+    --cm-bg-panel: #0a1929cc;
+    --cm-bg-sidebar: #0a192999;
+    --cm-bg-surface: #ffffff08;
+    --cm-bg-surface-muted: #ffffff05;
+    --cm-bg-input: #0d2540e6;
+    --cm-bg-accent-soft: #00b8db33;
+    --cm-bg-grid-line: rgba(0, 240, 255, 0.02);
+    --cm-bg-grid-block: rgba(0, 0, 0, 0.2);
+    --cm-select-option-bg: #0f172a;
+    --cm-scrollbar-track: rgba(0, 0, 0, 0.3);
+    --cm-scrollbar-thumb: var(--cm-border-default);
+  }
+}

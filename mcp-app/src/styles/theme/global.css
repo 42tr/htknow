@@ -1,0 +1,109 @@
+@layer base {
+  html,
+  body,
+  #app {
+    min-height: 100vh;
+    background: var(--cm-bg-canvas);
+    color: var(--cm-text-primary);
+  }
+
+  html,
+  body {
+    width: 100%;
+  }
+
+  body {
+    width: 100vw;
+    height: 100vh;
+    overflow: hidden;
+    background: var(--cm-bg-body);
+    background-image:
+      linear-gradient(90deg, var(--cm-bg-grid-line) 1px, transparent 1px),
+      linear-gradient(var(--cm-bg-grid-block) 1px, transparent 1px);
+    background-size: 50px 50px;
+    font-family: var(--cm-font-sans);
+    line-height: 1.6;
+  }
+
+  * {
+    box-sizing: border-box;
+  }
+
+  #app {
+    width: 100vw;
+    height: 100vh;
+    position: relative;
+  }
+
+  select option,
+  select optgroup {
+    background-color: var(--cm-select-option-bg);
+    color: var(--cm-text-primary);
+  }
+
+  select option:disabled {
+    color: var(--cm-text-tertiary);
+  }
+
+  .el-icon {
+    width: 1em;
+    height: 1em;
+    line-height: 1;
+  }
+
+  .el-icon svg {
+    width: 1em;
+    height: 1em;
+    display: block;
+  }
+
+  ::-webkit-scrollbar {
+    width: 4px;
+  }
+
+  ::-webkit-scrollbar-track {
+    background: var(--cm-scrollbar-track);
+  }
+
+  ::-webkit-scrollbar-thumb {
+    background: var(--cm-scrollbar-thumb);
+    border-radius: 2px;
+  }
+
+  ::-webkit-scrollbar-thumb:hover {
+    background: var(--cm-brand-primary);
+  }
+
+  /* Legacy alias variables for Step 01 compatibility */
+  :root,
+  [data-theme='light'],
+  [data-theme='dark'] {
+    --bg-dark: var(--cm-bg-canvas);
+    --bg-panel: var(--cm-bg-panel);
+    --bg-panel-border: var(--cm-border-default);
+
+    --bg-primary: var(--cm-bg-surface);
+    --bg-primary-dark: var(--cm-bg-surface-muted);
+
+    --text-main: var(--cm-text-primary);
+    --text-primary: var(--cm-text-primary);
+    --text-secondary: var(--cm-text-secondary);
+    --text-dim: var(--cm-text-tertiary);
+
+    --accent-blue: var(--cm-brand-primary);
+    --accent-blue-dim: color-mix(in srgb, var(--cm-brand-primary) 20%, transparent);
+    --accent-blue-light: color-mix(in srgb, var(--cm-brand-primary) 72%, white);
+    --accent-blue-dark: var(--cm-brand-secondary);
+
+    --primary-blue: var(--cm-brand-primary);
+    --primary-blue-dim: color-mix(in srgb, var(--cm-brand-primary) 20%, transparent);
+    --accent-cyan: var(--cm-text-accent);
+
+    --success-green: var(--cm-status-success);
+    --warning-orange: var(--cm-status-warning);
+    --error-red: var(--cm-status-danger);
+    --status-success: var(--cm-status-success);
+    --status-warning: var(--cm-status-warning);
+    --status-danger: var(--cm-status-danger);
+  }
+}

@@ -6,14 +6,14 @@ use sqlx::SqlitePool;
 use utoipa::OpenApi;
 
 mod chat;
-mod common;
-mod error;
-mod file;
-mod graph;
-mod knowledge_base;
-mod search;
+pub(crate) mod common;
+pub(crate) mod error;
+pub(crate) mod file;
+pub(crate) mod graph;
+pub(crate) mod knowledge_base;
+pub(crate) mod search;
 mod system;
-mod wiki;
+pub(crate) mod wiki;
 // 重新导出 File 类型供其他模块使用
 pub use file::File;
 pub(crate) use file::{

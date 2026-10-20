@@ -1,0 +1,14 @@
+@layer base {
+  :root,
+  [data-theme='dark'] {
+    --cm-brand-primary: #00d3f3;
+    --cm-brand-secondary: #2b7fff;
+    --cm-brand-glow: #22d3ee73;
+
+    --cm-border-subtle: #ffffff0d;
+    --cm-border-default: #00b8db40;
+    --cm-border-strong: #00d3f380;
+    --cm-border-focus: #53eafd;
+    --cm-border-divider: #ffffff1a;
+  }
+}

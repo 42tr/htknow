@@ -1,0 +1,17 @@
+@layer base {
+  [data-theme='light'] {
+    --cm-bg-canvas: #f3fafd;
+    --cm-bg-body: linear-gradient(135deg, #f3fafd, #e7f4fb);
+    --cm-bg-panel: #ffffffe6;
+    --cm-bg-sidebar: #f8fcffeb;
+    --cm-bg-surface: #ffffff;
+    --cm-bg-surface-muted: #eef6fa;
+    --cm-bg-input: #f7fbfe;
+    --cm-bg-accent-soft: #00b8db1f;
+    --cm-bg-grid-line: rgba(0, 146, 175, 0.08);
+    --cm-bg-grid-block: rgba(16, 36, 52, 0.05);
+    --cm-select-option-bg: #f7fbfe;
+    --cm-scrollbar-track: rgba(16, 36, 52, 0.08);
+    --cm-scrollbar-thumb: var(--cm-border-default);
+  }
+}

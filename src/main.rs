@@ -119,10 +119,12 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
-    // API 路由需要认证
+    // API 路由需要认证；MCP（streamable HTTP）与 REST 共用同一套 header 鉴权，
+    // tool 内从请求扩展取回 AuthUser 做数据级权限过滤。
     let upload_limit = cfg.server.upload_limit_mb * 1024 * 1024;
     let api_router = Router::new()
-        .nest("/api/v1/knowledge/", api::app(pool, search_engine))
+        .nest("/api/v1/knowledge/", api::app(pool.clone(), search_engine.clone()))
+        .nest_service("/mcp", htknow::mcp::service(pool, search_engine))
         .layer(middleware::from_fn(auth))
         .layer(DefaultBodyLimit::max(upload_limit));
 
@@ -132,7 +134,11 @@ async fn main() -> anyhow::Result<()> {
         .merge(SwaggerUi::new("/swagger-ui-assets").url("/api-docs/openapi.json", api::openapi()));
 
     // 合并路由：前端和 Swagger 不需要认证，API 需要认证
-    let app = Router::new().merge(swagger).merge(api_router).merge(frontend::router());
+    let app = Router::new()
+        .merge(swagger)
+        .merge(api_router)
+        .merge(htknow::mcp::app_ui::router())
+        .merge(frontend::router());
 
     let addr = format!("{}:{}", cfg.server.host, cfg.server.port);
     let listener = TcpListener::bind(&addr).await?;
