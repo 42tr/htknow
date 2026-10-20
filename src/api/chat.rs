@@ -31,6 +31,7 @@ use crate::{AuthUser, config, search::SearchEngine};
 mod calculation;
 mod context;
 mod grounding;
+mod temporal;
 
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -211,7 +212,7 @@ impl KnowledgeSearchTool {
         let ids = merge_sources(&mut sources, select_sources(found));
         send(&self.tx, "sources", json!({"sources": *sources})).await.map_err(|e| ToolError::new(e.to_string()))?;
         let visible = grounding::visible_sources(&sources);
-        Ok(json!({"sources":visible.as_array().unwrap().iter()
+        Ok(json!({"temporal_scope":temporal::scope(&self.context,&sources),"sources":visible.as_array().unwrap().iter()
             .filter(|s| ids.iter().any(|id| s["id"].as_u64() == Some(*id as u64))).collect::<Vec<_>>()}))
     }
 }
@@ -272,7 +273,10 @@ async fn run_chat(
             anyhow::anyhow!(UPSTREAM_FAILURE)
         })?;
     }
-    let initial = json!({"sources":grounding::visible_sources(&sources.lock().await)});
+    let initial = {
+        let visible = sources.lock().await;
+        json!({"sources":grounding::visible_sources(&visible),"temporal_scope":temporal::scope(&context,&visible)})
+    };
     let history = request
         .messages
         .iter()
@@ -340,6 +344,7 @@ async fn run_chat(
             {"role":"system","content":format!("{SYSTEM}\n{}", grounding::OUTPUT_RULES)},
             {"role":"user","content":json!({"question":request.question,"question_context":*context,
                 "history":history,"sources":grounding::visible_sources(&sources),
+                "temporal_scope":temporal::scope(&context,&sources),
                 "instruction":"追加检索预算已耗尽。只依据这些可见资料回答，未知部分说明资料不足，不再调用工具。"}).to_string()}
         ]), &sources).await.map_err(|error| {
             error!("chat bounded-search completion failed: {error}");
@@ -398,6 +403,7 @@ async fn run_chat(
                     {"role":"system","content":format!("{SYSTEM}\n{}", grounding::OUTPUT_RULES)},
                     {"role":"user","content":json!({"question":request.question,"question_context":*context,"history":history,
                         "sources":grounding::visible_sources(&sources),"rejected_draft":draft,
+                        "temporal_scope":temporal::scope(&context,&sources),
                         "validation_error":format!("{error:#}"),
                         "instruction":if format_failure {
                             "只修复JSON字段和结构以符合schema，保留原有事实、数值和算式含义；不添加或删除所问要点。此步骤不表示事实已经核验通过。"

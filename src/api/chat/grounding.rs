@@ -55,6 +55,7 @@ text写成不含逗号和分号的独立陈述；名称内部原本有逗号时�
 遵守用户限定的来源和时间范围：询问 Wiki 的记录时如实报告 Wiki 内容，不能擅自换成其他资料的最新数值。
 未被要求比较版本时，不补充其他版本的冲突数值，以免混淆所问的记录。
 用户仅问某日期下的属性时，直接回答该日期的属性并引用当时有效的记录；除非用户要求版本或解释依据，不另建版本选择条目。
+temporal_scope列出原文明示的版本生效区间。审批不等于生效；历史归档在指定日期仍可能有效，不能用之后生效的新版本覆盖当时的规则。
 所有计算结果使用 calculation 字段：{"expression":"40*3*2-5","unit":"元"}，非计算事实用 null。
 expression 只写数字、四则算符和括号，不可写字段名、单位或等号；结果由服务端精确计算并展示完整算式。
 计算条目的 text 只写结果的含义，如“扣减后的总费用”，不要另行重复原始单价、数量和计算结果。
@@ -239,11 +240,8 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
             calculation.expression = calculation::canonical(&expanded)?;
             let result = calculation::result(&calculation.expression)?;
             let expression = calculation.expression.chars().filter(|c| !c.is_whitespace()).collect::<String>();
-            claim.text = format!(
-                "{}（计算：{expression}={result}{}）",
-                claim.text.trim().trim_end_matches('。'),
-                calculation.unit
-            );
+            let label = calculation_label(&claim.text, calculation, &claim.evidence, &calculations, sources)?;
+            claim.text = format!("{}（计算：{expression}={result}{}）", label, calculation.unit);
             calculations.push(Some((calculation.expression.clone(), calculation.unit.clone(), claim.evidence.clone())));
         } else {
             // A comparison may name a result computed earlier in this draft.
@@ -256,6 +254,38 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
     }
     validate_answer(&answer, sources)?;
     Ok(answer)
+}
+
+fn calculation_label(
+    text: &str, current: &Calculation, evidence: &[Evidence], prior: &[Option<(String, String, Vec<Evidence>)>],
+    sources: &[ChatSource],
+) -> Result<String> {
+    static ATTACHMENT: once_cell::sync::Lazy<regex::Regex> = once_cell::sync::Lazy::new(|| {
+        regex::Regex::new(r"[（(]计算[：:]\s*(.+)\s*=\s*(-?\d+(?:\.\d+)?)\s*([^（）()]*?)[）)]$").unwrap()
+    });
+    let mut label = text.trim().trim_end_matches('。').to_owned();
+    loop {
+        let Some(start) =
+            ["（计算：", "（计算:", "(计算：", "(计算:"].iter().filter_map(|marker| label.rfind(marker)).max()
+        else {
+            break;
+        };
+        let Some(c) = ATTACHMENT.captures(&label[start..]) else { break };
+        if c[3].trim() != current.unit {
+            break;
+        }
+        // Validate before removing anything. Equivalent expanded expressions
+        // may be normalized, but a wrong value or a different input formula
+        // must stay visible to the ordinary checks.
+        calculation::equations(c.get(0).unwrap().as_str())?;
+        let mut selected = evidence.to_vec();
+        let expanded = expand_money_inputs(c[1].trim(), &current.unit, &mut selected, prior, sources)?;
+        if calculation::canonical(&expanded)? != current.expression || calculation::result(&expanded)? != c[2].trim() {
+            break;
+        }
+        label = label[..start].trim().to_owned();
+    }
+    Ok(label)
 }
 
 fn validate_answer(answer: &GroundedAnswer, sources: &[ChatSource]) -> Result<()> {
@@ -727,6 +757,8 @@ contributes只判断该来源是否提供联合推导必需的一个前提；缺
 每个 evidence.source_id 分别给出 contributes，只有它支持本条事实或联合推理的必要前提时才为true；主题相关不足以证明事实。
 来源直接记载本条事实可以为true；间接来源必须是联合推导所必需的数值、关系或条件，不能只是额外印证。
 若一个版本文档已完整证明其适用日期，另一个版本的生效日期不是该版本事实所必需的证据，不能仅因时间相关就判贡献。
+“V2的生效日期为某日”是版本自身的直接属性，验收记录日期对它无贡献；“某日应适用V2”才可能需要验收日期与版本区间共同证明。
+保留明确陈述的实体关系：若结论包含“订单服务所属交易域”，服务目录对这个归属关系有贡献，不能只检查句末的阈值数字。
 检查 atomic：仅依据当前这条text，不把问题中的其他事项或引句中其他未陈述的属性算进本条事实。
 “负责人是甲”和“容量为20”各自都是单一事实；即使同一引句含两个属性，也不能误判这两条为合并事实。
 同一计算结果及其必要算式、单一比较结论、跨文档映射结论可以atomic=true；并列的独立属性必须拆分。
@@ -780,21 +812,7 @@ async fn verify_claim(
     let mut pruned = false;
     for _ in 0..3 {
         let single = GroundedAnswer { claims: vec![claim.clone()], insufficient: false };
-        let mut selected = Vec::new();
-        let mut visible = Vec::new();
-        for evidence in &claim.evidence {
-            let source = sources.iter().find(|s| s.id == evidence.source_id).context("证据来源不存在")?;
-            let excerpts = evidence_text(evidence, source)?;
-            selected.push(json!({"claim_index":0,"source_id":source.id,"excerpts":excerpts}));
-            visible.push(json!({"id":source.id,"kind":if source.result.wiki.is_some() { "wiki" } else { "original" },
-    "content":excerpts.join("\n"),"passages":evidence.passage_ids.iter().zip(&excerpts)
-        .map(|(id,text)| json!({"id":id,"text":text})).collect::<Vec<_>>()}));
-        }
-        let messages = json!([
-            {"role":"system","content":VERIFY},
-            {"role":"user","content":json!({"evidence_scope":context.evidence_scope(),
-                "answer":single,"sources":visible,"selected_evidence":selected}).to_string()},
-        ]);
+        let messages = claim_messages(&claim, sources, context)?;
         let mut verdict = request_verdict(&single, messages).await?;
         let mut verdict = verdict.claims.remove(0);
         if !verdict.atomic {
@@ -843,9 +861,45 @@ async fn verify_claim(
             claim.evidence.retain(|e| retained.contains(&e.source_id));
             continue;
         }
+        if !pruned && verdict.supported && verdict.atomic && claim.calculation.is_none() && claim.evidence.len() > 1 {
+            // A literal date attribute can be fully proved by its own document.
+            // Ask again with only that document: observed/approval dates in a
+            // neighboring source must not become redundant citations.
+            for evidence in &claim.evidence {
+                let source = sources.iter().find(|s| s.id == evidence.source_id).context("证据来源不存在")?;
+                if !super::temporal::date_fact_candidates(&claim.text, &evidence_text(evidence, source)?) {
+                    continue;
+                }
+                let candidate = Claim { evidence: vec![evidence.clone()], ..claim.clone() };
+                let single = GroundedAnswer { claims: vec![candidate.clone()], insufficient: false };
+                let checked = request_verdict(&single, claim_messages(&candidate, sources, context)?).await?;
+                let checked = checked.claims.into_iter().next().context("日期属性核验缺少条目")?;
+                if checked.supported && checked.atomic && checked.evidence.iter().all(|e| e.contributes) {
+                    return Ok((candidate, checked));
+                }
+            }
+        }
         return Ok((claim, verdict));
     }
     unreachable!()
+}
+
+fn claim_messages(claim: &Claim, sources: &[ChatSource], context: &super::context::QuestionContext) -> Result<Value> {
+    let single = GroundedAnswer { claims: vec![claim.clone()], insufficient: false };
+    let mut selected = Vec::new();
+    let mut visible = Vec::new();
+    for evidence in &claim.evidence {
+        let source = sources.iter().find(|s| s.id == evidence.source_id).context("证据来源不存在")?;
+        super::temporal::validate(&claim.text, source, context)?;
+        let excerpts = evidence_text(evidence, source)?;
+        selected.push(json!({"claim_index":0,"source_id":source.id,"excerpts":excerpts}));
+        visible.push(json!({"id":source.id,"kind":if source.result.wiki.is_some(){"wiki"}else{"original"},
+            "content":excerpts.join("\n"),"passages":evidence.passage_ids.iter().zip(&excerpts).map(|(id,text)|json!({"id":id,"text":text})).collect::<Vec<_>>()}));
+    }
+    Ok(json!([
+        {"role":"system","content":VERIFY},
+        {"role":"user","content":json!({"evidence_scope":context.evidence_scope(),"answer":single,"sources":visible,"selected_evidence":selected}).to_string()}
+    ]))
 }
 
 pub(super) async fn verify(
@@ -1122,6 +1176,28 @@ fn validate_verdict(verdict: Verification, answer: &GroundedAnswer) -> Result<()
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn calculated_answers_roundtrip_without_repeating_equivalent_formula_attachments() {
+        let mut sources = sources();
+        sources[0].result.content = "单价40元。采购3个。周期2个月。".into();
+        let evidence = json!([{"source_id":1,"passage_ids":[1,2,3]}]);
+        let mut draft = json!({"claims":[
+            {"text":"每月费用为120元（计算：40*3=120元）","calculation":{"expression":"40*3","unit":"元"},"evidence":evidence},
+            {"text":"周期费用为240元（计算：120*2=240元）","calculation":{"expression":"40*3*2","unit":"元"},"evidence":evidence}
+        ],"insufficient":false});
+        let parsed = parse_answer(&draft.to_string(), &sources).unwrap();
+        assert!(parsed.claims.iter().all(|c| c.text.matches("计算：").count() == 1));
+        let again = parse_answer(&serde_json::to_string(&parsed).unwrap(), &sources).unwrap();
+        assert_eq!(render(&again), render(&parsed));
+        draft["claims"][1]["text"] = json!("周期费用为240元（计算：120*2=241元）");
+        assert!(parse_answer(&draft.to_string(), &sources).is_err());
+        draft["claims"][1]["text"] = json!("周期费用为240元（计算：60*4=240元）");
+        let parsed = parse_answer(&draft.to_string(), &sources).unwrap();
+        assert!(
+            parsed.claims[1].text.contains("60*4=240"),
+            "unrelated input formulas must remain for semantic checking"
+        );
+    }
     #[test]
     fn entity_headers_are_selected_without_exposing_other_unselected_passages() {
         let mut source = sources().remove(0);
