@@ -180,21 +180,7 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
     for claim in &mut answer.claims {
         // Multiple selections from the same source form one citation. Merge
         // them before checking dependency coverage; invalid passages still fail.
-        let mut merged: Vec<Evidence> = Vec::new();
-        for evidence in std::mem::take(&mut claim.evidence) {
-            let mut seen = HashSet::new();
-            ensure!(evidence.passage_ids.iter().all(|id| seen.insert(*id)), "证据片段编号不可重复");
-            if let Some(existing) = merged.iter_mut().find(|e| e.source_id == evidence.source_id) {
-                for id in evidence.passage_ids {
-                    if !existing.passage_ids.contains(&id) {
-                        existing.passage_ids.push(id);
-                    }
-                }
-            } else {
-                merged.push(evidence);
-            }
-        }
-        claim.evidence = merged;
+        claim.evidence = merge_evidence(std::mem::take(&mut claim.evidence))?;
         ensure!(claim.depends_on.len() <= 8, "事实依赖条目过多");
         for index in std::mem::take(&mut claim.depends_on) {
             let dependencies = prior_evidence.get(index).with_context(|| format!("事实依赖{index}必须指向前序条目"))?;
@@ -421,6 +407,24 @@ fn inherit_evidence(current: &mut Vec<Evidence>, dependencies: &[Evidence]) {
             current.push(dependency.clone());
         }
     }
+}
+
+fn merge_evidence(evidence: Vec<Evidence>) -> Result<Vec<Evidence>> {
+    let mut merged: Vec<Evidence> = Vec::new();
+    for selection in evidence {
+        let mut seen = HashSet::new();
+        ensure!(selection.passage_ids.iter().all(|id| seen.insert(*id)), "证据片段编号不可重复");
+        if let Some(existing) = merged.iter_mut().find(|e| e.source_id == selection.source_id) {
+            for id in selection.passage_ids {
+                if !existing.passage_ids.contains(&id) {
+                    existing.passage_ids.push(id);
+                }
+            }
+        } else {
+            merged.push(selection);
+        }
+    }
+    Ok(merged)
 }
 
 // Preserve text identifiers in structured "label: value" evidence. Whitespace
@@ -770,7 +774,7 @@ struct Coverage {
 
 async fn verify_claim(
     mut claim: Claim, sources: &[ChatSource], context: &super::context::QuestionContext,
-    binding_budget: &std::sync::atomic::AtomicUsize,
+    binding_budget: &std::sync::atomic::AtomicUsize, prior: &[Claim],
 ) -> Result<(Claim, ClaimVerdict)> {
     for round in 0..2 {
         let single = GroundedAnswer { claims: vec![claim.clone()], insufficient: false };
@@ -809,7 +813,7 @@ async fn verify_claim(
                 })
                 .is_ok()
         {
-            match binding::reselect(&claim, sources, context, &verdict.reason).await {
+            match binding::reselect(&claim, sources, context, &verdict.reason, prior).await {
                 Ok(evidence) if serde_json::to_value(&evidence)? != serde_json::to_value(&claim.evidence)? => {
                     log::info!("chat reselected evidence for an unsupported claim; verifying again");
                     claim.evidence = evidence;
@@ -843,9 +847,10 @@ pub(super) async fn verify(
     // fact's support judgment. Dropping these checks cannot make an answer pass.
     let binding_budget = std::sync::atomic::AtomicUsize::new(3);
     let binding_budget = &binding_budget;
+    let prior = &answer.claims;
     let checks =
         futures::stream::iter(answer.claims.clone().into_iter().enumerate().map(|(index, claim)| async move {
-            let (claim, mut verdict) = verify_claim(claim, sources, context, binding_budget).await?;
+            let (claim, mut verdict) = verify_claim(claim, sources, context, binding_budget, &prior[..index]).await?;
             verdict.index = index;
             Ok::<_, anyhow::Error>((claim, verdict))
         }))
