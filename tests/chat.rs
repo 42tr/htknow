@@ -44,6 +44,8 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
     let mock_malformed_verdict = malformed_verdict.clone();
     let shape_omissions = Arc::new(AtomicUsize::new(0));
     let mock_shape_omissions = shape_omissions.clone();
+    let correction_count = Arc::new(AtomicUsize::new(0));
+    let mock_correction_count = correction_count.clone();
     let disconnected = Arc::new(AtomicBool::new(false));
     let disconnected_mock = disconnected.clone();
     let mock = Router::new()
@@ -59,9 +61,10 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             let malformed_verdict = mock_malformed_verdict.clone();
             let disconnected = disconnected_mock.clone();
             let shape_omissions = mock_shape_omissions.clone();
+            let correction_count = mock_correction_count.clone();
             // chat 是 agent 架构：模型必须先回 OpenAI 风格的 tool_calls，knowledge_search
             // 才会执行并发出 sources 事件；看到工具结果（role = tool）后再回正文。
-            let wants_tool = (mode == 0 || (4..=26).contains(&mode))
+            let wants_tool = (mode == 0 || (4..=30).contains(&mode))
                 && ([21,22].contains(&mode) || !body["messages"].as_array().is_some_and(|messages| messages.iter().any(|m| m["role"] == "tool")));
             async move {
                 // Non-streaming calls are either the independent verifier or the single correction.
@@ -76,6 +79,9 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                         "evidence":[evidence]}],"insufficient":false})
                 } else { json!({"claims":[],"insufficient":true}) };
                 if mode == 11 { grounded["insufficient"] = json!(true); }
+                if [28,29].contains(&mode) {
+                    grounded["claims"][0]["text"] = json!(if mode == 28 {"FPP是桨距固定的螺旋桨类型。"} else {"虚构的桨叶采用金属X。"});
+                }
                 if [18,19].contains(&mode) && !grounded["claims"].as_array().unwrap().is_empty() { grounded["claims"][0]["text"] = json!("FPP的桨距固定，CPP的桨距可调整。"); }
                 if mode == 20 && !grounded["claims"].as_array().unwrap().is_empty() {
                     let evidence = visible.iter().take(2).map(|s| json!({"source_id":s["id"],"passage_ids":[1]})).collect::<Vec<_>>();
@@ -87,6 +93,12 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                     grounded["claims"][0]["text"] = json!("FPP的桨距固定，CPP的桨距可调整。");
                 }
                 if body["stream"] == false {
+                    if message_text(&body["messages"][0]["content"]).starts_with("你是原文证据选择器") {
+                        let evidence = if [28,29].contains(&mode) {
+                            json!(visible.iter().take(2).map(|s| json!({"source_id":s["id"],"passage_ids":[1]})).collect::<Vec<_>>())
+                        } else { input["claim"]["evidence"].clone() };
+                        return Json(json!({"choices":[{"message":{"role":"assistant","content":json!({"evidence":evidence}).to_string()},"finish_reason":"stop"}]})).into_response();
+                    }
                     if message_text(&body["messages"][0]["content"]).starts_with("你是事实拆分器") {
                         let evidence = grounded["claims"][0]["evidence"].clone();
                         let split = json!({"claims":[{"text":"FPP的桨距固定。","evidence":evidence},
@@ -126,7 +138,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                     }
                     let mut content = if verifying {
                         json!({"claims":input["answer"]["claims"].as_array().unwrap().iter().enumerate().map(|(index,c)| {
-                            let supported = !c["text"].as_str().unwrap().contains("虚构") && !(mode == 25 && c["evidence"].as_array().unwrap().len() == 1);
+                            let supported = !c["text"].as_str().unwrap().contains("虚构") && !([25,28].contains(&mode) && c["evidence"].as_array().unwrap().len() == 1);
                             json!({"index":index,"supported":supported,"atomic":![17,18,19,26].contains(&mode),
                                 "answers_question":!c["text"].as_str().unwrap().contains("资料仅包含"),
                                 "evidence":c["evidence"].as_array().unwrap().iter().enumerate().map(|(i,e)|
@@ -144,6 +156,13 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                         json!({"claims":[{"text":"FPP的桨距固定。","evidence":evidence},
                             {"text":"CPP的桨距可调整。","evidence":evidence}],"insufficient":false})
                     } else { grounded };
+                    if !verifying && mode == 27 && correction_count.fetch_add(1, Ordering::SeqCst) < 2 {
+                        content["claims"][0]["text"] = json!("虚构的桨叶采用金属X。");
+                    }
+                    if !verifying && mode == 30 {
+                        let id = content["claims"][0]["evidence"][0].as_object_mut().unwrap().remove("source_id").unwrap();
+                        content["claims"][0]["evidence"][0]["source_id_ref"] = id;
+                    }
                     if verifying && [12, 13, 15].contains(&mode) {
                         let first = shape_omissions.fetch_or(1 << mode, Ordering::SeqCst) & (1 << mode) == 0;
                         if first || mode == 15 {
@@ -195,6 +214,10 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                     return Response::builder().header("content-type", "text/event-stream").body(Body::from_stream(stream)).unwrap();
                 }
                 let mut grounded = grounded;
+                if [27,30].contains(&mode) {
+                    let id = grounded["claims"][0]["evidence"][0].as_object_mut().unwrap().remove("source_id").unwrap();
+                    grounded["claims"][0]["evidence"][0]["source_id_ref"] = id;
+                }
                 if mode == 4 { grounded["claims"][0]["evidence"] = json!([]); }
                 if mode == 6 { grounded["claims"][0]["evidence"][0]["source_id"] = json!(99); }
                 if [9,25].contains(&mode) {
@@ -209,7 +232,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                 }
                 let payload = json!({"choices":[{"delta":{"content":grounded.to_string()}}]});
                 let mut data = format!(": comment\r\ndata: {payload}\r\n\r\n").into_bytes();
-                if mode == 0 || (4..=26).contains(&mode) { data.extend_from_slice(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"); }
+                if mode == 0 || (4..=30).contains(&mode) { data.extend_from_slice(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"); }
                 // 任意字节边界分片，包括中文 UTF-8 和 SSE CRLF。
                 let mut chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
                     data.chunks(7).map(|v| Ok(bytes::Bytes::copy_from_slice(v))).collect();
@@ -593,6 +616,56 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             );
         }
         assert!(!text.contains("虚构") && !text.contains("检索前的未核验草稿"));
+    }
+    // A generation schema fault has its own one-shot budget. It cannot consume
+    // either substantive correction or permit persistently malformed output.
+    // Passage reselection is independently reverified and never edits the fact.
+    for current_mode in [27, 28, 29, 30] {
+        mode.store(current_mode, Ordering::SeqCst);
+        correction_count.store(0, Ordering::SeqCst);
+        let before = received.lock().unwrap().len();
+        let response = app
+            .clone()
+            .oneshot(authed_json_request("POST", "/api/v1/knowledge/chat", &owner, request.clone()))
+            .await
+            .unwrap();
+        let text = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
+        let events = parse_events(&text);
+        let success = [27, 28].contains(&current_mode);
+        assert_eq!(events.last().unwrap().0, if success { "done" } else { "error" }, "mode={current_mode}: {text}");
+        assert_eq!(events.iter().filter(|(e, _)| e == "delta").count(), usize::from(success));
+        assert!(!text.contains("虚构") && !text.contains("source_id_ref"));
+        let requests = received.lock().unwrap();
+        let new = &requests[before..];
+        let rewrites = new
+            .iter()
+            .filter(|r| {
+                r["stream"] == false && message_text(&r["messages"][0]["content"]).starts_with("你是知识库问答助手")
+            })
+            .count();
+        assert_eq!(
+            rewrites,
+            match current_mode {
+                27 => 3,
+                28 => 0,
+                29 => 2,
+                30 => 1,
+                _ => unreachable!(),
+            }
+        );
+        if current_mode == 28 {
+            assert!(events.iter().any(|(e, v)| e == "delta" && v["text"] == "FPP是桨距固定的螺旋桨类型。[1][2]"));
+            let checks = new
+                .iter()
+                .filter(|r| message_text(&r["messages"][0]["content"]).contains("证据核验器"))
+                .collect::<Vec<_>>();
+            assert_eq!(checks.len(), 2);
+            let input = |r: &Value| serde_json::from_str::<Value>(&message_text(&r["messages"][1]["content"])).unwrap();
+            let (first, second) = (input(checks[0]), input(checks[1]));
+            assert_eq!(first["answer"]["claims"][0]["text"], second["answer"]["claims"][0]["text"]);
+            assert_eq!(first["sources"].as_array().unwrap().len(), 1);
+            assert_eq!(second["sources"].as_array().unwrap().len(), 2);
+        }
     }
     // Explicit Wiki scope applies to tool calls, generation, correction and
     // verification, even when retrieval also returns an original with a new value.

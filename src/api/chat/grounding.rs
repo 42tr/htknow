@@ -6,8 +6,18 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{collections::HashSet, time::Duration};
 
+mod binding;
 mod normalize;
 pub(super) use normalize::split_answer;
+
+#[derive(Debug)]
+pub(super) struct AnswerFormatFailure(String);
+impl std::fmt::Display for AnswerFormatFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+impl std::error::Error for AnswerFormatFailure {}
 
 #[derive(Debug)]
 pub(super) struct CompoundClaim {
@@ -163,7 +173,7 @@ fn decode_answer(text: &str) -> Result<GroundedAnswer> {
 }
 
 pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<GroundedAnswer> {
-    let mut answer = decode_answer(text)?;
+    let mut answer = decode_answer(text).map_err(|error| AnswerFormatFailure(format!("{error:#}")))?;
     ensure!(answer.claims.len() <= 32, "事实条目过多，请仅回答当前问题");
     let mut calculations: Vec<Option<(String, String, Vec<Evidence>)>> = Vec::new();
     let mut prior_evidence: Vec<Vec<Evidence>> = Vec::new();
@@ -250,10 +260,19 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
             );
             calculations.push(Some((calculation.expression.clone(), calculation.unit.clone(), claim.evidence.clone())));
         } else {
+            // A comparison may name a result computed earlier in this draft.
+            // Restore only a unique current-draft proof; the comparison itself
+            // must still pass independent verification on the raw excerpts.
+            binding::inherit_comparison_proof(claim, &calculations, sources)?;
             calculations.push(None);
         }
         prior_evidence.push(claim.evidence.clone());
     }
+    validate_answer(&answer, sources)?;
+    Ok(answer)
+}
+
+fn validate_answer(answer: &GroundedAnswer, sources: &[ChatSource]) -> Result<()> {
     ensure!(!answer.claims.is_empty() || answer.insufficient, "空回答必须说明资料不足");
     let mut derived: Vec<(calculation::Number, &Vec<Evidence>)> = Vec::new();
     for (index, claim) in answer.claims.iter().enumerate() {
@@ -306,7 +325,7 @@ pub(super) fn parse_answer(text: &str, sources: &[ChatSource]) -> Result<Grounde
             }
         }
     }
-    Ok(answer)
+    Ok(())
 }
 
 // Restore the proof behind an unambiguous current-answer monetary intermediate.
@@ -751,6 +770,7 @@ struct Coverage {
 
 async fn verify_claim(
     mut claim: Claim, sources: &[ChatSource], context: &super::context::QuestionContext,
+    binding_budget: &std::sync::atomic::AtomicUsize,
 ) -> Result<(Claim, ClaimVerdict)> {
     for round in 0..2 {
         let single = GroundedAnswer { claims: vec![claim.clone()], insufficient: false };
@@ -781,6 +801,25 @@ async fn verify_claim(
             }
         }
         if round == 0
+            && !verdict.supported
+            && verdict.atomic
+            && binding_budget
+                .fetch_update(std::sync::atomic::Ordering::Relaxed, std::sync::atomic::Ordering::Relaxed, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+        {
+            match binding::reselect(&claim, sources, context, &verdict.reason).await {
+                Ok(evidence) if serde_json::to_value(&evidence)? != serde_json::to_value(&claim.evidence)? => {
+                    log::info!("chat reselected evidence for an unsupported claim; verifying again");
+                    claim.evidence = evidence;
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => log::warn!("chat evidence selection could not be repaired: {error:#}"),
+            }
+        }
+        if round == 0
             && verdict.supported
             && verdict.atomic
             && verdict.evidence.iter().any(|e| e.contributes)
@@ -802,9 +841,11 @@ pub(super) async fn verify(
     // Each fact sees only its own selected passages. Completeness sees all visible
     // sources in a separate request, so unrelated evidence cannot leak into a
     // fact's support judgment. Dropping these checks cannot make an answer pass.
+    let binding_budget = std::sync::atomic::AtomicUsize::new(3);
+    let binding_budget = &binding_budget;
     let checks =
         futures::stream::iter(answer.claims.clone().into_iter().enumerate().map(|(index, claim)| async move {
-            let (claim, mut verdict) = verify_claim(claim, sources, context).await?;
+            let (claim, mut verdict) = verify_claim(claim, sources, context, binding_budget).await?;
             verdict.index = index;
             Ok::<_, anyhow::Error>((claim, verdict))
         }))
@@ -823,6 +864,9 @@ pub(super) async fn verify(
             claim.reason = format!("相关性：{}；支持性：{}", relevance.reason, claim.reason);
         }
     }
+    // Pruning/rebinding must preserve the same local proof and identifier
+    // invariants as the original draft, in addition to semantic revalidation.
+    validate_answer(answer, sources)?;
     validate_verdict(
         Verification {
             claims,
@@ -1160,7 +1204,7 @@ mod tests {
         server.await.unwrap();
     }
     use crate::api::search::SearchResultItem;
-    fn sources() -> Vec<ChatSource> {
+    pub(super) fn sources() -> Vec<ChatSource> {
         vec![ChatSource {
             id: 1,
             result: SearchResultItem {

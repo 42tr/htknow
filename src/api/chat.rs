@@ -349,10 +349,9 @@ async fn run_chat(
         anyhow::ensure!(completed && !draft.trim().is_empty(), UPSTREAM_FAILURE);
     }
     let mut answer = None;
-    // A schema failure can consume the first correction. Keep one more bounded
-    // correction for substantive evidence/computation issues; every draft still
-    // passes the same checks before any text becomes visible.
-    for attempt in 0..3 {
+    let mut format_repaired = false;
+    let mut attempt = 0;
+    loop {
         send(tx, "status", json!({"stage":"verifying"})).await?;
         let result = match grounding::parse_answer(&draft, &sources) {
             Ok(mut parsed) => {
@@ -370,8 +369,17 @@ async fn run_chat(
                 if error.downcast_ref::<grounding::VerifierFailure>().is_some() {
                     return Err(anyhow::anyhow!("来源核验服务暂不可用，请稍后重试"));
                 }
-                if attempt == 2 {
+                let format_failure = error.is::<grounding::AnswerFormatFailure>();
+                if format_failure && format_repaired {
                     break;
+                }
+                if !format_failure && attempt == 2 {
+                    break;
+                }
+                if format_failure {
+                    format_repaired = true;
+                } else {
+                    attempt += 1;
                 }
                 send(tx, "status", json!({"stage":"correcting"})).await?;
                 let split =
@@ -391,7 +399,11 @@ async fn run_chat(
                     {"role":"user","content":json!({"question":request.question,"question_context":*context,"history":history,
                         "sources":grounding::visible_sources(&sources),"rejected_draft":draft,
                         "validation_error":format!("{error:#}"),
-                        "instruction":"修正上述核验问题。删除无关事实与重复陈述，补充真正支持陈述的证据，不可盲目添加编号。若拆分会超出条目预算，去掉重复的规则、前提和背景，保留所问的各项独立结论。"}).to_string()},
+                        "instruction":if format_failure {
+                            "只修复JSON字段和结构以符合schema，保留原有事实、数值和算式含义；不添加或删除所问要点。此步骤不表示事实已经核验通过。"
+                        } else {
+                            "修正上述核验问题。删除无关事实与重复陈述，补充真正支持陈述的证据，不可盲目添加编号。跨轮费用必须重新引用当前原文的单价、数量、周期和抵扣规则并展开原始算式，不能复用历史金额当原始常数。若拆分会超出条目预算，去掉重复的规则、前提和背景，保留所问的各项独立结论。"
+                        }}).to_string()},
                 ]), &sources).await
                 };
                 draft = correction.map_err(|error| {
