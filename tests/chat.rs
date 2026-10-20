@@ -64,7 +64,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             let correction_count = mock_correction_count.clone();
             // chat 是 agent 架构：模型必须先回 OpenAI 风格的 tool_calls，knowledge_search
             // 才会执行并发出 sources 事件；看到工具结果（role = tool）后再回正文。
-            let wants_tool = (mode == 0 || (4..=30).contains(&mode))
+            let wants_tool = (mode == 0 || (4..=32).contains(&mode))
                 && ([21,22].contains(&mode) || !body["messages"].as_array().is_some_and(|messages| messages.iter().any(|m| m["role"] == "tool")));
             async move {
                 // Non-streaming calls are either the independent verifier or the single correction.
@@ -81,6 +81,13 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                 if mode == 11 { grounded["insufficient"] = json!(true); }
                 if [28,29].contains(&mode) {
                     grounded["claims"][0]["text"] = json!(if mode == 28 {"FPP是桨距固定的螺旋桨类型。"} else {"虚构的桨叶采用金属X。"});
+                }
+                if [31,32].contains(&mode) && visible.len() > 1 {
+                    grounded["claims"] = json!([
+                        {"text":"CPP的桨距可调整。","evidence":[{"source_id":visible[1]["id"],"passage_ids":[1]}]},
+                        {"text":if mode == 31 {"FPP是桨距固定的螺旋桨类型。"} else {"FPP的桨距固定。"},
+                            "evidence":[{"source_id":visible[0]["id"],"passage_ids":[1]}]}
+                    ]);
                 }
                 if [18,19].contains(&mode) && !grounded["claims"].as_array().unwrap().is_empty() { grounded["claims"][0]["text"] = json!("FPP的桨距固定，CPP的桨距可调整。"); }
                 if mode == 20 && !grounded["claims"].as_array().unwrap().is_empty() {
@@ -138,11 +145,14 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                     }
                     let mut content = if verifying {
                         json!({"claims":input["answer"]["claims"].as_array().unwrap().iter().enumerate().map(|(index,c)| {
-                            let supported = !c["text"].as_str().unwrap().contains("虚构") && !([25,28].contains(&mode) && c["evidence"].as_array().unwrap().len() == 1);
+                            let is_fpp = c["text"].as_str().unwrap().starts_with("FPP");
+                            let incomplete_proof = (mode == 31 && is_fpp && c["evidence"].as_array().unwrap().len() == 1)
+                                || (mode == 32 && is_fpp && !c["evidence"].as_array().unwrap().iter().any(|e| e["source_id"] == 2));
+                            let supported = !c["text"].as_str().unwrap().contains("虚构") && !incomplete_proof && !([25,28].contains(&mode) && c["evidence"].as_array().unwrap().len() == 1);
                             json!({"index":index,"supported":supported,"atomic":![17,18,19,26].contains(&mode),
                                 "answers_question":!c["text"].as_str().unwrap().contains("资料仅包含"),
                                 "evidence":c["evidence"].as_array().unwrap().iter().enumerate().map(|(i,e)|
-                                    json!({"source_id":e["source_id"],"contributes":![9,25].contains(&mode) || i == 0,
+                                    json!({"source_id":e["source_id"],"contributes":(![9,25].contains(&mode) || i == 0) && (mode != 32 || !is_fpp || e["source_id"] == 2),
                                         "reason":if mode == 9 && i > 0 {"主题相关但不支持这条事实"} else {"supports the requested fact"}})
                                 ).collect::<Vec<_>>(),
                                 "reason":if supported {"supported"} else {"引用有原句，但不支持金属X"}})
@@ -232,7 +242,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                 }
                 let payload = json!({"choices":[{"delta":{"content":grounded.to_string()}}]});
                 let mut data = format!(": comment\r\ndata: {payload}\r\n\r\n").into_bytes();
-                if mode == 0 || (4..=30).contains(&mode) { data.extend_from_slice(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"); }
+                if mode == 0 || (4..=32).contains(&mode) { data.extend_from_slice(b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n"); }
                 // 任意字节边界分片，包括中文 UTF-8 和 SSE CRLF。
                 let mut chunks: Vec<Result<bytes::Bytes, std::io::Error>> =
                     data.chunks(7).map(|v| Ok(bytes::Bytes::copy_from_slice(v))).collect();
@@ -620,7 +630,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
     // A generation schema fault has its own one-shot budget. It cannot consume
     // either substantive correction or permit persistently malformed output.
     // Passage reselection is independently reverified and never edits the fact.
-    for current_mode in [27, 28, 29, 30] {
+    for current_mode in [27, 28, 29, 30, 31, 32] {
         mode.store(current_mode, Ordering::SeqCst);
         correction_count.store(0, Ordering::SeqCst);
         let before = received.lock().unwrap().len();
@@ -631,7 +641,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             .unwrap();
         let text = String::from_utf8(response.into_body().collect().await.unwrap().to_bytes().to_vec()).unwrap();
         let events = parse_events(&text);
-        let success = [27, 28].contains(&current_mode);
+        let success = [27, 28, 31, 32].contains(&current_mode);
         assert_eq!(events.last().unwrap().0, if success { "done" } else { "error" }, "mode={current_mode}: {text}");
         assert_eq!(events.iter().filter(|(e, _)| e == "delta").count(), usize::from(success));
         assert!(!text.contains("虚构") && !text.contains("source_id_ref"));
@@ -650,6 +660,7 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
                 28 => 0,
                 29 => 2,
                 30 => 1,
+                31 | 32 => 0,
                 _ => unreachable!(),
             }
         );
@@ -665,6 +676,27 @@ async fn chat_stream_uses_scoped_evidence_and_reports_upstream_failures() {
             assert_eq!(first["answer"]["claims"][0]["text"], second["answer"]["claims"][0]["text"]);
             assert_eq!(first["sources"].as_array().unwrap().len(), 1);
             assert_eq!(second["sources"].as_array().unwrap().len(), 2);
+        }
+        if [31, 32].contains(&current_mode) {
+            assert!(!new.iter().any(|r| message_text(&r["messages"][0]["content"]).starts_with("你是原文证据选择器")));
+            let fpp = new
+                .iter()
+                .filter(|r| message_text(&r["messages"][0]["content"]).contains("证据核验器"))
+                .filter_map(|r| serde_json::from_str::<Value>(&message_text(&r["messages"][1]["content"])).ok())
+                .filter(|v| v["answer"]["claims"][0]["text"].as_str().unwrap().starts_with("FPP"))
+                .collect::<Vec<_>>();
+            assert_eq!(fpp.len(), if current_mode == 31 { 2 } else { 3 });
+            assert_eq!(fpp[0]["sources"].as_array().unwrap().len(), 1);
+            assert_eq!(fpp[1]["sources"].as_array().unwrap().len(), 2);
+            if current_mode == 32 {
+                assert_eq!(fpp[2]["sources"].as_array().unwrap().len(), 1);
+                assert_eq!(fpp[2]["sources"][0]["id"], 2);
+                assert!(
+                    events
+                        .iter()
+                        .any(|(e, v)| e == "delta" && v["text"].as_str().unwrap().contains("FPP的桨距固定。[2]"))
+                );
+            }
         }
     }
     // Explicit Wiki scope applies to tool calls, generation, correction and

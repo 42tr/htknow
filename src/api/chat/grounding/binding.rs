@@ -126,6 +126,18 @@ fn validate_selection(evidence: &[Evidence], sources: &[ChatSource]) -> Result<(
     Ok(())
 }
 
+pub(super) fn candidate_proof(claim: &Claim, prior: &[Claim], sources: &[ChatSource]) -> Option<Vec<Evidence>> {
+    // These are pointers to already-visible raw passages, never prior claim
+    // text or a historical answer. Select them explicitly as candidates, then
+    // independently verify and prune sources before rendering any citation.
+    let mut evidence = claim.evidence.clone();
+    for previous in prior {
+        inherit_evidence(&mut evidence, &previous.evidence);
+    }
+    validate_selection(&evidence, sources).ok()?;
+    (serde_json::to_value(&evidence).ok()? != serde_json::to_value(&claim.evidence).ok()?).then_some(evidence)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +211,25 @@ mod tests {
         let mut raw_claim = parsed.claims[0].clone();
         raw_claim.calculation = None;
         assert!(resolve_selection(selection(json!([0])), &[raw_claim], &sources).is_err());
+    }
+
+    #[test]
+    fn candidate_proof_keeps_current_inputs_and_adds_only_explicit_current_draft_passages() {
+        let mut sources = super::super::tests::sources();
+        sources[0].result.content = "单价40元。数量3个。额度150元。未选择的其他服务信息。".into();
+        let claim = |text: &str, ids: Vec<usize>| Claim {
+            text: text.into(),
+            calculation: None,
+            depends_on: vec![],
+            evidence: vec![Evidence { source_id: 1, passage_ids: ids }],
+        };
+        let conclusion = claim("额度能覆盖应付金额。", vec![3]);
+        let earlier = [claim("单价40元。", vec![1]), claim("数量3个。", vec![2])];
+        let selected = candidate_proof(&conclusion, &earlier, &sources).unwrap();
+        assert_eq!(selected[0].passage_ids, vec![3, 1, 2]);
+        assert!(!selected[0].passage_ids.contains(&4));
+        assert!(candidate_proof(&conclusion, &[], &sources).is_none());
+        let invalid = [claim("非法片段。", vec![99])];
+        assert!(candidate_proof(&conclusion, &invalid, &sources).is_none());
     }
 }

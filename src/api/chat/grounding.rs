@@ -776,7 +776,9 @@ async fn verify_claim(
     mut claim: Claim, sources: &[ChatSource], context: &super::context::QuestionContext,
     binding_budget: &std::sync::atomic::AtomicUsize, prior: &[Claim],
 ) -> Result<(Claim, ClaimVerdict)> {
-    for round in 0..2 {
+    let mut rebound = false;
+    let mut pruned = false;
+    for _ in 0..3 {
         let single = GroundedAnswer { claims: vec![claim.clone()], insufficient: false };
         let mut selected = Vec::new();
         let mut visible = Vec::new();
@@ -804,7 +806,7 @@ async fn verify_claim(
                 verdict.reason = atomicity.reason;
             }
         }
-        if round == 0
+        if !rebound
             && !verdict.supported
             && verdict.atomic
             && binding_budget
@@ -813,6 +815,12 @@ async fn verify_claim(
                 })
                 .is_ok()
         {
+            rebound = true;
+            if let Some(evidence) = binding::candidate_proof(&claim, prior, sources) {
+                log::info!("chat selected current-draft raw evidence for an unsupported claim; verifying again");
+                claim.evidence = evidence;
+                continue;
+            }
             match binding::reselect(&claim, sources, context, &verdict.reason, prior).await {
                 Ok(evidence) if serde_json::to_value(&evidence)? != serde_json::to_value(&claim.evidence)? => {
                     log::info!("chat reselected evidence for an unsupported claim; verifying again");
@@ -823,12 +831,13 @@ async fn verify_claim(
                 Err(error) => log::warn!("chat evidence selection could not be repaired: {error:#}"),
             }
         }
-        if round == 0
+        if !pruned
             && verdict.supported
             && verdict.atomic
             && verdict.evidence.iter().any(|e| e.contributes)
             && verdict.evidence.iter().any(|e| !e.contributes)
         {
+            pruned = true;
             let retained =
                 verdict.evidence.iter().filter(|e| e.contributes).map(|e| e.source_id).collect::<HashSet<_>>();
             claim.evidence.retain(|e| retained.contains(&e.source_id));
