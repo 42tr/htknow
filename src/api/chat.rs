@@ -1,7 +1,9 @@
 //! 无会话存储的检索增强对话。客户端逐次提交历史；仅检索结果可作为引用来源。
 use async_trait::async_trait;
 use futures::StreamExt;
-use g::{Agent, OpenAIChatModel, RunEvent, Tool, ToolBehavior, ToolContext, ToolError, ToolSpec};
+use g::{
+    Agent, AgentError, OpenAIChatModel, RunEvent, RunLimits, Tool, ToolBehavior, ToolContext, ToolError, ToolSpec,
+};
 use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use axum::{
@@ -26,7 +28,10 @@ use super::{
 };
 use crate::{AuthUser, config, search::SearchEngine};
 
+mod calculation;
+mod context;
 mod grounding;
+mod temporal;
 
 #[derive(Debug, Deserialize, Serialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
@@ -153,18 +158,23 @@ fn select_sources(results: Vec<search::SearchResultItem>) -> Vec<ChatSource> {
 fn merge_sources(all: &mut Vec<ChatSource>, found: Vec<ChatSource>) -> Vec<usize> {
     found
         .into_iter()
-        .map(|mut source| {
+        .filter_map(|mut source| {
             if let Some(existing) = all.iter().find(|existing| {
                 existing.result.wiki.is_some() == source.result.wiki.is_some()
                     && existing.result.file_id == source.result.file_id
                     && existing.result.id == source.result.id
             }) {
-                return existing.id;
+                return Some(existing.id);
             }
+            let remaining = 24_000usize.saturating_sub(all.iter().map(|s| s.result.content.chars().count()).sum());
+            if all.len() >= 16 || remaining == 0 {
+                return None;
+            }
+            source.result.content = source.result.content.chars().take(remaining).collect();
             source.id = all.len() + 1;
             let id = source.id;
             all.push(source);
-            id
+            Some(id)
         })
         .collect()
 }
@@ -176,6 +186,7 @@ struct KnowledgeSearchTool {
     kb_id: Option<i64>,
     tx: mpsc::Sender<Event>,
     sources: Arc<Mutex<Vec<ChatSource>>>,
+    context: Arc<context::QuestionContext>,
 }
 
 impl KnowledgeSearchTool {
@@ -189,10 +200,19 @@ impl KnowledgeSearchTool {
         .await
         .map_err(|_| ToolError::new("knowledge search failed"))?;
         let mut sources = self.sources.lock().await;
-        let ids = merge_sources(&mut sources, select_sources(found.results));
+        let found = found
+            .results
+            .into_iter()
+            .filter(|result| match self.context.source_scope {
+                context::SourceScope::Any => true,
+                context::SourceScope::Wiki => result.wiki.is_some(),
+                context::SourceScope::Original => result.wiki.is_none(),
+            })
+            .collect();
+        let ids = merge_sources(&mut sources, select_sources(found));
         send(&self.tx, "sources", json!({"sources": *sources})).await.map_err(|e| ToolError::new(e.to_string()))?;
         let visible = grounding::visible_sources(&sources);
-        Ok(json!({"sources":visible.as_array().unwrap().iter()
+        Ok(json!({"temporal_scope":temporal::scope(&self.context,&sources),"sources":visible.as_array().unwrap().iter()
             .filter(|s| ids.iter().any(|id| s["id"].as_u64() == Some(*id as u64))).collect::<Vec<_>>()}))
     }
 }
@@ -235,21 +255,28 @@ async fn run_chat(
     let key = cfg.llm.api_key.clone().unwrap_or_default();
     let model = Arc::new(OpenAIChatModel::new(key, cfg.llm.model.clone()).with_base_url(url));
     let sources = Arc::new(Mutex::new(Vec::new()));
-    let tool =
-        KnowledgeSearchTool { pool, engine, user, kb_id: request.kb_id, tx: tx.clone(), sources: sources.clone() };
+    let context = Arc::new(context::QuestionContext::new(&request));
+    let tool = KnowledgeSearchTool {
+        pool,
+        engine,
+        user,
+        kb_id: request.kb_id,
+        tx: tx.clone(),
+        sources: sources.clone(),
+        context: context.clone(),
+    };
     // A follow-up must retrieve again: prior-turn answers and [n] are never evidence.
-    let query = request
-        .messages
-        .iter()
-        .rev()
-        .find(|m| matches!(m.role, ChatRole::User))
-        .map(|m| format!("{} {}", m.content, request.question))
-        .unwrap_or_else(|| request.question.clone());
     send(tx, "status", json!({"stage":"searching"})).await?;
-    let initial = tool.search(&query).await.map_err(|e| {
-        error!("chat initial search failed: {e}");
-        anyhow::anyhow!(UPSTREAM_FAILURE)
-    })?;
+    for query in context.queries() {
+        tool.search(&query).await.map_err(|e| {
+            error!("chat initial search failed: {e}");
+            anyhow::anyhow!(UPSTREAM_FAILURE)
+        })?;
+    }
+    let initial = {
+        let visible = sources.lock().await;
+        json!({"sources":grounding::visible_sources(&visible),"temporal_scope":temporal::scope(&context,&visible)})
+    };
     let history = request
         .messages
         .iter()
@@ -263,17 +290,32 @@ async fn run_chat(
             )
         })
         .collect::<Vec<_>>();
-    let agent = Agent::new(model).tool(tool).instruction(format!("{SYSTEM}\n{}", grounding::OUTPUT_RULES));
+    let agent = Agent::new(model)
+        .tool(tool)
+        .instruction(format!("{SYSTEM}\n{}", grounding::OUTPUT_RULES))
+        .with_limits(RunLimits { max_turns: 4, max_tool_calls: 3, ..RunLimits::default() });
     let mut prompt = history;
-    prompt.push(g::Message::user(&json!({"question":request.question,"initial_search":initial}).to_string()));
+    prompt.push(g::Message::user(
+        &json!({"question":request.question,"question_context":*context,"initial_search":initial}).to_string(),
+    ));
     let mut events = g::Runtime::new().stream_run(&agent, g::RunRequest::new(prompt));
     let mut draft = String::new();
     let mut completed = false;
+    let mut search_limit = false;
     while let Some(event) = events.next().await {
-        match event.map_err(|e| {
-            error!("chat run failed: {e}");
-            anyhow::anyhow!(UPSTREAM_FAILURE)
-        })? {
+        let event = match event {
+            Ok(event) => event,
+            Err(AgentError::MaxTurnsExceeded(_) | AgentError::MaxToolCallsExceeded(_)) => {
+                log::warn!("chat additional search budget exhausted; generating from visible evidence");
+                search_limit = true;
+                break;
+            }
+            Err(error) => {
+                error!("chat run failed: {error}");
+                return Err(anyhow::anyhow!(UPSTREAM_FAILURE));
+            }
+        };
+        match event {
             RunEvent::ModelStarted { .. } => {
                 // Discard any planning text from a preceding tool-call model turn.
                 draft.clear();
@@ -293,16 +335,32 @@ async fn run_chat(
             _ => {}
         }
     }
-    anyhow::ensure!(completed && !draft.trim().is_empty(), UPSTREAM_FAILURE);
+    drop(events);
     // Snapshot precisely the excerpts supplied to this turn, never wiki.page.content.
     let sources = sources.lock().await;
     let history = serde_json::to_value(&request.messages)?;
+    if search_limit {
+        draft = grounding::complete_answer(json!([
+            {"role":"system","content":format!("{SYSTEM}\n{}", grounding::OUTPUT_RULES)},
+            {"role":"user","content":json!({"question":request.question,"question_context":*context,
+                "history":history,"sources":grounding::visible_sources(&sources),
+                "temporal_scope":temporal::scope(&context,&sources),
+                "instruction":"追加检索预算已耗尽。只依据这些可见资料回答，未知部分说明资料不足，不再调用工具。"}).to_string()}
+        ]), &sources).await.map_err(|error| {
+            error!("chat bounded-search completion failed: {error}");
+            anyhow::anyhow!(UPSTREAM_FAILURE)
+        })?;
+    } else {
+        anyhow::ensure!(completed && !draft.trim().is_empty(), UPSTREAM_FAILURE);
+    }
     let mut answer = None;
-    for attempt in 0..2 {
+    let mut format_repaired = false;
+    let mut attempt = 0;
+    loop {
         send(tx, "status", json!({"stage":"verifying"})).await?;
         let result = match grounding::parse_answer(&draft, &sources) {
-            Ok(parsed) => {
-                grounding::verify(&parsed, &sources, &request.question, history.clone()).await.map(|()| parsed)
+            Ok(mut parsed) => {
+                grounding::verify(&mut parsed, &sources, &context, history.clone()).await.map(|()| parsed)
             }
             Err(error) => Err(error),
         };
@@ -312,18 +370,49 @@ async fn run_chat(
                 break;
             }
             Err(error) => {
-                log::warn!("chat grounding attempt {} rejected: {error}", attempt + 1);
-                if attempt == 1 {
+                log::warn!("chat grounding attempt {} rejected: {error:#}", attempt + 1);
+                if error.downcast_ref::<grounding::VerifierFailure>().is_some() {
+                    return Err(anyhow::anyhow!("来源核验服务暂不可用，请稍后重试"));
+                }
+                let format_failure = error.is::<grounding::AnswerFormatFailure>();
+                if format_failure && format_repaired {
                     break;
                 }
+                if !format_failure && attempt == 2 {
+                    break;
+                }
+                if format_failure {
+                    format_repaired = true;
+                } else {
+                    attempt += 1;
+                }
                 send(tx, "status", json!({"stage":"correcting"})).await?;
-                draft = grounding::complete_json(json!([
+                let split =
+                    if let Some(compound) = error.downcast_ref::<grounding::CompoundClaim>().filter(|c| c.can_split) {
+                        match grounding::split_answer(&draft, compound.index, &sources).await {
+                            Err(error) if error.is::<grounding::SplitCapacity>() => None,
+                            result => Some(result),
+                        }
+                    } else {
+                        None
+                    };
+                let correction = if let Some(result) = split {
+                    result
+                } else {
+                    grounding::complete_answer(json!([
                     {"role":"system","content":format!("{SYSTEM}\n{}", grounding::OUTPUT_RULES)},
-                    {"role":"user","content":json!({"question":request.question,"history":history,
+                    {"role":"user","content":json!({"question":request.question,"question_context":*context,"history":history,
                         "sources":grounding::visible_sources(&sources),"rejected_draft":draft,
-                        "validation_error":error.to_string(),
-                        "instruction":"修正上述核验问题。删除无关事实，补充真正支持陈述的证据，不可盲目添加编号。"}).to_string()},
-                ])).await.map_err(|error| {
+                        "temporal_scope":temporal::scope(&context,&sources),
+                        "validation_error":format!("{error:#}"),
+                        "instruction":if format_failure {
+                            "只修复JSON字段和结构以符合schema，保留原有事实、数值和算式含义；不添加或删除所问要点。此步骤不表示事实已经核验通过。"
+                        } else {
+                            "修正上述核验问题。删除无关事实与重复陈述，补充真正支持陈述的证据，不可盲目添加编号。跨轮费用必须重新引用当前原文的单价、数量、周期和抵扣规则并展开原始算式，不能复用历史金额当原始常数。若拆分会超出条目预算，去掉重复的规则、前提和背景，保留所问的各项独立结论。"
+                        }}).to_string()},
+                ]), &sources).await
+                };
+                draft = correction.map_err(|error| {
                     log::error!("chat correction failed: {error}");
                     anyhow::anyhow!(UPSTREAM_FAILURE)
                 })?;
@@ -361,6 +450,14 @@ mod tests {
         assert_eq!(sources.len(), 3);
         assert_eq!(sources[0].result.id, 20);
         assert_eq!(sources[2].id, 3);
+        for i in 0..20 {
+            let mut next = source(100 + i);
+            next.result.content = "字".repeat(4000);
+            merge_sources(&mut sources, vec![next]);
+        }
+        assert_eq!(sources.iter().map(|s| s.result.content.chars().count()).sum::<usize>(), 24_000);
+        assert!(sources.len() <= 16);
+        assert_eq!(merge_sources(&mut sources, vec![source(20)]), vec![1]);
     }
     #[test]
     fn chat_rejects_invalid_history_and_limits() {
