@@ -509,7 +509,7 @@ async fn merge_wiki_hits(
         {
             continue;
         }
-        let detail = super::wiki::build_detail(pool, page).await?;
+        let detail = super::wiki::build_detail(pool, page, user).await?;
         if file_ids.is_some_and(|ids| !detail.sources.iter().any(|source| ids.contains(&source.file_id))) {
             continue;
         }

@@ -276,7 +276,7 @@ pub fn extract_archive_with_limits(
         ArchiveFormat::Zip => extract_zip(src_path, dest_dir, password, file_id, limits),
         ArchiveFormat::Rar => rar::extract(src_path, dest_dir, password, file_id, limits),
         ArchiveFormat::SevenZ => sevenz::extract(src_path, dest_dir, password, file_id, limits),
-        _ if format.is_tar_variant() => extract_tar(src_path, dest_dir, file_id, limits),
+        _ if format.is_tar_variant() => extract_tar(src_path, filename, dest_dir, file_id, limits),
         _ => Err(ArchiveError::UnsupportedFormat(format.desc().to_string())),
     }
 }
@@ -293,7 +293,7 @@ pub fn read_archive_entry(
         ArchiveFormat::Zip => read_zip_entry(src_path, entry_path, password),
         ArchiveFormat::Rar => rar::read_entry(src_path, entry_path, password),
         ArchiveFormat::SevenZ => sevenz::read_entry(src_path, entry_path, password),
-        _ if format.is_tar_variant() => read_tar_entry(src_path, entry_path),
+        _ if format.is_tar_variant() => read_tar_entry(src_path, filename, entry_path),
         _ => Err(ArchiveError::UnsupportedFormat(format.desc().to_string())),
     }
 }
@@ -448,9 +448,9 @@ fn read_zip_entry(src_path: &str, entry_path: &str, password: Option<&str>) -> R
 // TAR 解压（含 GZ/BZ2/XZ 变体）
 // ============================================================================
 
-fn open_tar_reader(src_path: &str) -> Result<Box<dyn Read>, ArchiveError> {
+fn open_tar_reader(src_path: &str, filename: &str) -> Result<Box<dyn Read>, ArchiveError> {
     let file = std::fs::File::open(src_path)?;
-    let lower = src_path.to_lowercase();
+    let lower = filename.to_lowercase();
 
     if lower.ends_with(".tar") {
         Ok(Box::new(file))
@@ -466,9 +466,9 @@ fn open_tar_reader(src_path: &str) -> Result<Box<dyn Read>, ArchiveError> {
 }
 
 fn extract_tar(
-    src_path: &str, dest_dir: &str, file_id: i64, limits: &ExtractLimits,
+    src_path: &str, filename: &str, dest_dir: &str, file_id: i64, limits: &ExtractLimits,
 ) -> Result<Vec<ArchiveEntry>, ArchiveError> {
-    let reader = open_tar_reader(src_path)?;
+    let reader = open_tar_reader(src_path, filename)?;
     let mut archive = tar::Archive::new(reader);
 
     let mut entries = Vec::new();
@@ -526,8 +526,8 @@ fn extract_tar(
     Ok(entries)
 }
 
-fn read_tar_entry(src_path: &str, entry_path: &str) -> Result<NamedTempFile, ArchiveError> {
-    let reader = open_tar_reader(src_path)?;
+fn read_tar_entry(src_path: &str, filename: &str, entry_path: &str) -> Result<NamedTempFile, ArchiveError> {
+    let reader = open_tar_reader(src_path, filename)?;
     let mut archive = tar::Archive::new(reader);
 
     let normalized_target = entry_path.replace('\\', "/").trim_start_matches('/').trim_end_matches('/').to_string();
@@ -689,5 +689,42 @@ mod tests {
 
         let _ = std::fs::remove_file(zip_path);
         let _ = std::fs::remove_dir_all(extract_dir);
+    }
+
+    #[test]
+    fn test_extract_tar_uses_uploaded_filename_when_storage_path_has_no_extension() {
+        let source = tempfile::NamedTempFile::new().unwrap();
+        {
+            let mut builder = tar::Builder::new(source.reopen().unwrap());
+            let content = b"tar content";
+            let mut header = tar::Header::new_gnu();
+            header.set_path("docs/report.txt").unwrap();
+            header.set_size(content.len() as u64);
+            header.set_cksum();
+            builder.append(&header, &content[..]).unwrap();
+            builder.finish().unwrap();
+        }
+
+        let destination = tempfile::tempdir().unwrap();
+        let entries = extract_archive_with_limits(
+            source.path().to_str().unwrap(),
+            destination.path().to_str().unwrap(),
+            "upload.tar",
+            None,
+            3,
+            &ExtractLimits::default(),
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(std::fs::read_to_string(destination.path().join("docs/report.txt")).unwrap(), "tar content");
+
+        let extracted = read_archive_entry(
+            source.path().to_str().unwrap(),
+            "upload.tar",
+            "docs/report.txt",
+            None,
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(extracted.path()).unwrap(), "tar content");
     }
 }

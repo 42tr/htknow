@@ -19,7 +19,7 @@ use crate::{
         common,
         error::{ApiError, ApiResult},
     },
-    wiki::{self, Granularity, PAGE_TYPE_INDEX, WikiPage, edit, lint, page, revision},
+    wiki::{self, Granularity, WikiPage, edit, lint, page, revision},
 };
 
 /// 列表项：不含正文，避免目录浏览时传输大量 Markdown。
@@ -270,7 +270,57 @@ async fn slice_refs(pool: &SqlitePool, source_ids: &[i64], slice_ids: &[i64]) ->
         .collect())
 }
 
-pub(crate) async fn build_detail(pool: &SqlitePool, page: WikiPage) -> ApiResult<WikiPageDetail> {
+/// Filter Wiki pages whose source files are all visible to the current user.
+///
+/// A page may contain a synthesis of several files. Returning it when only one
+/// of those files is private would still leak that file through the generated
+/// content, title, summary, or source references, so the whole page is hidden.
+pub(crate) async fn filter_visible_pages(
+    pool: &SqlitePool, pages: &[WikiPage], user: &AuthUser,
+) -> ApiResult<Vec<WikiPage>> {
+    if pages.is_empty() || user.is_admin() {
+        return Ok(pages.to_vec());
+    }
+
+    // The generated index has no source-file rows of its own, but its
+    // summary/content can enumerate pages generated from private files. The
+    // structured index endpoint is rebuilt from the filtered page set, so the
+    // raw index page is never exposed to a non-admin user.
+    let pages: Vec<WikiPage> = pages.iter().filter(|page| !page.is_index()).cloned().collect();
+    if pages.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT p.id FROM wiki_pages p WHERE p.id IN (",
+    );
+    {
+        let mut ids = qb.separated(", ");
+        for page in &pages {
+            ids.push_bind(page.id);
+        }
+    }
+    qb.push(") AND NOT EXISTS (SELECT 1 FROM wiki_page_sources s LEFT JOIN files f ON f.id = s.file_id WHERE s.page_id = p.id AND (f.id IS NULL OR NOT (f.user_id = ");
+    qb.push_bind(user.user_id.clone());
+    qb.push(" OR (f.kb_id IS NULL AND f.is_public = 1) OR f.kb_id IN (SELECT id FROM knowledge_bases WHERE user_id = ");
+    qb.push_bind(user.user_id.clone());
+    qb.push(") OR f.kb_id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ");
+    qb.push_bind(user.user_id.clone());
+    qb.push(") OR (f.is_public = 1 AND f.kb_id IN (SELECT id FROM knowledge_bases WHERE is_public = 1)))))");
+
+    let visible: HashSet<i64> = qb.build_query_scalar().fetch_all(pool).await?.into_iter().collect();
+    Ok(pages.iter().filter(|page| visible.contains(&page.id)).cloned().collect())
+}
+
+async fn ensure_page_visible(pool: &SqlitePool, page: &WikiPage, user: &AuthUser) -> ApiResult<()> {
+    if filter_visible_pages(pool, std::slice::from_ref(page), user).await?.is_empty() {
+        return Err(ApiError::NotFound("Wiki page not found".to_string()));
+    }
+    Ok(())
+}
+
+pub(crate) async fn build_detail(pool: &SqlitePool, page: WikiPage, user: &AuthUser) -> ApiResult<WikiPageDetail> {
+    ensure_page_visible(pool, &page, user).await?;
     let source_ids = page::source_file_ids(pool, page.id).await?;
     let mut sources = Vec::with_capacity(source_ids.len());
     if !source_ids.is_empty() {
@@ -304,6 +354,7 @@ pub async fn list_pages(
         params.before_id,
     )
     .await?;
+    let pages = filter_visible_pages(&pool, &pages, &user).await?;
     let has_more = pages.len() as i64 > limit;
     let items: Vec<WikiPageItem> = pages.into_iter().take(limit as usize).map(Into::into).collect();
     let next_before_id = if has_more { items.last().map(|item| item.id) } else { None };
@@ -320,7 +371,7 @@ pub async fn get_page(
     }
     let found = page::get_by_slug(&pool, params.kb_id, params.slug.trim()).await?;
     match found {
-        Some(page) => Ok(Json(build_detail(&pool, page).await?)),
+        Some(page) => Ok(Json(build_detail(&pool, page, &user).await?)),
         None => Err(ApiError::NotFound("Wiki page not found".to_string())),
     }
 }
@@ -332,6 +383,7 @@ pub async fn get_index(
     common::ensure_kb_accessible(&pool, params.kb_id, &user.user_id, user.is_admin()).await?;
     // 目录只要标题/摘要，用不带正文的投影：全库正文可能比整个响应大两个数量级。
     let pages = page::list_meta(&pool, params.kb_id, None, None, i64::MAX, None).await?;
+    let pages = filter_visible_pages(&pool, &pages, &user).await?;
     let index_page = pages.iter().find(|p| p.is_index());
     let intro = index_page.map(|p| p.summary.clone()).unwrap_or_default();
     let updated_at = index_page.map(|p| p.updated_at).unwrap_or(0);
@@ -364,7 +416,40 @@ pub async fn get_stats(
     Query(params): Query<WikiKbParams>, State(pool): State<SqlitePool>, Extension(user): Extension<AuthUser>,
 ) -> ApiResult<Json<page::WikiStats>> {
     common::ensure_kb_accessible(&pool, params.kb_id, &user.user_id, user.is_admin()).await?;
-    Ok(Json(page::stats(&pool, params.kb_id).await?))
+    let mut pages = page::list_meta(&pool, params.kb_id, None, None, i64::MAX, None).await?;
+    pages.extend(page::list_meta(&pool, params.kb_id, None, Some(wiki::STATUS_ARCHIVED), i64::MAX, None).await?);
+    let pages = filter_visible_pages(&pool, &pages, &user).await?;
+
+    let mut by_type = HashMap::<String, i64>::new();
+    let mut source_ids = HashSet::new();
+    let mut link_count = 0_i64;
+    let mut published = 0_i64;
+    let mut archived = 0_i64;
+    for current in &pages {
+        *by_type.entry(current.page_type.clone()).or_default() += 1;
+        if current.status == wiki::STATUS_PUBLISHED {
+            published += 1;
+        }
+        if current.status == wiki::STATUS_ARCHIVED {
+            archived += 1;
+        }
+        link_count += current.out_links.len() as i64;
+        source_ids.extend(page::source_file_ids(&pool, current.id).await?);
+    }
+    let mut by_type: Vec<page::TypeCount> = by_type
+        .into_iter()
+        .map(|(page_type, count)| page::TypeCount { page_type, count })
+        .collect();
+    by_type.sort_by(|left, right| left.page_type.cmp(&right.page_type));
+    Ok(Json(page::WikiStats {
+        kb_id: params.kb_id,
+        total: pages.len() as i64,
+        published,
+        archived,
+        by_type,
+        source_file_count: source_ids.len() as i64,
+        link_count,
+    }))
 }
 
 #[utoipa::path(get, path="/api/v1/knowledge/wiki/search", operation_id="wiki_search_pages", tag="wiki", params(WikiSearchParams), responses((status=200, body=WikiPageListResponse)))]
@@ -387,10 +472,20 @@ pub async fn search_pages(
     // 一次取回全部命中页：逐条 get_by_id 是 N+1，而 limit 上限是 100。
     let mut by_id: HashMap<i64, WikiPage> =
         page::get_by_ids(&pool, &ids).await?.into_iter().map(|page| (page.id, page)).collect();
+    let loaded_pages: Vec<WikiPage> = by_id.values().cloned().collect();
+    let visible_ids: HashSet<i64> = filter_visible_pages(&pool, &loaded_pages, &user)
+        .await?
+        .into_iter()
+        .map(|page| page.id)
+        .collect();
     let mut pages = Vec::new();
     for (candidate, _) in candidates {
         let Some(page) = by_id.remove(&candidate.id) else { continue };
-        if page.status == wiki::STATUS_PUBLISHED && page.version == candidate.version && page.kb_id == params.kb_id {
+        if visible_ids.contains(&page.id)
+            && page.status == wiki::STATUS_PUBLISHED
+            && page.version == candidate.version
+            && page.kb_id == params.kb_id
+        {
             pages.push(page);
         }
     }
@@ -405,14 +500,9 @@ pub async fn get_status(
     let resolved = wiki::resolve_config(&pool, params.kb_id).await?;
     let enabled = resolved.is_some_and(|config| config.enabled);
     let pending_tasks = wiki::queue::pending_count(&pool, params.kb_id).await?;
-    let page_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM wiki_pages WHERE status != 'withdrawn' AND kb_id = ? AND page_type != ? AND status != ?",
-    )
-    .bind(params.kb_id)
-    .bind(PAGE_TYPE_INDEX)
-    .bind(wiki::STATUS_ARCHIVED)
-    .fetch_one(&pool)
-    .await?;
+    let status_pages = page::list_meta(&pool, params.kb_id, None, None, i64::MAX, None).await?;
+    let status_pages = filter_visible_pages(&pool, &status_pages, &user).await?;
+    let page_count = status_pages.iter().filter(|page| !page.is_index()).count() as i64;
     let rows: Vec<(String, i64)> = sqlx::query_as(
         "SELECT b.status, COUNT(*) FROM wiki_builds b JOIN files f ON f.id = b.file_id
           WHERE f.kb_id = ? GROUP BY b.status",
@@ -447,6 +537,7 @@ pub async fn get_graph(
     common::ensure_kb_accessible(&pool, params.kb_id, &user.user_id, user.is_admin()).await?;
     // 图视图只用 slug/标题/摘要与出入链，正文不参与，走轻量投影。
     let pages = page::list_meta(&pool, params.kb_id, None, Some(wiki::STATUS_PUBLISHED), i64::MAX, None).await?;
+    let pages = filter_visible_pages(&pool, &pages, &user).await?;
     let by_slug: HashMap<String, &WikiPage> = pages.iter().map(|p| (p.slug.clone(), p)).collect();
 
     let selected: HashSet<String> = match params.center.as_deref().map(str::trim).filter(|v| !v.is_empty()) {
@@ -790,7 +881,7 @@ pub async fn update_page(
         editor_id: user.user_id.clone(),
     };
     let page = edit::apply_user_edit(&pool, req.kb_id, &req.slug, &edit).await?;
-    Ok(Json(build_detail(&pool, page).await?))
+    Ok(Json(build_detail(&pool, page, &user).await?))
 }
 
 #[utoipa::path(post, path="/api/v1/knowledge/wiki/page", operation_id="wiki_create_page", tag="wiki", request_body=WikiPageCreateReq, responses((status=200, body=WikiPageDetail)))]
@@ -809,7 +900,7 @@ pub async fn create_page(
         editor_id: user.user_id.clone(),
     };
     let page = edit::create_user_page(&pool, req.kb_id, &new).await?;
-    Ok(Json(build_detail(&pool, page).await?))
+    Ok(Json(build_detail(&pool, page, &user).await?))
 }
 
 #[utoipa::path(delete, path="/api/v1/knowledge/wiki/page", operation_id="wiki_delete_page", tag="wiki", request_body=WikiPageDeleteReq, responses((status=200, description="已删除")))]
@@ -828,6 +919,7 @@ pub async fn list_revisions(
     common::ensure_kb_accessible(&pool, params.kb_id, &user.user_id, user.is_admin()).await?;
     let limit = bounded_limit(params.limit, 50, 200)?;
     let page = require_page(&pool, params.kb_id, &params.slug).await?;
+    ensure_page_visible(&pool, &page, &user).await?;
     let items = revision::list(&pool, page.id, limit).await?;
     Ok(Json(WikiRevisionListResponse {
         kb_id: params.kb_id,
@@ -844,6 +936,7 @@ pub async fn get_revision(
 ) -> ApiResult<Json<WikiRevisionResponse>> {
     common::ensure_kb_accessible(&pool, params.kb_id, &user.user_id, user.is_admin()).await?;
     let page = require_page(&pool, params.kb_id, &params.slug).await?;
+    ensure_page_visible(&pool, &page, &user).await?;
     let Some(snapshot) = revision::get(&pool, page.id, params.version).await? else {
         return Err(ApiError::NotFound(format!("Revision {} not found", params.version)));
     };
@@ -860,7 +953,7 @@ pub async fn revert_page(
 ) -> ApiResult<Json<WikiPageDetail>> {
     common::ensure_kb_editor_or_admin(&pool, req.kb_id, &user).await?;
     let page = edit::revert(&pool, req.kb_id, &req.slug, req.version, &user.user_id).await?;
-    Ok(Json(build_detail(&pool, page).await?))
+    Ok(Json(build_detail(&pool, page, &user).await?))
 }
 
 #[utoipa::path(get, path="/api/v1/knowledge/wiki/lint", operation_id="wiki_lint", tag="wiki", params(WikiKbParams), responses((status=200, body=lint::LintReport)))]
@@ -868,7 +961,29 @@ pub async fn lint_kb(
     Query(params): Query<WikiKbParams>, State(pool): State<SqlitePool>, Extension(user): Extension<AuthUser>,
 ) -> ApiResult<Json<lint::LintReport>> {
     common::ensure_kb_accessible(&pool, params.kb_id, &user.user_id, user.is_admin()).await?;
-    Ok(Json(lint::lint_kb(&pool, params.kb_id).await?))
+    let mut report = lint::lint_kb(&pool, params.kb_id).await?;
+    let pages = page::list(&pool, params.kb_id, None, None, 20_000, None).await?;
+    let visible_ids: HashSet<i64> = filter_visible_pages(&pool, &pages, &user)
+        .await?
+        .into_iter()
+        .map(|page| page.id)
+        .collect();
+    report.issues.retain(|issue| visible_ids.contains(&issue.page_id));
+    let mut counts = HashMap::<String, usize>::new();
+    for issue in &report.issues {
+        *counts.entry(issue.kind.clone()).or_default() += 1;
+    }
+    report.scanned = visible_ids.len();
+    report.issue_count = report.issues.len();
+    report.truncated = report.issues.len() >= 500;
+    report.by_kind = counts
+        .into_iter()
+        .map(|(kind, count)| lint::LintKindCount { kind, count })
+        .collect();
+    report.by_kind.sort_by(|left, right| {
+        right.count.cmp(&left.count).then_with(|| left.kind.cmp(&right.kind))
+    });
+    Ok(Json(report))
 }
 
 /// 立即执行一次知识库收敛（交叉链接、死链清理、入链重算、索引目录），

@@ -943,6 +943,15 @@ pub async fn get(
         .bind(main_kb.parent_id)
         .fetch_all(&pool)
         .await?;
+    let path = if is_admin {
+        path
+    } else {
+        let visible_ids: std::collections::HashSet<i64> = get_user_viewable_kb_ids(&pool, &user_id, false)
+            .await
+            .into_iter()
+            .collect();
+        path.into_iter().filter(|ancestor| visible_ids.contains(&ancestor.id)).collect()
+    };
 
     // 4. Construct the response
     let response = KnowledgeDetailResponse {

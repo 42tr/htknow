@@ -381,10 +381,25 @@ impl HtknowMcp {
             .into_iter()
             .map(|page| (page.id, page))
             .collect();
+        let loaded_pages: Vec<wiki::WikiPage> = by_id.values().cloned().collect();
+        let visible_ids: std::collections::HashSet<i64> = wiki_api::filter_visible_pages(
+            &self.pool,
+            &loaded_pages,
+            &user,
+        )
+        .await
+        .map_err(api_err)?
+        .into_iter()
+        .map(|page| page.id)
+        .collect();
         let mut pages = Vec::new();
         for (candidate, _) in hits {
             let Some(page) = by_id.remove(&candidate.id) else { continue };
-            if page.status == wiki::STATUS_PUBLISHED && page.version == candidate.version && page.kb_id == params.kb_id {
+            if visible_ids.contains(&page.id)
+                && page.status == wiki::STATUS_PUBLISHED
+                && page.version == candidate.version
+                && page.kb_id == params.kb_id
+            {
                 pages.push(serde_json::json!({
                     "slug": page.slug, "title": page.title, "summary": page.summary,
                     "page_type": page.page_type, "updated_at": page.updated_at,
@@ -418,7 +433,7 @@ impl HtknowMcp {
             .await
             .map_err(|e| ErrorData::internal_error(format!("wiki page load failed: {e}"), None))?
             .ok_or_else(|| ErrorData::invalid_params(format!("wiki page {slug} not found in kb {}", params.kb_id), None))?;
-        let mut detail = wiki_api::build_detail(&self.pool, page).await.map_err(api_err)?;
+        let mut detail = wiki_api::build_detail(&self.pool, page, &user).await.map_err(api_err)?;
         let (content, truncated) = truncate_chars(&detail.content, WIKI_CONTENT_MAX_CHARS);
         detail.content = content;
 

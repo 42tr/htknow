@@ -101,10 +101,19 @@ jobs:
         with:
           node-version: 22
           cache: npm
-          cache-dependency-path: frontend/package-lock.json
+          cache-dependency-path: |
+            frontend/package-lock.json
+            mcp-app/package-lock.json
 
       - name: Build frontend (embedded into the Rust binary)
         working-directory: frontend
+        run: |
+          set -euo pipefail
+          npm ci --prefer-offline --no-audit --no-fund
+          npm run build
+
+      - name: Build MCP App (embedded into the Rust binary)
+        working-directory: mcp-app
         run: |
           set -euo pipefail
           npm ci --prefer-offline --no-audit --no-fund

@@ -1798,3 +1798,100 @@ async fn wiki_file_progress_is_visible_in_lists_details_stats_and_retry() {
     assert_eq!(stats["completed"], 1);
     assert_eq!(stats["processing"], 0);
 }
+
+#[tokio::test]
+async fn wiki_hides_pages_sourced_from_private_files_in_public_kb() {
+    let app = app().await;
+    let pool = get_pool().await;
+    let owner = TestUser::new("wiki-private-source-owner");
+    let outsider = TestUser::with_role("wiki-private-source-outsider", "user");
+    let kb_id = insert_kb(&pool, &owner, "public wiki with private source", "analysis", None, true).await;
+    let path = setup_env().data_dir.join(format!("private-wiki-source-{}.txt", next_seq()));
+    std::fs::write(&path, b"secret source").unwrap();
+    let file_id = insert_file(&pool, &owner, "private-source.txt", &path, Some(kb_id), vec![], false).await;
+    sqlx::query("UPDATE files SET status = 1 WHERE id = ?").bind(file_id).execute(&pool).await.unwrap();
+    htknow::wiki::page::upsert(
+        &pool,
+        &htknow::wiki::page::PageDraft {
+            kb_id,
+            slug: "entity/private-source".to_string(),
+            title: "Private source entity".to_string(),
+            page_type: htknow::wiki::PAGE_TYPE_ENTITY.to_string(),
+            summary: "private summary".to_string(),
+            content: "private generated content".to_string(),
+            aliases: Vec::new(),
+            edit_source: htknow::wiki::EDIT_SOURCE_PIPELINE.to_string(),
+            editor_id: String::new(),
+        },
+        &[file_id],
+        &[],
+    )
+    .await
+    .unwrap();
+
+    let page = app
+        .clone()
+        .oneshot(authed_empty_request(
+            "GET",
+            format!("/api/v1/knowledge/wiki/page?kb_id={kb_id}&slug=entity/private-source"),
+            &outsider,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(page.status(), StatusCode::NOT_FOUND);
+
+    let pages = app
+        .clone()
+        .oneshot(authed_empty_request(
+            "GET",
+            format!("/api/v1/knowledge/wiki/pages?kb_id={kb_id}"),
+            &outsider,
+        ))
+        .await
+        .unwrap();
+    assert!(response_json(pages).await["items"].as_array().unwrap().is_empty());
+
+    let index = app
+        .clone()
+        .oneshot(authed_empty_request(
+            "GET",
+            format!("/api/v1/knowledge/wiki/index?kb_id={kb_id}"),
+            &outsider,
+        ))
+        .await
+        .unwrap();
+    assert!(!response_json(index).await.to_string().contains("private-source"));
+
+    let graph = app
+        .clone()
+        .oneshot(authed_empty_request(
+            "GET",
+            format!("/api/v1/knowledge/wiki/graph?kb_id={kb_id}"),
+            &outsider,
+        ))
+        .await
+        .unwrap();
+    assert!(response_json(graph).await["nodes"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn knowledge_base_detail_hides_inaccessible_ancestors() {
+    let app = app().await;
+    let pool = get_pool().await;
+    let owner = TestUser::new("ancestor-owner");
+    let outsider = TestUser::with_role("ancestor-outsider", "user");
+    let parent_id = insert_kb(&pool, &owner, "private parent", "analysis", None, false).await;
+    let child_id = insert_kb(&pool, &owner, "public child", "analysis", Some(parent_id), true).await;
+
+    let response = app
+        .oneshot(authed_empty_request(
+            "GET",
+            format!("/api/v1/knowledge/knowledge_base/{child_id}"),
+            &outsider,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let detail = response_json(response).await;
+    assert!(detail["path"].as_array().unwrap().iter().all(|item| item["id"] != parent_id));
+}
