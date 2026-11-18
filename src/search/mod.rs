@@ -1045,7 +1045,13 @@ impl SearchEngine {
     pub async fn search(
         &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
     ) -> anyhow::Result<Vec<SearchResultItem>> {
-        let candidates = self.search_candidates(query, file_ids, kb_ids).await?;
+        self.search_with_embedding(query, file_ids, kb_ids, None).await
+    }
+
+    pub async fn search_with_embedding(
+        &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>, query_embedding: Option<Vec<f32>>,
+    ) -> anyhow::Result<Vec<SearchResultItem>> {
+        let candidates = self.search_candidates(query, file_ids, kb_ids, query_embedding).await?;
         if candidates.is_empty() {
             return Ok(candidates);
         }
@@ -1055,7 +1061,7 @@ impl SearchEngine {
     }
 
     async fn search_candidates(
-        &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
+        &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>, query_embedding: Option<Vec<f32>>,
     ) -> anyhow::Result<Vec<SearchResultItem>> {
         let total_start = Instant::now();
         debug!("Searching for query: {}", query);
@@ -1097,7 +1103,10 @@ impl SearchEngine {
         });
 
         let lancedb_started = Instant::now();
-        let lancedb_result = lancedb::search(query, file_ids, kb_ids).await;
+        let lancedb_result = match query_embedding.as_deref() {
+            Some(vector) => lancedb::search_with_vector(query, file_ids, kb_ids, vector).await,
+            None => lancedb::search(query, file_ids, kb_ids).await,
+        };
         debug!("LanceDB branch total {}ms", lancedb_started.elapsed().as_millis());
         let tantivy_result = tantivy_task.await.map_err(|err| anyhow!("Tantivy search task failed: {}", err))?;
 
@@ -1570,7 +1579,7 @@ impl SearchEngine {
 
         // Bound external embedding concurrency and rerank only once against the original question.
         let searches = futures::stream::iter(expanded_queries.clone().into_iter().enumerate())
-            .map(|(index, term)| async move { (index, self.search_candidates(&term, file_ids, kb_ids).await) })
+            .map(|(index, term)| async move { (index, self.search_candidates(&term, file_ids, kb_ids, None).await) })
             .buffered(4);
         let per_query: Vec<_> = searches.collect().await;
         let mut all_results: HashMap<i64, SearchResultItem> = HashMap::new();

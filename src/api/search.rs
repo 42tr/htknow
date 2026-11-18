@@ -385,9 +385,24 @@ pub(crate) async fn search_items_for_user(
         return Ok(vec![]);
     }
 
+    // Slice and Wiki vector recall use the same query embedding. Generate it once
+    // for configured embedding services and share it across both branches.
+    let shared_embedding = if crate::config::get().services.embedding_url.trim().is_empty() {
+        None
+    } else {
+        match crate::search::embedding::get_embedding(query).await {
+            Ok(vector) => Some(vector),
+            Err(err) => {
+                // An empty vector makes both vector branches fail fast and preserve
+                // their existing lexical fallbacks without issuing duplicate retries.
+                log::warn!("Shared query embedding failed, using lexical fallbacks: {}", err);
+                Some(Vec::new())
+            }
+        }
+    };
     let (searched, wiki_hits) = tokio::join!(
-        search_engine.search(query, file_id, kb_ids_to_search.as_ref()),
-        fetch_wiki_hits(search_engine, query, file_id, kb_ids_to_search.as_ref())
+        search_engine.search_with_embedding(query, file_id, kb_ids_to_search.as_ref(), shared_embedding.clone()),
+        fetch_wiki_hits(search_engine, query, file_id, kb_ids_to_search.as_ref(), shared_embedding.as_deref())
     );
     let raw_results = searched.map_err(|e| crate::api::error::ApiError::internal(format!("Search failed: {}", e)))?;
     let wiki_hits = wiki_hits?;
@@ -470,6 +485,7 @@ async fn resolve_scope_for_user(
 /// 避免开启 Wiki 后证据切片被大面积挤掉（RAG 场景下切片才是可引用证据）。
 async fn fetch_wiki_hits(
     engine: &SearchEngine, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>,
+    query_embedding: Option<&[f32]>,
 ) -> ApiResult<Vec<WikiHit>> {
     if file_ids.is_some_and(Vec::is_empty) {
         return Ok(Vec::new());
@@ -478,9 +494,12 @@ async fn fetch_wiki_hits(
     if wiki_limit == 0 {
         return Ok(Vec::new());
     }
-    engine.search_wiki_scoped(query, file_ids, kb_ids, wiki_limit).await.map_err(|e| {
+    engine
+        .search_wiki_scoped_with_embedding(query, file_ids, kb_ids, wiki_limit, query_embedding)
+        .await
+        .map_err(|e| {
         ApiError::internal(format!("Wiki search failed: {e}"))
-    })
+        })
 }
 
 /// Fuse independently ranked slice and Wiki lists. If Wiki has no hits, existing scores stay intact.
@@ -492,14 +511,26 @@ async fn merge_wiki_hits(
     if hits.is_empty() {
         return Ok(());
     }
-    let ids: Vec<_> = hits.iter().map(|(p, _)| p.kb_id).collect();
-    let kbs = get_kbs_by_ids(pool, &ids).await?;
+    let kb_ids: Vec<_> = hits.iter().map(|(p, _)| p.kb_id).collect();
+    let kbs = get_kbs_by_ids(pool, &kb_ids).await?;
+    let kb_permissions = super::knowledge_base::get_kb_permissions_batch(
+        pool,
+        &kb_ids,
+        &user.user_id,
+        user.is_admin(),
+    )
+    .await;
+    let page_ids: Vec<_> = hits.iter().map(|(p, _)| p.id).collect();
+    let loaded_pages = crate::wiki::page::get_by_ids(pool, &page_ids).await?;
+    let visible_pages = super::wiki::filter_visible_pages(pool, &loaded_pages, user).await?;
+    let visible_ids: std::collections::HashSet<i64> = visible_pages.into_iter().map(|page| page.id).collect();
+    let pages_by_id: HashMap<i64, crate::wiki::WikiPage> = loaded_pages.into_iter().map(|page| (page.id, page)).collect();
     let mut wiki_results = Vec::new();
     for (candidate, _) in hits {
-        if super::common::ensure_kb_accessible(pool, candidate.kb_id, &user.user_id, user.is_admin()).await.is_err() {
+        if !kb_permissions.contains_key(&candidate.kb_id) || !visible_ids.contains(&candidate.id) {
             continue;
         }
-        let Some(page) = crate::wiki::page::get_by_id(pool, candidate.id).await? else {
+        let Some(page) = pages_by_id.get(&candidate.id).cloned() else {
             continue;
         };
         // Recheck after recall: stale or concurrently changed pages must not leak old content.
@@ -831,7 +862,7 @@ pub async fn search_with_graph(
 
     let (searched, wiki_hits) = tokio::join!(
         search_engine.search_with_graph_expansion(&params.query, params.file_id.as_ref(), kb_ids_to_search.as_ref()),
-        fetch_wiki_hits(&search_engine, &params.query, params.file_id.as_ref(), kb_ids_to_search.as_ref())
+        fetch_wiki_hits(&search_engine, &params.query, params.file_id.as_ref(), kb_ids_to_search.as_ref(), None)
     );
     let raw_results =
         searched.map_err(|e| crate::api::error::ApiError::internal(format!("Graph search failed: {}", e)))?;

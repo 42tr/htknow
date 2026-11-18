@@ -367,18 +367,29 @@ pub async fn search(
         return Ok(Vec::new());
     }
 
-    let cfg = config::get();
-    let table = get_table()?;
-
     // 获取查询文本的 embedding
     let embedding_start = std::time::Instant::now();
     let query_vector = embedding::get_embedding(query).await?;
     debug!("LanceDB embedding {}ms", embedding_start.elapsed().as_millis());
 
+    search_with_vector(query, file_ids, kb_ids, &query_vector).await
+}
+
+/// Vector search using a caller-provided query embedding. Search endpoints that
+/// combine slice and Wiki recall can calculate the embedding once and share it.
+pub async fn search_with_vector(
+    _query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>, query_vector: &[f32],
+) -> Result<Vec<SearchResultItem>> {
+    let cfg = config::get();
+    let table = get_table()?;
+
     // 使用向量搜索
     let fast_search = vector_fast_search_enabled();
-    let mut query_builder =
-        table.query().nearest_to(query_vector)?.column("vector").select(Select::columns(SEARCH_SELECT_COLUMNS));
+    let mut query_builder = table
+        .query()
+        .nearest_to(query_vector.to_vec())?
+        .column("vector")
+        .select(Select::columns(SEARCH_SELECT_COLUMNS));
     if fast_search {
         query_builder = query_builder.fast_search();
     }

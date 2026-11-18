@@ -1,4 +1,10 @@
-use std::{collections::HashMap, path::Path, sync::Arc};
+use std::{
+    collections::HashMap,
+    fs::File,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use anyhow::Context;
 use arrow_array::{
@@ -295,6 +301,89 @@ pub async fn export_knowledge_bases(
     );
 
     Ok(export_dir_str)
+}
+
+/// Root directory for user-visible exports. Only its basename is exposed to
+/// clients; the server filesystem path never crosses the API boundary.
+pub fn export_root() -> PathBuf {
+    Path::new(&config::get().storage.files_path)
+        .parent()
+        .unwrap_or(Path::new("data"))
+        .join("exports")
+}
+
+/// Resolve an export directory from an opaque basename supplied by a client.
+/// Reject separators and traversal before joining to the export root.
+pub fn export_dir_for_id(export_id: &str) -> anyhow::Result<PathBuf> {
+    if export_id.is_empty()
+        || export_id == "."
+        || export_id == ".."
+        || export_id.contains('/')
+        || export_id.contains('\\')
+        || export_id.contains("..")
+    {
+        anyhow::bail!("invalid export id");
+    }
+    Ok(export_root().join(export_id))
+}
+
+/// Build a downloadable ZIP beside an export directory. The operation runs on
+/// a blocking thread because ZIP traversal and compression are synchronous.
+pub async fn archive_export(export_dir: &Path) -> anyhow::Result<PathBuf> {
+    let export_dir = export_dir.to_path_buf();
+    Ok(tokio::task::spawn_blocking(move || {
+        anyhow::ensure!(export_dir.is_dir(), "export directory does not exist");
+        let export_id = export_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .ok_or_else(|| anyhow::anyhow!("invalid export directory name"))?;
+        let archive_path = export_dir
+            .parent()
+            .ok_or_else(|| anyhow::anyhow!("export directory has no parent"))?
+            .join(format!("{}.zip", export_id));
+        let _ = std::fs::remove_file(&archive_path);
+        let file = File::create(&archive_path)?;
+        let mut zip = zip::ZipWriter::new(file);
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated)
+            .unix_permissions(0o600);
+        append_export_dir(&mut zip, &export_dir, &export_dir, options)?;
+        zip.finish()?;
+        Ok(archive_path)
+    })
+    .await??)
+}
+
+fn append_export_dir(
+    zip: &mut zip::ZipWriter<File>, root: &Path, current: &Path, options: zip::write::SimpleFileOptions,
+) -> anyhow::Result<()> {
+    for entry in std::fs::read_dir(current)? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.file_type().is_symlink() {
+            continue;
+        }
+        if metadata.is_dir() {
+            append_export_dir(zip, root, &path, options)?;
+            continue;
+        }
+        if !metadata.is_file() {
+            continue;
+        }
+        let relative = path.strip_prefix(root)?.to_string_lossy().replace('\\', "/");
+        zip.start_file(relative, options)?;
+        let mut input = File::open(path)?;
+        let mut buffer = [0u8; 128 * 1024];
+        loop {
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            zip.write_all(&buffer[..count])?;
+        }
+    }
+    Ok(())
 }
 
 async fn collect_kb_ids(pool: &SqlitePool, root_kb_ids: &[i64], include_children: bool) -> anyhow::Result<Vec<i64>> {
@@ -1774,6 +1863,34 @@ mod tests {
                 .fetch_one(&dst)
                 .await?;
         assert_eq!(mention_file, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn export_archive_is_safe_and_contains_export_files() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let export_dir = root.path().join("kb_1_test");
+        std::fs::create_dir_all(export_dir.join("files"))?;
+        std::fs::write(export_dir.join("manifest.json"), b"{}")?;
+        std::fs::write(export_dir.join("files").join("note.txt"), b"hello")?;
+
+        let archive = tokio::task::spawn_blocking({
+            let export_dir = export_dir.clone();
+            move || {
+                let file = File::create(export_dir.with_extension("zip"))?;
+                let mut zip = zip::ZipWriter::new(file);
+                let options = zip::write::SimpleFileOptions::default();
+                append_export_dir(&mut zip, &export_dir, &export_dir, options)?;
+                zip.finish()?;
+                Ok::<_, anyhow::Error>(export_dir.with_extension("zip"))
+            }
+        })
+        .await??;
+        let mut reader = zip::ZipArchive::new(File::open(archive)?)?;
+        let mut note = String::new();
+        reader.by_name("files/note.txt")?.read_to_string(&mut note)?;
+        assert_eq!(note, "hello");
+        assert!(export_dir_for_id("../escape").is_err());
         Ok(())
     }
 }

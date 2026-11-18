@@ -138,7 +138,8 @@ const addExportRecord = (result) => {
   const record = {
     id: Date.now(),
     timestamp: new Date().toISOString(),
-    exportPath: result.export_path || '',
+    exportId: result.export_id || '',
+    downloadUrl: result.download_url || '',
     kbNames: manifest.kb_names || [],
     kbCount: manifest.kb_ids?.length || 0,
     kb_ids: manifest.kb_ids || [],

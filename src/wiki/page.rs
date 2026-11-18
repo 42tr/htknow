@@ -4,6 +4,7 @@ use anyhow::Result;
 use log::debug;
 use serde::Serialize;
 use sqlx::{Row, SqlitePool};
+use std::collections::HashSet;
 use utoipa::ToSchema;
 
 use super::{EDIT_SOURCE_PIPELINE, STATUS_ARCHIVED, STATUS_PUBLISHED, WikiPage, revision};
@@ -467,6 +468,27 @@ pub async fn source_file_ids(pool: &SqlitePool, page_id: i64) -> Result<Vec<i64>
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(|(id,)| id).collect())
+}
+
+/// Return the distinct source files for a batch of pages in bounded queries.
+/// Statistics and search result assembly should not issue one query per page.
+pub async fn source_file_ids_for_pages(pool: &SqlitePool, page_ids: &[i64]) -> Result<HashSet<i64>> {
+    let mut result = HashSet::new();
+    for batch in page_ids.chunks(500) {
+        if batch.is_empty() {
+            continue;
+        }
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT DISTINCT file_id FROM wiki_page_sources WHERE page_id IN (",
+        );
+        let mut ids = qb.separated(", ");
+        for page_id in batch {
+            ids.push_bind(page_id);
+        }
+        ids.push_unseparated(")");
+        result.extend(qb.build_query_scalar::<i64>().fetch_all(pool).await?);
+    }
+    Ok(result)
 }
 
 pub async fn slice_ref_ids(pool: &SqlitePool, page_id: i64) -> Result<Vec<i64>> {

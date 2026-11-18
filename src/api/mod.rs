@@ -42,6 +42,7 @@ use crate::search::SearchEngine;
         knowledge_base::delete,
         knowledge_base::tree,
         knowledge_base::batch_export_kb,
+        knowledge_base::download_export,
         knowledge_base::list_permissions,
         knowledge_base::add_permission,
         knowledge_base::remove_permission,
@@ -254,6 +255,7 @@ pub fn app(pool: SqlitePool, search_engine: SearchEngine) -> Router {
         .route("/{id}/files", get(knowledge_base::get_files))
         .route("/{id}/tags", get(knowledge_base::get_tags))
         .route("/export", post(knowledge_base::batch_export_kb))
+        .route("/export/{export_id}/download", get(knowledge_base::download_export))
         .route("/tree", get(knowledge_base::tree))
         .route("/{id}", get(knowledge_base::get).put(knowledge_base::update).delete(knowledge_base::delete))
         .route("/{id}/permissions", get(knowledge_base::list_permissions).post(knowledge_base::add_permission))

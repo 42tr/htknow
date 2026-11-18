@@ -251,6 +251,24 @@ pub async fn search(
         return Ok(Vec::new());
     }
     let vector = embedding::get_embedding(query).await?;
+    search_with_vector(pool, page_ids, kb_ids, limit, &vector).await
+}
+
+/// Search using a caller-provided embedding so mixed slice/Wiki searches do not
+/// send the same query to the embedding service twice.
+pub async fn search_with_vector(
+    pool: &sqlx::SqlitePool, page_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>, limit: usize, vector: &[f32],
+) -> Result<Vec<(i64, String)>> {
+    if limit == 0 || kb_ids.is_some_and(Vec::is_empty) || page_ids.is_some_and(Vec::is_empty) {
+        return Ok(Vec::new());
+    }
+    let Some(table) = TABLE.get() else {
+        return Ok(Vec::new());
+    };
+    let total = table.count_rows(None).await?;
+    if total == 0 {
+        return Ok(Vec::new());
+    }
     let mut filters = Vec::new();
     if let Some(ids) = kb_ids {
         filters.push(format!("kb_id IN ({})", ids.iter().map(ToString::to_string).collect::<Vec<_>>().join(",")));
@@ -262,7 +280,7 @@ pub async fn search(
     let mut requested = limit.min(total);
     loop {
         let mut search =
-            table.query().nearest_to(vector.clone())?.column("vector").select(Select::columns(&["id", "fingerprint"]));
+            table.query().nearest_to(vector.to_vec())?.column("vector").select(Select::columns(&["id", "fingerprint"]));
         if !filters.is_empty() {
             search = search.only_if(filters.join(" AND "));
         }

@@ -2,12 +2,15 @@ use std::collections::HashMap;
 
 use axum::{
     Extension,
+    body::Body,
     extract::{Path, Query, State},
-    response::Json,
+    http::{StatusCode, header},
+    response::{Json, Response},
 };
 use log::warn;
 use serde::{Deserialize, Serialize};
 use sqlx::{QueryBuilder, Row, Sqlite, SqlitePool};
+use tokio_util::io::ReaderStream;
 use utoipa::{IntoParams, ToSchema};
 
 use super::file::{self, FileStatusBreakdown};
@@ -115,44 +118,47 @@ pub async fn get_kb_permissions_batch(
         set.into_iter().collect()
     };
 
-    // Query 1: owner + is_public for each KB.
-    let mut kb_qb = QueryBuilder::<Sqlite>::new("SELECT id, user_id, is_public FROM knowledge_bases WHERE id IN (");
-    {
-        let mut sep = kb_qb.separated(", ");
-        for id in &unique_ids {
-            sep.push_bind(*id);
+    // Keep each pair of IN queries below SQLite's bind-variable limit.
+    for chunk in unique_ids.chunks(500) {
+        // Query 1: owner + is_public for each KB.
+        let mut kb_qb = QueryBuilder::<Sqlite>::new("SELECT id, user_id, is_public FROM knowledge_bases WHERE id IN (");
+        {
+            let mut sep = kb_qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(*id);
+            }
         }
-    }
-    kb_qb.push(")");
-    let kb_rows: Vec<(i64, String, i64)> = kb_qb.build_query_as().fetch_all(pool).await.unwrap_or_default();
+        kb_qb.push(")");
+        let kb_rows: Vec<(i64, String, i64)> = kb_qb.build_query_as().fetch_all(pool).await.unwrap_or_default();
 
-    // Query 2: explicit permissions for this user.
-    let mut perm_qb = QueryBuilder::<Sqlite>::new("SELECT kb_id, permission FROM kb_permissions WHERE user_id = ");
-    perm_qb.push_bind(user_id);
-    perm_qb.push(" AND kb_id IN (");
-    {
-        let mut sep = perm_qb.separated(", ");
-        for id in &unique_ids {
-            sep.push_bind(*id);
+        // Query 2: explicit permissions for this user.
+        let mut perm_qb = QueryBuilder::<Sqlite>::new("SELECT kb_id, permission FROM kb_permissions WHERE user_id = ");
+        perm_qb.push_bind(user_id);
+        perm_qb.push(" AND kb_id IN (");
+        {
+            let mut sep = perm_qb.separated(", ");
+            for id in chunk {
+                sep.push_bind(*id);
+            }
         }
-    }
-    perm_qb.push(")");
-    let perm_rows: Vec<(i64, String)> = perm_qb.build_query_as().fetch_all(pool).await.unwrap_or_default();
-    let explicit: HashMap<i64, String> = perm_rows.into_iter().collect();
+        perm_qb.push(")");
+        let perm_rows: Vec<(i64, String)> = perm_qb.build_query_as().fetch_all(pool).await.unwrap_or_default();
+        let explicit: HashMap<i64, String> = perm_rows.into_iter().collect();
 
-    for (id, owner, is_public) in kb_rows {
-        // Priority: owner > explicit permission > is_public.
-        let perm = if owner == user_id {
-            Some("admin".to_string())
-        } else if let Some(p) = explicit.get(&id) {
-            Some(p.clone())
-        } else if is_public == 1 {
-            Some("viewer".to_string())
-        } else {
-            None
-        };
-        if let Some(perm) = perm {
-            result.insert(id, perm);
+        for (id, owner, is_public) in kb_rows {
+            // Priority: owner > explicit permission > is_public.
+            let perm = if owner == user_id {
+                Some("admin".to_string())
+            } else if let Some(p) = explicit.get(&id) {
+                Some(p.clone())
+            } else if is_public == 1 {
+                Some("viewer".to_string())
+            } else {
+                None
+            };
+            if let Some(perm) = perm {
+                result.insert(id, perm);
+            }
         }
     }
 
@@ -1023,24 +1029,19 @@ pub async fn get_files(
     };
 
     if let Some(tag) = tag {
-        let mut qb = QueryBuilder::<Sqlite>::new(
+        let mut count_qb = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM files WHERE kb_id = ");
+        count_qb.push_bind(id);
+        push_filters(&mut count_qb);
+        count_qb.push(" AND json_valid(tags) AND EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ").push_bind(tag).push(")");
+        let total: i64 = count_qb.build_query_scalar().fetch_one(&pool).await?;
+
+        let mut list_qb = QueryBuilder::<Sqlite>::new(
             "SELECT id, user_id, user_name, hash, filename, path, size, tags, status, log, slice_type, kb_id, is_public, meta, summary, created_at, updated_at FROM files WHERE kb_id = ",
         );
-        qb.push_bind(id);
-        push_filters(&mut qb);
-        qb.push(" ORDER BY updated_at DESC");
-        let rows: Vec<FileWithoutContent> = qb.build_query_as().fetch_all(&pool).await?;
-        let filtered: Vec<FileWithoutContent> = rows
-            .into_iter()
-            .filter(|f| {
-                serde_json::from_str::<Vec<String>>(&f.tags)
-                    .map(|tags| tags.contains(&tag.to_string()))
-                    .unwrap_or(false)
-            })
-            .collect();
-        let total = filtered.len() as i64;
-        let mut items: Vec<FileWithoutContent> =
-            filtered.into_iter().skip(offset as usize).take(limit as usize).collect();
+        list_qb.push_bind(id);
+        push_filters(&mut list_qb);
+        list_qb.push(" AND json_valid(tags) AND EXISTS (SELECT 1 FROM json_each(tags) WHERE json_each.value = ").push_bind(tag).push(") ORDER BY updated_at DESC LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
+        let mut items: Vec<FileWithoutContent> = list_qb.build_query_as().fetch_all(&pool).await?;
         populate_file_progress(&pool, &mut items).await?;
         return Ok(Json(KnowledgeBaseFilesResponse { total, items }));
     }
@@ -1734,7 +1735,8 @@ pub async fn tree(
 
 #[derive(Serialize, ToSchema)]
 pub struct ExportKbResponse {
-    pub export_path: String,
+    pub export_id: String,
+    pub download_url: String,
     pub manifest: crate::export::ExportManifest,
 }
 
@@ -1771,16 +1773,17 @@ pub async fn batch_export_kb(
         return Err(ApiError::BadRequest("kb_ids cannot be empty".to_string()));
     }
 
-    // Verify all knowledge bases exist and user has access (viewer or above)
-    let mut allowed_ids = Vec::new();
-    for kb_id in &req.kb_ids {
-        let perm = get_kb_permission(&pool, *kb_id, &auth_user.user_id, is_admin).await;
-        if perm.is_some() {
-            allowed_ids.push(*kb_id);
-        }
-    }
+    // Export contains every file in the selected KB. Require editor access so a
+    // viewer of a public KB cannot export private files stored in that KB.
+    let permissions = get_kb_permissions_batch(&pool, &req.kb_ids, &auth_user.user_id, is_admin).await;
+    let allowed_ids: Vec<i64> = req
+        .kb_ids
+        .iter()
+        .copied()
+        .filter(|id| meets_requirement(permissions.get(id).map(String::as_str), "editor"))
+        .collect();
     if allowed_ids.is_empty() {
-        return Err(ApiError::NotFound("No knowledge bases found or permission denied.".to_string()));
+        return Err(ApiError::Forbidden("Export requires editor or admin permission.".to_string()));
     }
 
     if allowed_ids.len() != req.kb_ids.len() {
@@ -1798,7 +1801,7 @@ pub async fn batch_export_kb(
         }
         expanded.sort_unstable();
         expanded.dedup();
-        let authorized = common::filter_kb_ids_by_permission(&pool, &expanded, &auth_user, "viewer").await;
+        let authorized = common::filter_kb_ids_by_permission(&pool, &expanded, &auth_user, "editor").await;
         if authorized.len() != expanded.len() {
             warn!(
                 "User {} export skipped {} descendant knowledge base(s) without access",
@@ -1826,7 +1829,73 @@ pub async fn batch_export_kb(
     let manifest: crate::export::ExportManifest = serde_json::from_str(&manifest_json)
         .map_err(|e| ApiError::Internal(format!("Failed to parse manifest: {}", e)))?;
 
-    Ok(Json(ExportKbResponse { export_path, manifest }))
+    let export_id = std::path::Path::new(&export_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| ApiError::Internal("Export path has no valid identifier".to_string()))?
+        .to_string();
+    crate::export::archive_export(std::path::Path::new(&export_path))
+        .await
+        .map_err(|e| ApiError::Internal(format!("Failed to package export: {}", e)))?;
+    let download_url = format!("/api/v1/knowledge/knowledge_base/export/{}/download", export_id);
+
+    Ok(Json(ExportKbResponse { export_id, download_url, manifest }))
+}
+
+/// Download a previously generated export archive.
+#[utoipa::path(
+    get,
+    path = "/api/v1/knowledge/knowledge_base/export/{export_id}/download",
+    operation_id = "knowledge_base_export_download",
+    tag = "knowledge_base",
+    params(("export_id" = String, Path, description = "导出任务 ID")),
+    responses((status = 200, description = "导出压缩包"), (status = 404, description = "导出不存在")),
+    security(("x-user-id" = []), ("x-role" = []))
+)]
+pub async fn download_export(
+    State(pool): State<SqlitePool>, Extension(auth_user): Extension<AuthUser>, Path(export_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let export_dir = crate::export::export_dir_for_id(&export_id)
+        .map_err(|_| ApiError::NotFound("Export not found".to_string()))?;
+    let manifest_path = export_dir.join("manifest.json");
+    let manifest_json = tokio::fs::read_to_string(&manifest_path)
+        .await
+        .map_err(|_| ApiError::NotFound("Export not found".to_string()))?;
+    let manifest: crate::export::ExportManifest = serde_json::from_str(&manifest_json)
+        .map_err(|_| ApiError::NotFound("Export manifest is invalid".to_string()))?;
+
+    // Permission can change after export creation; re-check every target KB before
+    // serving the snapshot instead of trusting a client-held download URL.
+    let permissions = get_kb_permissions_batch(&pool, &manifest.kb_ids, &auth_user.user_id, auth_user.is_admin()).await;
+    let authorized_count = manifest
+        .kb_ids
+        .iter()
+        .filter(|id| meets_requirement(permissions.get(id).map(String::as_str), "editor"))
+        .count();
+    if authorized_count != manifest.kb_ids.iter().collect::<std::collections::HashSet<_>>().len() {
+        return Err(ApiError::NotFound("Export not found".to_string()));
+    }
+
+    let archive_path = export_dir
+        .parent()
+        .ok_or_else(|| ApiError::NotFound("Export not found".to_string()))?
+        .join(format!("{}.zip", export_id));
+    if !archive_path.is_file() {
+        crate::export::archive_export(&export_dir)
+            .await
+            .map_err(|_| ApiError::NotFound("Export not found".to_string()))?;
+    }
+    let file = tokio::fs::File::open(&archive_path).await.map_err(|_| ApiError::NotFound("Export not found".to_string()))?;
+    let length = file.metadata().await?.len();
+    let body = Body::from_stream(ReaderStream::new(file));
+    let filename = format!("{}.zip", export_id);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/zip")
+        .header(header::CONTENT_LENGTH, length)
+        .header(header::CONTENT_DISPOSITION, common::content_disposition("attachment", &filename))
+        .body(body)
+        .map_err(|e| ApiError::Internal(format!("Failed to build download response: {}", e)))
 }
 
 // ---------------------------------------------------------------------------

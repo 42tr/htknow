@@ -1,5 +1,6 @@
 <script setup>
 import { ref, computed, onMounted } from 'vue'
+import { api } from '../api.js'
 
 const STORAGE_KEY = 'htknow_export_records'
 const MAX_RECORDS = 50
@@ -41,12 +42,12 @@ const handleClear = () => {
   emit('clear')
 }
 
-const copyPath = async (path) => {
+const downloadExport = async (record) => {
+  if (!record.exportId) return
   try {
-    await navigator.clipboard.writeText(path)
-    alert('路径已复制到剪贴板')
-  } catch {
-    alert('复制失败')
+    await api.downloadExport(record.exportId, `${record.exportId}.zip`)
+  } catch (error) {
+    alert(error?.message || '下载失败')
   }
 }
 </script>
@@ -112,12 +113,12 @@ const copyPath = async (path) => {
               </div>
             </div>
             <button
-              @click="copyPath(record.exportPath)"
+              @click="downloadExport(record)"
               class="shrink-0 p-1.5 text-slate-400 hover:text-blue-500 hover:bg-blue-50 rounded-lg transition-colors"
-              title="复制导出路径"
+              title="下载导出文件"
             >
               <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M8 16H6a2 2 0 01-2-2V6a2 2 0 012-2h8a2 2 0 012 2v2m-6 12h8a2 2 0 002-2v-8a2 2 0 00-2-2h-8a2 2 0 00-2 2v8a2 2 0 002 2z" />
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M12 3v12m0 0 4-4m-4 4-4-4M5 21h14" />
               </svg>
             </button>
           </div>

@@ -291,24 +291,29 @@ pub(crate) async fn filter_visible_pages(
         return Ok(Vec::new());
     }
 
-    let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-        "SELECT p.id FROM wiki_pages p WHERE p.id IN (",
-    );
-    {
-        let mut ids = qb.separated(", ");
-        for page in &pages {
-            ids.push_bind(page.id);
+    // SQLite has a finite bind-variable limit. Keep the permission query bounded
+    // so a large knowledge base cannot turn the visibility check into a SQL error.
+    let mut visible = HashSet::with_capacity(pages.len());
+    for batch in pages.chunks(500) {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT p.id FROM wiki_pages p WHERE p.id IN (",
+        );
+        {
+            let mut ids = qb.separated(", ");
+            for page in batch {
+                ids.push_bind(page.id);
+            }
         }
-    }
-    qb.push(") AND NOT EXISTS (SELECT 1 FROM wiki_page_sources s LEFT JOIN files f ON f.id = s.file_id WHERE s.page_id = p.id AND (f.id IS NULL OR NOT (f.user_id = ");
-    qb.push_bind(user.user_id.clone());
-    qb.push(" OR (f.kb_id IS NULL AND f.is_public = 1) OR f.kb_id IN (SELECT id FROM knowledge_bases WHERE user_id = ");
-    qb.push_bind(user.user_id.clone());
-    qb.push(") OR f.kb_id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ");
-    qb.push_bind(user.user_id.clone());
-    qb.push(") OR (f.is_public = 1 AND f.kb_id IN (SELECT id FROM knowledge_bases WHERE is_public = 1)))))");
+        qb.push(") AND NOT EXISTS (SELECT 1 FROM wiki_page_sources s LEFT JOIN files f ON f.id = s.file_id WHERE s.page_id = p.id AND (f.id IS NULL OR NOT (f.user_id = ");
+        qb.push_bind(user.user_id.clone());
+        qb.push(" OR (f.kb_id IS NULL AND f.is_public = 1) OR f.kb_id IN (SELECT id FROM knowledge_bases WHERE user_id = ");
+        qb.push_bind(user.user_id.clone());
+        qb.push(") OR f.kb_id IN (SELECT kb_id FROM kb_permissions WHERE user_id = ");
+        qb.push_bind(user.user_id.clone());
+        qb.push(") OR (f.is_public = 1 AND f.kb_id IN (SELECT id FROM knowledge_bases WHERE is_public = 1)))))");
 
-    let visible: HashSet<i64> = qb.build_query_scalar().fetch_all(pool).await?.into_iter().collect();
+        visible.extend(qb.build_query_scalar::<i64>().fetch_all(pool).await?);
+    }
     Ok(pages.iter().filter(|page| visible.contains(&page.id)).cloned().collect())
 }
 
@@ -421,7 +426,7 @@ pub async fn get_stats(
     let pages = filter_visible_pages(&pool, &pages, &user).await?;
 
     let mut by_type = HashMap::<String, i64>::new();
-    let mut source_ids = HashSet::new();
+    let page_ids: Vec<i64> = pages.iter().map(|page| page.id).collect();
     let mut link_count = 0_i64;
     let mut published = 0_i64;
     let mut archived = 0_i64;
@@ -434,8 +439,8 @@ pub async fn get_stats(
             archived += 1;
         }
         link_count += current.out_links.len() as i64;
-        source_ids.extend(page::source_file_ids(&pool, current.id).await?);
     }
+    let source_ids = page::source_file_ids_for_pages(&pool, &page_ids).await?;
     let mut by_type: Vec<page::TypeCount> = by_type
         .into_iter()
         .map(|(page_type, count)| page::TypeCount { page_type, count })

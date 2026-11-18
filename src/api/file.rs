@@ -604,10 +604,13 @@ pub async fn upload(
                         let mut file = tokio::fs::File::create(filepath.clone()).await?;
 
                         // 把 SHA-256 计算卸载到阻塞线程，避免在异步循环里做 CPU 密集哈希。
-                        let (hash_tx, hash_rx) = std::sync::mpsc::channel::<Bytes>();
+                        // Keep a bounded queue between the async upload stream and the
+                        // blocking hasher. A slow hasher must apply backpressure instead
+                        // of allowing an unbounded amount of upload data to accumulate.
+                        let (hash_tx, mut hash_rx) = tokio::sync::mpsc::channel::<Bytes>(8);
                         let hash_handle = tokio::task::spawn_blocking(move || {
                             let mut hasher = Sha256::new();
-                            while let Ok(chunk) = hash_rx.recv() {
+                            while let Some(chunk) = hash_rx.blocking_recv() {
                                 hasher.update(&chunk);
                             }
                             hex::encode(hasher.finalize())
@@ -617,7 +620,7 @@ pub async fn upload(
                         while let Some(chunk) = field.chunk().await? {
                             size += chunk.len() as i64;
                             file.write_all(&chunk).await?;
-                            if hash_tx.send(chunk).is_err() {
+                            if hash_tx.send(chunk).await.is_err() {
                                 break;
                             }
                         }
@@ -723,6 +726,10 @@ pub async fn upload(
     let mut uploaded_file_ids: Vec<i64> = Vec::new();
     let mut parse_file_ids: Vec<i64> = Vec::new();
 
+    // Register the whole multipart batch atomically. If any metadata insert fails,
+    // the transaction rolls back and TempFileGuard removes every uploaded file.
+    let mut insert_tx = pool.begin().await?;
+    let mut inserted_files: Vec<(i64, String)> = Vec::with_capacity(files_data.len());
     for (hash, filename, filepath, size) in files_data {
         let sql = "INSERT INTO files (user_id, user_name, hash, filename, path, size, slice_type, kb_id, is_public, tags, status, log, meta) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
         let id = sqlx::query(sql)
@@ -739,12 +746,18 @@ pub async fn upload(
             .bind(status)
             .bind(log_message)
             .bind(meta.clone())
-            .execute(&pool)
+            .execute(&mut *insert_tx)
             .await?
             .last_insert_rowid();
-        // 已经有数据库行引用这个路径，后续生命周期由文件记录负责。
-        temp_guard.release(&filepath);
+        inserted_files.push((id, filepath));
+    }
+    insert_tx.commit().await?;
+    for (_, filepath) in &inserted_files {
+        // The database rows now own the uploaded paths.
+        temp_guard.release(filepath);
+    }
 
+    for (id, _filepath) in inserted_files {
         let mut file: File = sqlx::query_as(&format!("SELECT {FILE_COLS_NO_CONTENT} FROM files WHERE id = ?"))
             .bind(id)
             .fetch_one(&pool)
@@ -864,7 +877,15 @@ pub async fn upload(
                 }));
             }
             for handle in handles {
-                handle.await.map_err(|e| ApiError::internal(format!("parse join error: {}", e)))??;
+                // Processing is per-file work. The upload metadata transaction has
+                // already committed, so one parser failure must be reflected in
+                // that file's status instead of turning the whole HTTP request into
+                // a retryable batch failure that creates duplicates.
+                match handle.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => warn!("Synchronous parse failed after upload: {}", err),
+                    Err(err) => warn!("Synchronous parse task panicked after upload: {}", err),
+                }
             }
             uploaded_files.clear();
             if !uploaded_file_ids.is_empty() {
@@ -2423,39 +2444,42 @@ pub async fn list(
     let tag = query.tag.as_deref().filter(|s| !s.is_empty());
 
     if let Some(tag) = tag {
-        let mut qb = QueryBuilder::<Sqlite>::new(&format!("SELECT {FILE_COLS_NO_CONTENT} FROM files f WHERE 1=1"));
+        let mut count_qb = QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM files f WHERE 1=1");
         match kb_filter {
             Some(None) => {
-                qb.push(" AND f.kb_id IS NULL");
+                count_qb.push(" AND f.kb_id IS NULL");
             }
             Some(Some(kb_id)) => {
-                qb.push(" AND f.kb_id = ").push_bind(kb_id);
+                count_qb.push(" AND f.kb_id = ").push_bind(kb_id);
             }
             None => {}
         }
         if !is_admin {
-            qb.push(" AND ");
-            common::push_file_access_filter(&mut qb, &user_id, Some("f"));
+            count_qb.push(" AND ");
+            common::push_file_access_filter(&mut count_qb, &user_id, Some("f"));
         }
-        qb.push(" ORDER BY f.created_at DESC");
-        let mut files: Vec<File> = qb.build_query_as().fetch_all(&pool).await?;
-        files.retain(|file: &File| {
-            if let Ok(tags) = serde_json::from_str::<Vec<String>>(&file.tags) {
-                tags.contains(&tag.to_string())
-            } else {
-                false
+        count_qb.push(" AND json_valid(f.tags) AND EXISTS (SELECT 1 FROM json_each(f.tags) WHERE json_each.value = ").push_bind(tag).push(")");
+        let total: i64 = count_qb.build_query_scalar().fetch_one(&pool).await?;
+
+        let mut list_qb = QueryBuilder::<Sqlite>::new(&format!("SELECT {FILE_COLS_NO_CONTENT} FROM files f WHERE 1=1"));
+        match kb_filter {
+            Some(None) => {
+                list_qb.push(" AND f.kb_id IS NULL");
             }
-        });
-        let total = files.len() as i64;
-        let mut items: Vec<File> = files
-            .into_iter()
-            .skip(offset as usize)
-            .take(limit as usize)
-            .map(|mut file| {
-                file.content = None;
-                file
-            })
-            .collect();
+            Some(Some(kb_id)) => {
+                list_qb.push(" AND f.kb_id = ").push_bind(kb_id);
+            }
+            None => {}
+        }
+        if !is_admin {
+            list_qb.push(" AND ");
+            common::push_file_access_filter(&mut list_qb, &user_id, Some("f"));
+        }
+        list_qb.push(" AND json_valid(f.tags) AND EXISTS (SELECT 1 FROM json_each(f.tags) WHERE json_each.value = ").push_bind(tag).push(") ORDER BY f.created_at DESC LIMIT ").push_bind(limit).push(" OFFSET ").push_bind(offset);
+        let mut items: Vec<File> = list_qb.build_query_as().fetch_all(&pool).await?;
+        for file in &mut items {
+            file.content = None;
+        }
         crate::wiki::file_status::populate(&pool, &mut items).await?;
         return Ok(Json(FileListResponse { total, items }));
     }

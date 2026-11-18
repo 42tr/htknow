@@ -21,20 +21,11 @@ const selectedCount = computed(() => selected.value.size)
 const selectedIds = computed(() => Array.from(selected.value.keys()))
 const selectedNames = computed(() => Array.from(selected.value.values()).map((kb) => kb.name))
 
-const loadBranch = async (parentId = null) => {
-  const result = await api.getKnowledgeBases(parentId)
-  const nodes = result.items || []
-  return Promise.all(nodes.map(async (kb) => ({
-    ...kb,
-    children: await loadBranch(kb.id),
-  })))
-}
-
 const loadTree = async () => {
   loading.value = true
   error.value = ''
   try {
-    tree.value = await loadBranch()
+    tree.value = await api.getKnowledgeBaseTree()
   } catch (err) {
     error.value = err?.message || '加载知识库目录失败'
   } finally {

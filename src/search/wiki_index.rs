@@ -122,6 +122,13 @@ impl WikiIndex {
     pub async fn recall(
         &self, pool: &SqlitePool, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>, limit: usize,
     ) -> Result<Vec<(IndexedPage, f32)>> {
+        self.recall_with_embedding(pool, query, file_ids, kb_ids, limit, None).await
+    }
+
+    pub async fn recall_with_embedding(
+        &self, pool: &SqlitePool, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>, limit: usize,
+        query_embedding: Option<&[f32]>,
+    ) -> Result<Vec<(IndexedPage, f32)>> {
         if query.trim().is_empty() || kb_ids.is_some_and(Vec::is_empty) || file_ids.is_some_and(Vec::is_empty) {
             return Ok(Vec::new());
         }
@@ -161,7 +168,10 @@ impl WikiIndex {
                 limit,
             )
         });
-        let vector = super::wiki_vector::search(pool, query, page_ids.as_ref(), kb_ids, limit).await;
+        let vector = match query_embedding {
+            Some(vector) => super::wiki_vector::search_with_vector(pool, page_ids.as_ref(), kb_ids, limit, vector).await,
+            None => super::wiki_vector::search(pool, query, page_ids.as_ref(), kb_ids, limit).await,
+        };
         let lexical = lexical_task
             .await
             .map_err(|err| anyhow::anyhow!("Wiki lexical search task failed: {}", err))??;
@@ -221,8 +231,17 @@ impl SearchEngine {
     pub async fn search_wiki_scoped(
         &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>, limit: usize,
     ) -> Result<Vec<(IndexedPage, f32)>> {
+        self.search_wiki_scoped_with_embedding(query, file_ids, kb_ids, limit, None).await
+    }
+
+    pub async fn search_wiki_scoped_with_embedding(
+        &self, query: &str, file_ids: Option<&Vec<i64>>, kb_ids: Option<&Vec<i64>>, limit: usize,
+        query_embedding: Option<&[f32]>,
+    ) -> Result<Vec<(IndexedPage, f32)>> {
         let pool = self.pool.as_ref().ok_or_else(|| anyhow::anyhow!("search engine db pool not set"))?;
-        self.wiki_index.recall(pool, query, file_ids, kb_ids, limit).await
+        self.wiki_index
+            .recall_with_embedding(pool, query, file_ids, kb_ids, limit, query_embedding)
+            .await
     }
 
     pub async fn search_wiki_limited(

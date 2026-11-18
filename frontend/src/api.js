@@ -274,6 +274,14 @@ export const api = {
     return response.json()
   },
 
+  async getKnowledgeBaseTree() {
+    const response = await fetch(`${API_BASE}/knowledge_base/tree`, {
+      headers: getHeaders(false),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '加载知识库目录失败'))
+    return response.json()
+  },
+
   async getKnowledgeBase(id) {
     const response = await fetch(`${API_BASE}/knowledge_base/${id}`, {
       headers: getHeaders(),
@@ -352,6 +360,22 @@ export const api = {
     })
     if (!response.ok) throw new Error(await readErrorMessage(response, '导出知识库失败'))
     return response.json()
+  },
+
+  async downloadExport(exportId, filename = '') {
+    const response = await fetch(`${API_BASE}/knowledge_base/export/${encodeURIComponent(exportId)}/download`, {
+      headers: getHeaders(false),
+    })
+    if (!response.ok) throw new Error(await readErrorMessage(response, '下载导出文件失败'))
+    const blob = await response.blob()
+    const url = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = url
+    link.download = filename || `${exportId}.zip`
+    document.body.appendChild(link)
+    link.click()
+    link.remove()
+    URL.revokeObjectURL(url)
   },
 
   // 知识库权限管理
